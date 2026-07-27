@@ -13,3 +13,4 @@ traffic-proxy/bin/
 __pycache__/
 *.pyc
 AGENTS.md
+.playwright-cli/
