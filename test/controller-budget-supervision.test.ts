@@ -2731,6 +2731,65 @@ test("executor dependency brief carries partial predecessor capabilities and reu
   harness.controller.close();
 });
 
+test("executor dependency brief falls back to event digest when the outcome has no capability refs", async () => {
+  const harness = createControllerHarness();
+  harness.controller.graphStore.upsertDelta({
+    sourceEventIds: ["event:dependency"],
+    nodes: [{
+      id: "task:recon",
+      graphKind: "task",
+      type: "Task",
+      label: "Recon target",
+      properties: { status: "completed" }
+    }],
+    edges: []
+  });
+  await harness.controller.executionLog.append({
+    taskId: "task:recon",
+    role: "executor",
+    eventType: "tool_started",
+    summary: "tool_started:bash",
+    payload: {
+      toolCallId: "call:upload",
+      toolName: "bash",
+      args: { command: "curl -H 'X-Api-Key: accepted-key' -F file=@poc.php /api/upload.php" }
+    }
+  });
+  await harness.controller.executionLog.append({
+    taskId: "task:recon",
+    role: "executor",
+    eventType: "tool_finished",
+    summary: "tool_finished:bash:ok",
+    payload: {
+      toolCallId: "call:upload",
+      toolName: "bash",
+      result: { content: [{ type: "text", text: "Upload accepted at /files/poc.php" }] }
+    }
+  });
+  harness.controller.runtimeStore.upsertTaskOutcome({
+    taskRef: "task:recon",
+    epochRef: "epoch:recon-1",
+    status: "completed",
+    summary: "API key accepted by POST /api/upload.php",
+    evidenceRefs: [],
+    artifactRefs: [],
+    capabilityRefs: [],
+    terminalSeq: 2,
+    createdAt: new Date().toISOString()
+  });
+
+  const brief = await harness.controllerHarness.createDependencyOutcomeBrief(makeTaskEnvelope({
+    taskId: "task:exploit",
+    dependsOnTaskRefs: ["task:recon"]
+  }));
+
+  assert.match(brief, /task:recon status=completed/);
+  assert.match(brief, /result: API key accepted by POST \/api\/upload\.php/);
+  assert.match(brief, /capabilities:/);
+  assert.match(brief, /X-Api-Key: accepted-key/);
+  harness.controller.close();
+});
+
 test("executor session refs surface evidence-backed artifact refs", async () => {
   const harness = createControllerHarness();
   const materialEvent = await harness.controller.executionLog.append({

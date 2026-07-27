@@ -71,8 +71,36 @@ if command -v docker >/dev/null 2>&1 \
   npm run build:executor-image --prefix "${PROJECT_ROOT}"
   log "Building Docker network image"
   npm run build:network-image --prefix "${PROJECT_ROOT}"
+elif command -v docker >/dev/null 2>&1; then
+  log "Docker CLI found but the daemon is unreachable. On Linux this is usually a permission issue: add the user to the docker group (sudo usermod -aG docker \$USER, then re-login) or use rootless Docker; native sandbox backends remain available"
 else
-  log "Docker daemon unavailable; native sandbox backends remain available"
+  log "Docker not installed; native sandbox backends remain available (macOS Seatbelt / Linux Bubblewrap / workspace)"
+fi
+
+# Optional first-run .env configuration (interactive terminals only; skipped when .env
+# already exists or stdin is not a TTY, so CI/piped installs never block).
+ENV_FILE="${PROJECT_ROOT}/.env"
+if [ ! -f "${ENV_FILE}" ] && [ -t 0 ]; then
+  printf '\033[1;34m[install]\033[0m %s' "No .env found. Configure the LLM connection now? [y/N] "
+  read -r answer || answer=""
+  if [ "${answer}" = "y" ] || [ "${answer}" = "Y" ]; then
+    read -r -p "LLM_API_BASE_URL [https://api.openai.com/v1]: " input_base || input_base=""
+    read -r -p "LLM_DEFAULT_MODEL: " input_model || input_model=""
+    read -r -s -p "LLM_API_KEY (input hidden): " input_key || input_key=""
+    printf '\n'
+    {
+      printf 'LLM_API_KEY=%s\n' "${input_key}"
+      printf 'LLM_API_BASE_URL=%s\n' "${input_base:-https://api.openai.com/v1}"
+      printf 'LLM_DEFAULT_MODEL=%s\n' "${input_model}"
+      printf 'LLM_API_TYPE=openai-completions\n'
+    } > "${ENV_FILE}"
+    chmod 600 "${ENV_FILE}"
+    log "Wrote ${ENV_FILE} (mode 0600); tune model/thinking options later via the Web workbench or .env.example"
+  else
+    log "Skipped; copy .env.example to .env and set LLM_API_KEY before starting a run"
+  fi
+elif [ ! -f "${ENV_FILE}" ]; then
+  log "No .env found; copy .env.example to .env and set LLM_API_KEY before starting a run"
 fi
 
 log "Done. Start a run with: npm start -- --goal \"...\" --scope \"...\""

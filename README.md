@@ -205,7 +205,7 @@ LuaN1ao uses the Agent Skills convention through the Pi runtime. These optional 
 | [Eyadkelleh/awesome-skills-security](https://github.com/Eyadkelleh/awesome-skills-security) | Curated fuzzing payloads, password and username lists, sensitive-data patterns, web-shell samples, and LLM security testing resources |
 | [ljagiello/ctf-skills](https://github.com/ljagiello/ctf-skills) | CTF and lab workflows covering Web, Pwn, Crypto, Reverse Engineering, Forensics, OSINT, AI/ML, malware analysis, and writeups |
 
-One-click setup from the repository root — installs all three recommended skill collections into the project-local `.agents/skills/`, runs `npm ci` and `npm run build`, and builds both Docker images when a daemon is available:
+One-click setup from the repository root — installs all three recommended skill collections into the project-local `.agents/skills/`, runs `npm ci` and `npm run build`, and builds both Docker images when a daemon is available. On first run in an interactive terminal it also offers to write a minimal `.env` (mode `0600`); existing `.env` files are never touched and non-interactive installs skip the prompt:
 
 ```bash
 ./install.sh
@@ -256,7 +256,7 @@ Each fresh CLI invocation creates an isolated session under `.agent-runtime/sess
 |---|---|---|
 | Operating system | macOS or Linux | Windows has not been validated as a v2 release target |
 | Node.js | 25+ | Must support the built-in `node:sqlite` runtime used by v2 |
-| Docker | Recommended | Required by the preferred transparent Gateway backend; native host backends remain available |
+| Docker | Recommended | Required by the preferred transparent Gateway backend; on Linux the user must be able to reach the daemon — use rootless Docker or add the user to the `docker` group (`sudo usermod -aG docker $USER`, then re-login), otherwise install falls back to the native host backends |
 | LLM API | OpenAI-compatible | Chat Completions by default; Responses API is optional |
 | Terminal | ANSI-compatible TTY | Required for the interactive Agent timeline |
 | Browser | Current Chromium, Firefox, or Safari | Used by the authenticated Web workbench |

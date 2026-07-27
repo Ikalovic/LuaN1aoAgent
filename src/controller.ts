@@ -4433,7 +4433,7 @@ export class SecurityAgentController {
         ]
       });
       const outcome = this.runtimeStore.getTaskOutcome(dependencyTaskId);
-      const capabilities = outcome
+      const capabilities = outcome && outcome.capabilityRefs.length > 0
         ? outcome.capabilityRefs.join(", ")
         : capabilityDigest(buildProjectionObservations(dependencyEvents.events), 1200);
       const artifactRefs = outcome?.artifactRefs ?? stringArrayProperty(taskNode.properties.artifactRefs);

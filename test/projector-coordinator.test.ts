@@ -266,6 +266,46 @@ test("owns retry timing after a failed projector callback", async () => {
   await coordinator.close();
 });
 
+test("backs off repeated retries exponentially up to a cap and resets after progress", async () => {
+  const store = new FakeProjectionStore();
+  const attemptTimes: number[] = [];
+  let attempts = 0;
+  const coordinator = new ProjectorCoordinator({
+    store,
+    countObservations: ({ toSeq, afterSeq }) => toSeq - afterSeq,
+    run: (work) => {
+      attempts += 1;
+      attemptTimes.push(Date.now());
+      if (attempts <= 4 || attempts === 6) {
+        throw new Error(`failure ${attempts}`);
+      }
+      store.commit(work.taskId, work.targetSeq);
+    },
+    liveObservationThreshold: 1,
+    retryDelayMs: 25,
+    maxRetryDelayMs: 60
+  });
+
+  await coordinator.request({ taskId: "task:backoff", desiredSeq: 1 });
+  await coordinator.waitForCommitted("task:backoff", 1, { timeoutMs: 2_000 });
+  assert.equal(attempts, 5);
+
+  const gap = (index: number) => attemptTimes[index]! - attemptTimes[index - 1]!;
+  assert.ok(gap(1) >= 20, `first retry gap ${gap(1)}ms, expected ~25ms base delay`);
+  assert.ok(gap(2) >= 45, `second retry gap ${gap(2)}ms, expected ~50ms doubled delay`);
+  assert.ok(gap(3) < gap(2) * 1.5, `third retry gap ${gap(3)}ms should be capped near 60ms, not double again`);
+  assert.ok(gap(4) < gap(2) * 1.5, `fourth retry gap ${gap(4)}ms should stay at the cap`);
+
+  await coordinator.request({ taskId: "task:backoff", desiredSeq: 2 });
+  await coordinator.waitForCommitted("task:backoff", 2, { timeoutMs: 2_000 });
+  assert.equal(attempts, 7);
+  assert.ok(
+    gap(6) >= 20 && gap(6) < 45,
+    `retry after progress ${gap(6)}ms should reset to the ~25ms base delay`
+  );
+  await coordinator.close();
+});
+
 test("keeps the process alive while a persisted retry is awaited", () => {
   const moduleUrl = new URL("../src/projector-coordinator.js", import.meta.url).href;
   const child = spawnSync(process.execPath, [

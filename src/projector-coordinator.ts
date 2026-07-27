@@ -48,6 +48,7 @@ export type ProjectorCoordinatorOptions = {
   backlogThreshold?: number;
   backlogBatchSize?: number;
   retryDelayMs?: number;
+  maxRetryDelayMs?: number;
   closeDrainTimeoutMs?: number;
   now?: () => number;
 };
@@ -85,6 +86,7 @@ const DEFAULT_NORMAL_BATCH_SIZE = 16;
 const DEFAULT_BACKLOG_THRESHOLD = 32;
 const DEFAULT_BACKLOG_BATCH_SIZE = 32;
 const DEFAULT_RETRY_DELAY_MS = 2_000;
+const DEFAULT_MAX_RETRY_DELAY_MS = 60_000;
 const DEFAULT_CLOSE_DRAIN_TIMEOUT_MS = 30_000;
 const DEFAULT_CANCEL_GRACE_MS = 2_000;
 
@@ -100,11 +102,13 @@ export class ProjectorCoordinator {
   private readonly backlogThreshold: number;
   private readonly backlogBatchSize: number;
   private readonly retryDelayMs: number;
+  private readonly maxRetryDelayMs: number;
   private readonly closeDrainTimeoutMs: number;
   private readonly now: () => number;
   private readonly activeByTask = new Map<string, ActiveWork>();
   private readonly wakeTimers = new Map<string, NodeJS.Timeout>();
   private readonly retryNotBefore = new Map<string, number>();
+  private readonly retryAttempts = new Map<string, number>();
   private readonly waitersByTask = new Map<string, Set<CommitWaiter>>();
   private pumping = false;
   private pumpScheduled = false;
@@ -128,6 +132,7 @@ export class ProjectorCoordinator {
     this.backlogThreshold = positiveInteger(options.backlogThreshold, DEFAULT_BACKLOG_THRESHOLD);
     this.backlogBatchSize = positiveInteger(options.backlogBatchSize, DEFAULT_BACKLOG_BATCH_SIZE);
     this.retryDelayMs = nonNegativeInteger(options.retryDelayMs, DEFAULT_RETRY_DELAY_MS);
+    this.maxRetryDelayMs = nonNegativeInteger(options.maxRetryDelayMs, DEFAULT_MAX_RETRY_DELAY_MS);
     this.closeDrainTimeoutMs = positiveInteger(
       options.closeDrainTimeoutMs,
       DEFAULT_CLOSE_DRAIN_TIMEOUT_MS
@@ -390,8 +395,7 @@ export class ProjectorCoordinator {
     this.activeByTask.set(work.taskId, active);
     active.promise = this.executeWork(work, abortController.signal)
       .catch(async (error) => {
-        this.retryNotBefore.set(work.taskId, this.now() + this.retryDelayMs);
-        this.scheduleWake(work.taskId, this.retryDelayMs);
+        this.scheduleRetry(work.taskId);
         try {
           await this.onError?.(error, work);
         } catch {
@@ -431,11 +435,22 @@ export class ProjectorCoordinator {
     }
     await this.resolveCommittedWaiters(work.taskId, state);
     if (failed || (state.desiredSeq > state.committedSeq && state.committedSeq <= work.fromSeq)) {
-      this.retryNotBefore.set(work.taskId, this.now() + this.retryDelayMs);
-      this.scheduleWake(work.taskId, this.retryDelayMs);
+      this.scheduleRetry(work.taskId);
     } else {
       this.retryNotBefore.delete(work.taskId);
+      this.retryAttempts.delete(work.taskId);
     }
+  }
+
+  // Consecutive failures back off exponentially (retryDelayMs * 2^(n-1))
+  // capped at maxRetryDelayMs, so a deterministically failing job cannot
+  // spin LLM invocations on a fixed short cadence.
+  private scheduleRetry(taskId: string): void {
+    const attempt = (this.retryAttempts.get(taskId) ?? 0) + 1;
+    this.retryAttempts.set(taskId, attempt);
+    const delayMs = Math.min(this.retryDelayMs * 2 ** (attempt - 1), this.maxRetryDelayMs);
+    this.retryNotBefore.set(taskId, this.now() + delayMs);
+    this.scheduleWake(taskId, delayMs);
   }
 
   private scheduleWake(taskId: string, delayMs: number): void {

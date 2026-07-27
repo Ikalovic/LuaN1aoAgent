@@ -205,7 +205,7 @@ LuaN1ao 通过 Pi Runtime 使用 Agent Skills 约定。推荐按需安装以下�
 | [Eyadkelleh/awesome-skills-security](https://github.com/Eyadkelleh/awesome-skills-security) | Fuzzing Payload、密码与用户名字典、敏感信息模式、WebShell 样本和 LLM 安全测试资料 |
 | [ljagiello/ctf-skills](https://github.com/ljagiello/ctf-skills) | Web、Pwn、Crypto、逆向、取证、OSINT、AI/ML、恶意代码分析和 Writeup 等 CTF 与靶场工作流 |
 
-在仓库根目录执行一键安装脚本 —— 将三个推荐 Skills 集合全部安装到项目本地 `.agents/skills/`，执行 `npm ci` 和 `npm run build`，并在 Docker daemon 可用时构建两个 Docker 镜像：
+在仓库根目录执行一键安装脚本 —— 将三个推荐 Skills 集合全部安装到项目本地 `.agents/skills/`，执行 `npm ci` 和 `npm run build`，并在 Docker daemon 可用时构建两个 Docker 镜像。首次在交互式终端运行时会可选写入一份最小 `.env`（权限 `0600`）；已存在的 `.env` 不会被改动，非交互环境自动跳过该提示：
 
 ```bash
 ./install.sh
@@ -256,7 +256,7 @@ npx skills add ljagiello/ctf-skills \
 |---|---|---|
 | 操作系统 | macOS 或 Linux | Windows 尚未作为 v2 发布目标进行验证 |
 | Node.js | 25+ | 必须支持 v2 使用的内置 `node:sqlite` 运行时 |
-| Docker | 推荐 | 透明 Gateway 首选后端需要；仍保留原生宿主沙箱后端 |
+| Docker | 推荐 | 透明 Gateway 首选后端需要；在 Linux 上用户必须能访问 daemon —— 使用 rootless Docker 或将用户加入 `docker` 组（`sudo usermod -aG docker $USER` 后重新登录），否则安装将回退到原生宿主沙箱后端 |
 | LLM API | OpenAI 兼容 | 默认使用 Chat Completions，可选 Responses API |
 | 终端 | 支持 ANSI 的 TTY | 交互式 Agent 时间线所需 |
 | 浏览器 | 当前版本 Chromium、Firefox 或 Safari | 用于带认证的 Web 工作台 |
