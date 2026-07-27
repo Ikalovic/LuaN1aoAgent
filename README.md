@@ -63,6 +63,9 @@ The system is designed around one principle: every important conclusion must rem
 
 ## <a id="showcase"></a>🖥️ Showcase
 
+https://github.com/user-attachments/assets/85febe15-0644-496a-888d-905fbf5f4d5f
+<p align="center"><strong>Demo video</strong></p>
+
 <p align="center">
   <img src="docs/assets/workbench-live-trace.png" alt="LuaN1aoAgent v2 live Agent trace with reasoning, actions, artifacts, and runtime inspection" width="100%" />
 </p>
