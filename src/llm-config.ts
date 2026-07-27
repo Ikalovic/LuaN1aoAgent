@@ -236,6 +236,11 @@ export function createLlmRuntime(config = loadLlmRuntimeConfig()): LlmRuntime {
   };
 }
 
+export function providerAdmissionKey(runtime: LlmRuntime, role: LlmAgentRole): string {
+  const config = runtime.roleConfig[role];
+  return `${config.provider}@${config.baseUrl}`;
+}
+
 export function normalizeOpenAICompletionsBaseUrl(rawBaseUrl: string): string {
   return normalizeOpenAIBaseUrl(rawBaseUrl, "openai-completions");
 }

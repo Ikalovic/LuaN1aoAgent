@@ -1,8 +1,10 @@
-import { appendFile, mkdir, readFile, stat, writeFile } from "node:fs/promises";
-import { existsSync, mkdirSync, readFileSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { createReadStream, createWriteStream, existsSync, mkdirSync, readFileSync } from "node:fs";
+import { appendFile, link, lstat, mkdir, readFile, stat, unlink, writeFile } from "node:fs/promises";
+import { dirname, extname, join } from "node:path";
 import { createHash, randomUUID } from "node:crypto";
 import { DatabaseSync } from "node:sqlite";
+import { Transform } from "node:stream";
+import { pipeline } from "node:stream/promises";
 import { toJsonLine } from "../json.js";
 import type { ArtifactRecord } from "../types.js";
 
@@ -57,7 +59,7 @@ export class ArtifactStore {
 
     const createdAt = new Date().toISOString();
     const artifactRef = `artifact:${randomUUID()}`;
-    const extension = input.extension ?? extensionForKind(input.kind);
+    const extension = normalizeExtension(input.extension ?? extensionForKind(input.kind));
     const relativePath = join(input.taskId ?? "global", `${contentHash}.${extension}`);
     const absolutePath = join(this.rootDir, relativePath);
     await mkdir(dirname(absolutePath), { recursive: true });
@@ -86,6 +88,86 @@ export class ArtifactStore {
     }
     await this.appendRecord(record);
     return record;
+  }
+
+  async importFile(input: {
+    taskId?: string;
+    kind: ArtifactRecord["kind"];
+    mediaType: string;
+    sourcePath: string;
+    extension?: string;
+  }): Promise<ArtifactRecord> {
+    const sourceMetadata = await lstat(input.sourcePath);
+    if (!sourceMetadata.isFile() || sourceMetadata.isSymbolicLink()) {
+      throw new Error("Artifact source must be a regular file");
+    }
+
+    const temporaryDirectory = join(this.rootDir, ".tmp");
+    const temporaryPath = join(temporaryDirectory, `${randomUUID()}.tmp`);
+    await mkdir(temporaryDirectory, { recursive: true, mode: 0o700 });
+    const hash = createHash("sha256");
+    let byteLength = 0;
+    try {
+      await pipeline(
+        createReadStream(input.sourcePath),
+        new Transform({
+          transform(chunk: Buffer, _encoding, callback) {
+            hash.update(chunk);
+            byteLength += chunk.byteLength;
+            callback(null, chunk);
+          }
+        }),
+        createWriteStream(temporaryPath, { flags: "wx", mode: 0o600 })
+      );
+      const contentHash = hash.digest("hex");
+      const existing = this.database.prepare(`
+        SELECT * FROM artifacts
+        WHERE task_id IS ? AND content_hash = ?
+        ORDER BY created_at DESC LIMIT 1
+      `).get(input.taskId ?? null, contentHash) as ArtifactRow | undefined;
+      if (existing) {
+        return rowToRecord(existing);
+      }
+
+      const sourceExtension = extname(input.sourcePath).slice(1);
+      const extension = normalizeExtension(input.extension ?? (sourceExtension || extensionForKind(input.kind)));
+      const relativePath = join(input.taskId ?? "global", `${contentHash}.${extension}`);
+      const absolutePath = join(this.rootDir, relativePath);
+      await mkdir(dirname(absolutePath), { recursive: true });
+      try {
+        await link(temporaryPath, absolutePath);
+      } catch (error) {
+        if (!isAlreadyExistsError(error)) {
+          throw error;
+        }
+      }
+      const dataBuffer = await readFile(absolutePath);
+      const createdAt = new Date().toISOString();
+      const record: ArtifactRecord = {
+        artifactRef: `artifact:${randomUUID()}`,
+        taskId: input.taskId,
+        kind: input.kind,
+        mediaType: input.mediaType,
+        path: absolutePath,
+        byteLength,
+        createdAt,
+        preview: dataBuffer.toString("utf8", 0, Math.min(dataBuffer.byteLength, 800)),
+        contentHash
+      };
+      const inserted = this.insertRecord(record, dataBuffer.toString("utf8"));
+      if (!inserted) {
+        const concurrent = this.database.prepare(`
+          SELECT * FROM artifacts WHERE task_id IS ? AND content_hash = ? ORDER BY created_at DESC LIMIT 1
+        `).get(input.taskId ?? null, contentHash) as ArtifactRow | undefined;
+        if (concurrent) {
+          return rowToRecord(concurrent);
+        }
+      }
+      await this.appendRecord(record);
+      return record;
+    } finally {
+      await unlink(temporaryPath).catch(() => undefined);
+    }
   }
 
   async read(refOrPath: string, range?: { offset?: number; length?: number }): Promise<string> {
@@ -348,4 +430,19 @@ function extensionForKind(kind: ArtifactRecord["kind"]): string {
     default:
       return "txt";
   }
+}
+
+function normalizeExtension(value: string): string {
+  const stripped = value.replace(/^\.+/, "").toLowerCase();
+  const normalized = stripped.includes(".")
+    ? stripped.slice(stripped.lastIndexOf(".") + 1)
+    : stripped;
+  if (!/^[a-z0-9][a-z0-9_-]{0,15}$/.test(normalized)) {
+    throw new Error(`Invalid artifact extension: ${value}`);
+  }
+  return normalized;
+}
+
+function isAlreadyExistsError(error: unknown): boolean {
+  return Boolean(error && typeof error === "object" && "code" in error && error.code === "EEXIST");
 }

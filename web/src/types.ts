@@ -214,8 +214,11 @@ export interface TrafficHeaderEntry {
   ordinal: number;
 }
 
+export type TrafficFlowRef = string;
+
 export interface TrafficExchange {
-  id: number;
+  id: TrafficFlowRef;
+  kind?: "http" | "tcp";
   started_at: string;
   completed_at: string;
   duration_ms: number;
@@ -248,11 +251,13 @@ export interface TrafficExchange {
   attribution?: string;
   route_ref?: string;
   session_ref?: string;
+  connection_ref?: string;
+  epoch_ref?: string;
   connect_ref?: string;
   connect_authority?: string;
   connect_host?: string;
   connect_port?: string;
-  replay_of?: number;
+  replay_of?: TrafficFlowRef;
   error_code?: string;
   evicted_exchanges: number;
   request_headers?: TrafficHeaderEntry[];
@@ -276,7 +281,7 @@ export interface TrafficHistoryFilters {
 }
 
 export interface TrafficHistoryBody {
-  exchange_id: number;
+  exchange_id: TrafficFlowRef;
   side: "request" | "response";
   body_ref: string;
   encoding: "base64";
@@ -298,8 +303,8 @@ export interface TrafficReplayInput {
 }
 
 export interface TrafficReplayResponse {
-  exchangeId: number;
-  replayOf: number;
+  exchangeId: TrafficFlowRef;
+  replayOf: TrafficFlowRef;
   status: number;
   errorCode?: string;
 }
@@ -307,39 +312,33 @@ export interface TrafficReplayResponse {
 export interface ConnectionItem {
   id: string;
   externalId: string;
-  kind: "tunnel" | "session" | "route";
+  kind: "tunnel" | "route" | "connection";
+  layer?: "definition" | "observation";
   direction: string;
   transport: string;
   managed: boolean;
-  desiredState: "running" | "stopped" | "closed";
+  actions?: Array<"status" | "stop" | "reconnect" | "forget">;
+  desiredState?: "running" | "stopped" | "closed";
   observedState: "live" | "degraded" | "stale" | "closed";
   lastHeartbeat?: string;
   error?: string;
   available: boolean;
   graphUrl?: string;
+  routeRef?: string;
+  connectionRef?: string;
+  sessionRef?: string;
+  taskRef?: string;
+  runRef?: string;
+  epochRef?: string;
 }
 
 export interface ConnectionsResponse {
   runtimeDir: string;
   loadedAt: string;
+  runtimeControl: {
+    active: boolean;
+    mode: "controller" | "read_only";
+    error?: string;
+  };
   connections: ConnectionItem[];
-}
-
-export interface CreateSshTunnelInput {
-  runtimeDir: string;
-  externalId: string;
-  fromHostRef: string;
-  toHostRef: string;
-  host: string;
-  port?: number;
-  user?: string;
-  credentialRef?: string;
-  desiredState?: "running" | "stopped";
-  forwards: Array<{
-    mode: "local" | "remote" | "dynamic";
-    bindHost?: string;
-    bindPort: number;
-    targetHost?: string;
-    targetPort?: number;
-  }>;
 }

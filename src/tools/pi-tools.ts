@@ -1,119 +1,28 @@
 import { Type } from "typebox";
 import { defineTool } from "@earendil-works/pi-coding-agent";
+import { createHash, randomUUID } from "node:crypto";
+import { constants } from "node:fs";
+import { chmod, copyFile, lstat, mkdir, realpath, rename, unlink } from "node:fs/promises";
+import { basename, extname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { compactExecutionEvents } from "../log-summary.js";
+import {
+  PROJECTOR_MAX_DELTA_EDGES,
+  PROJECTOR_MAX_DELTA_NODES,
+  validateProjectionDraftIntegrity,
+  type ProjectionDraftValidationOptions,
+  type ProjectorGraphRefRegistry
+} from "../projection.js";
 import type { ArtifactStore } from "../stores/artifact-store.js";
 import type { ExecutionLog } from "../stores/execution-log.js";
 import type { SQLiteGraphStore } from "../stores/graph-store.js";
-import type { ArtifactRecord, GraphDelta, GraphView } from "../types.js";
+import type { ArtifactRecord, GraphEdge, GraphNode, GraphSnapshot, GraphView } from "../types.js";
 
-const ReasoningNodeTypeSchema = Type.Union([
-  Type.Literal("Evidence"),
-  Type.Literal("Hypothesis"),
-  Type.Literal("Vulnerability"),
-  Type.Literal("Exploit")
-]);
-
-const OperationNodeTypeSchema = Type.Union([
-  Type.Literal("Host"),
-  Type.Literal("Port"),
-  Type.Literal("Service"),
-  Type.Literal("WebEndpoint"),
-  Type.Literal("Parameter"),
-  Type.Literal("Credential"),
-  Type.Literal("AgentSession"),
-  Type.Literal("ShellSession"),
-  Type.Literal("Session"),
-  Type.Literal("File"),
-  Type.Literal("Process")
-]);
-
-const TaskNodeTypeSchema = Type.Union([
-  Type.Literal("Goal"),
-  Type.Literal("Task"),
-  Type.Literal("Milestone"),
-  Type.Literal("Blocker"),
-  Type.Literal("Scope")
-]);
-
-const GraphEdgeTypeSchema = Type.Union([
-  Type.Literal("supports"),
-  Type.Literal("contradicts"),
-  Type.Literal("confirms"),
-  Type.Literal("promoted_to"),
-  Type.Literal("exploited_by"),
-  Type.Literal("produces_evidence"),
-  Type.Literal("observed_on"),
-  Type.Literal("affects"),
-  Type.Literal("has_port"),
-  Type.Literal("runs_service"),
-  Type.Literal("exposes_endpoint"),
-  Type.Literal("has_parameter"),
-  Type.Literal("authenticates_to"),
-  Type.Literal("creates_session"),
-  Type.Literal("session_on"),
-  Type.Literal("tunnels_to"),
-  Type.Literal("proxy_route"),
-  Type.Literal("contains_file"),
-  Type.Literal("spawns_process"),
-  Type.Literal("decomposes_to"),
-  Type.Literal("depends_on"),
-  Type.Literal("within_scope"),
-  Type.Literal("produces_milestone"),
-  Type.Literal("blocked_by"),
-  Type.Literal("unblocked_by"),
-  Type.Literal("requires_evidence")
-]);
-
-const ProjectorGraphEdgeTypeSchema = Type.Union([
-  Type.Literal("supports"),
-  Type.Literal("contradicts"),
-  Type.Literal("confirms"),
-  Type.Literal("promoted_to"),
-  Type.Literal("exploited_by"),
-  Type.Literal("produces_evidence"),
-  Type.Literal("observed_on"),
-  Type.Literal("affects"),
-  Type.Literal("has_port"),
-  Type.Literal("runs_service"),
-  Type.Literal("exposes_endpoint"),
-  Type.Literal("has_parameter"),
-  Type.Literal("authenticates_to"),
-  Type.Literal("creates_session"),
-  Type.Literal("session_on"),
-  Type.Literal("tunnels_to"),
-  Type.Literal("proxy_route"),
-  Type.Literal("contains_file"),
-  Type.Literal("spawns_process")
-]);
-
-const GraphScalarSchema = Type.Union([
-  Type.String({ maxLength: 600 }),
-  Type.Number(),
-  Type.Boolean(),
-  Type.Null()
-]);
-
-const GraphNestedValueSchema = Type.Union([
-  GraphScalarSchema,
-  Type.Array(GraphScalarSchema, { maxItems: 32 })
-]);
-
-const GraphObjectSchema = Type.Record(
-  Type.String({ maxLength: 120 }),
-  GraphNestedValueSchema
-);
-
-const GraphPropertyValueSchema = Type.Union([
-  GraphNestedValueSchema,
-  GraphObjectSchema,
-  Type.Array(GraphObjectSchema, { maxItems: 32 })
-]);
-
+export const GRAPH_TOOL_MAX_OUTPUT_BYTES = 10_000;
 const GraphNodeCommonProperties = {
   id: Type.String({ minLength: 1, maxLength: 256 }),
-  label: Type.String({ minLength: 1, maxLength: 500 }),
-  properties: Type.Optional(Type.Object({}, { additionalProperties: GraphPropertyValueSchema })),
-  evidenceRefs: Type.Optional(Type.Array(Type.String({ maxLength: 32 }), { maxItems: 8 }))
+  label: Type.String({ minLength: 1 }),
+  properties: Type.Optional(Type.Record(Type.String(), Type.Unknown())),
+  evidenceRefs: Type.Optional(Type.Array(Type.String()))
 };
 
 const ProjectorGraphNodeCommonProperties = {
@@ -121,52 +30,22 @@ const ProjectorGraphNodeCommonProperties = {
   id: Type.String({ pattern: "^(existing|new):[1-9][0-9]*$", maxLength: 32 })
 };
 
-const GraphNodeSchema = Type.Union([
-  Type.Object({
-    ...GraphNodeCommonProperties,
-    graphKind: Type.Literal("reasoning"),
-    type: ReasoningNodeTypeSchema
-  }, { additionalProperties: false }),
-  Type.Object({
-    ...GraphNodeCommonProperties,
-    graphKind: Type.Literal("operation"),
-    type: OperationNodeTypeSchema
-  }, { additionalProperties: false }),
-  Type.Object({
-    ...GraphNodeCommonProperties,
-    graphKind: Type.Literal("task"),
-    type: TaskNodeTypeSchema
-  }, { additionalProperties: false })
-]);
-
-const ProjectorGraphNodeSchema = Type.Union([
-  Type.Object({
-    ...ProjectorGraphNodeCommonProperties,
-    graphKind: Type.Literal("reasoning"),
-    type: ReasoningNodeTypeSchema
-  }, { additionalProperties: false }),
-  Type.Object({
-    ...ProjectorGraphNodeCommonProperties,
-    graphKind: Type.Literal("operation"),
-    type: OperationNodeTypeSchema
-  }, { additionalProperties: false })
-]);
-
-const GraphEdgeSchema = Type.Object({
-  from: Type.String({ minLength: 1, maxLength: 256 }),
-  to: Type.String({ minLength: 1, maxLength: 256 }),
-  type: GraphEdgeTypeSchema,
-  properties: Type.Optional(Type.Object({}, { additionalProperties: GraphPropertyValueSchema })),
-  evidenceRefs: Type.Optional(Type.Array(Type.String({ maxLength: 32 }), { maxItems: 8 }))
-}, { additionalProperties: false });
+// graphKind/type vocabulary and unexpected keys are rejected by
+// validateProjectionDraftIntegrity with actionable messages; the wire schema
+// only checks field shapes so model mistakes get precise feedback.
+const ProjectorGraphNodeSchema = Type.Object({
+  ...ProjectorGraphNodeCommonProperties,
+  graphKind: Type.String({ minLength: 1, maxLength: 32 }),
+  type: Type.String({ minLength: 1, maxLength: 64 })
+});
 
 const ProjectorGraphEdgeSchema = Type.Object({
   from: Type.String({ pattern: "^(existing|new):[1-9][0-9]*$", maxLength: 32 }),
   to: Type.String({ pattern: "^(existing|new):[1-9][0-9]*$", maxLength: 32 }),
-  type: ProjectorGraphEdgeTypeSchema,
-  properties: Type.Optional(Type.Object({}, { additionalProperties: GraphPropertyValueSchema })),
-  evidenceRefs: Type.Optional(Type.Array(Type.String({ maxLength: 32 }), { maxItems: 8 }))
-}, { additionalProperties: false });
+  type: Type.String({ minLength: 1, maxLength: 64 }),
+  properties: Type.Optional(Type.Record(Type.String(), Type.Unknown())),
+  evidenceRefs: Type.Optional(Type.Array(Type.String()))
+});
 
 const PlannerTaskIdSchema = Type.String({ pattern: "^task:.+", minLength: 6, maxLength: 256 });
 const PlannerNodeIdSchema = Type.String({ minLength: 1, maxLength: 256 });
@@ -240,7 +119,7 @@ const PlannerCommandSchema = Type.Union([
 ]);
 
 export function createPlannerSubmitTool(input: {
-  validate?: (value: unknown) => void | Promise<void>;
+  validate?: (value: unknown) => unknown | Promise<unknown>;
 } = {}) {
   return defineTool({
     name: "planner_submit",
@@ -253,10 +132,12 @@ export function createPlannerSubmitTool(input: {
       basedOnRefs: PlannerRefArraySchema
     }, { additionalProperties: false }),
     execute: async (_toolCallId, params) => {
-      await input.validate?.(params);
+      // validate may return a normalized replacement (e.g. abbreviated
+      // Artifact Refs resolved to their full form); persist that version.
+      const validated = await input.validate?.(params);
       return {
         content: [{ type: "text", text: "Planner decision submitted" }],
-        details: params,
+        details: validated ?? params,
         terminate: true
       };
     }
@@ -278,6 +159,7 @@ export function createTaskResultSubmitTool() {
       summary: Type.String(),
       evidenceRefs: Type.Array(Type.String()),
       artifactRefs: Type.Array(Type.String()),
+      capabilityRefs: Type.Optional(Type.Array(Type.String())),
       blockerReason: Type.Optional(Type.String()),
       suggestedNextGoal: Type.Optional(Type.String()),
       checkpointReason: Type.Optional(Type.String()),
@@ -299,6 +181,7 @@ export function createControlSubmitTool() {
     parameters: Type.Object({
       decision: Type.Union([
         Type.Literal("continue"),
+        Type.Literal("redirect"),
         Type.Literal("checkpoint"),
         Type.Literal("stop_executor"),
         Type.Literal("need_planner")
@@ -310,10 +193,7 @@ export function createControlSubmitTool() {
         Type.Literal("medium"),
         Type.Literal("high")
       ])),
-      budgetExtension: Type.Optional(Type.Object({
-        maxTurnsDelta: Type.Optional(Type.Number()),
-        reason: Type.Optional(Type.String())
-      }))
+      guidance: Type.Optional(Type.String())
     }),
     execute: async (_toolCallId, params) => ({
       content: [{ type: "text", text: "Control signal submitted" }],
@@ -323,28 +203,36 @@ export function createControlSubmitTool() {
   });
 }
 
-export function createGraphDeltaSubmitTool() {
+export function createGraphDeltaSubmitTool(options: ProjectionDraftValidationOptions = {}) {
   return defineTool({
     name: "graph_delta_submit",
     label: "Submit Graph Delta",
     description: "Submit the final Projector GraphDelta and terminate this Projector invocation.",
     parameters: Type.Object({
-      nodes: Type.Array(ProjectorGraphNodeSchema, { maxItems: 12 }),
-      edges: Type.Array(ProjectorGraphEdgeSchema, { maxItems: 20 })
+      nodes: Type.Array(ProjectorGraphNodeSchema, { maxItems: PROJECTOR_MAX_DELTA_NODES }),
+      edges: Type.Array(ProjectorGraphEdgeSchema, { maxItems: PROJECTOR_MAX_DELTA_EDGES })
     }, { additionalProperties: false }),
-    execute: async (_toolCallId, params) => ({
-      content: [{ type: "text", text: "Graph delta submitted" }],
-      details: params,
-      terminate: true
-    })
+    execute: async (_toolCallId, params) => {
+      validateProjectionDraftIntegrity(params, options);
+      return {
+        content: [{ type: "text", text: "Graph delta submitted atomically" }],
+        details: params,
+        terminate: true
+      };
+    }
   });
 }
 
-export function createGraphQueryTool(graphStore: SQLiteGraphStore) {
+export function createGraphQueryTool(
+  graphStore: SQLiteGraphStore,
+  references?: ProjectorGraphRefRegistry,
+  cache?: Map<string, string>,
+  materials?: GraphToolMaterialsResolver
+) {
   return defineTool({
     name: "graph_query",
     label: "Graph Query",
-    description: "Read a bounded tri-graph view when the initial planner decision view is insufficient. This is read-only and does not expose raw logs or artifacts.",
+    description: "Read a byte-bounded closed tri-graph page when the initial view is insufficient. Returned edges always include both endpoint nodes; use nextCursor with unchanged arguments for continuation.",
     parameters: Type.Object({
       view: Type.Union([
         Type.Literal("planner"),
@@ -353,75 +241,554 @@ export function createGraphQueryTool(graphStore: SQLiteGraphStore) {
         Type.Literal("task"),
         Type.Literal("sessions")
       ]),
-      focusNodeIds: Type.Optional(Type.Array(Type.String())),
-      limit: Type.Optional(Type.Number())
-    }),
-    execute: async (_toolCallId, params) => ({
-      content: [{ type: "text", text: JSON.stringify(graphStore.query(params.view as GraphView, params.focusNodeIds, params.limit), null, 2) }],
-      details: {}
-    })
-  });
-}
-
-export function createGraphTraceTool(graphStore: SQLiteGraphStore) {
-  return defineTool({
-    name: "graph_trace",
-    label: "Graph Trace",
-    description: "Trace a node or evidence id back to related graph context. This is read-only and does not expose raw logs or artifacts.",
-    parameters: Type.Object({
-      nodeId: Type.Optional(Type.String()),
-      evidenceId: Type.Optional(Type.String())
-    }),
-    execute: async (_toolCallId, params) => ({
-      content: [{ type: "text", text: JSON.stringify(graphStore.trace(params), null, 2) }],
-      details: {}
-    })
-  });
-}
-
-export function createGraphSearchTool(graphStore: SQLiteGraphStore) {
-  return defineTool({
-    name: "graph_search",
-    label: "Graph Search",
-    description: "Search existing operation and reasoning nodes by semantic anchors when the supplied projection context is incomplete. This is read-only.",
-    parameters: Type.Object({
-      query: Type.String(),
-      graphKind: Type.Optional(Type.Union([
-        Type.Literal("operation"),
-        Type.Literal("reasoning")
-      ])),
-      limit: Type.Optional(Type.Number())
-    }),
-    execute: async (_toolCallId, params) => ({
-      content: [{ type: "text", text: JSON.stringify(graphStore.searchSemanticNodes({
-        query: params.query,
-        graphKind: params.graphKind,
-        limit: params.limit
-      }), null, 2) }],
-      details: {}
-    })
-  });
-}
-
-export function createGraphUpsertDeltaTool(graphStore: SQLiteGraphStore) {
-  return defineTool({
-    name: "graph_upsert_delta",
-    label: "Graph Upsert Delta",
-    description: "Write Observer-approved graph deltas into the tri-graph store.",
-    parameters: Type.Object({
-      sourceEventIds: Type.Array(Type.String()),
-      nodes: Type.Array(GraphNodeSchema, { maxItems: 12 }),
-      edges: Type.Array(GraphEdgeSchema, { maxItems: 20 })
-    }),
+      focusNodeIds: Type.Optional(Type.Array(Type.String({ minLength: 1, maxLength: 256 }), { maxItems: 32 })),
+      limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 200 })),
+      cursor: Type.Optional(Type.String({ minLength: 1, maxLength: 256 }))
+    }, { additionalProperties: false }),
     execute: async (_toolCallId, params) => {
-      const delta = params as GraphDelta;
-      graphStore.upsertDelta(delta);
+      const cacheKey = `graph_query:${JSON.stringify(params)}`;
+      const cached = cache?.get(cacheKey);
+      if (cached !== undefined) {
+        return { content: [{ type: "text", text: cached }], details: {} };
+      }
+      const focusNodeIds = params.focusNodeIds ?? [];
+      const resolvedFocusNodeIds = references
+        ? focusNodeIds.map((nodeId) => references.resolveNodeId(nodeId))
+        : focusNodeIds;
+      const snapshot = graphStore.query(params.view as GraphView, resolvedFocusNodeIds, params.limit);
+      const text = renderBoundedGraphSnapshot(
+          references?.aliasSnapshot(snapshot) ?? snapshot,
+          {
+            toolName: "graph_query",
+            request: {
+              view: params.view,
+              focusNodeIds,
+              limit: params.limit ?? 200
+            },
+            focusNodeIds,
+            cursor: params.cursor,
+            materialsByEvidenceRef: resolveGraphToolMaterials(materials, snapshot)
+          }
+        );
+      cache?.set(cacheKey, text);
       return {
-        content: [{ type: "text", text: JSON.stringify({ ok: true, nodes: delta.nodes.length, edges: delta.edges.length }) }],
+        content: [{ type: "text", text }],
         details: {}
       };
     }
   });
+}
+
+export function createGraphTraceTool(
+  graphStore: SQLiteGraphStore,
+  references?: ProjectorGraphRefRegistry,
+  cache?: Map<string, string>,
+  materials?: GraphToolMaterialsResolver
+) {
+  return defineTool({
+    name: "graph_trace",
+    label: "Graph Trace",
+    description: "Trace one real graph reference through a byte-bounded closed graph page. Returned edges always include both endpoint nodes; use nextCursor with unchanged arguments for continuation.",
+    parameters: Type.Object({
+      ref: Type.String({ minLength: 1, maxLength: 256 }),
+      cursor: Type.Optional(Type.String({ minLength: 1, maxLength: 256 }))
+    }, { additionalProperties: false }),
+    execute: async (_toolCallId, params) => {
+      const cacheKey = `graph_trace:${JSON.stringify(params)}`;
+      const cached = cache?.get(cacheKey);
+      if (cached !== undefined) {
+        return { content: [{ type: "text", text: cached }], details: {} };
+      }
+      const resolvedRef = references?.resolveNodeId(params.ref) ?? params.ref;
+      const snapshot = graphStore.trace({ nodeId: resolvedRef });
+      const text = renderBoundedGraphSnapshot(
+          references?.aliasSnapshot(snapshot) ?? snapshot,
+          {
+            toolName: "graph_trace",
+            request: {
+              ref: params.ref
+            },
+            focusNodeIds: [params.ref],
+            cursor: params.cursor,
+            materialsByEvidenceRef: resolveGraphToolMaterials(materials, snapshot)
+          }
+        );
+      cache?.set(cacheKey, text);
+      return {
+        content: [{ type: "text", text }],
+        details: {}
+      };
+    }
+  });
+}
+
+export function createGraphSearchTool(
+  graphStore: SQLiteGraphStore,
+  references?: ProjectorGraphRefRegistry,
+  cache?: Map<string, string>,
+  materials?: GraphToolMaterialsResolver
+) {
+  return defineTool({
+    name: "graph_search",
+    label: "Graph Search",
+    description: "Search semantic nodes in a byte-bounded closed graph page. Returned edges always include both endpoint nodes; use nextCursor with unchanged arguments for continuation.",
+    parameters: Type.Object({
+      query: Type.String({ minLength: 1, maxLength: 1_000 }),
+      graphKind: Type.Optional(Type.Union([
+        Type.Literal("operation"),
+        Type.Literal("reasoning")
+      ])),
+      limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 50 })),
+      cursor: Type.Optional(Type.String({ minLength: 1, maxLength: 256 }))
+    }, { additionalProperties: false }),
+    execute: async (_toolCallId, params) => {
+      const cacheKey = `graph_search:${JSON.stringify(params)}`;
+      const cached = cache?.get(cacheKey);
+      if (cached !== undefined) {
+        return { content: [{ type: "text", text: cached }], details: {} };
+      }
+      const snapshot = graphStore.searchSemanticNodes({
+        query: references?.resolveSearchQuery(params.query) ?? params.query,
+        graphKind: params.graphKind,
+        limit: params.limit
+      });
+      const visibleSnapshot = references?.aliasSnapshot(snapshot) ?? snapshot;
+      const text = renderBoundedGraphSnapshot(visibleSnapshot, {
+        toolName: "graph_search",
+        request: {
+          query: params.query,
+          graphKind: params.graphKind ?? null,
+          limit: params.limit ?? 20
+        },
+        focusNodeIds: visibleSnapshot.nodes[0] ? [visibleSnapshot.nodes[0].id] : [],
+        cursor: params.cursor,
+        materialsByEvidenceRef: resolveGraphToolMaterials(materials, snapshot)
+      });
+      cache?.set(cacheKey, text);
+      return {
+        content: [{ type: "text", text }],
+        details: {}
+      };
+    }
+  });
+}
+
+type GraphToolNodeRecord = {
+  id: string;
+  graphKind: GraphNode["graphKind"];
+  type: string;
+  label: string;
+  properties: Record<string, unknown>;
+  evidenceRefs: string[];
+  materialRefs?: string[];
+  recordMeta?: Record<string, number>;
+};
+
+export type GraphToolMaterialsResolver = (evidenceRefs: string[]) => ReadonlyMap<string, string[]>;
+
+const GRAPH_TOOL_MAX_MATERIAL_REFS_PER_NODE = 8;
+
+function resolveGraphToolMaterials(
+  resolver: GraphToolMaterialsResolver | undefined,
+  snapshot: GraphSnapshot
+): ReadonlyMap<string, string[]> | undefined {
+  if (!resolver) {
+    return undefined;
+  }
+  const evidenceRefs = [...new Set([
+    ...snapshot.nodes.flatMap((node) => node.evidenceRefs ?? []),
+    ...snapshot.edges.flatMap((edge) => edge.evidenceRefs ?? [])
+  ])];
+  if (evidenceRefs.length === 0) {
+    return undefined;
+  }
+  const resolved = resolver(evidenceRefs);
+  return resolved.size > 0 ? resolved : undefined;
+}
+
+function graphToolMaterialRefs(
+  evidenceRefs: string[],
+  materialsByEvidenceRef: ReadonlyMap<string, string[]>
+): string[] {
+  const materialRefs: string[] = [];
+  for (const evidenceRef of evidenceRefs) {
+    for (const materialRef of materialsByEvidenceRef.get(evidenceRef) ?? []) {
+      if (!materialRefs.includes(materialRef)) {
+        materialRefs.push(materialRef);
+      }
+      if (materialRefs.length >= GRAPH_TOOL_MAX_MATERIAL_REFS_PER_NODE) {
+        return materialRefs;
+      }
+    }
+  }
+  return materialRefs;
+}
+
+type GraphToolEdgeRecord = {
+  id?: string;
+  from: string;
+  to: string;
+  type: string;
+  properties: Record<string, unknown>;
+  evidenceRefs: string[];
+  recordMeta?: Record<string, number>;
+};
+
+type GraphPageUnit = {
+  nodeIds: string[];
+  edge?: GraphToolEdgeRecord;
+};
+
+const GRAPH_TOOL_IDENTITY_PROPERTY_KEYS = [
+  "hostRef", "routeRef", "connectionRef", "sessionRef", "credentialRef", "artifactRef",
+  "host", "hostname", "ip", "port", "protocol", "scheme", "url", "path", "method",
+  "sessionId", "agentSessionId", "shellSessionId", "routeId", "tunnelId", "dialAddress",
+  "targetCidrs", "username", "status"
+];
+
+export function renderBoundedGraphSnapshot(
+  snapshot: GraphSnapshot,
+  options: {
+    toolName: "graph_query" | "graph_trace" | "graph_search";
+    request: Record<string, unknown>;
+    focusNodeIds?: string[];
+    cursor?: string;
+    maxBytes?: number;
+    materialsByEvidenceRef?: ReadonlyMap<string, string[]>;
+  }
+): string {
+  const maxBytes = Math.max(2_000, Math.floor(options.maxBytes ?? GRAPH_TOOL_MAX_OUTPUT_BYTES));
+  const signature = graphToolRequestSignature(options.toolName, options.request);
+  const sourceNodes = dedupeGraphToolNodes(snapshot.nodes);
+  const sourceNodeIds = new Set(sourceNodes.map((node) => node.id));
+  const sourceEdges = dedupeGraphToolEdges(snapshot.edges);
+  const closedEdges = sourceEdges.filter((edge) => sourceNodeIds.has(edge.from) && sourceNodeIds.has(edge.to));
+  const danglingSourceEdgeCount = sourceEdges.length - closedEdges.length;
+  const compactNodes = new Map(sourceNodes.map((node) => [node.id, compactGraphToolNode(node)]));
+  if (options.materialsByEvidenceRef) {
+    for (const [nodeId, record] of compactNodes) {
+      const materialRefs = graphToolMaterialRefs(record.evidenceRefs, options.materialsByEvidenceRef);
+      if (materialRefs.length > 0) {
+        compactNodes.set(nodeId, { ...record, materialRefs });
+      }
+    }
+  }
+  const compactEdges = closedEdges.map(compactGraphToolEdge);
+  const requestedFocusIds = [...new Set(options.focusNodeIds ?? [])];
+  const availableFocusIds = requestedFocusIds.filter((nodeId) => compactNodes.has(nodeId));
+  const priorityNodeIds = availableFocusIds.length > 0
+    ? availableFocusIds
+    : sourceNodes[0]
+      ? [sourceNodes[0].id]
+      : [];
+  const prioritySet = new Set(priorityNodeIds);
+  const incidentEdges = compactEdges.filter((edge) => prioritySet.has(edge.from) || prioritySet.has(edge.to));
+  const remainingEdges = compactEdges.filter((edge) => !prioritySet.has(edge.from) && !prioritySet.has(edge.to));
+  const units: GraphPageUnit[] = [
+    ...priorityNodeIds.map((nodeId) => ({ nodeIds: [nodeId] })),
+    ...[...incidentEdges, ...remainingEdges].map((edge) => ({ nodeIds: [edge.from, edge.to], edge })),
+    ...sourceNodes.filter((node) => !prioritySet.has(node.id)).map((node) => ({ nodeIds: [node.id] }))
+  ];
+  const startOffset = decodeGraphToolCursor(options.cursor, signature, units.length);
+  let nextOffset = startOffset;
+  let selectedNodes = new Map<string, GraphToolNodeRecord>();
+  let selectedEdges = new Map<string, GraphToolEdgeRecord>();
+
+  while (nextOffset < units.length) {
+    const unit = units[nextOffset]!;
+    const candidateNodes = new Map(selectedNodes);
+    const candidateEdges = new Map(selectedEdges);
+    for (const nodeId of unit.nodeIds) {
+      const node = compactNodes.get(nodeId);
+      if (node) candidateNodes.set(nodeId, node);
+    }
+    if (unit.edge) candidateEdges.set(graphToolEdgeKey(unit.edge), unit.edge);
+    const candidateOffset = nextOffset + 1;
+    const candidateText = serializeGraphToolPage({
+      snapshot,
+      signature,
+      sourceNodes,
+      sourceEdges,
+      danglingSourceEdgeCount,
+      requestedFocusIds,
+      units,
+      nextOffset: candidateOffset,
+      selectedNodes: candidateNodes,
+      selectedEdges: candidateEdges,
+      maxBytes
+    });
+    if (Buffer.byteLength(candidateText, "utf8") > maxBytes) {
+      break;
+    }
+    selectedNodes = candidateNodes;
+    selectedEdges = candidateEdges;
+    nextOffset = candidateOffset;
+  }
+
+  if (nextOffset === startOffset && nextOffset < units.length) {
+    const unit = units[nextOffset]!;
+    for (const nodeId of unit.nodeIds) {
+      const node = compactNodes.get(nodeId);
+      if (node) selectedNodes.set(nodeId, graphToolNodeIdentity(node));
+    }
+    if (unit.edge) selectedEdges.set(graphToolEdgeKey(unit.edge), graphToolEdgeIdentity(unit.edge));
+    nextOffset += 1;
+  }
+
+  const text = serializeGraphToolPage({
+    snapshot,
+    signature,
+    sourceNodes,
+    sourceEdges,
+    danglingSourceEdgeCount,
+    requestedFocusIds,
+    units,
+    nextOffset,
+    selectedNodes,
+    selectedEdges,
+    maxBytes
+  });
+  if (Buffer.byteLength(text, "utf8") > maxBytes) {
+    throw new Error(`Bounded graph page exceeded ${maxBytes} UTF-8 bytes`);
+  }
+  return text;
+}
+
+function serializeGraphToolPage(input: {
+  snapshot: GraphSnapshot;
+  signature: string;
+  sourceNodes: GraphNode[];
+  sourceEdges: GraphEdge[];
+  danglingSourceEdgeCount: number;
+  requestedFocusIds: string[];
+  units: GraphPageUnit[];
+  nextOffset: number;
+  selectedNodes: Map<string, GraphToolNodeRecord>;
+  selectedEdges: Map<string, GraphToolEdgeRecord>;
+  maxBytes: number;
+}): string {
+  const nextCursor = input.nextOffset < input.units.length
+    ? encodeGraphToolCursor(input.signature, input.nextOffset)
+    : undefined;
+  const page = {
+    view: input.snapshot.view,
+    nodes: [...input.selectedNodes.values()],
+    edges: [...input.selectedEdges.values()],
+    summary: compactGraphToolSummary(input.snapshot.summary),
+    page: {
+      byteLimit: input.maxBytes,
+      sourceNodeCount: input.sourceNodes.length,
+      sourceEdgeCount: input.sourceEdges.length,
+      returnedNodeCount: input.selectedNodes.size,
+      returnedEdgeCount: input.selectedEdges.size,
+      omittedNodeCount: Math.max(0, input.sourceNodes.length - input.selectedNodes.size),
+      omittedEdgeCount: Math.max(0, input.sourceEdges.length - input.selectedEdges.size),
+      danglingSourceEdgeCount: input.danglingSourceEdgeCount,
+      missingFocusNodeIds: input.requestedFocusIds.filter((nodeId) => !input.sourceNodes.some((node) => node.id === nodeId)),
+      hasMore: Boolean(nextCursor),
+      ...(nextCursor ? { nextCursor } : {})
+    }
+  };
+  return JSON.stringify(page);
+}
+
+function graphToolRequestSignature(toolName: string, request: Record<string, unknown>): string {
+  return createHash("sha256").update(`${toolName}\u0000${JSON.stringify(request)}`).digest("hex").slice(0, 20);
+}
+
+function encodeGraphToolCursor(signature: string, offset: number): string {
+  return Buffer.from(JSON.stringify({ version: 1, signature, offset }), "utf8").toString("base64url");
+}
+
+function decodeGraphToolCursor(cursor: string | undefined, signature: string, unitCount: number): number {
+  if (!cursor) return 0;
+  try {
+    const value = JSON.parse(Buffer.from(cursor, "base64url").toString("utf8")) as Record<string, unknown>;
+    const offset = Number(value.offset);
+    if (value.version !== 1 || value.signature !== signature || !Number.isInteger(offset) || offset < 0 || offset > unitCount) {
+      throw new Error("mismatch");
+    }
+    return offset;
+  } catch {
+    throw new Error("Invalid graph continuation cursor for these request arguments");
+  }
+}
+
+function dedupeGraphToolNodes(nodes: GraphNode[]): GraphNode[] {
+  const byId = new Map<string, GraphNode>();
+  for (const node of nodes) byId.set(node.id, node);
+  return [...byId.values()];
+}
+
+function dedupeGraphToolEdges(edges: GraphEdge[]): GraphEdge[] {
+  const byKey = new Map<string, GraphEdge>();
+  for (const edge of edges) byKey.set(graphToolEdgeKey(edge), edge);
+  return [...byKey.values()];
+}
+
+function compactGraphToolNode(node: GraphNode): GraphToolNodeRecord {
+  const sourceProperties = Object.entries(node.properties ?? {}).sort(([leftKey], [rightKey]) => (
+    graphIdentityPropertyRank(leftKey) - graphIdentityPropertyRank(rightKey) || leftKey.localeCompare(rightKey)
+  ));
+  let properties: Record<string, unknown> = {};
+  let omittedPropertyCount = 0;
+  const base = {
+    id: node.id,
+    graphKind: node.graphKind,
+    type: node.type,
+    label: compactUtf8Prefix(node.label, 700),
+    properties,
+    evidenceRefs: [] as string[]
+  };
+  for (const [key, value] of sourceProperties) {
+    const candidateProperties = { ...properties, [key]: compactGraphToolValue(value, 0) };
+    if (Buffer.byteLength(JSON.stringify({ ...base, properties: candidateProperties }), "utf8") <= 2_300) {
+      properties = candidateProperties;
+    } else {
+      omittedPropertyCount += 1;
+    }
+  }
+  let evidenceRefs: string[] = [];
+  let omittedEvidenceRefCount = 0;
+  for (const evidenceRef of node.evidenceRefs ?? []) {
+    const candidateEvidenceRefs = [...evidenceRefs, evidenceRef];
+    if (Buffer.byteLength(JSON.stringify({ ...base, properties, evidenceRefs: candidateEvidenceRefs }), "utf8") <= 2_500) {
+      evidenceRefs = candidateEvidenceRefs;
+    } else {
+      omittedEvidenceRefCount += 1;
+    }
+  }
+  const recordMeta = omittedPropertyCount > 0 || omittedEvidenceRefCount > 0
+    ? {
+        sourcePropertyCount: sourceProperties.length,
+        omittedPropertyCount,
+        sourceEvidenceRefCount: node.evidenceRefs?.length ?? 0,
+        omittedEvidenceRefCount
+      }
+    : undefined;
+  return { ...base, properties, evidenceRefs, ...(recordMeta ? { recordMeta } : {}) };
+}
+
+function compactGraphToolEdge(edge: GraphEdge): GraphToolEdgeRecord {
+  const sourceProperties = Object.entries(edge.properties ?? {}).sort(([leftKey], [rightKey]) => leftKey.localeCompare(rightKey));
+  let properties: Record<string, unknown> = {};
+  let omittedPropertyCount = 0;
+  const base = {
+    ...(edge.id ? { id: edge.id } : {}),
+    from: edge.from,
+    to: edge.to,
+    type: edge.type,
+    properties,
+    evidenceRefs: [] as string[]
+  };
+  for (const [key, value] of sourceProperties) {
+    const candidateProperties = { ...properties, [key]: compactGraphToolValue(value, 0) };
+    if (Buffer.byteLength(JSON.stringify({ ...base, properties: candidateProperties }), "utf8") <= 1_100) {
+      properties = candidateProperties;
+    } else {
+      omittedPropertyCount += 1;
+    }
+  }
+  let evidenceRefs: string[] = [];
+  let omittedEvidenceRefCount = 0;
+  for (const evidenceRef of edge.evidenceRefs ?? []) {
+    const candidateEvidenceRefs = [...evidenceRefs, evidenceRef];
+    if (Buffer.byteLength(JSON.stringify({ ...base, properties, evidenceRefs: candidateEvidenceRefs }), "utf8") <= 1_300) {
+      evidenceRefs = candidateEvidenceRefs;
+    } else {
+      omittedEvidenceRefCount += 1;
+    }
+  }
+  const recordMeta = omittedPropertyCount > 0 || omittedEvidenceRefCount > 0
+    ? {
+        sourcePropertyCount: sourceProperties.length,
+        omittedPropertyCount,
+        sourceEvidenceRefCount: edge.evidenceRefs?.length ?? 0,
+        omittedEvidenceRefCount
+      }
+    : undefined;
+  return { ...base, properties, evidenceRefs, ...(recordMeta ? { recordMeta } : {}) };
+}
+
+function graphToolNodeIdentity(node: GraphToolNodeRecord): GraphToolNodeRecord {
+  return {
+    id: node.id,
+    graphKind: node.graphKind,
+    type: node.type,
+    label: compactUtf8Prefix(node.label, 320),
+    properties: Object.fromEntries(Object.entries(node.properties).filter(([key]) => graphIdentityPropertyRank(key) === 0)),
+    evidenceRefs: node.evidenceRefs,
+    recordMeta: {
+      sourcePropertyCount: Object.keys(node.properties).length,
+      omittedPropertyCount: Object.keys(node.properties).filter((key) => graphIdentityPropertyRank(key) !== 0).length,
+      sourceEvidenceRefCount: node.evidenceRefs.length,
+      omittedEvidenceRefCount: 0
+    }
+  };
+}
+
+function graphToolEdgeIdentity(edge: GraphToolEdgeRecord): GraphToolEdgeRecord {
+  return {
+    ...(edge.id ? { id: edge.id } : {}),
+    from: edge.from,
+    to: edge.to,
+    type: edge.type,
+    properties: {},
+    evidenceRefs: edge.evidenceRefs,
+    recordMeta: {
+      sourcePropertyCount: Object.keys(edge.properties).length,
+      omittedPropertyCount: Object.keys(edge.properties).length,
+      sourceEvidenceRefCount: edge.evidenceRefs.length,
+      omittedEvidenceRefCount: 0
+    }
+  };
+}
+
+function graphIdentityPropertyRank(key: string): number {
+  return GRAPH_TOOL_IDENTITY_PROPERTY_KEYS.includes(key) ? 0 : 1;
+}
+
+function graphToolEdgeKey(edge: Pick<GraphEdge, "id" | "from" | "to" | "type" | "properties">): string {
+  return edge.id ?? `${edge.from}\u0000${edge.type}\u0000${edge.to}\u0000${JSON.stringify(edge.properties ?? {})}`;
+}
+
+function compactGraphToolValue(value: unknown, depth: number): unknown {
+  if (typeof value === "string") return compactUtf8Prefix(value, 700);
+  if (typeof value === "number" || typeof value === "boolean" || value === null) return value;
+  if (Array.isArray(value)) {
+    return value.slice(0, 16).map((item) => compactGraphToolValue(item, depth + 1));
+  }
+  if (value && typeof value === "object") {
+    if (depth >= 2) return compactUtf8Prefix(JSON.stringify(value), 700);
+    return Object.fromEntries(Object.entries(value as Record<string, unknown>).slice(0, 20)
+      .map(([key, nestedValue]) => [key, compactGraphToolValue(nestedValue, depth + 1)]));
+  }
+  return String(value ?? "");
+}
+
+function compactGraphToolSummary(value: unknown): unknown {
+  const compacted = compactGraphToolValue(value, 0);
+  const serialized = JSON.stringify(compacted);
+  if (Buffer.byteLength(serialized, "utf8") <= 1_200) return compacted;
+  return {
+    preview: compactUtf8Prefix(serialized, 1_100),
+    truncated: true
+  };
+}
+
+function compactUtf8Prefix(value: string, maxBytes: number): string {
+  if (Buffer.byteLength(value, "utf8") <= maxBytes) return value;
+  const suffix = "...[truncated]";
+  const budget = Math.max(0, maxBytes - Buffer.byteLength(suffix, "utf8"));
+  let prefix = "";
+  let usedBytes = 0;
+  for (const character of value) {
+    const characterBytes = Buffer.byteLength(character, "utf8");
+    if (usedBytes + characterBytes > budget) break;
+    prefix += character;
+    usedBytes += characterBytes;
+  }
+  return `${prefix}${suffix}`;
 }
 
 export function createLogWindowTool(
@@ -468,35 +835,141 @@ export function createLogWindowTool(
 
 export function createArtifactReadTool(
   artifactStore: ArtifactStore,
-  options: { maxReadBytes?: number } = {}
+  options: {
+    maxReadBytes?: number;
+    workspace?: { hostDir: string; visibleRoot: string; sharedWithContainer?: boolean };
+  } = {}
 ) {
   return defineTool({
     name: "artifact_read",
     label: "Artifact Read",
-    description: "Read a bounded artifact range by artifact ref or path.",
+    description: "Read a bounded artifact range by artifact ref, or explicitly materialize the complete artifact into the persistent workspace.",
     parameters: Type.Object({
       path: Type.String(),
       offset: Type.Optional(Type.Number()),
-      length: Type.Optional(Type.Number())
+      length: Type.Optional(Type.Number()),
+      materialize: Type.Optional(Type.Boolean())
     }),
-    execute: async (_toolCallId, params) => ({
-      content: [{
-        type: "text",
-        text: await artifactStore.read(params.path, {
-          offset: params.offset,
-          length: Math.min(params.length ?? options.maxReadBytes ?? Number.MAX_SAFE_INTEGER, options.maxReadBytes ?? Number.MAX_SAFE_INTEGER)
-        })
-      }],
-      details: {}
-    })
+    execute: async (_toolCallId, params) => {
+      if (!params.path.startsWith("artifact:")) {
+        throw new Error("artifact_read requires a real artifactRef");
+      }
+      // Models habitually truncate Refs (like git short hashes); accept an
+      // unambiguous prefix and resolve it to the canonical full Ref.
+      const artifactRef = await resolveArtifactRef(artifactStore, params.path);
+      if (params.materialize) {
+        if (!options.workspace) {
+          throw new Error("Artifact materialization requires an Executor workspace");
+        }
+        if (params.offset !== undefined || params.length !== undefined) {
+          throw new Error("Artifact materialization always imports the complete artifact; offset and length are not allowed");
+        }
+        const materialized = await materializeArtifactIntoWorkspace(
+          artifactStore,
+          artifactRef,
+          options.workspace
+        );
+        return {
+          content: [{ type: "text", text: JSON.stringify(materialized, null, 2) }],
+          details: materialized
+        };
+      }
+      return {
+        content: [{
+          type: "text",
+          text: await artifactStore.read(artifactRef, {
+            offset: params.offset,
+            length: Math.min(params.length ?? options.maxReadBytes ?? Number.MAX_SAFE_INTEGER, options.maxReadBytes ?? Number.MAX_SAFE_INTEGER)
+          })
+        }],
+        details: {}
+      };
+    }
   });
 }
 
-export function createArtifactWriteTool(artifactStore: ArtifactStore) {
+async function resolveArtifactRef(artifactStore: ArtifactStore, artifactRef: string): Promise<string> {
+  const exact = await artifactStore.get(artifactRef);
+  if (exact) return exact.artifactRef;
+  const matches = (await artifactStore.list())
+    .map((record) => record.artifactRef)
+    .filter((candidate) => candidate.startsWith(artifactRef));
+  if (matches.length === 1) return matches[0];
+  throw new Error(
+    matches.length > 1
+      ? `Artifact Ref ${artifactRef} is ambiguous (candidates: ${matches.slice(0, 3).join(", ")}); use the exact full Ref`
+      : `Artifact not found: ${artifactRef}`
+  );
+}
+
+async function materializeArtifactIntoWorkspace(
+  artifactStore: ArtifactStore,
+  artifactRef: string,
+  workspace: { hostDir: string; visibleRoot: string; sharedWithContainer?: boolean }
+): Promise<{
+  artifactRef: string;
+  path: string;
+  mediaType: string;
+  byteLength: number;
+  contentHash?: string;
+}> {
+  const record = await artifactStore.get(artifactRef);
+  if (!record) {
+    throw new Error(`Artifact not found: ${artifactRef}`);
+  }
+  const workspaceDirectory = resolve(workspace.hostDir);
+  await mkdir(workspaceDirectory, { recursive: true, mode: 0o700 });
+  const [workspaceMetadata, canonicalWorkspaceDirectory] = await Promise.all([
+    lstat(workspaceDirectory),
+    realpath(workspaceDirectory)
+  ]);
+  if (!workspaceMetadata.isDirectory() || workspaceMetadata.isSymbolicLink()) {
+    throw new Error("Executor workspace must be a real directory");
+  }
+  const directory = join(canonicalWorkspaceDirectory, ".artifacts");
+  const directoryMode = workspace.sharedWithContainer ? 0o755 : 0o700;
+  const fileMode = workspace.sharedWithContainer ? 0o644 : 0o600;
+  await mkdir(directory, { recursive: true, mode: directoryMode });
+  const [metadata, canonicalDirectory] = await Promise.all([lstat(directory), realpath(directory)]);
+  if (!metadata.isDirectory() || metadata.isSymbolicLink() || canonicalDirectory !== directory) {
+    throw new Error("Executor workspace artifact directory must be a real directory");
+  }
+  await chmod(canonicalDirectory, directoryMode);
+  const filename = basename(record.path);
+  const destination = join(canonicalDirectory, filename);
+  const temporary = join(canonicalDirectory, `.${filename}.${randomUUID()}.tmp`);
+  try {
+    await copyFile(record.path, temporary, constants.COPYFILE_EXCL);
+    await chmod(temporary, fileMode);
+    await rename(temporary, destination);
+  } finally {
+    await unlink(temporary).catch(() => undefined);
+  }
+  return {
+    artifactRef: record.artifactRef,
+    path: join(workspace.visibleRoot, ".artifacts", filename),
+    mediaType: record.mediaType,
+    byteLength: record.byteLength,
+    contentHash: record.contentHash
+  };
+}
+
+type ExecutorArtifactWorkspace = {
+  hostDir: string;
+  visibleRoot: string;
+};
+
+export function createArtifactWriteTool(
+  artifactStore: ArtifactStore,
+  options: {
+    workspace?: ExecutorArtifactWorkspace;
+    readExecutorFile?: (visiblePath: string) => Promise<Buffer>;
+  } = {}
+) {
   return defineTool({
     name: "artifact_write",
     label: "Artifact Write",
-    description: "Persist large outputs, raw responses, screenshots, PoCs or stdout as artifacts and return an artifact record.",
+    description: "Persist inline data or import a complete file from the Executor sandbox (for example /workspace or /tmp). Pass exactly one payload: source={data:\"...\"} for inline text or source={path\":\"/workspace/file\"} for a sandbox file; the optional source.type (\"inline\"|\"file\") is inferred from data/path when omitted.",
     parameters: Type.Object({
       taskId: Type.Optional(Type.String()),
       kind: Type.Union([
@@ -510,21 +983,105 @@ export function createArtifactWriteTool(artifactStore: ArtifactStore) {
         Type.Literal("other")
       ]),
       mediaType: Type.String(),
-      data: Type.String(),
+      source: Type.Object({
+        type: Type.Optional(Type.Union([
+          Type.Literal("inline"),
+          Type.Literal("file")
+        ])),
+        data: Type.Optional(Type.String()),
+        path: Type.Optional(Type.String())
+      }, { additionalProperties: false }),
       extension: Type.Optional(Type.String())
-    }),
+    }, { additionalProperties: false }),
     execute: async (_toolCallId, params) => {
-      const record = await artifactStore.write({
-        taskId: params.taskId,
-        kind: params.kind as ArtifactRecord["kind"],
-        mediaType: params.mediaType,
-        data: params.data,
-        extension: params.extension
-      });
+      const data = params.source.data;
+      const path = params.source.path;
+      const sourceType = params.source.type ?? (data !== undefined ? "inline" : "file");
+      let record: ArtifactRecord;
+      if (sourceType === "file") {
+        if (path === undefined || data !== undefined) {
+          throw new Error("artifact_write file source requires exactly path (no data); use source={path:\"/workspace/file\"} or source={type:\"file\",path:\"...\"}");
+        }
+        record = options.readExecutorFile
+          ? await artifactStore.write({
+              taskId: params.taskId,
+              kind: params.kind as ArtifactRecord["kind"],
+              mediaType: params.mediaType,
+              data: await options.readExecutorFile(path),
+              extension: params.extension ?? extensionFromPath(path)
+            })
+          : await artifactStore.importFile({
+              taskId: params.taskId,
+              kind: params.kind as ArtifactRecord["kind"],
+              mediaType: params.mediaType,
+              sourcePath: await resolveExecutorWorkspaceFile(path, options.workspace),
+              extension: params.extension
+            });
+      } else {
+        if (data === undefined || path !== undefined) {
+          throw new Error("artifact_write inline source requires exactly data (no path); use source={data:\"...\"} or source={type:\"inline\",data:\"...\"}");
+        }
+        record = await artifactStore.write({
+          taskId: params.taskId,
+          kind: params.kind as ArtifactRecord["kind"],
+          mediaType: params.mediaType,
+          data,
+          extension: params.extension
+        });
+      }
+      const publicRecord = publicArtifactRecord(record);
       return {
-        content: [{ type: "text", text: JSON.stringify(record, null, 2) }],
-        details: record
+        content: [{ type: "text", text: JSON.stringify(publicRecord, null, 2) }],
+        details: publicRecord
       };
     }
   });
+}
+
+async function resolveExecutorWorkspaceFile(
+  requestedPath: string,
+  workspace: ExecutorArtifactWorkspace | undefined
+): Promise<string> {
+  if (!workspace) {
+    throw new Error("Artifact file import requires an Executor workspace");
+  }
+  const visibleRoot = resolve(workspace.visibleRoot);
+  const visiblePath = resolve(visibleRoot, isAbsolute(requestedPath)
+    ? relative(visibleRoot, requestedPath)
+    : requestedPath);
+  const visibleRelativePath = relative(visibleRoot, visiblePath);
+  if (
+    visibleRelativePath === ""
+    || visibleRelativePath === ".."
+    || visibleRelativePath.startsWith(`..${sep}`)
+    || isAbsolute(visibleRelativePath)
+  ) {
+    throw new Error(`Artifact source is outside the Executor workspace: ${requestedPath}`);
+  }
+  const workspaceDirectory = await realpath(resolve(workspace.hostDir));
+  const candidate = join(workspaceDirectory, visibleRelativePath);
+  const metadata = await lstat(candidate);
+  if (!metadata.isFile() || metadata.isSymbolicLink()) {
+    throw new Error("Artifact source must be a regular workspace file");
+  }
+  const canonicalCandidate = await realpath(candidate);
+  const canonicalRelativePath = relative(workspaceDirectory, canonicalCandidate);
+  if (
+    canonicalRelativePath === ".."
+    || canonicalRelativePath.startsWith(`..${sep}`)
+    || isAbsolute(canonicalRelativePath)
+  ) {
+    throw new Error(`Artifact source resolves outside the Executor workspace: ${requestedPath}`);
+  }
+  return canonicalCandidate;
+}
+
+function publicArtifactRecord(record: ArtifactRecord): Omit<ArtifactRecord, "path"> {
+  const { path: _hostPath, ...publicRecord } = record;
+  return publicRecord;
+}
+
+function extensionFromPath(filePath: string): string | undefined {
+  const extension = extname(filePath).slice(1);
+  return extension || undefined;
 }

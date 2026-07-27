@@ -8,6 +8,8 @@ import type {
 
 export class PlannerProtocolError extends Error {}
 
+const ARTIFACT_REF_PATTERN = /artifact:[A-Za-z0-9][A-Za-z0-9._-]*/g;
+
 export function normalizePlannerDecision(value: unknown): PlannerDecision {
   if (!isRecord(value)) {
     throw new PlannerProtocolError("Planner output must be a JSON object");
@@ -27,6 +29,73 @@ export function normalizePlannerDecision(value: unknown): PlannerDecision {
     reason,
     basedOnRefs
   };
+}
+
+/**
+ * Verifies every artifact:* Ref in the decision against the ArtifactStore.
+ * Unambiguous abbreviations (exactly one artifact carries the prefix) are
+ * resolved to their full Ref in the returned decision — models habitually
+ * truncate UUIDs, and bouncing a deterministically fixable Ref back to the
+ * model only burns a Planner cycle. Unknown or ambiguous Refs still reject.
+ */
+export async function validatePlannerArtifactRefs(
+  decision: PlannerDecision,
+  listArtifacts: () => Promise<Array<{ artifactRef: string }>>
+): Promise<PlannerDecision> {
+  const referenced = artifactRefsFromValue(decision);
+  if (referenced.length === 0) return decision;
+  const artifacts = await listArtifacts();
+  const realRefs = new Set(artifacts.map((artifact) => artifact.artifactRef));
+  const resolutions = new Map<string, string>();
+  const problems: string[] = [];
+  for (const artifactRef of referenced) {
+    if (realRefs.has(artifactRef)) continue;
+    const matches = artifacts
+      .map((artifact) => artifact.artifactRef)
+      .filter((candidate) => candidate.startsWith(artifactRef));
+    if (matches.length === 1) {
+      resolutions.set(artifactRef, matches[0]);
+      continue;
+    }
+    problems.push(
+      matches.length > 1
+        ? `${artifactRef} (ambiguous, candidates: ${matches.slice(0, 3).join(", ")})`
+        : artifactRef
+    );
+  }
+  if (problems.length > 0) {
+    throw new PlannerProtocolError(
+      `Planner command contains unknown or ambiguous Artifact Ref(s): ${problems.join(", ")}. Use exact full Refs from Planner input.`
+    );
+  }
+  if (resolutions.size === 0) return decision;
+  return rewriteArtifactRefs(decision, resolutions);
+}
+
+function rewriteArtifactRefs<T>(value: T, resolutions: ReadonlyMap<string, string>): T {
+  if (typeof value === "string") {
+    let rewritten: string = value;
+    for (const [abbreviated, full] of resolutions) {
+      rewritten = rewritten.replace(
+        new RegExp(`${escapeRegExp(abbreviated)}(?![A-Za-z0-9._-])`, "g"),
+        full
+      );
+    }
+    return rewritten as unknown as T;
+  }
+  if (Array.isArray(value)) {
+    return value.map((entry) => rewriteArtifactRefs(entry, resolutions)) as T;
+  }
+  if (isRecord(value)) {
+    return Object.fromEntries(
+      Object.entries(value).map(([key, entry]) => [key, rewriteArtifactRefs(entry, resolutions)])
+    ) as T;
+  }
+  return value;
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
 function normalizePlannerCommand(value: unknown): PlannerCommand {
@@ -150,6 +219,25 @@ function stringArray(value: unknown): string[] {
 function nonEmptyStringArray(value: unknown, fallback: string[]): string[] {
   const values = stringArray(value);
   return values.length > 0 ? values : fallback;
+}
+
+function artifactRefsFromValue(value: unknown): string[] {
+  const refs: string[] = [];
+  const visit = (candidate: unknown): void => {
+    if (typeof candidate === "string") {
+      refs.push(...(candidate.match(ARTIFACT_REF_PATTERN) ?? []));
+      return;
+    }
+    if (Array.isArray(candidate)) {
+      candidate.forEach(visit);
+      return;
+    }
+    if (isRecord(candidate)) {
+      Object.values(candidate).forEach(visit);
+    }
+  };
+  visit(value);
+  return [...new Set(refs)];
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

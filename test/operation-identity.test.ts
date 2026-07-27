@@ -31,3 +31,15 @@ test("operation identities agree between explicit properties and graph topology"
   assert.equal(topology.get("endpoint:topology"), explicit.get("endpoint:explicit"));
   assert.equal(topology.get("parameter:topology"), explicit.get("parameter:explicit"));
 });
+
+test("host identities reject descriptive labels but accept real address labels", () => {
+  const identities = operationIdentityKeys([
+    { id: "host:description", graphKind: "operation", type: "Host", label: "DMZ Host", properties: {} },
+    { id: "host:hostname", graphKind: "operation", type: "Host", label: "dmz-web.internal", properties: {} },
+    { id: "host:ipv6", graphKind: "operation", type: "Host", label: "2001:db8::10", properties: {} }
+  ], []);
+
+  assert.equal(identities.has("host:description"), false);
+  assert.equal(identities.get("host:hostname"), "host:dmz-web.internal");
+  assert.equal(identities.get("host:ipv6"), "host:2001:db8::10");
+});

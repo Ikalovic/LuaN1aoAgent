@@ -185,6 +185,26 @@ export class ExecutionLog {
     return row ? Number(row.seq) : undefined;
   }
 
+  artifactRefsForEvents(eventIds: string[]): Map<string, string[]> {
+    const uniqueIds = [...new Set(eventIds)].filter((eventId) => eventId.length > 0);
+    const refsByEvent = new Map<string, string[]>();
+    const chunkSize = 200;
+    for (let offset = 0; offset < uniqueIds.length; offset += chunkSize) {
+      const chunk = uniqueIds.slice(offset, offset + chunkSize);
+      const rows = this.database.prepare(`
+        SELECT id, artifact_refs_json FROM execution_events
+        WHERE id IN (${chunk.map(() => "?").join(",")})
+      `).all(...chunk) as Array<{ id: string; artifact_refs_json: string }>;
+      for (const row of rows) {
+        const refs = (JSON.parse(row.artifact_refs_json) as string[]).filter((ref) => ref.startsWith("artifact:"));
+        if (refs.length > 0) {
+          refsByEvent.set(row.id, refs);
+        }
+      }
+    }
+    return refsByEvent;
+  }
+
   async readAll(): Promise<ExecutionEvent[]> {
     const rows = this.database.prepare("SELECT * FROM execution_events ORDER BY seq ASC").all() as ExecutionEventRow[];
     return rows.map(rowToEvent);

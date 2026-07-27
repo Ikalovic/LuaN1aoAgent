@@ -141,6 +141,7 @@ export type TaskResult = {
   summary: string;
   evidenceRefs: string[];
   artifactRefs: string[];
+  capabilityRefs?: string[];
   blockerReason?: string;
   suggestedNextGoal?: string;
   checkpointReason?: string;
@@ -217,6 +218,7 @@ export type PlannerCommand =
 
 export type ControlSignalDecision =
   | "continue"
+  | "redirect"
   | "checkpoint"
   | "stop_executor"
   | "need_planner";
@@ -226,10 +228,29 @@ export type ControlSignal = {
   reason: string;
   evidenceRefs: string[];
   confidence?: "low" | "medium" | "high";
-  budgetExtension?: {
-    maxTurnsDelta?: number;
+  guidance?: string;
+};
+
+export type SupervisorVerdict = ControlSignal & {
+  epochRef: string;
+  throughSeq: number;
+};
+
+export type TaskOutcome = {
+  taskRef: string;
+  epochRef: string;
+  status: TaskResultStatus;
+  summary: string;
+  evidenceRefs: string[];
+  artifactRefs: string[];
+  capabilityRefs: string[];
+  checkpoint?: {
     reason?: string;
+    retryable?: boolean;
+    resumeCursor?: string;
   };
+  terminalSeq: number;
+  createdAt: string;
 };
 
 export type RuntimeAbortKind =
@@ -293,6 +314,8 @@ export type ProjectionState = {
   generation: number;
   activeGeneration?: number;
   priority: number;
+  pendingSince?: string;
+  terminalTargetSeq?: number;
   updatedAt: string;
 };
 
@@ -337,6 +360,13 @@ export type PlannerTaskLedgerItem = {
   attempt?: number;
   priority?: number;
   dependsOnTaskRefs?: string[];
+  evidenceRefs?: string[];
+  artifactRefs?: string[];
+  capabilityRefs?: string[];
+  projection?: {
+    committedSeq: number;
+    desiredSeq: number;
+  };
 };
 
 export type PlannerDigestItem = {
@@ -359,6 +389,16 @@ export type PlannerDecisionView = {
     scopeRef: string | null;
   };
   taskLedger: PlannerTaskLedgerItem[];
+  taskOutcomes?: TaskOutcome[];
+  projectionDegradations?: Array<{
+    taskRef: string;
+    status: "degraded";
+    reason: "terminal_projection_incomplete" | "projection_watermark_lag";
+    committedSeq: number;
+    desiredSeq: number;
+    terminalTargetSeq?: number;
+    taskOutcome: TaskOutcome;
+  }>;
   reasoningDigest: PlannerDigestItem[];
   operationDigest: PlannerDigestItem[];
   blockers: PlannerDigestItem[];

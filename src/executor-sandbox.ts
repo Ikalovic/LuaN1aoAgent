@@ -7,11 +7,13 @@ import {
   createReadToolDefinition
 } from "@earendil-works/pi-coding-agent";
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
+import { createHostBrowserRuntime, type BrowserProcessRuntime } from "./tools/browser-tools.js";
 import { constants, existsSync } from "node:fs";
 import {
   access,
   chmod,
   copyFile,
+  lstat,
   mkdir,
   readFile,
   readdir,
@@ -31,7 +33,7 @@ import {
   sep
 } from "node:path";
 
-export type ExecutorSandboxMode = "macos-seatbelt" | "linux-bubblewrap" | "workspace";
+export type ExecutorSandboxMode = "docker" | "macos-seatbelt" | "linux-bubblewrap" | "workspace";
 
 // Default per-call bash timeout (seconds) when the model does not pass one.
 // The Pi SDK schema leaves timeout optional with no default; without a floor a
@@ -43,15 +45,22 @@ function executorBashDefaultTimeoutSeconds(): number {
   return Number.isFinite(value) && value > 0 ? Math.floor(value) : 300;
 }
 
-export type ExecutorSandboxRequestedMode = "auto" | "seatbelt" | "bubblewrap" | "workspace";
+export type ExecutorSandboxRequestedMode = "auto" | "docker" | "seatbelt" | "bubblewrap" | "workspace";
 
 export type ExecutorSandbox = {
   root: string;
+  hostRoot: string;
   mode: ExecutorSandboxMode;
   profilePath?: string;
   backendPath?: string;
   allowedReadRoots: string[];
+  workspaceDir?: string;
+  browserRuntime?: BrowserProcessRuntime;
+  readExecutorFile: (visiblePath: string) => Promise<Buffer>;
   createTools: () => ToolDefinition<any, any, any>[];
+  start?: () => Promise<void>;
+  quiesce?: () => Promise<void>;
+  dispose?: () => Promise<void>;
 };
 
 export async function createExecutorSandbox(input: {
@@ -76,6 +85,9 @@ export async function createExecutorSandbox(input: {
     ...(input.additionalReadRoots ?? [])
   ]);
   const requestedMode = input.mode ?? executorSandboxModeFromEnv();
+  if (requestedMode === "docker") {
+    throw new Error("Docker executor sandboxes are task-scoped; use createDockerTaskSandbox with a ready task Gateway");
+  }
   const seatbeltPath = process.platform === "darwin" && existsSync("/usr/bin/sandbox-exec")
     ? "/usr/bin/sandbox-exec"
     : undefined;
@@ -109,10 +121,26 @@ export async function createExecutorSandbox(input: {
 
   return {
     root: canonicalRoot,
+    hostRoot: canonicalRoot,
+    workspaceDir: canonicalRoot,
     mode,
     profilePath,
     backendPath: useSeatbelt ? seatbeltPath : useBubblewrap ? bubblewrapPath : undefined,
     allowedReadRoots,
+    browserRuntime: mode === "workspace"
+      ? createHostBrowserRuntime({ env: environment })
+      : undefined,
+    readExecutorFile: async (visiblePath) => {
+      const resolvedPath = resolve(canonicalRoot, visiblePath);
+      const metadata = await lstat(resolvedPath).catch(() => {
+        throw new Error(`Executor file source does not exist: ${visiblePath}`);
+      });
+      if (!metadata.isFile() || metadata.isSymbolicLink()) {
+        throw new Error("Executor file source must be a regular file");
+      }
+      const canonicalPath = await pathPolicy.requireReadable(resolvedPath);
+      return readFile(canonicalPath);
+    },
     createTools: () => [
       createReadToolDefinition(canonicalRoot, {
         operations: {
@@ -299,12 +327,12 @@ export function createBubblewrapCommand(input: {
   return argumentsList;
 }
 
-function executorSandboxModeFromEnv(): ExecutorSandboxRequestedMode {
+export function executorSandboxModeFromEnv(): ExecutorSandboxRequestedMode {
   const value = process.env.EXECUTOR_SANDBOX_MODE?.trim().toLowerCase();
   if (value === "bwrap" || value === "linux-bubblewrap") {
     return "bubblewrap";
   }
-  if (value === "seatbelt" || value === "bubblewrap" || value === "workspace") {
+  if (value === "docker" || value === "seatbelt" || value === "bubblewrap" || value === "workspace") {
     return value;
   }
   return "auto";

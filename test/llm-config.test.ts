@@ -4,7 +4,8 @@ import {
   createLlmRuntime,
   loadLlmRuntimeConfig,
   normalizeOpenAIBaseUrl,
-  normalizeOpenAICompletionsBaseUrl
+  normalizeOpenAICompletionsBaseUrl,
+  providerAdmissionKey
 } from "../src/llm-config.js";
 
 test("normalizes full chat completions endpoint to OpenAI-compatible base URL", () => {
@@ -125,6 +126,9 @@ test("registers a dedicated provider for roles with their own base URL or API ke
   assert.equal(runtime.models.planner.provider, "baizhi-openai");
   assert.equal(runtime.models.planner.baseUrl, "https://example.test/api/openai");
   assert.equal("backup-key" in runtime.metadata.models.executor, false);
+  assert.equal(providerAdmissionKey(runtime, "planner"), providerAdmissionKey(runtime, "projector"));
+  assert.notEqual(providerAdmissionKey(runtime, "planner"), providerAdmissionKey(runtime, "executor"));
+  assert.doesNotMatch(providerAdmissionKey(runtime, "executor"), /backup-key/);
 });
 
 test("keeps per-role budgets distinct when roles share a model id", () => {

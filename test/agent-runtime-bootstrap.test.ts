@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
-import { createServer, request } from "node:http";
+import { createServer, request, type Server } from "node:http";
 import { mkdtemp, rm } from "node:fs/promises";
 import { join } from "node:path";
 import test from "node:test";
@@ -28,30 +28,33 @@ test("shared bootstrap starts a fresh sidecar, injects environment, and attribut
   const runtimeDir = join(root, "runtime");
   const registry = new TrafficProxyManagerRegistry({ binary });
   const target = createServer((_request, response) => response.end("ok"));
-  await new Promise<void>((resolveListen) => target.listen(0, "127.0.0.1", resolveListen));
-  const address = target.address();
-  assert.ok(address && typeof address !== "string");
   let injectedEnvironment: NodeJS.ProcessEnv | undefined;
   try {
+    await listenHttpServer(target);
+    const address = target.address();
+    assert.ok(address && typeof address !== "string");
     const runtime = await bootstrapAgentRuntime({
       cwd: process.cwd(),
       runtimeDir,
       routeRef: "test-run",
+      executorSandboxMode: "workspace",
       trafficProxyRegistry: registry,
       controllerFactory: (input) => {
         injectedEnvironment = input.environment;
         return fakeController({ runId: "run:fresh" });
       }
     });
-    assert.equal(runtime.trafficProxyManager.ownsProcess(), true);
-    assert.equal(injectedEnvironment?.HTTP_PROXY, runtime.trafficProxyManager.proxyUrl);
-    assert.equal(injectedEnvironment?.http_proxy, runtime.trafficProxyManager.proxyUrl);
+    const trafficProxyManager = runtime.trafficProxyManager;
+    assert.ok(trafficProxyManager);
+    assert.equal(trafficProxyManager.ownsProcess(), true);
+    assert.equal(injectedEnvironment?.HTTP_PROXY, trafficProxyManager.proxyUrl);
+    assert.equal(injectedEnvironment?.http_proxy, trafficProxyManager.proxyUrl);
 
     await requestThroughProxy(
-      runtime.trafficProxyManager.proxyUrl!,
+      trafficProxyManager.proxyUrl!,
       `http://127.0.0.1:${address.port}/scope-check`
     );
-    const page = await runtime.trafficProxyManager.client.historyList({ limit: 10 });
+    const page = await trafficProxyManager.client.historyList({ limit: 10 });
     const exchange = page.items.find((item) => item.url.endsWith("/scope-check"));
     assert.ok(exchange);
     assert.equal(exchange.run_ref, "run:fresh");
@@ -63,7 +66,7 @@ test("shared bootstrap starts a fresh sidecar, injects environment, and attribut
     await runtime.close();
     assert.equal(registry.has(runtimeDir), false);
   } finally {
-    target.close();
+    await closeHttpServer(target);
     await registry.closeAll();
     await rm(root, { recursive: true, force: true });
   }
@@ -80,10 +83,11 @@ test("shared bootstrap attaches without killing the owner on close", async () =>
       cwd: process.cwd(),
       runtimeDir,
       routeRef: "test-attach",
+      executorSandboxMode: "workspace",
       trafficProxyRegistry: registry,
       controllerFactory: () => fakeController({ runId: "run:attached" })
     });
-    assert.equal(runtime.trafficProxyManager.ownsProcess(), false);
+    assert.equal(runtime.trafficProxyManager?.ownsProcess(), false);
     await runtime.close();
     assert.equal((await owner.client.health()).status, "ok");
   } finally {
@@ -104,6 +108,7 @@ test("shared bootstrap cleans controller and owned sidecar after initialization 
         cwd: process.cwd(),
         runtimeDir,
         routeRef: "test-failure",
+        executorSandboxMode: "workspace",
         trafficProxyRegistry: registry,
         controllerFactory: () => fakeController({
           runId: "run:failure",
@@ -137,6 +142,7 @@ test("shared bootstrap cleans controller and owned sidecar after scope configura
         cwd: process.cwd(),
         runtimeDir,
         routeRef: "test-scope-failure",
+        executorSandboxMode: "workspace",
         trafficProxyRegistry: registry,
         controllerFactory: () => fakeController({
           runId: "run:scope-failure",
@@ -149,6 +155,46 @@ test("shared bootstrap cleans controller and owned sidecar after scope configura
     assert.equal(registry.has(runtimeDir), false);
     const probe = new TrafficProxyManager(runtimeDir, { binary });
     await assert.rejects(probe.attachExisting());
+  } finally {
+    await registry.closeAll();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("Docker bootstrap skips the legacy traffic proxy and passes the resolved backend once", async () => {
+  const root = await mkdtemp("/tmp/agent-runtime-docker-bootstrap-");
+  const runtimeDir = join(root, "runtime");
+  const registry = new TrafficProxyManagerRegistry({ binary });
+  let controllerClosed = false;
+  let controllerInput: {
+    environment?: NodeJS.ProcessEnv;
+    executorSandboxMode?: string;
+  } | undefined;
+  registry.get = async () => {
+    throw new Error("legacy proxy must not start in Docker mode");
+  };
+  try {
+    const runtime = await bootstrapAgentRuntime({
+      cwd: process.cwd(),
+      runtimeDir,
+      routeRef: "docker-run",
+      executorSandboxMode: "docker",
+      trafficProxyRegistry: registry,
+      dockerRunner: async () => ({ code: 0, stdout: Buffer.from("27.0.0"), stderr: Buffer.alloc(0) }),
+      controllerFactory: (input) => {
+        controllerInput = input;
+        return fakeController({
+          runId: "run:docker",
+          close: async () => { controllerClosed = true; }
+        });
+      }
+    });
+    assert.equal(runtime.executorSandboxMode, "docker");
+    assert.equal(runtime.trafficProxyManager, undefined);
+    assert.equal(controllerInput?.environment, undefined);
+    assert.equal(controllerInput?.executorSandboxMode, "docker");
+    await runtime.close();
+    assert.equal(controllerClosed, true);
   } finally {
     await registry.closeAll();
     await rm(root, { recursive: true, force: true });
@@ -181,5 +227,28 @@ async function requestThroughProxy(proxyUrl: string, targetUrl: string): Promise
     });
     outgoing.once("error", rejectRequest);
     outgoing.end();
+  });
+}
+
+async function listenHttpServer(server: Server): Promise<void> {
+  await new Promise<void>((resolveListen, rejectListen) => {
+    const onError = (error: Error) => {
+      server.off("listening", onListening);
+      rejectListen(error);
+    };
+    const onListening = () => {
+      server.off("error", onError);
+      resolveListen();
+    };
+    server.once("error", onError);
+    server.once("listening", onListening);
+    server.listen(0, "127.0.0.1");
+  });
+}
+
+async function closeHttpServer(server: Server): Promise<void> {
+  if (!server.listening) return;
+  await new Promise<void>((resolveClose, rejectClose) => {
+    server.close((error) => error ? rejectClose(error) : resolveClose());
   });
 }

@@ -1,0 +1,7 @@
+#!/bin/sh
+set -eu
+socket="/run/luanniao/gateway.sock"
+command="${1:-}"
+payload="${2:-}"
+[ -n "$payload" ] || payload="{}"
+printf '{"command":"%s","payload":%s}\n' "$command" "$payload" | nc -U "$socket"

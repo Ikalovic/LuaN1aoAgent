@@ -5,8 +5,11 @@ import {
   buildProjectionObservations,
   causalObservationDigest,
   capabilityDigest,
+  compactProjectionBatchForInput,
+  compactProjectionGraphContextForInput,
   expandProjectionDraft,
   observationDigest,
+  partitionProjectionBatchForInput,
   renderProjectionGraphContext,
   renderProjectionObservations,
   selectProjectionBatch,
@@ -154,13 +157,57 @@ test("only terminal task result events become task outcome observations", () => 
     event(2, "event:wave", "task_wave_started", { taskIds: ["task:test"] }),
     event(3, "event:epoch", "epoch_transition", { state: "running" }),
     event(4, "event:partial", "task_partial", {
-      taskResult: { summary: "Confirmed internal admin token and paused for replanning" }
+      taskResult: {
+        summary: "Confirmed internal admin token and paused for replanning",
+        evidenceRefs: ["event:evidence:1", "event:evidence:2"],
+        artifactRefs: ["artifact:terminal-proof"],
+        capabilityRefs: ["connection:ssh-1", "route:internal"]
+      }
     })
   ]);
 
   assert.equal(observations.length, 1);
   assert.equal(observations[0]?.kind, "task_outcome");
   assert.match(observations[0]?.outcomeDigest ?? "", /internal admin token/);
+  assert.deepEqual(observations[0]?.sourceEventIds, ["event:partial", "event:evidence:1", "event:evidence:2"]);
+  assert.deepEqual(observations[0]?.artifactRefs, ["artifact:terminal-proof"]);
+  assert.deepEqual(observations[0]?.capabilityRefs, ["connection:ssh-1", "route:internal"]);
+});
+
+test("preserves typed connectivity facts for Projector-owned topology", () => {
+  const observations = buildProjectionObservations([
+    event(1, "event:session", "connectivity_observation", {
+      observationKind: "session",
+      transition: "opened",
+      connectionRef: "connection:ssh-1",
+      hostRef: "host:dmz",
+      dialAddress: "192.0.2.23",
+      status: "live"
+    }),
+    event(2, "event:route", "connectivity_observation", {
+      observationKind: "route",
+      transition: "opened",
+      routeRef: "route:internal",
+      connectionRef: "connection:ssh-1",
+      pivotHostRef: "host:dmz",
+      targetCidrs: ["172.31.0.0/24"],
+      status: "live"
+    })
+  ]);
+
+  assert.equal(observations.length, 2);
+  assert.equal(observations[0]?.kind, "connectivity");
+  assert.deepEqual(observations[0]?.anchors, [
+    "connection:ssh-1",
+    "host:dmz",
+    "192.0.2.23"
+  ]);
+  assert.deepEqual(observations[1]?.anchors, [
+    "route:internal",
+    "connection:ssh-1",
+    "host:dmz",
+    "172.31.0.0/24"
+  ]);
 });
 
 test("preserves the final conclusion of long tool results", () => {
@@ -270,7 +317,7 @@ test("expands graph aliases and observation evidence refs into stable GraphDelta
   assert.match(renderProjectionGraphContext(graphContext), /existing:1 operation\/WebEndpoint/);
 });
 
-test("projector cannot write task graph nodes or task edges", () => {
+test("projector rejects task graph mutations atomically", () => {
   const graphContext = aliasProjectionGraphContext({
     nodes: [{
       id: "task:read-flag",
@@ -281,7 +328,7 @@ test("projector cannot write task graph nodes or task edges", () => {
     }],
     edges: []
   });
-  const delta = expandProjectionDraft({
+  assert.throws(() => expandProjectionDraft({
     batch: {
       observations: [{
         ref: "o1",
@@ -307,19 +354,157 @@ test("projector cannot write task graph nodes or task edges", () => {
         properties: {},
         evidenceRefs: ["o1"]
       }, {
-        id: "blocker:flag-missing",
+        id: "new:1",
         graphKind: "task",
         type: "Blocker",
         label: "Flag missing",
         properties: {},
         evidenceRefs: ["o1"]
       }],
-      edges: [{ from: "existing:1", to: "blocker:flag-missing", type: "blocked_by", evidenceRefs: ["o1"] }]
+      edges: [{ from: "existing:1", to: "new:1", type: "supports", evidenceRefs: ["o1"] }]
     }
-  });
+  }), /graphKind "task"; expected "operation" or "reasoning".*No part of the delta was accepted/);
+  assert.throws(() => expandProjectionDraft({
+    batch: {
+      observations: [{
+        ref: "o1",
+        kind: "task_outcome",
+        seqStart: 1,
+        seqEnd: 1,
+        outcomeDigest: "Flag is not yet available",
+        status: "ok",
+        artifactRefs: [],
+        anchors: [],
+        sourceEventIds: ["event:1"]
+      }],
+      toSeq: 1,
+      sourceEventIds: ["event:1"]
+    },
+    graphContext,
+    value: {
+      nodes: [{
+        id: "new:1",
+        graphKind: "operation",
+        type: "Host",
+        label: "Flag host",
+        properties: {},
+        evidenceRefs: ["o1"]
+      }],
+      edges: [{ from: "existing:1", to: "new:1", type: "observed_on", evidenceRefs: ["o1"] }]
+    }
+  }), /cannot mutate task graph aliases existing:1\(Task\); no part of the delta was accepted/);
+});
 
-  assert.deepEqual(delta.nodes, []);
-  assert.deepEqual(delta.edges, []);
+test("rejects unknown edge aliases instead of silently dropping relationships", () => {
+  const graphContext = aliasProjectionGraphContext({ nodes: [], edges: [] });
+  assert.throws(() => expandProjectionDraft({
+    batch: {
+      observations: [{
+        ref: "o1",
+        kind: "action",
+        seqStart: 1,
+        seqEnd: 1,
+        action: "bash",
+        outcomeDigest: "Observed a relationship",
+        status: "ok",
+        artifactRefs: [],
+        anchors: [],
+        sourceEventIds: ["event:1"]
+      }],
+      toSeq: 1,
+      sourceEventIds: ["event:1"]
+    },
+    graphContext,
+    value: {
+      nodes: [{
+        id: "new:1",
+        graphKind: "reasoning",
+        type: "Evidence",
+        label: "Observed evidence",
+        evidenceRefs: ["o1"]
+      }],
+      edges: [{ from: "new:1", to: "existing:2", type: "supports", evidenceRefs: ["o1"] }]
+    }
+  }), /unknown existing alias/);
+});
+
+test("rejects malformed projection drafts with actionable per-node and per-edge messages", () => {
+  const graphContext = aliasProjectionGraphContext({ nodes: [], edges: [] });
+  const batch = {
+    observations: [{
+      ref: "o1",
+      kind: "action" as const,
+      seqStart: 1,
+      seqEnd: 1,
+      action: "bash",
+      outcomeDigest: "Observed evidence",
+      status: "ok" as const,
+      artifactRefs: [],
+      anchors: [],
+      sourceEventIds: ["event:1"]
+    }],
+    toSeq: 1,
+    sourceEventIds: ["event:1"]
+  };
+  const baseNode = {
+    id: "new:1",
+    graphKind: "operation",
+    type: "Host",
+    label: "host.docker.internal:32856",
+    properties: {},
+    evidenceRefs: ["o1"]
+  };
+
+  assert.throws(() => expandProjectionDraft({
+    batch,
+    graphContext,
+    value: { nodes: [{ ...baseNode, status: "active", target: "x" }], edges: [] }
+  }), /unexpected top-level keys \[status, target\].*nodes only allow id, graphKind, type, label, properties, evidenceRefs/);
+
+  assert.throws(() => expandProjectionDraft({
+    batch,
+    graphContext,
+    value: { nodes: [{ ...baseNode, graphKind: "operational" }], edges: [] }
+  }), /graphKind "operational"; expected "operation" or "reasoning"/);
+
+  assert.throws(() => expandProjectionDraft({
+    batch,
+    graphContext,
+    value: { nodes: [{ ...baseNode, type: "Endpoint" }], edges: [] }
+  }), /\(operation\) has type "Endpoint"; valid operation types: Host, Port, Service, WebEndpoint, Parameter, Credential, AgentSession, ShellSession, Session, File, Process/);
+
+  assert.doesNotThrow(() => expandProjectionDraft({
+    batch,
+    graphContext,
+    value: {
+      nodes: [baseNode],
+      edges: []
+    }
+  }));
+
+  assert.throws(() => expandProjectionDraft({
+    batch,
+    graphContext,
+    value: {
+      nodes: [baseNode],
+      edges: [{ from: "new:1", to: "new:1", type: "tunnel_to", evidenceRefs: ["o1"] }]
+    }
+  }), /edge at index 0 has type "tunnel_to"; valid edge types:/);
+});
+
+test("rejects one Projector submission above the 24/40 delta contract instead of slicing it", () => {
+  const graphContext = aliasProjectionGraphContext({ nodes: [], edges: [] });
+  const batch = { observations: [], toSeq: 0, sourceEventIds: [] };
+  assert.throws(() => expandProjectionDraft({
+    batch,
+    graphContext,
+    value: { nodes: Array.from({ length: 25 }, () => ({})), edges: [] }
+  }), /nodes contains 25 items; maximum per submission is 24/);
+  assert.throws(() => expandProjectionDraft({
+    batch,
+    graphContext,
+    value: { nodes: [], edges: Array.from({ length: 41 }, () => ({})) }
+  }), /edges contains 41 items; maximum per submission is 40/);
 });
 
 test("updates existing semantic nodes while preserving their identity", () => {
@@ -355,8 +540,8 @@ test("updates existing semantic nodes while preserving their identity", () => {
     value: {
       nodes: [{
         id: "existing:1",
-        graphKind: "operation",
-        type: "Host",
+        graphKind: "reasoning",
+        type: "Evidence",
         label: "Repeated access denial",
         properties: { count: 2 },
         evidenceRefs: ["o1"]
@@ -423,8 +608,8 @@ test("new projector aliases receive runtime identities instead of colliding with
   assert.notEqual(delta.nodes[0]?.id, "new:13");
 });
 
-test("projector drops explicit global ids outside the alias boundary", () => {
-  const delta = expandProjectionDraft({
+test("projector rejects explicit global ids outside the alias boundary atomically", () => {
+  assert.throws(() => expandProjectionDraft({
     batch: {
       observations: [],
       toSeq: 0,
@@ -441,9 +626,7 @@ test("projector drops explicit global ids outside the alias boundary", () => {
       }],
       edges: []
     }
-  });
-
-  assert.deepEqual(delta.nodes, []);
+  }), /invalid alias evidence:model-chosen-global-id; no part of the delta was accepted/);
 });
 
 test("planner observation digest preserves task outcomes and diverse earlier findings", () => {
@@ -477,6 +660,242 @@ test("planner observation digest preserves task outcomes and diverse earlier fin
   assert.match(digest, /confirmed arbitrary file read/);
   assert.match(digest, /phase result confirms reusable file-read capability/);
   assert.ok(digest.split("\n").length <= 6);
+});
+
+test("projection compaction advances only through the continuous prefix shown to the model", () => {
+  const observations: ProjectionObservation[] = Array.from({ length: 4 }, (_, index) => ({
+    ref: `original:${index + 1}`,
+    kind: index === 3 ? "task_outcome" : "action",
+    seqStart: index * 2 + 1,
+    seqEnd: index * 2 + 2,
+    action: index === 3 ? undefined : "bash",
+    interpretation: index === 3 ? undefined : `interpretation ${index + 1}`,
+    outcomeDigest: `${"large body ".repeat(100)}result ${index + 1}`,
+    status: index === 3 ? "error" : "ok",
+    artifactRefs: [`artifact:${index + 1}`],
+    anchors: [`10.0.0.${index + 1}`, `/path/${index + 1}`],
+    sourceEventIds: [`event:${index * 2 + 1}`, `event:${index * 2 + 2}`]
+  }));
+
+  const compacted = compactProjectionBatchForInput({
+    observations,
+    toSeq: 12,
+    sourceEventIds: observations.flatMap((observation) => observation.sourceEventIds)
+  }, {
+    maxObservations: 2,
+    maxBytes: 2_000
+  });
+
+  assert.equal(compacted.observations.length, 2);
+  assert.equal(compacted.toSeq, 4);
+  assert.deepEqual(compacted.sourceEventIds, ["event:1", "event:2", "event:3", "event:4"]);
+  assert.equal(compacted.observations.some((observation) => observation.kind === "task_outcome"), false);
+  assert.doesNotMatch(renderProjectionObservations(compacted.observations), /result 3|result 4/);
+});
+
+test("projection compaction preserves structural facts for an oversized observation", () => {
+  const artifactRefs = Array.from({ length: 12 }, (_, index) => `artifact:${index + 1}`);
+  const anchors = Array.from({ length: 16 }, (_, index) => `172.31.0.${index + 1}`);
+  const sourceEventIds = Array.from({ length: 20 }, (_, index) => `event:${index + 1}`);
+  const actions = Array.from({ length: 10 }, (_, index) => ({
+    action: `tool-${index + 1}`,
+    inputDigest: `input ${index + 1} ${"x".repeat(500)}`,
+    outcomeDigest: `outcome ${index + 1} ${"y".repeat(500)}`,
+    status: "ok" as const
+  }));
+  const compacted = compactProjectionBatchForInput({
+    observations: [{
+      ref: "original:1",
+      kind: "task_outcome",
+      seqStart: 1,
+      seqEnd: 20,
+      outcomeDigest: `terminal outcome ${"z".repeat(5_000)}`,
+      status: "error",
+      artifactRefs,
+      anchors,
+      sourceEventIds,
+      actions
+    }],
+    toSeq: 25,
+    sourceEventIds
+  }, {
+    maxObservations: 1,
+    maxBytes: 800
+  });
+
+  assert.equal(compacted.toSeq, 25);
+  assert.equal(compacted.observations[0]?.status, "error");
+  assert.deepEqual(compacted.observations[0]?.artifactRefs, artifactRefs);
+  assert.deepEqual(compacted.observations[0]?.anchors, anchors);
+  assert.deepEqual(compacted.observations[0]?.sourceEventIds, sourceEventIds);
+  assert.equal(compacted.observations[0]?.actions?.length, actions.length);
+  const rendered = renderProjectionObservations(compacted.observations);
+  assert.match(rendered, /artifact:12/);
+  assert.match(rendered, /172\.31\.0\.16/);
+  assert.match(rendered, /tool\[10\]: tool-10/);
+  assert.ok(Buffer.byteLength(rendered, "utf8") <= 800);
+});
+
+test("projection compaction measures multibyte text in UTF-8 bytes", () => {
+  const compacted = compactProjectionBatchForInput({
+    observations: [{
+      ref: "original:1",
+      kind: "task_outcome",
+      seqStart: 10,
+      seqEnd: 10,
+      outcomeDigest: `确认结论 ${"内网证据".repeat(2_000)} 最终标记`,
+      status: "ok",
+      artifactRefs: ["artifact:proof"],
+      anchors: ["172.31.0.20", "/flag.html"],
+      sourceEventIds: ["event:outcome"]
+    }],
+    toSeq: 12,
+    sourceEventIds: ["event:outcome", "event:non-semantic-tail"]
+  }, {
+    maxObservations: 1,
+    maxBytes: 512
+  });
+
+  const rendered = renderProjectionObservations(compacted.observations);
+  assert.ok(Buffer.byteLength(rendered, "utf8") <= 512);
+  assert.equal(compacted.toSeq, 12);
+  assert.equal(compacted.observations[0]?.status, "ok");
+  assert.deepEqual(compacted.observations[0]?.artifactRefs, ["artifact:proof"]);
+  assert.deepEqual(compacted.observations[0]?.anchors, ["172.31.0.20", "/flag.html"]);
+  assert.deepEqual(compacted.observations[0]?.sourceEventIds, ["event:outcome"]);
+  assert.deepEqual(compacted.sourceEventIds, ["event:outcome", "event:non-semantic-tail"]);
+});
+
+test("partitions one huge grouped observation without losing structure or provenance", () => {
+  const events: ExecutionEvent[] = [
+    event(1, "event:intent", "assistant_intent", { text: "并行验证全部候选服务" })
+  ];
+  for (let index = 0; index < 80; index += 1) {
+    events.push(event(index + 2, `event:start-${index}`, "tool_started", {
+      toolCallId: `call:${index}`,
+      toolName: "bash",
+      args: { command: `curl http://10.0.0.${index + 1}/path/${index}` }
+    }));
+  }
+  for (let index = 0; index < 80; index += 1) {
+    events.push(event(index + 82, `event:end-${index}`, "tool_finished", {
+      toolCallId: `call:${index}`,
+      toolName: "bash",
+      artifactRef: `artifact:${index}`,
+      result: { content: [{ type: "text", text: `HTTP 200 from 10.0.0.${index + 1}` }] }
+    }));
+  }
+  events.push(event(162, "event:interpretation", "assistant_intent", {
+    text: "全部候选完成验证，保留每个目标的独立证据。"
+  }));
+
+  const [grouped] = buildProjectionObservations(events);
+  assert.equal(grouped?.actions?.length, 80);
+  const batch = {
+    observations: [grouped!],
+    toSeq: 162,
+    sourceEventIds: [...grouped!.sourceEventIds, "event:non-semantic-tail"]
+  };
+  const chunks = partitionProjectionBatchForInput(batch, {
+    maxObservations: 4,
+    maxBytes: 1_200
+  });
+
+  assert.ok(chunks.length > 1);
+  assert.ok(chunks.every((chunk) => Buffer.byteLength(
+    renderProjectionObservations(chunk.observations),
+    "utf8"
+  ) <= 1_200));
+  assert.equal(chunks.flatMap((chunk) => chunk.observations)
+    .flatMap((observation) => observation.actions ?? []).length, 80);
+  assert.deepEqual(
+    new Set(chunks.flatMap((chunk) => chunk.sourceEventIds)),
+    new Set(batch.sourceEventIds)
+  );
+  assert.deepEqual(
+    new Set(chunks.flatMap((chunk) => chunk.observations).flatMap((observation) => observation.artifactRefs)),
+    new Set(grouped!.artifactRefs)
+  );
+  assert.deepEqual(
+    new Set(chunks.flatMap((chunk) => chunk.observations).flatMap((observation) => observation.anchors)),
+    new Set(grouped!.anchors)
+  );
+  assert.ok(chunks.flatMap((chunk) => chunk.observations)
+    .every((observation) => observation.status === grouped!.status));
+});
+
+test("rejects an irreducible projection envelope instead of returning an oversized batch", () => {
+  const oversizedRef = `artifact:${"x".repeat(2_000)}`;
+  assert.throws(() => compactProjectionBatchForInput({
+    observations: [{
+      ref: "o1",
+      kind: "task_outcome",
+      seqStart: 1,
+      seqEnd: 1,
+      outcomeDigest: "completed",
+      status: "ok",
+      artifactRefs: [oversizedRef],
+      anchors: [],
+      sourceEventIds: ["event:1"]
+    }],
+    toSeq: 1,
+    sourceEventIds: ["event:1"]
+  }, {
+    maxObservations: 1,
+    maxBytes: 512
+  }), /Projection observation envelope requires .* maximum is 512/);
+});
+
+test("normalization bounds repeated coalescing without losing provenance", () => {
+  const repeatedEvents: ExecutionEvent[] = [];
+  for (let index = 0; index < 40; index += 1) {
+    repeatedEvents.push(
+      event(index * 2 + 1, `event:start-${index}`, "tool_started", {
+        toolCallId: `call:${index}`,
+        toolName: "bash",
+        args: { command: "same probe" }
+      }),
+      event(index * 2 + 2, `event:end-${index}`, "tool_finished", {
+        toolCallId: `call:${index}`,
+        toolName: "bash",
+        result: { content: [{ type: "text", text: "HTTP 403 access denied" }] }
+      })
+    );
+  }
+  const repeated = buildProjectionObservations(repeatedEvents);
+  assert.equal(repeated.length, 3);
+  assert.ok(repeated.every((observation) => (observation.repeatCount ?? 1) <= 16));
+  assert.deepEqual(
+    repeated.flatMap((observation) => observation.sourceEventIds),
+    repeatedEvents.map((item) => item.id)
+  );
+  const firstBatch = selectProjectionBatch(repeatedEvents, { fromSeq: 0, maxObservations: 1 });
+  assert.equal(firstBatch.toSeq, 32);
+  assert.deepEqual(firstBatch.sourceEventIds, repeatedEvents.slice(0, 32).map((item) => item.id));
+});
+
+test("observation normalization retains every discovered anchor", () => {
+  const observations = buildProjectionObservations([
+    event(1, "event:result", "tool_finished", {
+      toolCallId: "call:scan",
+      toolName: "bash",
+      result: {
+        content: [{
+          type: "text",
+          text: "10.0.0.1 10.0.0.2 10.0.0.3 10.0.0.4 10.0.0.5 10.0.0.6"
+        }]
+      }
+    })
+  ]);
+
+  assert.deepEqual(observations[0]?.anchors, [
+    "10.0.0.1",
+    "10.0.0.2",
+    "10.0.0.3",
+    "10.0.0.4",
+    "10.0.0.5",
+    "10.0.0.6"
+  ]);
 });
 
 test("planner observation digest renders the latest task outcome before older actions", () => {
@@ -549,6 +968,35 @@ test("projection context preserves parallel edge identities and properties", () 
   assert.deepEqual(context.edges.map((edge) => edge.properties.tunnelId), ["first", "second"]);
   assert.match(renderProjectionGraphContext(context), /"tunnelId":"first"/);
   assert.match(renderProjectionGraphContext(context), /"status":"degraded"/);
+});
+
+test("projection graph context compaction keeps complete records and aligned aliases", () => {
+  const context = aliasProjectionGraphContext({
+    nodes: Array.from({ length: 20 }, (_, index): GraphNode => ({
+      id: `host:${index}`,
+      graphKind: "operation",
+      type: "Host",
+      label: `host-${index}-${"label".repeat(30)}`,
+      properties: { host: `10.0.0.${index + 1}`, resultSummary: "summary".repeat(40) }
+    })),
+    edges: Array.from({ length: 19 }, (_, index): GraphEdge => ({
+      from: `host:${index}`,
+      to: `host:${index + 1}`,
+      type: "reachable_from",
+      properties: { via: `route-${index}` }
+    }))
+  });
+
+  const compacted = compactProjectionGraphContextForInput(context, 2_000);
+  const rendered = renderProjectionGraphContext(compacted);
+
+  assert.ok(Buffer.byteLength(rendered, "utf8") <= 2_000);
+  assert.ok(compacted.nodes.length > 0 && compacted.nodes.length < context.nodes.length);
+  assert.equal(compacted.nodeAliases.size, compacted.nodes.length);
+  assert.ok(compacted.edges.every((edge) => (
+    compacted.nodeAliases.has(edge.from) && compacted.nodeAliases.has(edge.to)
+  )));
+  assert.match(rendered, /byte view omitted nodes=/);
 });
 
 test("projector derives stable tunnel and proxy route edge identities", () => {

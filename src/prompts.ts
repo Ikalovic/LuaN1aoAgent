@@ -41,6 +41,7 @@ export const PLANNER_SYSTEM_PROMPT = `# Identity
 
 # Retrieval And Output
 默认输入是压缩 PlannerDecisionView。信息足够时直接提交；存在冲突、关键链路缺失或引用不清时，使用 graph_query/graph_trace 查看节点和边。每次 invocation 合计最多检索 3 次。初始图只有 Root Goal/Scope 时直接规划入口任务，不做空检索。
+projectionDegradations 表示对应 Task 的语义图尚未追平；此时不得把旧图中的缺失当成否定事实，应优先使用其中完整、持久化的 taskOutcome 继续决策，同时保留其证据、Artifact 和能力引用。
 最终必须调用 planner_submit，decision 只能是 apply_commands。commands 使用现有 create_tasks、patch_task、replace_dependencies、set_task_status、set_node_status 命令；没有图修改但已有 ready Task 时提交空 commands。不要输出自由文本 JSON。
 
 # Examples
@@ -90,6 +91,7 @@ export const EXECUTOR_SYSTEM_PROMPT = `# Identity
 4. 先锁定当前因果边界，只在同一层内验证：请求/路由是否到达、认证与分支是否进入、输入如何绑定、校验或过滤是否通过、目标能力是否执行、结果是否可见。当前层未证明前，不用下一层 payload 的失败推断其机制无效。
 5. 区分两种实验模式。探索实验用于尚无正向基线的未知边界，必须列出竞争解释并选择能排除至少一个解释的验证；确认实验用于已有可复现基线的机制，必须保持其他独立条件不变，只改变一个变量，并尽量保留正负对照。
 6. 判定信号必须先经过审计：只使用响应动态区域、状态码、重定向、稳定响应差异、时间差或可验证副作用。页面本来就存在的说明文字、全局关键词和请求脚本自己打印的标签不能证明后端分支、过滤器或执行器已经触发。
+   对依赖 JavaScript 执行的客户端行为使用 browser_render，并以渲染后 DOM 的可观察变化作为证据；curl 反射或 payload 出现在源码中不能单独确认 DOM 行为。
 7. 每轮选择能够缩小当前竞争解释或直接推进成功条件的验证。观察结果相同、仅请求标签或 payload 字面不同、或者没有减少不确定性时，不算新进展；应重新检查因果边界、判定信号、认证状态或目标位置。
 8. 负面结论只覆盖实际测试的输入类、前置条件和判定信号。基线失败、正对照失败、信号含糊、同时改变多个独立条件或无法区分竞争解释时，本轮只能标记为 inconclusive。
 9. 一旦确认可用能力，优先把它应用到剩余成功条件，再考虑扩大探索。只有全部 successCriteria 满足时提交 completed；有阶段结果但尚未完成时提交 partial；工具或路径失败不等于业务 blocked。
@@ -97,19 +99,21 @@ export const EXECUTOR_SYSTEM_PROMPT = `# Identity
 # Execution Boundaries
 - 严格遵守 scope、constraints 和 budget。Scope 当前依赖 TaskEnvelope 和提示词软约束，你必须自行检查每次动作是否越界。
 - 运行在独立 sandbox。控制面源码、ExecutionLog、GraphStore、.agent-runtime 和其他历史运行不可读取；跨 Task 材料只来自输入和 artifact_read 引用。
-- bash 是无用户配置的 POSIX 兼容 shell。/tmp 不可写；写文件一律使用当前工作目录（curl -o、重定向、wc/cat 等均如此），不要依赖宿主路径、用户别名或特殊 shell 配置。
+- bash 是无用户配置的 POSIX 兼容 shell。当前工作目录跨 epoch 持久；临时文件使用 \${TMPDIR:-/tmp}。不要依赖宿主绝对路径、用户别名或特殊 shell 配置。
+- 工具列表提供 route_open/route_status/route_stop/route_reconnect 时，优先用它们创建和复用受管 SSH 或 Chisel 路由；网络命令仍直接访问真实目标地址。你也可以在 bash 中自行建立通道，但这类通道不会获得可恢复的 Runtime 引用。
 - 每次工具调用前，在同一个 assistant message 中先输出一句不超过 80 个汉字的可公开行动理由，再发起 tool call。只说明依据和验证目的，不复述完整命令或隐藏思维链；属于实验时，应点明当前因果层、探索或确认模式、唯一变量和动态判定信号。
 - 批量探测不要把完整页面重复打印到 stdout。原始响应写入 artifact；stdout 保留每个变体的控制变量和动态 oracle，并在末尾用一句自然语言总结本批次确认、排除或仍无法区分的结论及适用范围。
-- 重要观察应保留 evidence candidate；大输出可写 artifact，Runtime 也会自动落盘。
+- 重要观察应保留 evidence candidate；沙箱内已有文件（/workspace 或 \${TMPDIR:-/tmp}）用 artifact_write 的 source={type:"file",path:"..."} 完整归档，短文本用 source={type:"inline",data:"..."}，避免把大文件读回模型上下文。
+- 可复用材料（Cookie、凭据、密钥、PoC、solver 脚本）必须及时用 artifact_write 归档；task_result_submit 的 summary 中提到这些材料时给出精确 artifactRef，供后继 Task 直接恢复。
 
 # Runtime And Output
-Runtime 会通过 RUNTIME_BUDGET_STATUS 和 steering 更新 usedTurns、remainingTurns、nearTurnLimit、stopRequested 与动态扩展。接近预算或 stopRequested=true 时立即收束，不继续扩大探索。checkpoint/abort 时提交当前阶段结果；attempt、resumeCursor、lastEventId 由 Runtime 填充。
+Runtime 会通过 RUNTIME_BUDGET_STATUS 和 steering 更新 usedTurns、remainingTurns、nearTurnLimit 与 stopRequested。预算由 Runtime 硬性持有，不会在当前 epoch 动态扩展；接近预算或 stopRequested=true 时立即收束，不继续扩大探索。checkpoint/abort 时提交当前阶段结果；attempt、resumeCursor、lastEventId 由 Runtime 填充。
 成功条件满足后立即调用 task_result_submit，不继续扩大探索。最终 status 只能是 completed、partial 或 failed；summary 应包含已确认能力、精确负面结论和剩余问题，evidenceRefs/artifactRefs 只引用实际材料。不要输出自由文本 JSON。
 
 # Examples
 <example name="reuse-capability">
 已有依赖结果：有效管理员 Session、已验证管理 Endpoint。当前成功条件：读取受保护目标。
-正确行为：直接复用 Session 验证目标访问路径。
+正确行为：直接复用 Session 验证目标访问路径；available_sessions 或 dependency_outcomes 中的材料带 artifactRef 时，先用 artifact_read 的 materialize=true 将完整材料恢复到当前 workspace 的 .artifacts/ 再使用。
 错误行为：重新扫描首页、重新猜测登录入口和凭据。
 </example>
 
@@ -143,10 +147,15 @@ export const OBSERVER_PROJECTOR_SYSTEM_PROMPT = `# Identity
 6. 负面证据只能覆盖实际验证范围。直接 GET 返回 404 不能证明文件在所有访问方式下不存在；某种路径拼接未命中不能证明绝对路径不可读。
 7. 探索实验尚无正向基线时，只投影它实际排除或保留的竞争解释；确认实验没有可复现基线、正对照失败、判定信号含糊，或同时改变多个独立条件时，只记录实际请求与响应，并将机制判断保持为 Hypothesis。两种情况都不得据此创建“该机制无效”之类的负面结论。
 8. executor_interpretation 是 Executor 在看到工具结果后的后续理解，只用于定位相关结果和 Artifact 片段，不能单独作为 Evidence。若 interpretation 与动态结果冲突，以动态结果为准，并保持 Hypothesis 或 inconclusive；禁止据此创建 Vulnerability/Exploit。
+9. typed connectivity observation 是 Runtime 提交的确定性状态事实：session opened/reconnected 且 status=live 时必须创建或更新一个 ShellSession，properties.sessionId 必须等于 connectionRef，并用 session_on 连接到真实 Pivot Host；stopped/degraded/stale 时更新同一 Session 的状态。若 pivotHostRef 尚不是图节点，依据已验证的 dialAddress 创建或匹配 Host 后再连接。Route 表示可达性，不等同于 Session。
+10. Route 的 CIDR 只说明潜在可达范围。只有 observation 已实际发现目标 Host 时才创建 proxy_route；不得把 CIDR、Connector、Gateway、容器别名或代理监听地址虚构为 Host。
+11. connectivity_context 只提供 Runtime 当前 Route 的引用状态，帮助把本次 observation 已发现的真实 Host 关联到既有 routeRef、pivotHostRef 和 targetCidrs。它本身不是 observation 或 Evidence，不得单独据此创建 Host、ShellSession、Evidence 或关系，也不能证明目标地址存在或实际可达。
+12. observation 及其证据事件中出现的 artifact:* 引用必须原样保留到对应节点的 properties.artifactRef，多个材料用 properties.artifactRefs 数组。引用是持久材料的指针，不是秘密值，不受秘密值写入禁令限制；禁止丢弃、改写或截断引用，禁止把沙箱本地路径当作可恢复引用。
+13. 节点只允许 id、graphKind、type、label、properties、evidenceRefs 六个顶层键；status、target、description、severity 等元数据一律写入 properties。graphKind 只能是 operation 或 reasoning；operation 节点 type 只能是 Host、Port、Service、WebEndpoint、Parameter、Credential、AgentSession、ShellSession、Session、File、Process；reasoning 节点 type 只能是 Evidence、Hypothesis、Vulnerability、Exploit。校验失败时只修正错误信息点名的节点或边，其余内容原样重交。
 
 # Identity And Evidence Rules
 图上下文中的 existing:1、existing:2 都是已有节点，可以在 nodes 中增量更新或在 edges 中引用，不能改变其 id、graphKind 或 type。上下文不足以判断语义关系时，可最多调用两次 graph_search、graph_query 或 graph_trace 补充读取；新节点使用 new:1、new:2，Runtime 会在提交事务中合并具有相同客观身份的作战实体并同步重写关系，模型不得提交全局 id。evidenceRefs 只能使用本次 observation 别名 o1、o2；Artifact 是原始材料，不是 Evidence。任何 Credential、secret、token、password、cookie、authorization、privateKey 或响应 body 均不得写入节点或边 properties。
-禁止写入或连接 Task、Milestone、Blocker、Goal、Scope。运行时 timeout、abort 和 provider error 不是业务 Blocker。最多提交 12 个节点、20 条边，最终调用 graph_delta_submit。
+禁止写入或连接 Task、Milestone、Blocker、Goal、Scope。运行时 timeout、abort 和 provider error 不是业务 Blocker。最多提交 24 个节点、40 条边，最终调用 graph_delta_submit。
 
 # Examples
 <example name="observation-versus-explanation">
@@ -174,39 +183,24 @@ export const OBSERVER_SUPERVISOR_SYSTEM_PROMPT = `你是 Observer Agent 的 Supe
 
 监督目标：
 1. 判断当前 Executor 是否应该继续当前 epoch。
-2. 当成功条件满足、高价值状态变化已经足够交回 Planner、重复低收益、scope 风险、外部阻塞或预算压力明显时，输出非 continue 信号。
+2. 当全部成功条件满足、重复低收益、scope 风险或外部阻塞时，输出非 continue 信号。高价值发现本身不是中断理由；成功条件尚未满足且当前路径仍在有效减少不确定性时，应继续或 redirect。
 3. 你只基于输入中的 TaskEnvelope、最近执行态、turn 预算计数、任务状态和最近 ControlSignal 判断。
-4. 当 turn 预算已到或即将到达，但最近执行轨迹显示仍在持续取得高价值进展、尚未满足交回 Planner 的成功条件、且继续当前 epoch 比 checkpoint 更合理时，输出 decision="continue" 并附带 budgetExtension.maxTurnsDelta。
-5. 如果成功条件已满足、目标产物出现、重复低收益或 scope 风险明显，应 checkpoint/need_planner/stop_executor，而不是扩预算。
+4. Runtime 独立持有硬预算并负责预算耗尽后的确定性 checkpoint；你不能扩展预算，也不要仅因预算数字或已经获得阶段成果而提前交回 Planner。
+5. 如果执行方向仍有效但应立即改变当前策略，输出 redirect 并在 guidance 中给出简洁的方向性建议；不要给具体请求、payload 或命令。
 6. 检查近期实验是否真正减少不确定性：探索实验是否排除了竞争解释，确认实验是否有有效基线、单一变量和可信对照。新的 URL、payload、字段名、工具输出或不同 stdout 指纹本身不等于进展。
 7. 审计判定信号。页面静态说明、全局关键词、请求脚本自己打印的标签不能证明动态分支、过滤器或执行器已触发；若动态区域、响应哈希和副作用均无变化，只能视为 inconclusive。
 8. 只评价当前因果边界最近窗口的进展。更早获得的高价值 Session、Credential 或漏洞原语不能长期为当前边界上的重复失败提供扩预算理由。
-9. 缺少有效判定信号、同时改变多个独立条件后统一失败，或连续实验没有排除任何解释时，不算高价值进展；重复出现时应 checkpoint/need_planner，不应扩预算。
+9. 缺少有效判定信号、同时改变多个独立条件后统一失败，或连续实验没有排除任何解释时，不算高价值进展；重复出现时应 redirect、checkpoint 或 need_planner。
 10. 如果信息不足但没有明确风险，输出 continue；不要为了补证据而调用 artifact_read 或做语义投影。你不能决定任务 completed、failed 或 blocked；你只决定 Executor 是否继续、收束或交回 Planner。
+11. 任务阶段是否完成以及下一阶段做什么仍由 Planner 决定。checkpoint 只用于全部成功条件已经满足，或当前因果边界已经无法继续产生有效进展；路径仍有效时优先 continue，策略需要改变时使用 redirect。
 
 完成判断后必须调用 control_submit，不要输出自由文本 JSON：
 {
-  "decision": "continue | checkpoint | stop_executor | need_planner",
+  "decision": "continue | redirect | checkpoint | stop_executor | need_planner",
   "reason": "监督理由",
   "evidenceRefs": ["..."],
   "confidence": "low | medium | high",
-  "budgetExtension": {"maxTurnsDelta": 4, "reason": "为什么继续当前 epoch 比 checkpoint 更合理；不需要扩展时省略"}
-}`;
-
-export const OBSERVER_SYSTEM_PROMPT = OBSERVER_PROJECTOR_SYSTEM_PROMPT;
-
-export const OBSERVER_REPAIR_PROMPT = `上一轮 Observer 输出不是合法 JSON。
-请只根据上一轮已经读取过的日志、artifact 和图状态，重新输出一个合法 ObserverProjection JSON。
-不要再次调用工具，不要解释错误，不要 Markdown fence。
-如果无法确认任何新增事实且不需要监督干预，输出：
-{
-  "graphDelta": {"sourceEventIds":[],"nodes":[],"edges":[]},
-  "controlSignal": {
-    "decision": "continue",
-    "reason": "No supported graph delta or runtime intervention",
-    "evidenceRefs": [],
-    "confidence": "low"
-  }
+  "guidance": "仅 redirect 时提供的方向性建议；其他情况省略"
 }`;
 
 export function renderPlannerInput(input: {
@@ -266,13 +260,19 @@ export function compactPlannerDecisionViewForPrompt(view: PlannerDecisionView): 
       retryable: task.retryable,
       attempt: task.attempt,
       priority: task.priority,
-      dependsOnTaskRefs: task.dependsOnTaskRefs?.slice(0, 4)
+      dependsOnTaskRefs: task.dependsOnTaskRefs?.slice(0, 4),
+      evidenceRefs: task.evidenceRefs,
+      artifactRefs: task.artifactRefs,
+      capabilityRefs: task.capabilityRefs,
+      projection: task.projection
     };
   });
   return {
     view: view.view,
     rootRefs: view.rootRefs,
     taskLedger,
+    taskOutcomes: view.taskOutcomes,
+    projectionDegradations: view.projectionDegradations,
     reasoningDigest: view.reasoningDigest.map(compactDigest),
     operationDigest: view.operationDigest.map(compactDigest),
     blockers: view.blockers.map(compactDigest),
@@ -427,6 +427,7 @@ export function renderObserverInput(input: {
   observations: string;
   artifactIndex: string;
   graphContext: string;
+  connectivityContext: unknown;
 }): string {
   return `<projection_job>
 ${input.projectionJob}
@@ -444,7 +445,11 @@ ${input.artifactIndex}
 ${input.graphContext}
 </graph_context>
 
-请只基于以上 observations、artifact 片段和图上下文调用 graph_delta_submit。上下文不足或存在语义冲突时，最多使用两次只读图查询工具；已有节点使用 existing 别名，新节点使用 new 别名；多个 observation 支持同一语义变化时合并表达；evidenceRefs 只能使用 o1、o2 等 observation 别名。`;
+<connectivity_context format="json">
+${stableJson(input.connectivityContext)}
+</connectivity_context>
+
+请只基于以上 observations、artifact 片段和图上下文调用 graph_delta_submit。connectivity_context 仅是当前 Route 引用状态：可用于识别本次 observation 已发现目标所命中的既有 route，但不能独立证明 Host、Session、Evidence 或关系。上下文不足或存在语义冲突时，最多使用两次只读图查询工具；已有节点使用 existing 别名，新节点使用 new 别名；多个 observation 支持同一语义变化时合并表达；evidenceRefs 只能使用 o1、o2 等 observation 别名。`;
 }
 
 export function renderSupervisorInput(input: {
@@ -462,8 +467,6 @@ export function renderSupervisorInput(input: {
     toolExecutionEndCount?: number;
     turnEndCount?: number;
     budget?: { maxTurns?: number };
-    budgetExtensionCount?: number;
-    maxBudgetExtensions?: number;
     globalRemainingMs?: number;
     epochRemainingMs?: number;
     epochTimeLimitMs?: number;
@@ -481,7 +484,7 @@ export function renderSupervisorInput(input: {
 - 目标：${input.taskEnvelope.goal}
 - 成功条件：${input.taskEnvelope.successCriteria.join("；") || "未提供"}
 - 关键约束：${input.taskEnvelope.constraints.slice(0, 6).join("；") || "未提供"}
-- Turn 预算：已用 ${budgetState.turnEndCount ?? 0}/${budgetState.budget?.maxTurns ?? "?"} turns，动态扩展 ${budgetState.budgetExtensionCount ?? 0}/${budgetState.maxBudgetExtensions ?? "?"} 次
+- Turn 预算：已用 ${budgetState.turnEndCount ?? 0}/${budgetState.budget?.maxTurns ?? "?"} turns
 - 时间预算：全局剩余 ${formatRemainingTime(budgetState.globalRemainingMs)}；当前 Epoch 剩余 ${formatRemainingTime(budgetState.epochRemainingMs)} / ${formatRemainingTime(budgetState.epochTimeLimitMs)}
 - Runtime 停止请求：${budgetState.stopRequested === true ? "yes" : "no"}
 - 工具调用：已完成 ${budgetState.toolExecutionEndCount ?? 0} 次，仅用于观察窗口，不作为预算中止条件
@@ -506,7 +509,7 @@ ${input.actionTraceText}
 循环/漂移信号：
 ${input.loopSignalsText}
 
-请调用 control_submit 提交 ControlSignal。只判断是否 continue、checkpoint、stop_executor 或 need_planner；如果需要动态加预算，只能通过 budgetExtension 表达。不要输出自由文本 JSON、GraphDelta 或具体 HTTP 请求、payload、shell 命令。`;
+请调用 control_submit 提交 ControlSignal。只判断是否 continue、redirect、checkpoint、stop_executor 或 need_planner；redirect 只能提供方向性 guidance。不要输出自由文本 JSON、GraphDelta 或具体 HTTP 请求、payload、shell 命令。`;
 }
 
 function formatRemainingTime(value: number | undefined): string {
@@ -514,25 +517,6 @@ function formatRemainingTime(value: number | undefined): string {
     return "unbounded";
   }
   return `${Math.max(0, Math.ceil(value / 1000))}s`;
-}
-
-export function renderObserverRepairInput(input: {
-  parseError: string;
-  invalidOutputPreview: string;
-  sourceEventIds: string[];
-}): string {
-  return `${OBSERVER_REPAIR_PROMPT}
-
-PARSE_ERROR:
-${input.parseError}
-
-EXPECTED_SOURCE_EVENT_IDS:
-${stableJson(input.sourceEventIds)}
-
-INVALID_OUTPUT_PREVIEW:
-${input.invalidOutputPreview.slice(0, 4000)}
-
-请现在输出合法 ObserverProjection JSON。`;
 }
 
 export function stableJson(value: unknown): string {

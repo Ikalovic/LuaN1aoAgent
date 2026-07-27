@@ -91,7 +91,7 @@ v2 replaces the shared-history P-E-R loop with explicit runtime boundaries.
 - Reads compact task, reasoning, and operation graph views.
 - Creates or patches goal-level tasks instead of prescribing low-level actions.
 - Controls dependencies, priority, parallel groups, scope, and task budgets.
-- Schedules one deterministic admitted wave per planning cycle.
+- Reconciles ready tasks against available capacity after graph changes and task handoffs, without waiting for an entire parallel wave to finish.
 - Submits decisions through the structured `planner_submit` terminating tool.
 
 #### Executor
@@ -99,6 +99,7 @@ v2 replaces the shared-history P-E-R loop with explicit runtime boundaries.
 - Receives a bounded `TaskEnvelope` and independently chooses its tool strategy.
 - Records public intent, tool input, tool output, usage, errors, and final task results.
 - Preserves large outputs as immutable artifacts instead of inflating Agent context.
+- Reuses the same persisted Pi session lineage and workspace across epochs of one Task; different Tasks remain isolated.
 - Submits results through the structured `task_result_submit` terminating tool.
 
 #### Observer
@@ -185,7 +186,9 @@ Executors use Pi coding tools inside the configured sandbox boundary:
 - `web_fetch` for fetching public HTTP(S) references, advisories, and PoC writeups into bounded Markdown previews.
 - `web_search` for public web search through Brave Search when `BRAVE_SEARCH_API_KEY` or `BRAVE_API_KEY` is set, with HTML search fallbacks when no key is available.
 - `vulnerability_search` for CVE/advisory research through NVD and public web references, preserving weak negative semantics when no public hit is found.
-- `artifact_read` and `artifact_write` for durable cross-task material.
+- `browser_render` for post-JavaScript DOM inspection inside the Executor network boundary; Docker mode runs Chromium through the same transparent Gateway as other target traffic.
+- `artifact_read` and `artifact_write` for durable cross-task material; complete workspace files can be imported without passing their contents through the model context.
+- `route_open`, `route_status`, `route_stop`, and `route_reconnect` for Docker-mode Runtime-managed SSH/Chisel reachability.
 - `task_result_submit` for structured task completion or checkpoint handoff.
 
 Public research results are treated as hypotheses or intelligence leads until the Executor validates them against the authorized target with sandboxed tools. Optional `NVD_API_KEY` increases NVD rate limits but is not required.
@@ -202,7 +205,7 @@ LuaN1ao uses the Agent Skills convention through the Pi runtime. These optional 
 | [Eyadkelleh/awesome-skills-security](https://github.com/Eyadkelleh/awesome-skills-security) | Curated fuzzing payloads, password and username lists, sensitive-data patterns, web-shell samples, and LLM security testing resources |
 | [ljagiello/ctf-skills](https://github.com/ljagiello/ctf-skills) | CTF and lab workflows covering Web, Pwn, Crypto, Reverse Engineering, Forensics, OSINT, AI/ML, malware analysis, and writeups |
 
-One-click setup from the repository root — installs all three recommended skill collections into the project-local `.agents/skills/`, then runs `npm ci` and `npm run build`:
+One-click setup from the repository root — installs all three recommended skill collections into the project-local `.agents/skills/`, runs `npm ci` and `npm run build`, and builds both Docker images when a daemon is available:
 
 ```bash
 ./install.sh
@@ -222,9 +225,11 @@ Skills installed by `./install.sh` live in the project-local `.agents/skills/` (
 
 ### Sandbox Isolation
 
-- macOS uses Seatbelt through `sandbox-exec` when available.
-- Linux supports Bubblewrap isolation.
-- Executor workspaces and runtime roots are resolved explicitly.
+- `auto` prefers a per-Task Docker Executor sharing its Gateway network namespace; explicit `docker` fails closed when Docker or a required image is unavailable.
+- Docker Executors run as UID 1000 with no capabilities, a read-only root filesystem, executable size-limited `/tmp`, and a host-visible persistent `/workspace`.
+- Gateway containers add only `NET_ADMIN`, `SETUID`, and `SETGID` after dropping all capabilities: PID 1 configures TUN/policy routing and launches mitmproxy/connect gates as dedicated UIDs; the gate processes then clear their capability bounding sets.
+- Without Docker, macOS Seatbelt and Linux Bubblewrap remain available; `workspace` is the explicit development fallback.
+- Executor workspaces and runtime roots are resolved explicitly, and one Task retains its workspace across checkpoint/resume epochs.
 - Host paths outside allowed roots fail closed under forced sandbox modes.
 - Agent runtime state is not exposed to isolated Executor sessions as implicit context.
 
@@ -238,6 +243,9 @@ Each fresh CLI invocation creates an isolated session under `.agent-runtime/sess
 | `execution.jsonl` | Append-only audit mirror of normalized execution events |
 | `graph-deltas.jsonl` | Replayable graph delta mirror |
 | `artifacts/` | Large outputs and durable task artifacts |
+| `sandboxes/` | Per-Task persistent workspace plus host-only Pi session roots |
+| `executor-sessions/` | Persisted same-Task Pi session lineage across epochs |
+| `traffic/` | Segmented `.mitm` flows, `.net.jsonl` telemetry, public CA, and route/index metadata |
 | `web-auth.sqlite` | Local Web workbench users and sessions |
 
 ---
@@ -248,6 +256,7 @@ Each fresh CLI invocation creates an isolated session under `.agent-runtime/sess
 |---|---|---|
 | Operating system | macOS or Linux | Windows has not been validated as a v2 release target |
 | Node.js | 25+ | Must support the built-in `node:sqlite` runtime used by v2 |
+| Docker | Recommended | Required by the preferred transparent Gateway backend; native host backends remain available |
 | LLM API | OpenAI-compatible | Chat Completions by default; Responses API is optional |
 | Terminal | ANSI-compatible TTY | Required for the interactive Agent timeline |
 | Browser | Current Chromium, Firefox, or Safari | Used by the authenticated Web workbench |
@@ -266,6 +275,10 @@ git clone https://github.com/SanMuzZzZz/LuaN1aoAgent.git
 cd LuaN1aoAgent
 npm ci
 npm run build
+
+# Required for the preferred Docker backend; ./install.sh builds these automatically.
+npm run build:executor-image
+npm run build:network-image
 ```
 
 ### 2. Configure the LLM runtime
@@ -287,8 +300,8 @@ v2 reads `.env` locally. The file is ignored by Git and must never be committed.
 
 ```bash
 npm start -- \
-  --goal "在授权范围内评估 http://127.0.0.1:8080" \
-  --scope "仅限 http://127.0.0.1:8080" \
+  --goal "在授权范围内评估 http://<authorized-routable-host>:8080" \
+  --scope "仅限 http://<authorized-routable-host>:8080" \
   --max-cycles 8 \
   --max-parallel-tasks 2
 ```
@@ -373,19 +386,19 @@ The Web workbench is primarily an observability surface: it reads persisted grap
 
 All `/api/*` traffic and connectivity endpoints require a valid session. Analysts may read runtime metadata, sensitive proxy history, and connection status, but connectivity lifecycle mutations require the administrator-only `connectivity:manage` capability. No delete/export traffic endpoint is exposed. GET requests are CSRF-exempt, while mutations require the same-origin double-submit token. Runtime paths are canonicalized beneath the configured `--runtime-dir` root, including symlink checks, so the API is not an arbitrary filesystem browser.
 
-The managed traffic-proxy sidecar stores data under `<runtime>/traffic-proxy/data`, exposes cursor-based history list, exchange detail, captured request/response body, and authenticated public-CA download APIs. Bodies are base64 encoded and capped at 256 KiB per read. Only `ca.crt` is downloadable; the private key is never exposed. Web-started executors receive a copied environment containing `HTTP_PROXY`, `HTTPS_PROXY`, `NO_PROXY`, `SSL_CERT_FILE`, and `CURL_CA_BUNDLE`; `ALL_PROXY` is removed without mutating the process-global environment or forcing a Bash shell. Sidecar start/attach/stop, CA creation, and readiness are recorded in `ExecutionLog` without paths, secrets, or certificate contents.
+Docker Executors share a per-Task Gateway network namespace. The Executor receives no proxy variables, SOCKS endpoints, or Docker-internal aliases: ordinary `curl`, language sockets, and raw TCP clients keep the real destination address. IPv4 TCP is policy-routed through a TUN connect gate, captured by mitmproxy, and then dialed directly or through a managed SSH/Chisel route. The gate completes the Executor-side TCP handshake only after the real target connection succeeds, so a transparent proxy cannot turn a refused port into a false positive. UDP and ICMP remain direct and are attributed from conntrack telemetry.
 
-The sidebar's **Web Traffic** view provides exact method, host, status, task/run reference, mode, and error filters over newest-first opaque-cursor pages, with lazy exchange-detail loading. Request and response bodies are loaded only on demand, at most 256 KiB per read, and can be shown as UTF-8/JSON, base64, or hex; invalid UTF-8 falls back to base64. Headers and bodies are rendered as escaped text rather than HTML, and metadata-only, evicted, best-effort, and truncated states are identified explicitly. This is safe rendering, not redaction: authorized analysts can still see captured credentials and other sensitive values.
+Each epoch persists segmented `.mitm` capture files plus `.net.jsonl` connection telemetry under `<runtime>/traffic/flows/<task>/`. HTTP request/response bodies are truncated only in the persisted copy; live forwarding is unchanged. A read-only Index container rebuilds its view from those files after restart, so a dead localhost index process is not a second source of truth. The sidebar's **Web Traffic** view uses opaque `flowRef` identifiers and distinguishes HTTP from raw TCP; bodies are loaded on demand, rendered as escaped text, and expose truncation or eviction states explicitly.
 
 Replay is administrator-only; analysts can inspect exchanges but cannot replay them. The endpoint is `POST /api/traffic/history/:id/replay`, protected by session authorization and the same-origin double-submit CSRF check. `runtimeDir` and all optional method, URL, header, body, route, session, task, and run overrides belong to the allowlisted JSON request body, not the query string. The Web body override is base64 and currently limits `data` to 16 KiB of characters. Confirmation displays only target summary/counts, and `ExecutionLog` records `traffic_replay_requested`, `traffic_replay_succeeded`, or `traffic_replay_failed` with server-derived user/runtime attribution and stable result/error identifiers, never override URL, headers, body, or other request secrets.
 
-A replay is persisted as a separate `mode=replay` exchange whose `replay_of` points to the immutable source exchange. Control protocol v1 exposes the `replay` command with 64 KiB request frames and 1 MiB response frames; the sidecar allows four concurrent replays per `runtime_ref`, captures at most 1 MiB of the replay response, and applies a 30-second replay/control deadline, while the Web server independently permits four replay requests globally. The Web control client uses a replay-specific 35-second wait so the sidecar can return its own timeout result; other control commands retain the 2-second default. Errors are returned through stable machine-readable codes without exposing underlying sensitive values.
+A replay is persisted as a separate HTTP flow whose `replay_of` points to the immutable source flow. Active runs reuse their managed network and routes. Historical browsing uses a separate read-only Index; direct Replay lazily starts only a run network and one reusable Replay Gateway, while routed operations additionally restore the Connector and route definitions on demand. Replay keeps the original `routeRef` and `connectionRef`, never falls back to direct when that route is unavailable, and can resume after the administrator reconnects the same route reference.
 
-Replay accepts only absolute HTTP(S) targets, verifies HTTPS certificates and hostnames with TLS 1.2+, permits private/RFC1918 destinations, and rejects configured proxy self-target loops. It rejects `CONNECT`, URL userinfo/control characters, hop-by-hop headers (including names nominated by `Connection`), proxy authentication headers, and a `Host` header conflicting with the URL authority. Metadata-only/passthrough, CONNECT, truncated-header/request, and missing or incomplete captured-request-body sources are not replayable. There are no traffic export/delete endpoints.
+Replay accepts only complete captured HTTP requests and preserves method, URL, headers, body, route provenance, and the HTTP editor. Raw TCP, UDP, ICMP, incomplete request bodies, and evicted payloads are not replayable. There are no traffic export/delete endpoints.
 
-The traffic manager/client exposes a managed HTTP scope that applies task/run attribution together with non-empty `routeRef` and `sessionRef`. Only operations executed inside that scope carry those route/session references; raw or unmanaged traffic remains observable but is never automatically attributed.
+Connections and routes are persisted independently of graph projection. A Connection is a command channel; a Route is network reachability and may be backed by a Connection. `route_stop` preserves the definition, while `route_reconnect` restores the original reference. The Projector consumes typed connectivity observations to create semantic `ShellSession`, `session_on`, and discovered-host `proxy_route` facts; Runtime containers and Docker aliases never become graph hosts.
 
-The sidebar's **Connections** view lists tunnel/session direction, transport, desired and observed state, heartbeat, availability, errors, and operation-graph links. Administrators can control existing managed SSH tunnels and SSH session desired lifecycles in the UI; definitions are currently created through the administrator-only API, while analysts have read-only access. Requests may contain only a `credentialRef`—inline passwords, private keys, tokens, and nested credential material are rejected recursively—and every mutation is protected by CSRF, capability checks, and runtime-root containment. Chisel adapter configuration and allowlist integration exist, but Chisel Web lifecycle control is not currently wired; raw, unmanaged, and Chisel records are status-only in this view.
+The sidebar's **Connections** view lists Connection and Route desired/observed state, backing references, heartbeat, target CIDRs, failures, and operation-graph links. Lifecycle mutations are administrator-only and accept credential references rather than inline secrets. Agent-managed SSH and Chisel routes can be stopped and reconnected; channels created autonomously in Bash remain audited as unmanaged traffic and are not given a fabricated recoverable reference.
 
 ---
 
@@ -398,7 +411,7 @@ flowchart TB
     subgraph Runtime[LuaN1ao Runtime]
         Controller --> Planner
         Planner --> TaskGraph[(Task Graph)]
-        TaskGraph --> Scheduler[Deterministic wave scheduler]
+        TaskGraph --> Scheduler[Capacity-aware reconcile scheduler]
         Scheduler --> ExecutorA[Executor session A]
         Scheduler --> ExecutorB[Executor session B]
         ExecutorA --> ExecutionLog[(ExecutionLog)]
@@ -438,7 +451,10 @@ LuaN1aoAgent/
 │   ├── controller.ts             # Scheduling, lifecycle, supervision, and recovery
 │   ├── pi-runner.ts              # Pi invocation and normalized event logging
 │   ├── projection.ts             # Observation and graph projection contracts
-│   ├── executor-sandbox.ts       # macOS/Linux Executor isolation
+│   ├── executor-sandbox.ts       # Seatbelt/Bubblewrap/workspace host backends
+│   ├── executor-sandbox-docker.ts # Per-Task Docker Executor backend
+│   ├── projector-coordinator.ts  # Single-owner asynchronous projection scheduler
+│   ├── connectivity/             # ConnectivityRuntime, Gateway, Route, Replay, Index
 │   ├── stores/
 │   │   ├── execution-log.ts      # Durable event ledger
 │   │   ├── graph-store.ts        # Tri-graph persistence and atomic mutation
@@ -450,6 +466,9 @@ LuaN1aoAgent/
 │   └── web-server.ts             # Authenticated workbench server (start/stop runs)
 ├── web/                          # React Agent workbench
 ├── test/                         # Runtime and transition tests
+├── executor-image/               # Docker Executor image
+├── network-image/                # Gateway/Connector/Index image
+├── traffic-proxy/                # Workspace-compatible explicit HTTP proxy
 ├── package.json
 └── README.md
 ```

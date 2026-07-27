@@ -3,7 +3,7 @@ import { Alert, Button, Descriptions, Empty, Input, Modal, Radio, Select, Space,
 import { Plus, RotateCcw, Send, Trash2 } from "lucide-react";
 import { fetchTrafficBody, replayTrafficExchange } from "../api";
 import { useLanguage } from "../language";
-import type { AuthUser, TrafficExchange, TrafficHeaderEntry, TrafficHistoryBody } from "../types";
+import type { AuthUser, TrafficExchange, TrafficFlowRef, TrafficHeaderEntry, TrafficHistoryBody } from "../types";
 import { formatTime, shortRef } from "../utils";
 import { formatTrafficMode } from "./TrafficView";
 
@@ -11,8 +11,8 @@ interface TrafficInspectorProps {
   runtimeDir: string;
   exchange?: TrafficExchange;
   user: AuthUser;
-  onSelectExchange: (exchangeId: number) => void;
-  onReplayed: (exchangeId: number) => void;
+  onSelectExchange: (exchangeId: TrafficFlowRef) => void;
+  onReplayed: (exchangeId: TrafficFlowRef) => void;
 }
 
 type BodySide = "request" | "response";
@@ -74,14 +74,14 @@ export function TrafficInspector(props: TrafficInspectorProps) {
         <BodySection side="request" exchange={exchange} state={bodies.request} onLoad={() => void loadBody("request")} />
         <HeaderSection title={t("traffic.responseHeaders")} headers={exchange.response_headers} truncated={exchange.headers_truncated} reason={exchange.header_truncation_reason} />
         <BodySection side="response" exchange={exchange} state={bodies.response} onLoad={() => void loadBody("response")} />
-        <ReplayEditor
+        {exchange.kind === "tcp" ? <Alert type="info" showIcon title={t("traffic.tcpReplayUnavailable")} /> : <ReplayEditor
           runtimeDir={props.runtimeDir}
           exchange={exchange}
           user={props.user}
           requestBody={bodies.request.value}
           loadRequestBody={() => loadBody("request")}
           onReplayed={props.onReplayed}
-        />
+        />}
       </section>
     </div>
   );
@@ -143,7 +143,7 @@ function ReplayEditor({ runtimeDir, exchange, user, requestBody, loadRequestBody
   user: AuthUser;
   requestBody?: TrafficHistoryBody;
   loadRequestBody: () => Promise<TrafficHistoryBody | undefined>;
-  onReplayed: (exchangeId: number) => void;
+  onReplayed: (exchangeId: TrafficFlowRef) => void;
 }) {
   const { t } = useLanguage();
   const [open, setOpen] = useState(false);
@@ -248,11 +248,11 @@ function ReplayEditor({ runtimeDir, exchange, user, requestBody, loadRequestBody
   );
 }
 
-function ReferenceChain({ exchange, onSelectExchange }: { exchange: TrafficExchange; onSelectExchange: (id: number) => void }) {
+function ReferenceChain({ exchange, onSelectExchange }: { exchange: TrafficExchange; onSelectExchange: (id: TrafficFlowRef) => void }) {
   const { t } = useLanguage();
   const refs = [
-    ["task", exchange.task_ref], ["run", exchange.run_ref], ["route", exchange.route_ref], ["session", exchange.session_ref],
-    ["connect", exchange.connect_ref]
+    ["task", exchange.task_ref], ["epoch", exchange.epoch_ref], ["run", exchange.run_ref], ["route", exchange.route_ref], ["session", exchange.session_ref],
+    ["connection", exchange.connection_ref ?? exchange.connect_ref]
   ].filter((entry): entry is [string, string] => Boolean(entry[1]));
   return (
     <div className="traffic-section"><strong>{t("traffic.referenceChain")}</strong><Space size={[4, 4]} wrap>{refs.length ? refs.map(([label, value]) => <Tag key={`${label}:${value}`}>{label}: {shortRef(value, 28)}</Tag>) : <span className="muted-line">{t("traffic.noReferenceChain")}</span>}{exchange.replay_of ? <Button type="link" size="small" onClick={() => onSelectExchange(exchange.replay_of!)}>replay_of #{exchange.replay_of}</Button> : null}</Space></div>

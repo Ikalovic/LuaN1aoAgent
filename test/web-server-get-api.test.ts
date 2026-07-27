@@ -119,9 +119,9 @@ test("analyst reaches metadata and sensitive-read GET routes but lacks export an
 
   const list = await analystGet("/api/traffic/history?runtimeDir=runtime-a");
   assert.equal(list.status, 200);
-  const detail = await analystGet("/api/traffic/history/7?runtimeDir=runtime-a");
+  const detail = await analystGet("/api/traffic/history/legacy%3A7?runtimeDir=runtime-a");
   assert.equal(detail.status, 200);
-  const body = await analystGet("/api/traffic/history/7/body?runtimeDir=runtime-a&side=response");
+  const body = await analystGet("/api/traffic/history/legacy%3A7/body?runtimeDir=runtime-a&side=response");
   assert.equal(body.status, 200);
   const ca = await analystGet("/api/traffic/ca?runtimeDir=runtime-a");
   assert.equal(ca.status, 200);
@@ -156,7 +156,11 @@ test("history pagination and detail/body routes emit exact control protocol fiel
     "/api/traffic/history?runtimeDir=runtime-a&cursor=next-1&limit=25&runtime_ref=rr&task_ref=tt&run_ref=run&route_ref=route&session_ref=session&started_after=2026-01-01T00%3A00%3A00Z&started_before=2026-01-02T00%3A00%3A00Z&mode=mitm&method=POST&host=example.test&connect_ref=conn&error=tls&status=201"
   );
   assert.equal(listResponse.status, 200);
-  assert.deepEqual(await json(listResponse), { items: [], has_more: true, next_cursor: "next-2" });
+  assert.deepEqual(await json(listResponse), {
+    items: [{ id: "legacy:42", replay_of: "legacy:41" }],
+    has_more: true,
+    next_cursor: "next-2"
+  });
   const listRequest = fixture.requests.slice(before).find((request) => request.command === "history_list");
   assert.deepEqual(withoutRequestEnvelope(listRequest!), {
     command: "history_list",
@@ -179,14 +183,22 @@ test("history pagination and detail/body routes emit exact control protocol fiel
     }
   });
 
-  const detail = await analystGet("/api/traffic/history/42?runtimeDir=runtime-a");
+  const detail = await analystGet("/api/traffic/history/legacy%3A42?runtimeDir=runtime-a");
   assert.equal(detail.status, 200);
-  assert.equal((await json(detail)).id, 42);
+  assert.equal((await json(detail)).id, "legacy:42");
   assert.deepEqual(withoutRequestEnvelope(fixture.requests.at(-1)!), { command: "history_get", exchange_id: 42 });
 
-  const body = await analystGet("/api/traffic/history/42/body?runtimeDir=runtime-a&side=request&byteLimit=4096");
+  const body = await analystGet("/api/traffic/history/legacy%3A42/body?runtimeDir=runtime-a&side=request&byteLimit=4096");
   assert.equal(body.status, 200);
-  assert.equal((await json(body)).side, "request");
+  assert.deepEqual(await json(body), {
+    exchange_id: "legacy:42",
+    side: "request",
+    body_ref: "body:test",
+    encoding: "base64",
+    data: "dGVzdA==",
+    bytes: 4,
+    truncated: false
+  });
   assert.deepEqual(withoutRequestEnvelope(fixture.requests.at(-1)!), {
     command: "history_body",
     exchange_id: 42,
@@ -196,9 +208,10 @@ test("history pagination and detail/body routes emit exact control protocol fiel
 
   for (const pathname of [
     "/api/traffic/history?runtimeDir=runtime-a&limit=101",
-    "/api/traffic/history/42/body?runtimeDir=runtime-a&side=invalid",
-    "/api/traffic/history/42/body?runtimeDir=runtime-a&side=response&byteLimit=262145",
-    "/api/traffic/history/0?runtimeDir=runtime-a"
+    "/api/traffic/history/legacy%3A42/body?runtimeDir=runtime-a&side=invalid",
+    "/api/traffic/history/legacy%3A42/body?runtimeDir=runtime-a&side=response&byteLimit=262145",
+    "/api/traffic/history/42?runtimeDir=runtime-a",
+    "/api/traffic/history/legacy%3A0?runtimeDir=runtime-a"
   ]) {
     const response = await analystGet(pathname);
     assert.equal(response.status, 400, pathname);
@@ -331,7 +344,7 @@ function handleControlSocket(socket: Socket, requests: ControlRequest[], runtime
     const result = request.command === "hello"
       ? { protocol: "luanniao-traffic-proxy", version: 1, runtime_ref: runtimeRef, proxy: "127.0.0.1:8080" }
       : request.command === "history_list"
-        ? { items: [], has_more: Boolean(request.cursor), ...(request.cursor ? { next_cursor: "next-2" } : {}) }
+        ? { items: [{ id: 42, replay_of: 41 }], has_more: Boolean(request.cursor), ...(request.cursor ? { next_cursor: "next-2" } : {}) }
         : request.command === "history_get"
           ? { id: request.exchange_id }
           : request.command === "history_body"

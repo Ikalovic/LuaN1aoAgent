@@ -2,8 +2,33 @@ import assert from "node:assert/strict";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import test from "node:test";
-import { RuntimeStore } from "../src/stores/runtime-store.js";
+import { getOrCreateRuntimeRunRef, RuntimeStore } from "../src/stores/runtime-store.js";
+
+test("preserves the run reference when reopening a runtime", () => {
+  const runtimeDir = mkdtempSync(join(tmpdir(), "luanniao-runtime-"));
+  const databasePath = join(runtimeDir, "state.sqlite");
+  const firstStore = new RuntimeStore(databasePath);
+  const firstRunRef = firstStore.getOrCreateRunRef();
+  firstStore.close();
+
+  const reopenedStore = new RuntimeStore(databasePath);
+  assert.equal(reopenedStore.getOrCreateRunRef(), firstRunRef);
+  reopenedStore.close();
+});
+
+test("reads the persistent run reference without recovering active runtime state", () => {
+  const runtimeDir = mkdtempSync(join(tmpdir(), "luanniao-runtime-"));
+  const databasePath = join(runtimeDir, "state.sqlite");
+  const store = new RuntimeStore(databasePath);
+  store.createEpoch({ epochId: "epoch:active", taskId: "task:active", attempt: 1 });
+  store.transitionEpoch({ epochId: "epoch:active", state: "running" });
+
+  assert.equal(getOrCreateRuntimeRunRef(databasePath), store.getOrCreateRunRef());
+  assert.equal(store.getEpoch("epoch:active")?.state, "running");
+  store.close();
+});
 
 test("tracks multiple epochs for one task without shared lifecycle state", () => {
   const runtimeDir = mkdtempSync(join(tmpdir(), "luanniao-runtime-"));
@@ -52,4 +77,94 @@ test("releases interrupted projection claims without advancing committed sequenc
   assert.equal(state.desiredSeq, 9);
   assert.deepEqual(recoveredStore.listPendingProjectionTasks().map((item) => item.taskId), ["task:test"]);
   recoveredStore.close();
+});
+
+test("persists projection age and terminal fence across recovery", () => {
+  const runtimeDir = mkdtempSync(join(tmpdir(), "luanniao-runtime-"));
+  const databasePath = join(runtimeDir, "state.sqlite");
+  const firstStore = new RuntimeStore(databasePath);
+  const raised = firstStore.raiseProjectionDesired("task:test", 12, 10, 12);
+
+  assert.ok(raised.pendingSince);
+  assert.equal(raised.terminalTargetSeq, 12);
+  firstStore.close();
+
+  const recoveredStore = new RuntimeStore(databasePath);
+  const recovered = recoveredStore.getProjectionState("task:test");
+  assert.equal(recovered.pendingSince, raised.pendingSince);
+  assert.equal(recovered.terminalTargetSeq, 12);
+
+  recoveredStore.clearProjectionTerminalTarget("task:test", 12);
+  assert.equal(recoveredStore.getProjectionState("task:test").terminalTargetSeq, undefined);
+  recoveredStore.close();
+});
+
+test("lists a caught-up terminal fence until the coordinator acknowledges it", () => {
+  const runtimeDir = mkdtempSync(join(tmpdir(), "luanniao-runtime-"));
+  const store = new RuntimeStore(join(runtimeDir, "state.sqlite"));
+  store.raiseProjectionDesired("task:terminal-association", 4, 10, 4);
+  const claim = store.claimProjection("task:terminal-association");
+  assert.ok(claim);
+  store.releaseProjection("task:terminal-association", claim.generation);
+  const secondClaim = store.claimProjection("task:terminal-association");
+  assert.ok(secondClaim);
+
+  const database = new DatabaseSync(store.databasePath);
+  database.prepare(`
+    UPDATE projection_states
+    SET committed_seq = desired_seq, active_generation = NULL
+    WHERE task_id = ?
+  `).run("task:terminal-association");
+  database.close();
+
+  assert.deepEqual(
+    store.listPendingProjectionTasks().map((state) => state.taskId),
+    ["task:terminal-association"]
+  );
+  store.clearProjectionTerminalTarget("task:terminal-association", 4);
+  assert.deepEqual(store.listPendingProjectionTasks(), []);
+  store.close();
+});
+
+test("keeps the latest complete task outcome for dependency handoff", () => {
+  const runtimeDir = mkdtempSync(join(tmpdir(), "luanniao-runtime-"));
+  const databasePath = join(runtimeDir, "state.sqlite");
+  const store = new RuntimeStore(databasePath);
+  store.upsertTaskOutcome({
+    taskRef: "task:test",
+    epochRef: "epoch:1",
+    status: "partial",
+    summary: "initial foothold",
+    evidenceRefs: ["event:1"],
+    artifactRefs: ["artifact:1"],
+    capabilityRefs: ["route:1"],
+    checkpoint: { reason: "resume from foothold", resumeCursor: "artifact:1" },
+    terminalSeq: 8,
+    createdAt: "2026-07-25T00:00:00.000Z"
+  });
+  store.upsertTaskOutcome({
+    taskRef: "task:test",
+    epochRef: "epoch:2",
+    status: "completed",
+    summary: "verified access",
+    evidenceRefs: ["event:2"],
+    artifactRefs: ["artifact:2"],
+    capabilityRefs: ["route:1", "connection:1"],
+    terminalSeq: 18,
+    createdAt: "2026-07-25T00:01:00.000Z"
+  });
+
+  assert.deepEqual(store.getTaskOutcome("task:test"), {
+    taskRef: "task:test",
+    epochRef: "epoch:2",
+    status: "completed",
+    summary: "verified access",
+    evidenceRefs: ["event:2"],
+    artifactRefs: ["artifact:2"],
+    capabilityRefs: ["route:1", "connection:1"],
+    terminalSeq: 18,
+    createdAt: "2026-07-25T00:01:00.000Z"
+  });
+  assert.deepEqual(store.listTaskOutcomes(1).map((outcome) => outcome.taskRef), ["task:test"]);
+  store.close();
 });

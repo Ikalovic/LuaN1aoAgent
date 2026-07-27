@@ -3,14 +3,14 @@ import { Alert, Button, Empty, Input, InputNumber, Select, Skeleton, Tag } from 
 import { ChevronLeft, ChevronRight, Filter, RefreshCw } from "lucide-react";
 import { fetchTrafficExchange, fetchTrafficHistory } from "../api";
 import { useLanguage } from "../language";
-import type { TrafficExchange, TrafficHistoryFilters } from "../types";
+import type { TrafficExchange, TrafficFlowRef, TrafficHistoryFilters } from "../types";
 import { formatTime } from "../utils";
 
 interface TrafficViewProps {
   runtimeDir: string;
-  selectedExchangeId?: number;
+  selectedExchangeId?: TrafficFlowRef;
   refreshToken?: number;
-  onSelectExchange: (exchangeId: number | undefined) => void;
+  onSelectExchange: (exchangeId: TrafficFlowRef | undefined) => void;
   onExchangeLoaded: (exchange: TrafficExchange | undefined) => void;
 }
 
@@ -45,7 +45,6 @@ export function TrafficView(props: TrafficViewProps) {
     setItems([]);
     setHasMore(false);
     setNextCursor(undefined);
-    props.onSelectExchange(undefined);
     props.onExchangeLoaded(undefined);
     fetchTrafficHistory(props.runtimeDir, { cursor, limit: PAGE_SIZE, filters }, controller.signal)
       .then((page) => {
@@ -53,7 +52,9 @@ export function TrafficView(props: TrafficViewProps) {
         setItems(page.items);
         setHasMore(page.has_more);
         setNextCursor(page.next_cursor);
-        if (page.items[0]) props.onSelectExchange(page.items[0].id);
+        const selectedStillVisible = props.selectedExchangeId !== undefined
+          && page.items.some((item) => item.id === props.selectedExchangeId);
+        if (!selectedStillVisible) props.onSelectExchange(page.items[0]?.id);
       })
       .catch((cause) => {
         if (controller.signal.aborted) return;

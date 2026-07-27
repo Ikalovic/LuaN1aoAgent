@@ -4,10 +4,28 @@ import { join } from "node:path";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
 import { createExecutorAgentSession, createObserverAgentSession, createPlannerAgentSession, projectSkillsDirs, type SecurityAgentRuntime, type SecurityAgentSession } from "./agents.js";
 import { extractJsonObject } from "./json.js";
-import { createLlmRuntime, type LlmRuntime } from "./llm-config.js";
-import { createExecutorSandbox, type ExecutorSandbox } from "./executor-sandbox.js";
+import {
+  createLlmRuntime,
+  providerAdmissionKey,
+  type LlmAgentRole,
+  type LlmRuntime
+} from "./llm-config.js";
+import { ConnectivityRuntime } from "./connectivity/connectivity-runtime.js";
+import type { MitmFlowClient } from "./connectivity/mitm-flow-client.js";
+import type { GatewayReplayInput } from "./connectivity/replay-gateway-runtime.js";
+import type { RouteOpenInput, RouteProjectionContext, RouteStatus } from "./connectivity/route-manager.js";
+import type { TrafficReplayResult } from "./connectivity/traffic-proxy-client.js";
+import {
+  createDockerTaskSandbox,
+  type DockerTaskSandbox
+} from "./executor-sandbox-docker.js";
+import {
+  createExecutorSandbox,
+  type ExecutorSandbox,
+  type ExecutorSandboxRequestedMode
+} from "./executor-sandbox.js";
 import { summarizeSupervisorTrace } from "./log-summary.js";
-import { normalizePlannerDecision } from "./planner-commands.js";
+import { normalizePlannerDecision, validatePlannerArtifactRefs } from "./planner-commands.js";
 import {
   renderExecutorInput,
   renderExecutorResumeInput,
@@ -31,16 +49,28 @@ import {
   buildProjectionObservations,
   causalObservationDigest,
   capabilityDigest,
+  compactProjectionGraphContextForInput,
   compactProjectionBatchForInput,
+  compactUtf8HeadTail,
   expandProjectionDraft,
   observationDigest,
+  partitionProjectionBatchForInput,
+  PROJECTOR_MAX_DELTA_NODES,
+  ProjectorGraphRefRegistry,
+  ProjectionObservationEnvelopeTooLargeError,
   renderProjectionGraphContext,
   renderProjectionObservations,
   selectProjectionBatch,
+  type ProjectionDraftValidationOptions,
   type ProjectionBatch,
   type ProjectionObservation
 } from "./projection.js";
+import {
+  ProjectorCoordinator,
+  type ProjectorWorkItem
+} from "./projector-coordinator.js";
 import { ArtifactStore } from "./stores/artifact-store.js";
+import { ConnectivityStore } from "./stores/connectivity-store.js";
 import { ExecutionLog } from "./stores/execution-log.js";
 import {
   GraphValidationError,
@@ -49,12 +79,18 @@ import {
   type PlannerTaskBatchCommand
 } from "./stores/graph-store.js";
 import { RuntimeStore } from "./stores/runtime-store.js";
+import {
+  createExecutorConnectivityTools,
+  type ExecutorConnectivityRuntime
+} from "./tools/connectivity-tools.js";
 import type {
   AgentRole,
   ControlSignal,
   ExecutionEpochTerminationReason,
   ExecutionEvent,
   GraphDelta,
+  GraphEdge,
+  GraphNode,
   ObserverMode,
   ObserverProjection,
   PlannerCommand,
@@ -63,8 +99,10 @@ import type {
   PlannerTaskSpec,
   ProjectionClaim,
   RuntimeAbortContext,
+  SupervisorVerdict,
   TaskBudget,
   TaskEnvelope,
+  TaskOutcome,
   TaskResult,
   TaskResultStatus
 } from "./types.js";
@@ -128,9 +166,9 @@ const PROJECTOR_TOOL_WINDOW_SIZE = positiveIntegerEnv("PROJECTOR_TOOL_WINDOW_SIZ
 const TURN_WINDOW_REASON_PREFIX = "turn_window:";
 const PROJECT_WINDOW_REASON_PREFIX = "project_window:";
 const DEFAULT_MAX_PARALLEL_TASKS = 2;
-const BUDGET_EXTENSION_TURNS = 4;
-const MAX_BUDGET_EXTENSIONS = 3;
+const LLM_PROVIDER_MAX_CONCURRENT = positiveIntegerEnv("LLM_PROVIDER_MAX_CONCURRENT", 3);
 const BUDGET_PRESSURE_TURNS = 2;
+const DEFAULT_EXECUTOR_CHECKPOINT_GRACE_MS = 120_000;
 const PROJECTION_CANCEL_GRACE_MS = 2_000;
 const PROJECTION_DRAIN_TIMEOUT_MS = positiveIntegerEnv(
   "PROJECTION_DRAIN_TIMEOUT_MS",
@@ -139,25 +177,27 @@ const PROJECTION_DRAIN_TIMEOUT_MS = positiveIntegerEnv(
 const MAX_ACTIVE_PROJECTION_JOBS = positiveIntegerEnv("MAX_ACTIVE_PROJECTION_JOBS", 2);
 const PROJECTOR_ARTIFACT_MANIFEST_LIMIT = 3;
 const PROJECTOR_MAX_OBSERVATIONS_PER_JOB = positiveIntegerEnv("PROJECTOR_MAX_OBSERVATIONS_PER_JOB", 16);
-const PROJECTOR_INPUT_TARGET_BYTES = positiveIntegerEnv(
-  "PROJECTOR_INPUT_TARGET_BYTES",
-  positiveIntegerEnv("PROJECTOR_INPUT_HARD_LIMIT_BYTES", 32_000)
+const PROJECTOR_CATCHUP_MAX_OBSERVATIONS_PER_JOB = positiveIntegerEnv(
+  "PROJECTOR_CATCHUP_MAX_OBSERVATIONS_PER_JOB",
+  32
 );
-const PROJECTOR_MAX_RETRIES = 1;
+const PROJECTOR_INPUT_TARGET_BYTES = Math.min(
+  32_000,
+  positiveIntegerEnv("PROJECTOR_INPUT_TARGET_BYTES", 32_000)
+);
 const DEFAULT_PROJECTOR_CATCHUP_DELAY_MS = 45_000;
-const DEFAULT_PROJECTOR_CATCHUP_MIN_OBSERVATIONS = 4;
 const PROJECTOR_OBSERVATION_ROLES: Array<AgentRole | "runtime"> = ["executor", "runtime"];
 const PROJECTOR_OBSERVATION_EVENT_TYPES = [
   "assistant_intent",
   "tool_started",
   "tool_finished",
+  "connectivity_observation",
   "provider_error",
   "task_completed",
   "task_partial",
   "task_blocked",
   "task_failed"
 ];
-const EXECUTOR_CHECKPOINT_GRACE_MS = positiveIntegerEnv("EXECUTOR_CHECKPOINT_GRACE_MS", 120_000);
 const EXECUTOR_PROVIDER_RETRY_ATTEMPTS = 2;
 const EXECUTOR_PROVIDER_RETRY_BACKOFF_MS = 250;
 const EXECUTOR_SESSION_DIR = "executor-sessions";
@@ -169,15 +209,15 @@ type ObserverProjectionRequest = {
   sourceEventIds?: string[];
   queueId?: string;
   queuedAt?: number;
+  terminal?: boolean;
+  maxObservations?: number;
+  admissionSignal?: AbortSignal;
 };
 
-type PendingProjectionRequest = ObserverProjectionRequest & {
+type ProjectionRequestContext = ObserverProjectionRequest & {
+  desiredSeq: number;
   queueId: string;
   queuedAt: number;
-  sequence: number;
-  supersedes?: string[];
-  resolve?: (projection: ObserverProjection) => void;
-  reject?: (error: unknown) => void;
 };
 
 type SupervisorCheckRequest = {
@@ -187,12 +227,15 @@ type SupervisorCheckRequest = {
   taskResult?: TaskResult;
   queueId?: string;
   queuedAt?: number;
+  epochRef?: string;
+  throughSeq?: number;
 };
 
 type TaskSupervisionState = {
   taskId: string;
   phase: "recon" | "exploit" | "verify" | "extract" | "unknown";
   progressDigest: string;
+  lastVerdict?: Pick<SupervisorVerdict, "decision" | "reason" | "guidance">;
   repeatedPatterns: string[];
   negativeFindings: string[];
   openQuestions: string[];
@@ -209,16 +252,17 @@ type ActiveTaskState = {
   executorStopRequested: boolean;
   controlSignal?: ControlSignal;
   abortContext?: RuntimeAbortContext;
+  terminationFailure?: string;
   taskTimer?: NodeJS.Timeout;
   lastObserverProjection?: ObserverProjection;
   executorSession?: SecurityAgentSession;
   dynamicExecutor: boolean;
   attempt: number;
   lastEventId?: string;
-  budgetExtensionCount: number;
   budgetStatusSteerKeys: Set<string>;
-  budgetDecisionPending?: boolean;
   checkpointGraceTimer?: NodeJS.Timeout;
+  terminationPromise?: Promise<void>;
+  invocationAbortController: AbortController;
   runDeadlineAt?: number;
   epochDeadlineAt?: number;
   epochTimeLimitMs?: number;
@@ -228,8 +272,21 @@ type ActiveTaskState = {
 type TaskExecution = {
   taskEnvelope: TaskEnvelope;
   taskResult: TaskResult;
+  terminalSeq: number;
+  plannerProjectionTargetSeq?: number;
   graphDelta?: GraphDelta;
   controlSignal: ControlSignal;
+};
+
+type ActiveTaskRun = {
+  taskEnvelope: TaskEnvelope;
+  promise: Promise<TaskExecution>;
+};
+
+type TaskCompletion = {
+  taskId: string;
+  execution?: TaskExecution;
+  error?: unknown;
 };
 
 type ExecutorSessionLease = {
@@ -286,44 +343,68 @@ export class SecurityAgentController {
   readonly artifactStore: ArtifactStore;
   readonly runtimeStore: RuntimeStore;
   readonly llmRuntime: LlmRuntime;
-  readonly runId = randomUUID();
+  readonly runId: string;
   private readonly environment?: NodeJS.ProcessEnv;
+  private readonly executorSandboxMode?: ExecutorSandboxRequestedMode;
+  private readonly checkpointGraceMs: number;
   private executorSandbox?: ExecutorSandbox;
+  private connectivityRuntime?: ConnectivityRuntime;
+  private connectivityStore?: ConnectivityStore;
+  private connectivityRuntimeCleanupComplete = false;
+  private taskExecutorSandboxes = new Map<string, DockerTaskSandbox>();
   private agents?: SecurityAgentRuntime;
-  private supervisorInFlight = new Map<string, Promise<ControlSignal>>();
+  private supervisorInFlight = new Map<string, Promise<SupervisorVerdict>>();
+  private supervisorAbortByEpoch = new Map<string, AbortController>();
   private activeSupervisorSessions = new Set<SecurityAgentSession>();
   private activePlannerSessions = new Set<SecurityAgentSession>();
   private pendingSupervisorRequests = new Map<string, {
     request: SupervisorCheckRequest;
-    resolve: (signal: ControlSignal) => void;
+    resolve: (signal: SupervisorVerdict) => void;
     reject: (error: unknown) => void;
   }>();
+  private latestSupervisorThroughSeqByEpoch = new Map<string, number>();
   private activeProjectionJobCount = 0;
-  private projectionQueueClosed = false;
-  private projectionQueueDrainingOnClose = false;
+  private projectionRequestsClosed = false;
   private projectionCancellationRequested = false;
   private graphStoreClosed = false;
-  private projectionJobs = new Set<Promise<ObserverProjection>>();
+  private closePromise?: Promise<void>;
   private activeProjectorSessions = new Set<SecurityAgentSession>();
   private activeProjectorByTask = new Map<string, SecurityAgentSession>();
-  private pendingProjectionRequests = new Map<string, PendingProjectionRequest>();
-  private projectionSequence = 0;
-  private projectionRetryCountByTask = new Map<string, number>();
-  private projectionCatchupTimers = new Map<string, NodeJS.Timeout>();
-  private projectionOrphanRefsByTask = new Map<string, string[]>();
+  private projectionContextByTask = new Map<string, ProjectionRequestContext>();
+  private lastProjectionByTask = new Map<string, ObserverProjection>();
+  private readonly projectorCoordinator: ProjectorCoordinator;
   private activeEpochs = new Map<string, ActiveTaskState>();
   private activeEpochIdByTask = new Map<string, string>();
+  private activeTaskRuns = new Map<string, ActiveTaskRun>();
+  private taskCompletionQueue: TaskCompletion[] = [];
+  private taskCompletionWaiters = new Set<() => void>();
+  private taskReconcileChain: Promise<void> = Promise.resolve();
+  private plannerProjectionTargets = new Map<string, number>();
+  private awaitingPlannerTaskIds = new Set<string>();
   private taskSupervisionStates = new Map<string, TaskSupervisionState>();
+  private readonly invocationAbortController = new AbortController();
+  private readonly projectorInvocationAbortController = new AbortController();
   private stopRequestedReason?: string;
   private isolatedSessionsEnabled = false;
   private structuredInvocationsEnabled = false;
   private activeRun?: ActiveRunRecord;
   private currentUserGoal?: string;
 
-  constructor(input: { cwd: string; runtimeDir?: string; environment?: NodeJS.ProcessEnv }) {
+  constructor(input: {
+    cwd: string;
+    runtimeDir?: string;
+    environment?: NodeJS.ProcessEnv;
+    executorSandboxMode?: ExecutorSandboxRequestedMode;
+  }) {
     this.cwd = input.cwd;
     this.runtimeDir = input.runtimeDir ?? join(input.cwd, ".agent-runtime");
     this.environment = input.environment;
+    this.executorSandboxMode = input.executorSandboxMode;
+    this.checkpointGraceMs = positiveIntegerEnvironment(
+      input.environment ?? process.env,
+      "EXECUTOR_CHECKPOINT_GRACE_MS",
+      DEFAULT_EXECUTOR_CHECKPOINT_GRACE_MS
+    );
     this.graphStore = new SQLiteGraphStore(
       join(this.runtimeDir, "state.sqlite"),
       join(this.runtimeDir, "graph-deltas.jsonl")
@@ -332,29 +413,97 @@ export class SecurityAgentController {
     this.executionLog = new ExecutionLog(join(this.runtimeDir, "execution.jsonl"), databasePath);
     this.artifactStore = new ArtifactStore(join(this.runtimeDir, "artifacts"), databasePath);
     this.runtimeStore = new RuntimeStore(databasePath);
+    this.runId = this.runtimeStore.getOrCreateRunRef();
     this.llmRuntime = createLlmRuntime();
+    this.projectorCoordinator = new ProjectorCoordinator({
+      store: {
+        raiseDesired: ({ taskId, desiredSeq, priority, terminalTargetSeq }) => this.runtimeStore.raiseProjectionDesired(
+          taskId,
+          desiredSeq,
+          priority,
+          terminalTargetSeq
+        ),
+        getState: (taskId) => this.runtimeStore.getProjectionState(taskId),
+        listPending: () => this.runtimeStore.listPendingProjectionTasks(),
+        clearTerminalTarget: ({ taskId, terminalTargetSeq }) => {
+          this.runtimeStore.clearProjectionTerminalTarget(taskId, terminalTargetSeq);
+        }
+      },
+      countObservations: (range) => this.countProjectionObservations(range),
+      run: (work, signal) => this.runCoordinatedProjection(work, signal),
+      onError: (error, work) => this.logProjectionCoordinatorError(error, work),
+      globalConcurrency: MAX_ACTIVE_PROJECTION_JOBS,
+      liveObservationThreshold: PROJECTOR_TOOL_WINDOW_SIZE,
+      liveMaxAgeMs: positiveIntegerEnv("PROJECTOR_CATCHUP_DELAY_MS", DEFAULT_PROJECTOR_CATCHUP_DELAY_MS),
+      normalBatchSize: PROJECTOR_MAX_OBSERVATIONS_PER_JOB,
+      backlogThreshold: 32,
+      backlogBatchSize: PROJECTOR_CATCHUP_MAX_OBSERVATIONS_PER_JOB,
+      retryDelayMs: 2_000,
+      closeDrainTimeoutMs: PROJECTION_DRAIN_TIMEOUT_MS
+    });
   }
 
   async initialize(): Promise<void> {
     await mkdir(this.runtimeDir, { recursive: true });
-    this.executorSandbox = await createExecutorSandbox({
-      runtimeDir: this.runtimeDir,
-      runId: this.runId,
-      environment: this.environment,
-      additionalReadRoots: projectSkillsDirs(this.cwd)
-    });
-    await this.executionLog.append({
-      role: "runtime",
-      eventType: "executor_sandbox_ready",
-      summary: `${this.executorSandbox.mode} sandbox ready`,
-      payload: {
-        runId: this.runId,
-        mode: this.executorSandbox.mode,
-        backendPath: this.executorSandbox.backendPath,
-        root: this.executorSandbox.root,
-        allowedReadRoots: this.executorSandbox.allowedReadRoots
+    if (this.executorSandboxMode === "docker") {
+      const persistedTaskIds = this.graphStore.query("task", [], 1_000_000).nodes
+        .filter((node) => node.type === "Task")
+        .map((node) => node.id)
+        .sort();
+      this.connectivityStore = new ConnectivityStore(join(this.runtimeDir, "state.sqlite"));
+      this.connectivityRuntime = new ConnectivityRuntime({
+        runtimeDir: this.runtimeDir,
+        runRef: this.runId,
+        artifactStore: this.artifactStore,
+        executionLog: this.executionLog,
+        connectivityStore: this.connectivityStore,
+        knownTaskIds: persistedTaskIds
+      });
+      await this.connectivityRuntime.start();
+      for (const taskId of persistedTaskIds) {
+        const sandbox = await createDockerTaskSandbox({
+          runtimeDir: this.runtimeDir,
+          runRef: this.runId,
+          taskId,
+          environment: this.environment,
+          networkContainer: this.connectivityRuntime.network.gatewayContainerName(taskId),
+          transparentCaPath: this.connectivityRuntime.network.gatewayCaPath(),
+          additionalReadRoots: projectSkillsDirs(this.cwd)
+        });
+        this.taskExecutorSandboxes.set(taskId, sandbox);
       }
-    });
+      await this.executionLog.append({
+        role: "runtime",
+        eventType: "executor_sandbox_ready",
+        summary: "docker task sandbox backend ready",
+        payload: {
+          runId: this.runId,
+          mode: "docker",
+          workspace: "/workspace",
+          transparentGateway: true
+        }
+      });
+    } else {
+      this.executorSandbox = await createExecutorSandbox({
+        runtimeDir: this.runtimeDir,
+        runId: this.runId,
+        mode: this.executorSandboxMode,
+        environment: this.environment,
+        additionalReadRoots: projectSkillsDirs(this.cwd)
+      });
+      await this.executionLog.append({
+        role: "runtime",
+        eventType: "executor_sandbox_ready",
+        summary: `${this.executorSandbox.mode} sandbox ready`,
+        payload: {
+          runId: this.runId,
+          mode: this.executorSandbox.mode,
+          backendPath: this.executorSandbox.backendPath,
+          root: this.executorSandbox.root,
+          allowedReadRoots: this.executorSandbox.allowedReadRoots
+        }
+      });
+    }
     this.isolatedSessionsEnabled = true;
     this.structuredInvocationsEnabled = true;
     if (this.runtimeStore.recoveredProjectionClaims > 0) {
@@ -377,11 +526,46 @@ export class SecurityAgentController {
         });
         continue;
       }
-      void this.requestProjection({
+      this.rememberProjectionContext({
         reason: "projection_recovered",
-        taskEnvelope
+        taskEnvelope,
+        desiredSeq: projectionState.desiredSeq,
+        terminal: true,
+        queueId: `projection:${randomUUID()}`,
+        queuedAt: Date.now()
+      });
+      await this.projectorCoordinator.request({
+        taskId: projectionState.taskId,
+        desiredSeq: projectionState.desiredSeq,
+        priority: Math.max(10, projectionState.priority),
+        terminal: true
       });
     }
+    this.projectorCoordinator.start();
+  }
+
+  hasConnectivityRuntime(): boolean {
+    return Boolean(this.connectivityRuntime);
+  }
+
+  routeStatus(routeRef?: string): Promise<RouteStatus[]> {
+    return this.requireConnectivityRuntime().routeStatus(routeRef);
+  }
+
+  routeStop(routeRef: string): Promise<RouteStatus> {
+    return this.requireConnectivityRuntime().stopRoute(routeRef);
+  }
+
+  routeReconnect(routeRef: string): Promise<RouteStatus> {
+    return this.requireConnectivityRuntime().reconnectRoute(routeRef);
+  }
+
+  routeForget(routeRef: string): Promise<RouteStatus> {
+    return this.requireConnectivityRuntime().forgetRoute(routeRef);
+  }
+
+  replayTraffic(client: MitmFlowClient, input: GatewayReplayInput): Promise<TrafficReplayResult> {
+    return this.requireConnectivityRuntime().replayTraffic(client, input);
   }
 
   async runOnce(input: { userGoal: string; scopeSummary: string; maxParallelTasks?: number }): Promise<{
@@ -394,6 +578,8 @@ export class SecurityAgentController {
     controlSignal?: ControlSignal;
   }> {
     await this.ensureRootGraph(input);
+    await this.waitForPlannerProjectionFences();
+    const plannerVisibleWaitingTaskIds = new Set(this.awaitingPlannerTaskIds);
     let plannerDecision!: PlannerDecision;
     let taskEnvelopes: TaskEnvelope[] = [];
     let repairFeedback: string | undefined;
@@ -428,6 +614,7 @@ export class SecurityAgentController {
           plannerEvent.id,
           invocation.versionSnapshot
         );
+        this.releasePlannerWaitingTasks(plannerDecision, plannerVisibleWaitingTaskIds);
         break;
       } catch (error) {
         if (!(error instanceof GraphValidationError) || decisionAttempt >= PLANNER_DECISION_REPAIR_ATTEMPTS) {
@@ -541,6 +728,8 @@ export class SecurityAgentController {
       deadlineAt,
       startSeq: runStartedEvent.seq ?? 0
     };
+    await this.ensureRootGraph(input);
+    await this.runReadyTaskGraph({ maxParallelTasks });
     const decideRun = async (result: RunResult): Promise<RunResult> => {
       if (this.activeRun?.invocationId === invocationId) {
         this.activeRun.outcome = result;
@@ -630,6 +819,17 @@ export class SecurityAgentController {
           return await decideRun({ cycles, completed: false, stoppedReason: cycleResult.plannerDecision.reason });
         }
       }
+      const taskGraphDrained = await this.drainReadyTaskGraph({ maxParallelTasks, deadlineAt });
+      if (this.stopRequestedReason) {
+        return await decideRun({ cycles, completed: false, stoppedReason: this.stopRequestedReason });
+      }
+      if (!taskGraphDrained || Date.now() >= deadlineAt) {
+        return await decideRun({
+          cycles,
+          completed: false,
+          stoppedReason: `Reached global run time budget: ${maxRunTimeMs}ms`
+        });
+      }
       return await decideRun({
         cycles,
         completed: false,
@@ -658,8 +858,8 @@ export class SecurityAgentController {
       return;
     }
     this.stopRequestedReason = reason;
-    this.projectionQueueClosed = true;
-    this.clearProjectionCatchupTimers();
+    this.invocationAbortController.abort(reason);
+    this.projectionRequestsClosed = true;
     await this.executionLog.append({
       role: "runtime",
       eventType: "run_interrupted",
@@ -672,13 +872,14 @@ export class SecurityAgentController {
         activeProjectorCount: this.activeProjectorSessions.size
       }
     });
+    const executorTerminations: Promise<void>[] = [];
     for (const state of this.activeEpochs.values()) {
-      if (state.lifecycleState !== "running") {
+      if (state.lifecycleState === "closed") {
         continue;
       }
       state.executorStopRequested = true;
       state.abortContext = { kind: "controller_abort", reason };
-      this.terminateExecutorSession(state);
+      executorTerminations.push(this.terminateExecutorSession(state));
     }
     for (const session of this.activePlannerSessions) {
       void session.abort();
@@ -689,6 +890,8 @@ export class SecurityAgentController {
     for (const session of this.activeProjectorSessions) {
       void session.abort();
     }
+    await Promise.allSettled(executorTerminations);
+    await this.projectorCoordinator.close({ drain: false });
   }
 
   private async finalizeRunMetrics(): Promise<void> {
@@ -775,23 +978,41 @@ export class SecurityAgentController {
     }
   }
 
-  async close(input: {
+  close(input: {
     drainProjectionJobs?: boolean;
     projectionDrainTimeoutMs?: number;
     projectionCancelGraceMs?: number;
   } = {}): Promise<void> {
     if (this.graphStoreClosed) {
-      return;
+      return Promise.resolve();
     }
-    this.projectionQueueClosed = true;
-    this.clearProjectionCatchupTimers();
+    this.closePromise ??= this.closeInternal(input).catch((error: unknown) => {
+      this.closePromise = undefined;
+      throw error;
+    });
+    return this.closePromise;
+  }
+
+  private async closeInternal(input: {
+    drainProjectionJobs?: boolean;
+    projectionDrainTimeoutMs?: number;
+    projectionCancelGraceMs?: number;
+  }): Promise<void> {
+    this.invocationAbortController.abort("Controller shutdown");
+    const executorTerminations: Array<{ state: ActiveTaskState; promise: Promise<void> }> = [];
     for (const state of [...this.activeEpochs.values()]) {
       if (state.lifecycleState === "closed") {
         continue;
       }
       state.lifecycleState = "closing";
       state.abortContext = { kind: "controller_abort", reason: "Controller shutdown" };
-      this.terminateExecutorSession(state);
+      executorTerminations.push({ state, promise: this.terminateExecutorSession(state) });
+    }
+    await Promise.allSettled(executorTerminations.map((item) => item.promise));
+    await Promise.allSettled([...this.activeTaskRuns.values()].map((run) => run.promise));
+    this.projectionRequestsClosed = true;
+    for (const state of [...this.activeEpochs.values()]) {
+      await this.endExecutorNetworkEpoch(state);
       this.finishTaskExecution(state.taskEnvelope.taskId, "shutdown");
     }
     for (const pending of [...this.pendingSupervisorRequests.values()]) {
@@ -814,25 +1035,41 @@ export class SecurityAgentController {
         2_000
       );
     }
-    if (input.drainProjectionJobs !== false) {
-      this.projectionQueueDrainingOnClose = true;
-      this.drainProjectionQueue();
-      await this.drainProjectionJobs(
-        input.projectionDrainTimeoutMs ?? PROJECTION_DRAIN_TIMEOUT_MS,
-        input.projectionCancelGraceMs ?? PROJECTION_CANCEL_GRACE_MS
-      );
-      this.projectionQueueDrainingOnClose = false;
-    } else {
-      this.cancelPendingProjectionRequests("controller is closing; pending projection request discarded");
-      await this.cancelAndJoinProjectionJobs({
-        summary: `Controller close cancelled ${this.projectionJobs.size} projection job(s) without drain`,
+    const drainProjectionJobs = input.drainProjectionJobs !== false;
+    if (!drainProjectionJobs) {
+      this.projectionCancellationRequested = true;
+      this.projectorInvocationAbortController.abort("Controller shutdown cancelled projection drain");
+    }
+    const projectionClose = await this.projectorCoordinator.close({
+      drain: drainProjectionJobs,
+      timeoutMs: input.projectionDrainTimeoutMs ?? PROJECTION_DRAIN_TIMEOUT_MS,
+      cancelGraceMs: input.projectionCancelGraceMs ?? PROJECTION_CANCEL_GRACE_MS
+    });
+    if (!projectionClose.drained) {
+      this.projectionCancellationRequested = true;
+    }
+    this.projectorInvocationAbortController.abort("Controller projection shutdown complete");
+    if (!projectionClose.drained) {
+      await this.executionLog.append({
+        role: "runtime",
+        eventType: "projection_jobs_cancelled",
+        summary: drainProjectionJobs
+          ? `Controller close cancelled projections after drain timeout`
+          : `Controller close cancelled projections without drain`,
         payload: {
-          pendingProjectionJobs: this.pendingProjectionRequests.size,
-          activeProjectionJobCount: this.activeProjectionJobCount
-        },
-        graceMs: 0
+          pendingTaskIds: projectionClose.pendingTaskIds,
+          activeProjectionJobCount: this.activeProjectionJobCount,
+          cancelGraceMs: input.projectionCancelGraceMs ?? PROJECTION_CANCEL_GRACE_MS
+        }
       });
     }
+    if (!await this.projectorCoordinator.waitForSettled(0)) {
+      await this.executionLog.drain();
+      throw new Error(
+        "Controller close could not settle cancelled projector work; stores remain open and close may be retried"
+      );
+    }
+    await this.closeExecutorResources();
     await this.finalizeRunMetrics();
     await this.executionLog.drain();
     this.graphStoreClosed = true;
@@ -840,92 +1077,6 @@ export class SecurityAgentController {
     this.runtimeStore.close();
     this.artifactStore.close();
     this.executionLog.close();
-  }
-
-  private async drainProjectionJobs(timeoutMs: number, cancelGraceMs: number): Promise<void> {
-    const deadlineAt = Date.now() + timeoutMs;
-    while (this.projectionJobs.size > 0 || this.pendingProjectionRequests.size > 0) {
-      this.drainProjectionQueue();
-      const activeJobs = [...this.projectionJobs];
-      const remainingMs = deadlineAt - Date.now();
-      if (remainingMs <= 0 || activeJobs.length === 0) {
-        break;
-      }
-      const drainResult = await raceWithTimeout(
-        Promise.allSettled(activeJobs).then(() => "drained" as const),
-        remainingMs
-      );
-      if (drainResult === "timeout") {
-        break;
-      }
-    }
-    if (this.projectionJobs.size === 0 && this.pendingProjectionRequests.size === 0) {
-      return;
-    }
-    await this.cancelAndJoinProjectionJobs({
-      summary: `Controller close cancelled ${this.projectionJobs.size} active and ${this.pendingProjectionRequests.size} pending projection job(s) after drain timeout`,
-      payload: {
-        pendingProjectionJobs: this.pendingProjectionRequests.size,
-        activeProjectionJobCount: this.activeProjectionJobCount,
-        timeoutMs
-      },
-      graceMs: cancelGraceMs
-    });
-  }
-
-  private async cancelAndJoinProjectionJobs(input: {
-    summary: string;
-    payload: Record<string, unknown>;
-    graceMs: number;
-  }): Promise<void> {
-    this.cancelProjectionJobs();
-    await this.executionLog.append({
-      role: "runtime",
-      eventType: "projection_jobs_cancelled",
-      summary: input.summary,
-      payload: input.payload
-    });
-    if (this.projectionJobs.size > 0 && input.graceMs > 0) {
-      await raceWithTimeout(
-        Promise.allSettled([...this.projectionJobs]).then(() => "drained" as const),
-        input.graceMs
-      );
-    }
-    if (this.projectionJobs.size > 0) {
-      await this.executionLog.append({
-        role: "runtime",
-        eventType: "projection_shutdown_waiting",
-        summary: `Waiting for ${this.projectionJobs.size} cancelled projection job(s) to settle before closing stores`,
-        payload: { pendingProjectionJobs: this.projectionJobs.size }
-      });
-      await Promise.allSettled([...this.projectionJobs]);
-    }
-  }
-
-  private cancelProjectionJobs(): void {
-    this.projectionCancellationRequested = true;
-    this.cancelPendingProjectionRequests("controller shutdown cancelled pending projection request");
-    for (const taskId of this.activeProjectorByTask.keys()) {
-      this.runtimeStore.invalidateProjection(taskId);
-    }
-    for (const projectorSession of [...this.activeProjectorSessions]) {
-      void projectorSession.abort();
-    }
-  }
-
-  private cancelPendingProjectionRequests(reason: string): void {
-    for (const pendingRequest of [...this.pendingProjectionRequests.values()]) {
-      void this.resolveSupersededProjectionRequest(pendingRequest, reason);
-    }
-    this.pendingProjectionRequests.clear();
-  }
-
-  private clearProjectionCatchupTimers(): void {
-    for (const timer of this.projectionCatchupTimers.values()) {
-      clearTimeout(timer);
-    }
-    this.projectionCatchupTimers.clear();
-    this.projectionOrphanRefsByTask.clear();
   }
 
   private requireAgents(): SecurityAgentRuntime {
@@ -944,6 +1095,17 @@ export class SecurityAgentController {
 
   private async buildPlannerDecisionView(): Promise<PlannerDecisionView> {
     const view = this.graphStore.plannerDecisionView();
+    const taskOutcomes = this.runtimeStore.listTaskOutcomes(Number.MAX_SAFE_INTEGER);
+    const taskLedger = view.taskLedger.map((task) => {
+      const projectionState = this.runtimeStore.getProjectionState(task.taskId);
+      return {
+        ...task,
+        projection: {
+          committedSeq: projectionState.committedSeq,
+          desiredSeq: projectionState.desiredSeq
+        }
+      };
+    });
     const runtimeTail: NonNullable<PlannerDecisionView["runtimeTail"]> = [];
     for (const task of view.taskLedger) {
       if (runtimeTail.length >= 4) {
@@ -967,7 +1129,30 @@ export class SecurityAgentController {
         digest: observationDigest(observations, PLANNER_RUNTIME_TAIL_MAX_CHARS)
       });
     }
-    return { ...view, runtimeTail };
+    return {
+      ...view,
+      taskLedger,
+      taskOutcomes,
+      projectionDegradations: taskOutcomes.flatMap((taskOutcome) => {
+        const projectionState = this.runtimeStore.getProjectionState(taskOutcome.taskRef);
+        if (projectionState.desiredSeq <= projectionState.committedSeq
+          && projectionState.terminalTargetSeq === undefined) {
+          return [];
+        }
+        return [{
+          taskRef: taskOutcome.taskRef,
+          status: "degraded" as const,
+          reason: projectionState.terminalTargetSeq === undefined
+            ? "projection_watermark_lag" as const
+            : "terminal_projection_incomplete" as const,
+          committedSeq: projectionState.committedSeq,
+          desiredSeq: projectionState.desiredSeq,
+          terminalTargetSeq: projectionState.terminalTargetSeq,
+          taskOutcome
+        }];
+      }),
+      runtimeTail
+    };
   }
 
   private async ensureRootGraph(input: { userGoal: string; scopeSummary: string }): Promise<void> {
@@ -1059,6 +1244,19 @@ export class SecurityAgentController {
         taskCommands.push({ command, commandIndex });
       });
       rejectedCommand = commands;
+      const activeTaskIds = new Set([
+        ...this.activeTaskRuns.keys(),
+        ...this.activeEpochIdByTask.keys()
+      ]);
+      const activeTaskMutations = taskCommands
+        .map(({ command }) => command)
+        .filter((command) => activeTaskIds.has(command.taskId));
+      if (activeTaskMutations.length > 0) {
+        throw new GraphValidationError(
+          `Planner cannot mutate active Task(s): ${dedupeStrings(activeTaskMutations.map((command) => command.taskId)).join(", ")}. `
+          + "Wait for the Executor handoff, or create a new Task that depends on the active Task."
+        );
+      }
       const applied = this.graphStore.applyPlannerDecision({
         createTasks: taskCreateInputs.map(({ taskEnvelope, priority }) => ({
           parentTaskId: taskEnvelope.parentTaskId,
@@ -1172,6 +1370,7 @@ export class SecurityAgentController {
           });
           if (["completed", "blocked", "failed", "archived"].includes(command.status)) {
             this.runtimeStore.deleteExecutorSession(command.taskId);
+            await this.disposeTaskExecutorResources(command.taskId);
           }
         }
       }
@@ -1204,41 +1403,202 @@ export class SecurityAgentController {
   }
 
   private async runReadyTaskGraph(input: { maxParallelTasks: number }): Promise<TaskExecution[]> {
-    const candidates = this.graphStore.listReadyTasks(Math.max(input.maxParallelTasks * 4, 16));
-    const readyTasks = admitReadyTasks(candidates, input.maxParallelTasks);
-    if (readyTasks.length === 0) {
+    await this.reconcileReadyTasks(input.maxParallelTasks);
+    if (this.taskCompletionQueue.length === 0 && this.activeTaskRuns.size === 0) {
       return [];
     }
-    await this.executionLog.append({
-      role: "runtime",
-      eventType: "task_wave_started",
-      summary: `Running ${readyTasks.length} admitted task(s)`,
-      payload: {
-        waveIndex: 0,
-        candidateTaskIds: candidates.map((task) => task.taskId),
-        taskIds: readyTasks.map((task) => task.taskId),
-        maxParallelTasks: input.maxParallelTasks
+    if (this.taskCompletionQueue.length === 0) {
+      await new Promise<void>((resolve) => this.taskCompletionWaiters.add(resolve));
+    }
+    const completed = this.taskCompletionQueue.splice(0);
+    await this.reconcileReadyTasks(input.maxParallelTasks);
+    const failure = completed.find((item) => item.error !== undefined);
+    if (failure) {
+      throw failure.error;
+    }
+    const executions = completed.flatMap((item) => item.execution ? [item.execution] : []);
+    if (executions.length > 0) {
+      await this.executionLog.append({
+        role: "runtime",
+        eventType: "task_wave_completed",
+        summary: `Completed ${executions.length} task(s); independent tasks continue`,
+        payload: {
+          results: executions.map((execution) => ({
+            taskId: execution.taskEnvelope.taskId,
+            status: execution.taskResult.status,
+            controlSignal: execution.controlSignal.decision,
+            terminalSeq: execution.terminalSeq
+          })),
+          activeTaskIds: [...this.activeTaskRuns.keys()]
+        }
+      });
+    }
+    return executions;
+  }
+
+  private async drainReadyTaskGraph(input: {
+    maxParallelTasks: number;
+    deadlineAt: number;
+  }): Promise<boolean> {
+    while (!this.stopRequestedReason) {
+      await this.reconcileReadyTasks(input.maxParallelTasks);
+      if (this.taskCompletionQueue.length > 0) {
+        await this.runReadyTaskGraph({ maxParallelTasks: input.maxParallelTasks });
+        continue;
+      }
+      if (this.activeTaskRuns.size === 0) {
+        return true;
+      }
+      if (!await this.waitForTaskCompletionUntil(input.deadlineAt)) {
+        return false;
+      }
+    }
+    return false;
+  }
+
+  private waitForTaskCompletionUntil(deadlineAt: number): Promise<boolean> {
+    const remainingMs = deadlineAt - Date.now();
+    if (remainingMs <= 0) {
+      return Promise.resolve(false);
+    }
+    return new Promise<boolean>((resolve) => {
+      let settled = false;
+      const finish = (completed: boolean): void => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        clearTimeout(timer);
+        this.taskCompletionWaiters.delete(onCompletion);
+        resolve(completed);
+      };
+      const onCompletion = (): void => finish(true);
+      const timer = setTimeout(() => finish(false), remainingMs);
+      this.taskCompletionWaiters.add(onCompletion);
+      if (this.taskCompletionQueue.length > 0 || this.activeTaskRuns.size === 0) {
+        finish(true);
       }
     });
-    const waveExecutions = await Promise.all(
-      readyTasks.map((taskEnvelope) => this.runExecutorTask(taskEnvelope, {
-        useDynamicExecutor: this.isolatedSessionsEnabled || readyTasks.length > 1
-      }))
-    );
-    await this.executionLog.append({
-      role: "runtime",
-      eventType: "task_wave_completed",
-      summary: `Completed ${waveExecutions.length} task(s) in admitted wave`,
-      payload: {
-        waveIndex: 0,
-        results: waveExecutions.map((execution) => ({
-          taskId: execution.taskEnvelope.taskId,
-          status: execution.taskResult.status,
-          controlSignal: execution.controlSignal.decision
-        }))
+  }
+
+  private reconcileReadyTasks(maxParallelTasks: number): Promise<void> {
+    const reconcile = this.taskReconcileChain.then(async () => {
+      const capacity = Math.max(0, maxParallelTasks - this.activeTaskRuns.size);
+      if (capacity === 0 || this.stopRequestedReason || this.invocationAbortController.signal.aborted) {
+        return;
+      }
+      const candidates = this.graphStore
+        .listReadyTasks(Math.max(maxParallelTasks * 4, 16))
+        .filter((task) => !this.activeTaskRuns.has(task.taskId))
+        .filter((task) => !this.awaitingPlannerTaskIds.has(task.taskId));
+      const occupiedSessionRefs = new Set(
+        [...this.activeTaskRuns.values()].flatMap((run) => run.taskEnvelope.availableSessionRefs ?? [])
+      );
+      const readyTasks = admitReadyTasks(candidates, capacity, occupiedSessionRefs);
+      if (readyTasks.length === 0) {
+        return;
+      }
+      await this.executionLog.append({
+        role: "runtime",
+        eventType: "task_wave_started",
+        summary: `Scheduled ${readyTasks.length} ready task(s)`,
+        payload: {
+          candidateTaskIds: candidates.map((task) => task.taskId),
+          taskIds: readyTasks.map((task) => task.taskId),
+          activeTaskIds: [...this.activeTaskRuns.keys()],
+          maxParallelTasks
+        }
+      });
+      const useDynamicExecutor = this.isolatedSessionsEnabled
+        || this.activeTaskRuns.size > 0
+        || readyTasks.length > 1;
+      for (const taskEnvelope of readyTasks) {
+        const promise = this.runExecutorTask(taskEnvelope, {
+          useDynamicExecutor
+        });
+        const run = { taskEnvelope, promise };
+        this.activeTaskRuns.set(taskEnvelope.taskId, run);
+        void promise.then(
+          (execution) => this.recordTaskCompletion(run, { taskId: taskEnvelope.taskId, execution }, maxParallelTasks),
+          (error) => this.recordTaskCompletion(run, { taskId: taskEnvelope.taskId, error }, maxParallelTasks)
+        );
       }
     });
-    return waveExecutions;
+    this.taskReconcileChain = reconcile.catch(() => undefined);
+    return reconcile;
+  }
+
+  private recordTaskCompletion(run: ActiveTaskRun, completion: TaskCompletion, maxParallelTasks: number): void {
+    if (this.activeTaskRuns.get(completion.taskId) !== run) {
+      return;
+    }
+    this.activeTaskRuns.delete(completion.taskId);
+    this.awaitingPlannerTaskIds.add(completion.taskId);
+    if (completion.execution?.plannerProjectionTargetSeq !== undefined) {
+      this.plannerProjectionTargets.set(completion.taskId, completion.execution.plannerProjectionTargetSeq);
+    }
+    this.taskCompletionQueue.push(completion);
+    for (const resolve of this.taskCompletionWaiters) {
+      resolve();
+    }
+    this.taskCompletionWaiters.clear();
+    void this.reconcileReadyTasks(maxParallelTasks).catch(async (error) => {
+      await this.executionLog.append({
+        role: "runtime",
+        eventType: "task_reconcile_failed",
+        summary: error instanceof Error ? error.message : String(error),
+        payload: { completedTaskId: completion.taskId }
+      });
+    });
+  }
+
+  private releasePlannerWaitingTasks(
+    plannerDecision: PlannerDecision,
+    plannerVisibleWaitingTaskIds: Set<string>
+  ): void {
+    const reopenedTaskIds = new Set((plannerDecision.commands ?? []).flatMap((command) => (
+      command.kind === "set_task_status" && command.status === "open" ? [command.taskId] : []
+    )));
+    for (const taskId of plannerVisibleWaitingTaskIds) {
+      if (reopenedTaskIds.has(taskId)) {
+        this.awaitingPlannerTaskIds.delete(taskId);
+        continue;
+      }
+      const status = this.graphStore.getTaskNode(taskId)?.properties.status;
+      if (["completed", "blocked", "failed", "archived"].includes(String(status))) {
+        this.awaitingPlannerTaskIds.delete(taskId);
+      }
+    }
+  }
+
+  private async waitForPlannerProjectionFences(): Promise<void> {
+    while (this.plannerProjectionTargets.size > 0) {
+      const next = this.plannerProjectionTargets.entries().next().value as [string, number] | undefined;
+      if (!next) {
+        return;
+      }
+      const [taskId, targetSeq] = next;
+      try {
+        await this.projectorCoordinator.waitForCommitted(taskId, targetSeq, {
+          timeoutMs: this.remainingRunTimeLimit(PROJECTOR_HARD_TIMEOUT_MS)
+        });
+        this.plannerProjectionTargets.delete(taskId);
+      } catch (error) {
+        this.plannerProjectionTargets.delete(taskId);
+        const outcome = this.runtimeStore.getTaskOutcome(taskId);
+        await this.executionLog.append({
+          taskId,
+          role: "runtime",
+          eventType: "planner_projection_degraded",
+          summary: error instanceof Error ? error.message : String(error),
+          payload: {
+            targetSeq,
+            projectionState: this.runtimeStore.getProjectionState(taskId),
+            taskOutcome: outcome
+          }
+        });
+      }
+    }
   }
 
   private async runExecutorTask(
@@ -1247,7 +1607,15 @@ export class SecurityAgentController {
   ): Promise<TaskExecution> {
     for (let providerAttempt = 1; providerAttempt <= EXECUTOR_PROVIDER_RETRY_ATTEMPTS + 1; providerAttempt += 1) {
       const state = this.beginTaskExecution(taskEnvelope);
-      const executorSession = await this.createExecutorSessionForTask(taskEnvelope, options.useDynamicExecutor);
+      let executorSession: ExecutorSessionLease;
+      try {
+        await this.prepareExecutorSandboxForEpoch(state);
+        executorSession = await this.createExecutorSessionForTask(taskEnvelope, options.useDynamicExecutor);
+      } catch (error) {
+        await this.endExecutorNetworkEpoch(state);
+        this.finishTaskExecution(taskEnvelope.taskId, "provider_error");
+        throw error;
+      }
       const executorInvocationId = `executor:${state.epochId}:provider:${providerAttempt}`;
       const executorInvocationStartedAt = Date.now();
       const executorStatsBefore = readPiSessionStats(executorSession.session);
@@ -1311,10 +1679,13 @@ export class SecurityAgentController {
         if (this.structuredInvocationsEnabled) {
           taskResult = await invokeStructured(executorSession.session, executorInput, {
             toolName: "task_result_submit",
-            validate: (value) => normalizeTaskResult(value as Partial<TaskResult>, taskEnvelope)
+            validate: (value) => normalizeTaskResult(value as Partial<TaskResult>, taskEnvelope),
+            admission: this.providerAdmission("executor", state.invocationAbortController.signal)
           });
         } else {
-          executorOutput = await promptAndCollect(executorSession.session, executorInput);
+          executorOutput = await promptAndCollect(executorSession.session, executorInput, {
+            admission: this.providerAdmission("executor", state.invocationAbortController.signal)
+          });
           taskResult = normalizeTaskResult(extractJsonObject<Partial<TaskResult>>(executorOutput), taskEnvelope);
         }
       } catch (error) {
@@ -1322,36 +1693,58 @@ export class SecurityAgentController {
         providerFailure = state.executorStopRequested
           ? undefined
           : classifyExecutorProviderFailure(error, error, executorOutput);
-        executorInvocationStatus = providerFailure?.retryable ? "provider_error" : "failed";
+        executorInvocationStatus = state.executorStopRequested
+          ? isGracefulCheckpointSignal(state.controlSignal) ? "checkpointed" : "stopped"
+          : providerFailure?.retryable ? "provider_error" : "failed";
       } finally {
-        await executorLogging?.drain();
-        await this.appendInvocationMetrics({
-          session: executorSession.session,
-          before: executorStatsBefore,
-          invocationId: executorInvocationId,
-          invocationKind: "executor",
-          agentRole: "executor",
-          status: executorInvocationStatus,
-          startedAt: executorInvocationStartedAt,
-          taskId: taskEnvelope.taskId,
-          epochId: state.epochId,
-          inputBytes: executorInputBytes,
-          details: {
-            providerAttempt,
-            dynamicSession: executorSession.dynamicExecutor,
-            resumedSession: executorSession.resumed,
-            resumeCount: executorSession.resumeCount,
-            budget: taskEnvelope.budget,
-            toolExecutionEndCount: state.toolExecutionEndCount,
-            turnEndCount: state.turnEndCount
+        let invocationFinalizationError: unknown;
+        try {
+          this.settleGracefulCheckpointRequest(state);
+          await state.terminationPromise;
+          await executorLogging?.drain();
+          await this.appendInvocationMetrics({
+            session: executorSession.session,
+            before: executorStatsBefore,
+            invocationId: executorInvocationId,
+            invocationKind: "executor",
+            agentRole: "executor",
+            status: executorInvocationStatus,
+            startedAt: executorInvocationStartedAt,
+            taskId: taskEnvelope.taskId,
+            epochId: state.epochId,
+            inputBytes: executorInputBytes,
+            details: {
+              providerAttempt,
+              dynamicSession: executorSession.dynamicExecutor,
+              resumedSession: executorSession.resumed,
+              resumeCount: executorSession.resumeCount,
+              budget: taskEnvelope.budget,
+              toolExecutionEndCount: state.toolExecutionEndCount,
+              turnEndCount: state.turnEndCount
+            }
+          });
+        } catch (error) {
+          invocationFinalizationError = error;
+        } finally {
+          this.clearEpochTimeSlice(taskEnvelope);
+          try {
+            await this.endExecutorNetworkEpoch(state);
+          } catch (networkError) {
+            if (invocationFinalizationError !== undefined) {
+              throw new AggregateError(
+                [invocationFinalizationError, networkError],
+                `Executor epoch ${state.epochId} finalization and network drain failed`
+              );
+            }
+            throw networkError;
           }
-        });
-        this.clearEpochTimeSlice(taskEnvelope);
+        }
+        if (invocationFinalizationError !== undefined) {
+          throw invocationFinalizationError;
+        }
       }
 
-      if (taskResult && state.checkpointGraceTimer) {
-        clearTimeout(state.checkpointGraceTimer);
-        state.checkpointGraceTimer = undefined;
+      if (taskResult && state.executorStopRequested) {
         await this.executionLog.append({
           epochId: state.epochId,
           taskId: taskEnvelope.taskId,
@@ -1410,7 +1803,6 @@ export class SecurityAgentController {
         };
       }
       taskResult = await this.enrichTaskResultLifecycle(taskResult, taskEnvelope, state);
-      const isInfraFailure = taskResult.status === "failed" && taskResult.retryable === true;
 
       const taskCompletedEvent = await this.executionLog.append({
         epochId: state.epochId,
@@ -1422,39 +1814,28 @@ export class SecurityAgentController {
         artifactRefs: taskResult.artifactRefs
       });
       state.lastEventId = taskCompletedEvent.id;
-      const taskStatusDelta = isInfraFailure
-        ? (() => {
-          this.graphStore.markTaskStatus({
-            taskId: taskEnvelope.taskId,
-            status: "open",
-            sourceEventIds: [taskCompletedEvent.id],
-            properties: {
-              resultSummary: taskResult.summary,
-              checkpointReason: taskResult.checkpointReason,
-              retryable: taskResult.retryable,
-              attempt: taskResult.attempt,
-              resumeCursor: taskResult.resumeCursor,
-              lastEventId: taskResult.lastEventId
-            }
-          });
-          return undefined;
-        })()
-        : this.graphStore.updateTaskResult({
-          taskEnvelope,
-          taskResult,
-          sourceEventIds: [taskCompletedEvent.id]
-        });
-      if (providerFailure?.retryable && state.toolExecutionEndCount === 0) {
+      const terminalSeq = taskCompletedEvent.seq ?? this.executionLog.latestSeq(taskEnvelope.taskId);
+      this.runtimeStore.upsertTaskOutcome(createTaskOutcome({
+        taskResult,
+        epochRef: state.epochId,
+        terminalSeq
+      }));
+      const taskStatusDelta = this.graphStore.updateTaskResult({
+        taskEnvelope,
+        taskResult,
+        sourceEventIds: [taskCompletedEvent.id]
+      });
+      const projectionRequested = !(providerFailure?.retryable && state.toolExecutionEndCount === 0);
+      if (!projectionRequested) {
         await this.executionLog.append({
           epochId: state.epochId,
           taskId: taskEnvelope.taskId,
           role: "runtime",
           eventType: "projection_job_skipped",
-          summary: `task_end skipped: pure retryable provider error ${providerFailure.errorKind}`,
+          summary: `task_end skipped: pure retryable provider error ${providerFailure?.errorKind ?? "unknown"}`,
           payload: { reason: "task_end", providerFailure, sourceEventIds: [taskCompletedEvent.id] }
         });
       } else {
-        this.runtimeStore.raiseProjectionDesired(taskEnvelope.taskId, taskCompletedEvent.seq ?? 0, 10);
         void this.enqueueProjectionJob({
           reason: "task_end",
           taskEnvelope,
@@ -1471,9 +1852,233 @@ export class SecurityAgentController {
       if (executorSession.dynamicExecutor) {
         disposeSession(executorSession.session);
       }
-      return { taskEnvelope, taskResult, graphDelta: taskStatusDelta, controlSignal };
+      if (taskResult.status === "completed"
+        || taskResult.status === "blocked"
+        || (taskResult.status === "failed" && taskResult.retryable !== true)) {
+        await this.disposeTaskExecutorResources(taskEnvelope.taskId);
+      }
+      return {
+        taskEnvelope,
+        taskResult,
+        terminalSeq,
+        plannerProjectionTargetSeq: projectionRequested ? terminalSeq : undefined,
+        graphDelta: taskStatusDelta,
+        controlSignal
+      };
     }
     throw new Error(`Executor retry loop exhausted without result for ${taskEnvelope.taskId}`);
+  }
+
+  private async prepareExecutorSandboxForEpoch(state: ActiveTaskState): Promise<void> {
+    if (!this.connectivityRuntime) {
+      return;
+    }
+    const taskId = state.taskEnvelope.taskId;
+    const gateway = await this.connectivityRuntime.beginTaskEpoch({ taskId, epochId: state.epochId });
+    let sandbox = this.taskExecutorSandboxes.get(taskId);
+    try {
+      if (!sandbox) {
+        sandbox = await createDockerTaskSandbox({
+          runtimeDir: this.runtimeDir,
+          runRef: this.runId,
+          taskId,
+          environment: this.environment,
+          networkContainer: gateway.containerName,
+          transparentCaPath: this.connectivityRuntime.network.gatewayCaPath(),
+          additionalReadRoots: projectSkillsDirs(this.cwd)
+        });
+      }
+      await sandbox.start();
+      this.taskExecutorSandboxes.set(taskId, sandbox);
+    } catch (error) {
+      this.taskExecutorSandboxes.delete(taskId);
+      await sandbox?.dispose().catch(() => undefined);
+      await this.connectivityRuntime.disposeTask(taskId).catch(() => undefined);
+      throw error;
+    }
+    await this.executionLog.append({
+      epochId: state.epochId,
+      taskId,
+      role: "runtime",
+      eventType: "executor_task_sandbox_ready",
+      summary: `docker sandbox ready for ${taskId}`,
+      payload: {
+        mode: "docker",
+        workspace: sandbox.root,
+        flowFile: gateway.flowFile,
+        netFile: gateway.netFile
+      }
+    });
+  }
+
+  private async endExecutorNetworkEpoch(state: ActiveTaskState): Promise<void> {
+    if (!this.connectivityRuntime) return;
+    const taskId = state.taskEnvelope.taskId;
+    const sandbox = this.taskExecutorSandboxes.get(taskId);
+    try {
+      await sandbox?.quiesce?.();
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      state.terminationFailure = message;
+      await this.executionLog.append({
+        epochId: state.epochId,
+        taskId,
+        role: "runtime",
+        eventType: "executor_network_quiesce_failed",
+        summary: message,
+        payload: { epochId: state.epochId }
+      }).catch(() => undefined);
+      throw error;
+    }
+    const drain = await this.connectivityRuntime.endTaskEpoch({
+      taskId,
+      epochId: state.epochId
+    }).catch(async (error: unknown) => {
+      const message = error instanceof Error ? error.message : String(error);
+      state.terminationFailure = message;
+      await this.executionLog.append({
+        epochId: state.epochId,
+        taskId,
+        role: "runtime",
+        eventType: "network_epoch_flush_failed",
+        summary: message,
+        payload: { epochId: state.epochId }
+      }).catch(() => undefined);
+      throw error;
+    });
+    await this.executionLog.append({
+      epochId: state.epochId,
+      taskId,
+      role: "runtime",
+      eventType: "network_epoch_flushed",
+      summary: `${state.epochId} capture drained and flushed`,
+      payload: drain
+    });
+  }
+
+  private requireExecutorSandbox(taskId: string): ExecutorSandbox {
+    const sandbox = this.connectivityRuntime
+      ? this.taskExecutorSandboxes.get(taskId)
+      : this.executorSandbox;
+    if (!sandbox) throw new Error(`Executor sandbox is not ready for ${taskId}`);
+    return sandbox;
+  }
+
+  private requireConnectivityRuntime(): ConnectivityRuntime {
+    if (!this.connectivityRuntime) throw new Error("Connectivity runtime is unavailable for this run");
+    return this.connectivityRuntime;
+  }
+
+  private createTaskConnectivityTools(taskId: string) {
+    const runtime = this.connectivityRuntime;
+    if (!runtime) return [];
+    const executorRuntime: ExecutorConnectivityRuntime = {
+      openRoute: (input: RouteOpenInput, ownerTaskId: string) => runtime.openRoute(input, ownerTaskId),
+      routeStatus: (routeRef) => runtime.routeStatus(routeRef),
+      stopRoute: (routeRef) => runtime.stopRoute(routeRef),
+      reconnectRoute: (routeRef) => runtime.reconnectRoute(routeRef)
+    };
+    return createExecutorConnectivityTools(executorRuntime, taskId);
+  }
+
+  private async disposeTaskExecutorResources(
+    taskId: string,
+    options: { throwOnFailure?: boolean } = {}
+  ): Promise<void> {
+    const failures: unknown[] = [];
+    const sandbox = this.taskExecutorSandboxes.get(taskId);
+    if (sandbox) {
+      try {
+        await sandbox.dispose();
+        if (this.taskExecutorSandboxes.get(taskId) === sandbox) {
+          this.taskExecutorSandboxes.delete(taskId);
+        }
+      } catch (error) {
+        failures.push(error);
+      }
+    }
+    if (this.connectivityRuntime && !this.connectivityRuntimeCleanupComplete) {
+      try {
+        await this.connectivityRuntime.disposeTask(taskId);
+      } catch (error) {
+        failures.push(error);
+      }
+    }
+    if (failures.length > 0) {
+      const failureMessages = failures.map((error) => error instanceof Error ? error.message : String(error));
+      await this.executionLog.append({
+        taskId,
+        role: "runtime",
+        eventType: "executor_task_cleanup_failed",
+        summary: failureMessages.join("; "),
+        payload: { failures: failureMessages }
+      }).catch(() => undefined);
+      if (options.throwOnFailure) {
+        throw new AggregateError(failures, `Executor task cleanup failed for ${taskId}`);
+      }
+    }
+  }
+
+  private async closeExecutorResources(): Promise<void> {
+    const failures: unknown[] = [];
+    for (const taskId of [...this.taskExecutorSandboxes.keys()]) {
+      try {
+        await this.disposeTaskExecutorResources(taskId, { throwOnFailure: true });
+      } catch (error) {
+        failures.push(error);
+      }
+    }
+    const executorSandbox = this.executorSandbox;
+    if (executorSandbox) {
+      if (executorSandbox.dispose) {
+        try {
+          await executorSandbox.dispose();
+          if (this.executorSandbox === executorSandbox) this.executorSandbox = undefined;
+        } catch (error) {
+          failures.push(error);
+          await this.executionLog.append({
+            role: "runtime",
+            eventType: "executor_sandbox_cleanup_failed",
+            summary: error instanceof Error ? error.message : String(error),
+            payload: {}
+          }).catch(() => undefined);
+        }
+      } else if (this.executorSandbox === executorSandbox) {
+        this.executorSandbox = undefined;
+      }
+    }
+    if (this.connectivityRuntime && !this.connectivityRuntimeCleanupComplete) {
+      try {
+        await this.connectivityRuntime.close();
+        this.connectivityRuntimeCleanupComplete = true;
+      } catch (error) {
+        failures.push(error);
+        await this.executionLog.append({
+          role: "runtime",
+          eventType: "connectivity_runtime_cleanup_failed",
+          summary: error instanceof Error ? error.message : String(error),
+          payload: {}
+        }).catch(() => undefined);
+      }
+    }
+    if (failures.length === 0 && this.connectivityStore) {
+      try {
+        this.connectivityStore.close();
+      } catch (error) {
+        failures.push(error);
+        await this.executionLog.append({
+          role: "runtime",
+          eventType: "connectivity_store_cleanup_failed",
+          summary: error instanceof Error ? error.message : String(error),
+          payload: {}
+        }).catch(() => undefined);
+      }
+    }
+    if (failures.length > 0) {
+      throw new AggregateError(failures, "Controller executor resource cleanup failed");
+    }
+    this.connectivityStore = undefined;
+    this.connectivityRuntime = undefined;
   }
 
   private async createExecutorSessionForTask(
@@ -1483,16 +2088,19 @@ export class SecurityAgentController {
     if (!this.isolatedSessionsEnabled && !useDynamicExecutor) {
       return { session: this.requireAgents().executor, dynamicExecutor: false, resumed: false, resumeCount: 0 };
     }
+    const sandbox = this.requireExecutorSandbox(taskEnvelope.taskId);
     const persisted = this.runtimeStore.getExecutorSession(taskEnvelope.taskId);
     if (persisted) {
-      const sessionManager = SessionManager.open(persisted.sessionFile);
+      const sessionManager = SessionManager.open(persisted.sessionFile, undefined, sandbox.root);
       const executor = await createExecutorAgentSession({
-        cwd: this.executorSandbox?.root ?? this.cwd,
-        sandbox: this.executorSandbox,
+        cwd: sandbox.root,
+        sandbox,
         artifactStore: this.artifactStore,
         llmRuntime: this.llmRuntime,
         sessionManager,
-        skillsDirs: projectSkillsDirs(this.cwd)
+        skillsDirs: projectSkillsDirs(this.cwd),
+        additionalTools: this.createTaskConnectivityTools(taskEnvelope.taskId),
+        providerAdmission: this.providerAdmission("executor")
       });
       const lease: ExecutorSessionLease = {
         session: executor.session,
@@ -1527,15 +2135,18 @@ export class SecurityAgentController {
     if (!this.isolatedSessionsEnabled && !useDynamicExecutor) {
       return { session: this.requireAgents().executor, dynamicExecutor: false, resumed: false, resumeCount: 0 };
     }
+    const sandbox = this.requireExecutorSandbox(taskEnvelope.taskId);
     const sessionDir = join(this.runtimeDir, EXECUTOR_SESSION_DIR);
-    const sessionManager = SessionManager.create(this.executorSandbox?.root ?? this.cwd, sessionDir);
+    const sessionManager = SessionManager.create(sandbox.root, sessionDir);
     const executor = await createExecutorAgentSession({
-      cwd: this.executorSandbox?.root ?? this.cwd,
-      sandbox: this.executorSandbox,
+      cwd: sandbox.root,
+      sandbox,
       artifactStore: this.artifactStore,
       llmRuntime: this.llmRuntime,
       sessionManager,
-      skillsDirs: projectSkillsDirs(this.cwd)
+      skillsDirs: projectSkillsDirs(this.cwd),
+      additionalTools: this.createTaskConnectivityTools(taskEnvelope.taskId),
+      providerAdmission: this.providerAdmission("executor")
     });
     const sessionFile = executor.session.sessionFile;
     if (!sessionFile) {
@@ -1569,8 +2180,14 @@ export class SecurityAgentController {
       taskEnvelope: input.taskEnvelope,
       operationGraphSlice,
       reasoningGraphSlice: compactExecutorGraphClosure(executionGraphContext, "reasoning", 12),
-      sessionRefs: operationGraphSlice.nodes.filter((node) => node.type === "Session" || node.type === "Credential"),
-      toolCatalog: ["read", "bash", "grep", "find", "ls", "artifact_read", "artifact_write", "task_result_submit"],
+      sessionRefs: this.withSessionMaterialRefs(
+        operationGraphSlice.nodes.filter((node) => ["AgentSession", "ShellSession", "Session", "Credential"].includes(node.type))
+      ),
+      toolCatalog: [
+        "read", "bash", "grep", "find", "ls", "browser_render", "artifact_read", "artifact_write",
+        ...(this.connectivityRuntime ? ["route_open", "route_status", "route_stop", "route_reconnect"] : []),
+        "task_result_submit"
+      ],
       executionBrief: createExecutionBrief(input.taskEnvelope, (await this.executionLog.window({
         taskId: input.taskEnvelope.taskId,
         limit: 5,
@@ -1603,7 +2220,9 @@ export class SecurityAgentController {
       plannerHint: input.plannerHint,
       operationGraphSlice,
       reasoningGraphSlice: compactExecutorGraphClosure(executionGraphContext, "reasoning", 12),
-      sessionRefs: operationGraphSlice.nodes.filter((node) => node.type === "Session" || node.type === "Credential"),
+      sessionRefs: this.withSessionMaterialRefs(
+        operationGraphSlice.nodes.filter((node) => ["AgentSession", "ShellSession", "Session", "Credential"].includes(node.type))
+      ),
       executionBrief: createExecutionBrief(input.taskEnvelope, (await this.executionLog.window({
         taskId: input.taskEnvelope.taskId,
         limit: 5,
@@ -1611,6 +2230,30 @@ export class SecurityAgentController {
       })).events, input.taskStatus),
       dependencyOutcomes: await this.createDependencyOutcomeBrief(input.taskEnvelope),
       runtimeBudgetStatus: input.runtimeBudgetStatus
+    });
+  }
+
+  private withSessionMaterialRefs<T extends { evidenceRefs?: string[] }>(
+    nodes: T[]
+  ): Array<T & { materialRefs?: string[] }> {
+    const materialsByEvent = this.executionLog.artifactRefsForEvents(
+      nodes.flatMap((node) => node.evidenceRefs ?? [])
+    );
+    if (materialsByEvent.size === 0) {
+      return nodes;
+    }
+    return nodes.map((node) => {
+      const materialRefs: string[] = [];
+      for (const evidenceRef of node.evidenceRefs ?? []) {
+        for (const materialRef of materialsByEvent.get(evidenceRef) ?? []) {
+          if (!materialRefs.includes(materialRef)) {
+            materialRefs.push(materialRef);
+          }
+        }
+      }
+      return materialRefs.length > 0
+        ? { ...node, materialRefs: materialRefs.slice(0, 8) }
+        : node;
     });
   }
 
@@ -1683,13 +2326,17 @@ export class SecurityAgentController {
             toolName: "planner_submit",
             idleTimeoutMs: PLANNER_IDLE_TIMEOUT_MS,
             hardTimeoutMs: plannerHardTimeoutMs,
-            validate: normalizePlannerDecision
+            validate: normalizePlannerDecision,
+            admission: this.providerAdmission("planner")
           })
           : normalizePlannerDecision(extractJsonObject<unknown>(await withTimeout(
-            promptAndCollect(plannerSession, plannerInput),
+            promptAndCollect(plannerSession, plannerInput, {
+              admission: this.providerAdmission("planner")
+            }),
             plannerHardTimeoutMs,
             () => void plannerSession.abort()
           )));
+        await validatePlannerArtifactRefs(plannerDecision, () => this.artifactStore.list());
         return { plannerDecision, plannerPromptId, versionSnapshot };
       } catch (error) {
         lastError = error;
@@ -1794,14 +2441,19 @@ export class SecurityAgentController {
     const planner = await createPlannerAgentSession({
       cwd: this.cwd,
       graphStore: this.graphStore,
-      llmRuntime: this.llmRuntime
+      artifactStore: this.artifactStore,
+      llmRuntime: this.llmRuntime,
+      executionLog: this.executionLog,
+      providerAdmission: this.providerAdmission("planner")
     });
     return { session: planner.session, isolated: true };
   }
 
   private async createObserverSessionForMode(
     mode: ObserverMode,
-    taskId: string
+    taskId: string,
+    projectorGraphRefs?: ProjectorGraphRefRegistry,
+    projectorDraftValidation?: Omit<ProjectionDraftValidationOptions, "existingAliases">
   ): Promise<{
     session: SecurityAgentSession;
     dynamicObserver: boolean;
@@ -1813,7 +2465,10 @@ export class SecurityAgentController {
       executionLog: this.executionLog,
       artifactStore: this.artifactStore,
       llmRuntime: this.llmRuntime,
-      mode
+      mode,
+      projectorGraphRefs,
+      projectorDraftValidation,
+      providerAdmission: this.providerAdmission(mode === "supervise" ? "supervisor" : "projector")
     });
     const logging = attachExecutionLogging({
       session: observer.session,
@@ -1837,8 +2492,8 @@ export class SecurityAgentController {
       executorStopRequested: false,
       dynamicExecutor: false,
       attempt,
-      budgetExtensionCount: 0,
       budgetStatusSteerKeys: new Set(),
+      invocationAbortController: new AbortController(),
       supervisionState: restoreTaskSupervisionState(
         taskEnvelope,
         this.getTaskStatusSnapshot(taskEnvelope.taskId),
@@ -1874,12 +2529,14 @@ export class SecurityAgentController {
     if (state?.taskTimer) {
       clearTimeout(state.taskTimer);
     }
-    if (state?.checkpointGraceTimer) {
-      clearTimeout(state.checkpointGraceTimer);
-      state.checkpointGraceTimer = undefined;
-    }
     if (state) {
+      this.settleGracefulCheckpointRequest(state);
+      const supervisorAbort = this.supervisorAbortByEpoch.get(state.epochId);
+      if (supervisorAbort && !supervisorAbort.signal.aborted) {
+        supervisorAbort.abort(`Executor epoch ${state.epochId} closed`);
+      }
       this.activeEpochs.delete(state.epochId);
+      this.latestSupervisorThroughSeqByEpoch.delete(state.epochId);
     }
     this.activeEpochIdByTask.delete(taskId);
   }
@@ -1905,7 +2562,6 @@ export class SecurityAgentController {
     const includeTaskResultArtifacts = input.observations.some((observation) => observation.kind === "task_outcome");
     const taskResultRefs = includeTaskResultArtifacts ? input.taskResult?.artifactRefs ?? [] : [];
     const candidateRefs = dedupeStrings([...directRefs, ...taskResultRefs]);
-    const directRefSet = new Set(directRefs);
     const relevantSnippets = await this.artifactStore.searchWithin({
       artifactRefs: candidateRefs,
       query: [
@@ -1933,17 +2589,8 @@ export class SecurityAgentController {
         continue;
       }
       const snippet = relevantSnippets.find((candidate) => candidate.artifactRef === artifactRef);
-      const needsFallbackPreview = directRefSet.has(artifactRef) && !snippet;
-      const tail = needsFallbackPreview && record && record.byteLength > 240
-        ? await this.artifactStore.read(artifactRef, {
-          offset: Math.max(0, record.byteLength - 240),
-          length: 240
-        })
-        : "";
       selected.push([
         `${artifactRef} kind=${record?.kind ?? "unknown"} bytes=${record?.byteLength ?? "unknown"}`,
-        needsFallbackPreview && record?.preview ? `  head: ${truncateText(record.preview.replace(/\s+/g, " "), 240)}` : undefined,
-        tail ? `  tail: ${truncateText(tail.replace(/\s+/g, " "), 240)}` : undefined,
         snippet ? `  match: ${truncateText(snippet.snippet.replace(/\s+/g, " "), 480)}` : undefined
       ].filter((line): line is string => Boolean(line)).join("\n"));
     }
@@ -1988,7 +2635,7 @@ export class SecurityAgentController {
         reason: "turn_usage"
       });
       if (state.turnEndCount >= (taskEnvelope.budget?.maxTurns ?? DEFAULT_TASK_BUDGET.maxTurns)) {
-        this.requestSupervisorBudgetDecision(taskEnvelope, event, state);
+        this.requestBudgetCheckpoint(taskEnvelope, event, "maxTurns", state);
       } else if (state.turnEndCount % SUPERVISOR_TURN_WINDOW_SIZE === 0) {
         void this.enqueueSupervisorCheck({
           reason: `${TURN_WINDOW_REASON_PREFIX}${state.turnEndCount}`,
@@ -2009,17 +2656,24 @@ export class SecurityAgentController {
     }
   }
 
-  private enqueueSupervisorCheck(input: SupervisorCheckRequest): Promise<ControlSignal> {
+  private enqueueSupervisorCheck(input: SupervisorCheckRequest): Promise<SupervisorVerdict> {
+    const currentState = this.getActiveTaskState(input.taskEnvelope.taskId);
     const queueItem: SupervisorCheckRequest = {
       ...input,
       queueId: `supervisor:${randomUUID()}`,
-      queuedAt: Date.now()
+      queuedAt: Date.now(),
+      epochRef: input.epochRef ?? currentState?.epochId,
+      throughSeq: input.throughSeq ?? this.executionLog.latestSeq(input.taskEnvelope.taskId)
     };
-    const state = this.getActiveTaskState(input.taskEnvelope.taskId);
+    const state = currentState;
     if (!state) {
       return this.discardSupervisorCheck(queueItem, "task is no longer active", input.sourceEventIds ?? []);
     }
     const epochId = state.epochId;
+    this.latestSupervisorThroughSeqByEpoch.set(
+      epochId,
+      Math.max(this.latestSupervisorThroughSeqByEpoch.get(epochId) ?? 0, queueItem.throughSeq ?? 0)
+    );
     if (this.supervisorInFlight.has(epochId)) {
       const existing = this.pendingSupervisorRequests.get(epochId);
       if (existing) {
@@ -2029,27 +2683,41 @@ export class SecurityAgentController {
           existing.request.sourceEventIds ?? []
         ).then(existing.resolve, existing.reject);
       }
-      return new Promise<ControlSignal>((resolve, reject) => {
+      const pending = new Promise<SupervisorVerdict>((resolve, reject) => {
         this.pendingSupervisorRequests.set(epochId, { request: queueItem, resolve, reject });
       });
+      const activeAbort = this.supervisorAbortByEpoch.get(epochId);
+      if (activeAbort && !activeAbort.signal.aborted) {
+        activeAbort.abort(`Superseded by supervisor window ${queueItem.reason}`);
+      }
+      return pending;
     }
     return this.startSupervisorCheck(epochId, queueItem);
   }
 
-  private startSupervisorCheck(epochId: string, input: SupervisorCheckRequest): Promise<ControlSignal> {
-    const promise = this.runSupervisorCheck(input);
+  private startSupervisorCheck(epochId: string, input: SupervisorCheckRequest): Promise<SupervisorVerdict> {
+    const abortController = new AbortController();
+    const promise = this.runSupervisorCheck(input, abortController.signal);
     this.supervisorInFlight.set(epochId, promise);
+    this.supervisorAbortByEpoch.set(epochId, abortController);
     void promise.then(() => {
-      this.finishSupervisorCheck(epochId, promise);
+      this.finishSupervisorCheck(epochId, promise, abortController);
     }, () => {
-      this.finishSupervisorCheck(epochId, promise);
+      this.finishSupervisorCheck(epochId, promise, abortController);
     });
     return promise;
   }
 
-  private finishSupervisorCheck(epochId: string, promise: Promise<ControlSignal>): void {
+  private finishSupervisorCheck(
+    epochId: string,
+    promise: Promise<SupervisorVerdict>,
+    abortController: AbortController
+  ): void {
     if (this.supervisorInFlight.get(epochId) === promise) {
       this.supervisorInFlight.delete(epochId);
+    }
+    if (this.supervisorAbortByEpoch.get(epochId) === abortController) {
+      this.supervisorAbortByEpoch.delete(epochId);
     }
     const pending = this.pendingSupervisorRequests.get(epochId);
     if (!pending) {
@@ -2059,7 +2727,10 @@ export class SecurityAgentController {
     this.startSupervisorCheck(epochId, pending.request).then(pending.resolve, pending.reject);
   }
 
-  private async runSupervisorCheck(input: SupervisorCheckRequest): Promise<ControlSignal> {
+  private async runSupervisorCheck(
+    input: SupervisorCheckRequest,
+    admissionSignal: AbortSignal = new AbortController().signal
+  ): Promise<SupervisorVerdict> {
     const expectedSourceEventIds = input.sourceEventIds ?? [];
     const state = this.getActiveTaskState(input.taskEnvelope.taskId);
     const discardReason = this.supervisorCheckDiscardReason(input, state);
@@ -2084,6 +2755,7 @@ export class SecurityAgentController {
     let supervisorStatsBefore: PiSessionStatsSnapshot | undefined;
     let supervisorInputBytes = 0;
     let supervisorInvocationStatus = "failed";
+    let abortSession: (() => void) | undefined;
     const supervisorInvocationStartedAt = Date.now();
     try {
       const logWindow = await this.executionLog.window({
@@ -2116,6 +2788,17 @@ export class SecurityAgentController {
       supervisorStatsBefore = readPiSessionStats(activeSupervisorSession);
       supervisorLogging = observerSession.logging;
       this.activeSupervisorSessions.add(activeSupervisorSession);
+      abortSession = () => void activeSupervisorSession.abort();
+      admissionSignal.addEventListener("abort", abortSession, { once: true });
+      if (admissionSignal.aborted) {
+        abortSession();
+        supervisorInvocationStatus = "discarded";
+        return this.discardSupervisorCheck(
+          input,
+          String(admissionSignal.reason ?? "superseded supervisor window"),
+          expectedSourceEventIds
+        );
+      }
       const supervisorInput = renderSupervisorInput({
           taskEnvelope: input.taskEnvelope,
           actionTraceText: supervisorTrace.actionTraceText,
@@ -2127,11 +2810,9 @@ export class SecurityAgentController {
             ...budgetStatusSnapshot(input.taskEnvelope, state),
             toolExecutionEndCount: state?.toolExecutionEndCount ?? 0,
             turnEndCount: state?.turnEndCount ?? 0,
-            budgetExtensionCount: state?.budgetExtensionCount ?? 0,
-            maxBudgetExtensions: MAX_BUDGET_EXTENSIONS
           },
           taskStatus: this.getTaskStatusSnapshot(input.taskEnvelope.taskId),
-          lastControlSignal: state?.controlSignal,
+          lastControlSignal: state?.supervisionState.lastVerdict ?? state?.controlSignal,
           sourceEventIds: expectedSourceEventIds,
           reason: input.reason
         });
@@ -2140,16 +2821,21 @@ export class SecurityAgentController {
         ? await invokeStructured<unknown>(activeSupervisorSession, supervisorInput, {
           toolName: "control_submit",
           idleTimeoutMs: SUPERVISOR_IDLE_TIMEOUT_MS,
-          hardTimeoutMs: SUPERVISOR_HARD_TIMEOUT_MS
+          hardTimeoutMs: SUPERVISOR_HARD_TIMEOUT_MS,
+          admission: this.providerAdmission("supervisor", admissionSignal)
         })
         : extractJsonObject<unknown>(await withTimeout(
-          promptAndCollect(activeSupervisorSession, supervisorInput),
+          promptAndCollect(activeSupervisorSession, supervisorInput, {
+            admission: this.providerAdmission("supervisor", admissionSignal)
+          }),
           SUPERVISOR_HARD_TIMEOUT_MS,
           () => void supervisorSession?.abort()
         ));
-      const controlSignal = {
+      const controlSignal: SupervisorVerdict = {
         ...normalizeSupervisorControlSignal(rawControlSignal, expectedSourceEventIds),
-        evidenceRefs: expectedSourceEventIds
+        evidenceRefs: expectedSourceEventIds,
+        epochRef: input.epochRef ?? state?.epochId ?? "unknown",
+        throughSeq: input.throughSeq ?? 0
       };
       const postPromptDiscardReason = this.supervisorCheckDiscardReason(input, state);
       if (postPromptDiscardReason) {
@@ -2172,12 +2858,22 @@ export class SecurityAgentController {
       });
       return controlSignal;
     } catch (error) {
+      if (admissionSignal.aborted) {
+        supervisorInvocationStatus = "discarded";
+        return this.discardSupervisorCheck(
+          input,
+          String(admissionSignal.reason ?? "superseded supervisor window"),
+          expectedSourceEventIds
+        );
+      }
       supervisorInvocationStatus = "failed";
-      const controlSignal: ControlSignal = {
+      const controlSignal: SupervisorVerdict = {
         decision: "continue",
         reason: `Supervisor check failed; continuing hot path: ${error instanceof Error ? error.message : String(error)}`,
         evidenceRefs: expectedSourceEventIds,
-        confidence: "low"
+        confidence: "low",
+        epochRef: input.epochRef ?? state?.epochId ?? "unknown",
+        throughSeq: input.throughSeq ?? 0
       };
       await this.executionLog.append({
         taskId: input.taskEnvelope.taskId,
@@ -2194,6 +2890,9 @@ export class SecurityAgentController {
       });
       return controlSignal;
     } finally {
+      if (abortSession) {
+        admissionSignal.removeEventListener("abort", abortSession);
+      }
       await supervisorLogging?.drain();
       supervisorLogging?.();
       if (supervisorSession) {
@@ -2229,6 +2928,17 @@ export class SecurityAgentController {
     if (state.executorStopRequested) {
       return "executor already requested stop";
     }
+    if (input.epochRef && input.epochRef !== state.epochId) {
+      return `stale supervisor epoch: requested ${input.epochRef}, current ${state.epochId}`;
+    }
+    const latestThroughSeq = this.latestSupervisorThroughSeqByEpoch.get(state.epochId);
+    if (
+      input.throughSeq !== undefined
+      && latestThroughSeq !== undefined
+      && input.throughSeq < latestThroughSeq
+    ) {
+      return `superseded supervisor window: requested throughSeq ${input.throughSeq}, latest ${latestThroughSeq}`;
+    }
     const requestedTurnCount = turnWindowCount(input.reason);
     if (
       requestedTurnCount !== undefined
@@ -2243,12 +2953,14 @@ export class SecurityAgentController {
     input: SupervisorCheckRequest,
     discardReason: string,
     evidenceRefs: string[]
-  ): Promise<ControlSignal> {
-    const controlSignal: ControlSignal = {
+  ): Promise<SupervisorVerdict> {
+    const controlSignal: SupervisorVerdict = {
       decision: "continue",
       reason: `Supervisor check discarded: ${discardReason}`,
       evidenceRefs,
-      confidence: "low"
+      confidence: "low",
+      epochRef: input.epochRef ?? "unknown",
+      throughSeq: input.throughSeq ?? 0
     };
     await this.executionLog.append({
       taskId: input.taskEnvelope.taskId,
@@ -2265,170 +2977,227 @@ export class SecurityAgentController {
     return controlSignal;
   }
 
-  private enqueueProjectionJob(input: ObserverProjectionRequest): Promise<ObserverProjection> {
-    return this.requestProjection(input);
+  private async enqueueProjectionJob(input: ObserverProjectionRequest): Promise<ObserverProjection> {
+    const scheduled = await this.scheduleProjection(input, true);
+    if (scheduled.discarded) {
+      return scheduled.projection;
+    }
+    try {
+      await scheduled.completion;
+    } catch (error) {
+      return this.discardProjectionJob(
+        input,
+        error instanceof Error ? error.message : String(error)
+      );
+    }
+    return this.lastProjectionByTask.get(input.taskEnvelope.taskId) ?? scheduled.projection;
   }
 
-  private requestProjection(input: ObserverProjectionRequest): Promise<ObserverProjection> {
+  private async requestProjection(input: ObserverProjectionRequest): Promise<ObserverProjection> {
+    const scheduled = await this.scheduleProjection(input, false);
+    return scheduled.projection;
+  }
+
+  private async scheduleProjection(
+    input: ObserverProjectionRequest,
+    forceImmediate: boolean
+  ): Promise<{
+    targetSeq: number;
+    projection: ObserverProjection;
+    discarded: boolean;
+    completion?: Promise<void>;
+  }> {
+    const fallbackProjection = projectionPlaceholder(input, `${input.reason} scheduled`);
+    if (this.projectionRequestsClosed) {
+      return {
+        targetSeq: this.runtimeStore.getProjectionState(input.taskEnvelope.taskId).committedSeq,
+        projection: await this.discardProjectionJob(input, "controller is closing; projection coordinator is closed"),
+        discarded: true
+      };
+    }
     const currentProjectionState = this.runtimeStore.getProjectionState(input.taskEnvelope.taskId);
     const latestSeq = Math.max(
       currentProjectionState.desiredSeq,
       ...((input.sourceEventIds ?? []).map((eventId) => this.executionLog.seqForEvent(eventId) ?? 0))
     );
-    this.runtimeStore.raiseProjectionDesired(
-      input.taskEnvelope.taskId,
-      latestSeq,
-      input.reason === "task_end" ? 10 : 0
-    );
-    const queueItem: PendingProjectionRequest = {
+    const terminal = forceImmediate || input.terminal === true || input.reason === "task_end";
+    const queueItem: ProjectionRequestContext = {
       ...input,
       queueId: `projection:${randomUUID()}`,
       queuedAt: Date.now(),
-      sequence: this.projectionSequence += 1,
-      supersedes: []
+      desiredSeq: latestSeq,
+      terminal
     };
-    if (this.projectionQueueClosed) {
-      return this.discardProjectionJob(queueItem, "controller is closing; projection queue is closed");
-    }
-    return new Promise<ObserverProjection>((resolve, reject) => {
-      queueItem.resolve = resolve;
-      queueItem.reject = reject;
-      void this.executionLog.append({
-        taskId: input.taskEnvelope.taskId,
-        role: "runtime",
-        eventType: "projection_requested",
-        summary: `${input.reason} requested`,
-        payload: {
-          queueId: queueItem.queueId,
-          reason: input.reason,
-          sourceEventIds: input.sourceEventIds ?? [],
-          pendingProjectionCount: this.pendingProjectionRequests.size,
-          activeProjectionJobCount: this.activeProjectionJobCount
-        }
-      });
-      const pendingKey = input.taskEnvelope.taskId;
-      const existing = this.pendingProjectionRequests.get(pendingKey);
-      if (existing) {
-        const shouldReplace = projectionRequestPriority(queueItem) >= projectionRequestPriority(existing);
-        if (!shouldReplace) {
-          void this.resolveSupersededProjectionRequest(
-            queueItem,
-            `pending ${existing.reason} has higher priority`
-          );
-          return;
-        }
-        this.pendingProjectionRequests.delete(pendingKey);
-        queueItem.supersedes = [...(queueItem.supersedes ?? []), existing.queueId];
-        void this.resolveSupersededProjectionRequest(
-          existing,
-          `${queueItem.reason} superseded pending ${existing.reason}`
-        );
-        void this.executionLog.append({
-          taskId: input.taskEnvelope.taskId,
-          role: "runtime",
-          eventType: "projection_request_coalesced",
-          summary: `${existing.reason} -> ${queueItem.reason}`,
-          payload: {
-            supersededQueueId: existing.queueId,
-            queueId: queueItem.queueId,
-            previousReason: existing.reason,
-            reason: queueItem.reason,
-            pendingProjectionCount: this.pendingProjectionRequests.size,
-            activeProjectionJobCount: this.activeProjectionJobCount
-          }
-        });
-      }
-      this.pendingProjectionRequests.set(pendingKey, queueItem);
-      void this.executionLog.append({
-        taskId: input.taskEnvelope.taskId,
-        role: "runtime",
-        eventType: "projection_job_queued",
-        summary: `${input.reason} queued`,
-        payload: this.projectionQueuePayload(queueItem)
-      });
-      this.drainProjectionQueue();
+    const previousContext = this.projectionContextByTask.get(input.taskEnvelope.taskId);
+    this.rememberProjectionContext(queueItem);
+    const coordinatorRequest = this.projectorCoordinator.request({
+      taskId: input.taskEnvelope.taskId,
+      desiredSeq: latestSeq,
+      priority: terminal ? 10 : 0,
+      terminal
     });
-  }
-
-  private projectionQueuePayload(input: PendingProjectionRequest): Record<string, unknown> {
-    return {
-      queueId: input.queueId,
-      reason: input.reason,
-      sourceEventIds: input.sourceEventIds ?? [],
-      sequence: input.sequence,
-      supersedes: input.supersedes ?? [],
-      pendingProjectionCount: this.pendingProjectionRequests.size,
-      activeProjectionJobCount: this.activeProjectionJobCount
-    };
-  }
-
-  private drainProjectionQueue(): void {
-    if (
-      (this.projectionQueueClosed && !this.projectionQueueDrainingOnClose)
-      || this.projectionCancellationRequested
-    ) {
-      return;
-    }
-    while (this.activeProjectionJobCount < MAX_ACTIVE_PROJECTION_JOBS && this.pendingProjectionRequests.size > 0) {
-      const nextRequest = this.nextPendingProjectionRequest();
-      if (!nextRequest) {
-        return;
-      }
-      this.pendingProjectionRequests.delete(nextRequest.taskEnvelope.taskId);
-      const projectionPromise = this.runProjectionJob(nextRequest);
-      this.projectionJobs.add(projectionPromise);
-      projectionPromise.then((projection) => {
-        nextRequest.resolve?.(projection);
-        const state = this.getActiveTaskState(nextRequest.taskEnvelope.taskId);
-        if (state) {
-          state.lastObserverProjection = projection;
-        }
-      }, (error) => {
-        nextRequest.reject?.(error);
-      }).finally(() => {
-        this.projectionJobs.delete(projectionPromise);
-        this.drainProjectionQueue();
-      });
-    }
-  }
-
-  private nextPendingProjectionRequest(): PendingProjectionRequest | undefined {
-    return [...this.pendingProjectionRequests.values()]
-      .filter((request) => this.runtimeStore.getProjectionState(request.taskEnvelope.taskId).activeGeneration === undefined)
-      .sort((left, right) =>
-        projectionRequestPriority(right) - projectionRequestPriority(left)
-        || left.sequence - right.sequence
-      )[0];
-  }
-
-  private async resolveSupersededProjectionRequest(
-    input: PendingProjectionRequest,
-    supersededReason: string
-  ): Promise<void> {
-    const projection: ObserverProjection = {
-      graphDelta: { sourceEventIds: input.sourceEventIds ?? [], nodes: [], edges: [] },
-      controlSignal: {
-        decision: "continue",
-        reason: `Projection request superseded: ${supersededReason}`,
-        evidenceRefs: input.sourceEventIds ?? [],
-        confidence: "low"
-      }
-    };
+    const completion = forceImmediate
+      ? this.projectorCoordinator.waitForCommitted(
+        input.taskEnvelope.taskId,
+        latestSeq,
+        { timeoutMs: PROJECTION_DRAIN_TIMEOUT_MS }
+      )
+      : undefined;
+    void completion?.catch(() => undefined);
     await this.executionLog.append({
       taskId: input.taskEnvelope.taskId,
       role: "runtime",
-      eventType: "projection_request_superseded",
-      summary: `${input.reason}: ${supersededReason}`,
+      eventType: "projection_requested",
+      summary: `${input.reason} requested`,
       payload: {
-        queueId: input.queueId,
+        queueId: queueItem.queueId,
         reason: input.reason,
-        supersededReason,
         sourceEventIds: input.sourceEventIds ?? [],
-        pendingProjectionCount: this.pendingProjectionRequests.size,
+        desiredSeq: latestSeq,
+        terminal,
         activeProjectionJobCount: this.activeProjectionJobCount
       }
     });
-    input.resolve?.(projection);
+    if (previousContext) {
+      await this.executionLog.append({
+        taskId: input.taskEnvelope.taskId,
+        role: "runtime",
+        eventType: "projection_request_coalesced",
+        summary: `${previousContext.reason} -> ${queueItem.reason}`,
+        payload: {
+          previousQueueId: previousContext.queueId,
+          queueId: queueItem.queueId,
+          previousReason: previousContext.reason,
+          reason: queueItem.reason,
+          previousDesiredSeq: previousContext.desiredSeq,
+          desiredSeq: latestSeq,
+          activeProjectionJobCount: this.activeProjectionJobCount
+        }
+      });
+    }
+    await this.executionLog.append({
+      taskId: input.taskEnvelope.taskId,
+      role: "runtime",
+      eventType: "projection_job_queued",
+      summary: `${input.reason} queued`,
+      payload: {
+        queueId: queueItem.queueId,
+        reason: input.reason,
+        sourceEventIds: input.sourceEventIds ?? [],
+        desiredSeq: latestSeq,
+        terminal,
+        activeProjectionJobCount: this.activeProjectionJobCount
+      }
+    });
+    await coordinatorRequest;
+    return { targetSeq: latestSeq, projection: fallbackProjection, discarded: false, completion };
+  }
+
+  private rememberProjectionContext(input: ProjectionRequestContext): void {
+    const existing = this.projectionContextByTask.get(input.taskEnvelope.taskId);
+    if (
+      !existing
+      || input.desiredSeq > existing.desiredSeq
+      || projectionRequestPriority(input) >= projectionRequestPriority(existing)
+    ) {
+      this.projectionContextByTask.set(input.taskEnvelope.taskId, {
+        ...input,
+        taskResult: input.taskResult ?? existing?.taskResult,
+        terminal: input.terminal || existing?.terminal
+      });
+    }
+  }
+
+  private async countProjectionObservations(input: {
+    taskId: string;
+    afterSeq: number;
+    toSeq: number;
+  }): Promise<number> {
+    const events = await this.executionLog.range({
+      taskId: input.taskId,
+      afterSeq: input.afterSeq,
+      toSeq: input.toSeq,
+      roles: [...PROJECTOR_OBSERVATION_ROLES],
+      eventTypes: [...PROJECTOR_OBSERVATION_EVENT_TYPES]
+    });
+    return selectProjectionBatch(events, {
+      fromSeq: input.afterSeq,
+      maxObservations: Number.MAX_SAFE_INTEGER
+    }).observations.length;
+  }
+
+  private async runCoordinatedProjection(work: ProjectorWorkItem, signal: AbortSignal): Promise<void> {
+    if (signal.aborted) {
+      return;
+    }
+    const remembered = this.projectionContextByTask.get(work.taskId);
+    const taskEnvelope = remembered?.taskEnvelope ?? this.graphStore.getTaskEnvelope(work.taskId);
+    if (!taskEnvelope) {
+      throw new Error(`Projection ${work.taskId} has no persisted task envelope`);
+    }
+    const taskResult = remembered?.taskResult ?? taskResultFromOutcome(this.runtimeStore.getTaskOutcome(work.taskId));
+    const request: ObserverProjectionRequest = {
+      reason: remembered?.reason ?? `projection_${work.reason}`,
+      taskEnvelope,
+      taskResult,
+      sourceEventIds: remembered?.sourceEventIds,
+      queueId: remembered?.queueId ?? `projection:${randomUUID()}`,
+      queuedAt: remembered?.queuedAt ?? Date.now(),
+      terminal: work.reason === "terminal",
+      maxObservations: work.maxObservations,
+      admissionSignal: signal
+    };
+    const abortListener = (): void => {
+      const state = this.runtimeStore.getProjectionState(work.taskId);
+      if (state.activeGeneration !== undefined) {
+        this.runtimeStore.invalidateProjection(work.taskId);
+      }
+      void this.activeProjectorByTask.get(work.taskId)?.abort();
+    };
+    signal.addEventListener("abort", abortListener, { once: true });
+    const committedBefore = this.runtimeStore.getProjectionState(work.taskId).committedSeq;
+    try {
+      const projection = await this.runProjectionJob(request);
+      this.lastProjectionByTask.set(work.taskId, projection);
+      const state = this.getActiveTaskState(work.taskId);
+      if (state) {
+        state.lastObserverProjection = projection;
+      }
+      if (signal.aborted) {
+        return;
+      }
+      const projectedState = this.runtimeStore.getProjectionState(work.taskId);
+      if (
+        projectedState.desiredSeq > projectedState.committedSeq
+        && projectedState.committedSeq <= committedBefore
+      ) {
+        throw new Error(`Projection ${work.taskId} made no watermark progress`);
+      }
+      const projectionState = this.runtimeStore.getProjectionState(work.taskId);
+      const currentContext = this.projectionContextByTask.get(work.taskId);
+      if (currentContext && projectionState.committedSeq >= projectionState.desiredSeq) {
+        this.projectionContextByTask.delete(work.taskId);
+      }
+    } finally {
+      signal.removeEventListener("abort", abortListener);
+    }
+  }
+
+  private async logProjectionCoordinatorError(error: unknown, work: ProjectorWorkItem): Promise<void> {
+    await this.executionLog.append({
+      taskId: work.taskId,
+      role: "runtime",
+      eventType: "projection_retry_scheduled",
+      summary: error instanceof Error ? error.message : String(error),
+      payload: {
+        reason: work.reason,
+        fromSeq: work.fromSeq,
+        targetSeq: work.targetSeq,
+        terminalTargetSeq: work.terminalTargetSeq,
+        pendingObservationCount: work.pendingObservationCount,
+        maxObservations: work.maxObservations
+      }
+    });
   }
 
   private enqueueObserverProjection(input: ObserverProjectionRequest): Promise<ObserverProjection> {
@@ -2439,57 +3208,70 @@ export class SecurityAgentController {
     input: ObserverProjectionRequest;
     claim: ProjectionClaim;
     batch: ProjectionBatch;
-    nodeLimit: number;
-    edgeLimit: number;
     artifactTextLimit?: number;
-    observationTextLimit?: number;
     graphTextLimit?: number;
     goalTextLimit?: number;
   }) {
-    const orphanRefs = this.projectionOrphanRefsByTask.get(input.input.taskEnvelope.taskId) ?? [];
     const closure = this.graphStore.projectionClosure({
       taskId: input.input.taskEnvelope.taskId,
       scopeRef: input.input.taskEnvelope.scopeRef,
       dependencyTaskIds: input.input.taskEnvelope.dependsOnTaskRefs,
-      targetRefs: [...input.input.taskEnvelope.targetRefs, ...orphanRefs],
+      targetRefs: input.input.taskEnvelope.targetRefs,
       anchors: input.batch.observations.flatMap((observation) => observation.anchors),
-      nodeLimit: input.nodeLimit,
-      edgeLimit: input.edgeLimit
+      nodeLimit: 64,
+      edgeLimit: 96
     });
-    const graphContext = aliasProjectionGraphContext(closure);
+    const fullGraphContext = aliasProjectionGraphContext(closure);
     const artifactIndex = await this.loadProjectorArtifactIndex({
       taskEnvelope: input.input.taskEnvelope,
       taskResult: input.input.taskResult,
       observations: input.batch.observations
     });
     const artifactText = input.artifactTextLimit !== undefined
-      ? truncateText(artifactIndex.text, input.artifactTextLimit)
-      : artifactIndex.text;
-    const observationText = input.observationTextLimit !== undefined
-      ? truncateText(renderProjectionObservations(input.batch.observations), input.observationTextLimit)
-      : renderProjectionObservations(input.batch.observations);
-    const graphText = input.graphTextLimit !== undefined
-      ? truncateText(renderProjectionGraphContext(graphContext), input.graphTextLimit)
-      : renderProjectionGraphContext(graphContext);
-    const projectorInput = renderObserverInput({
-      projectionJob: [
-        `task=${input.input.taskEnvelope.taskId}`,
-        `reason=${input.input.reason}`,
-        `seq=(${input.claim.fromSeq},${input.batch.toSeq}] desired=${input.claim.toSeq}`,
-        orphanRefs.length > 0 ? `unconnectedNodeRefs=${orphanRefs.join(",")}` : undefined,
-        input.input.taskResult ? `taskOutcome=${truncateText(input.input.taskResult.summary, 600)}` : undefined,
-        `goal=${truncateText(input.input.taskEnvelope.goal, input.goalTextLimit ?? 500)}`
-      ].filter((line): line is string => Boolean(line)).join("\n"),
+      ? compactUtf8HeadTail(artifactIndex.text, input.artifactTextLimit)
+      : compactUtf8HeadTail(artifactIndex.text, 3_000);
+    const observationText = renderProjectionObservations(input.batch.observations);
+    const connectivityContext = compactProjectorConnectivityContext(
+      this.connectivityRuntime?.routeProjectionSnapshot() ?? [],
+      input.batch.observations,
+      4_000
+    );
+    const projectionJob = [
+      `task=${compactUtf8HeadTail(input.input.taskEnvelope.taskId, 240)}`,
+      `reason=${input.input.reason}`,
+      `seq=(${input.claim.fromSeq},${input.batch.toSeq}] desired=${input.claim.toSeq}`,
+      input.input.taskResult ? renderProjectorTaskResult(input.input.taskResult) : undefined,
+      `goal=${compactUtf8HeadTail(input.input.taskEnvelope.goal, input.goalTextLimit ?? 800)}`
+    ].filter((line): line is string => Boolean(line)).join("\n");
+    const fixedInput = renderObserverInput({
+      projectionJob,
       observations: observationText,
       artifactIndex: artifactText,
-      graphContext: graphText
+      graphContext: "",
+      connectivityContext
+    });
+    const availableGraphBytes = Math.max(
+      256,
+      PROJECTOR_INPUT_TARGET_BYTES - Buffer.byteLength(fixedInput, "utf8") - 512
+    );
+    const graphContext = compactProjectionGraphContextForInput(
+      fullGraphContext,
+      Math.min(input.graphTextLimit ?? availableGraphBytes, availableGraphBytes)
+    );
+    const graphText = renderProjectionGraphContext(graphContext);
+    const projectorInput = renderObserverInput({
+      projectionJob,
+      observations: observationText,
+      artifactIndex: artifactText,
+      graphContext: graphText,
+      connectivityContext
     });
     return {
       batch: input.batch,
       graphContext,
       artifactCount: artifactIndex.itemCount,
       projectorInput,
-      inputBytes: Buffer.byteLength(projectorInput)
+      inputBytes: Buffer.byteLength(projectorInput, "utf8")
     };
   }
 
@@ -2559,100 +3341,160 @@ export class SecurityAgentController {
       if (availableObservationCount === 0 && availableLogEvents.length > 0) {
         return this.discardProjectionJob(input, "waiting for executor result interpretation");
       }
-      const terminalProjection = Boolean(input.taskResult);
-      const selectedBatch = selectProjectionBatch(availableLogEvents, {
+      const maxObservations = input.maxObservations ?? PROJECTOR_MAX_OBSERVATIONS_PER_JOB;
+      const selectedBatch = attachTaskResultProjectionReferences(selectProjectionBatch(availableLogEvents, {
         fromSeq: claim.fromSeq,
-        maxObservations: terminalProjection ? Number.MAX_SAFE_INTEGER : PROJECTOR_MAX_OBSERVATIONS_PER_JOB
-      });
-      const initialBatch = terminalProjection || selectedBatch.observations.length >= availableObservationCount
+        maxObservations
+      }), input.taskResult);
+      const initialBatch = selectedBatch.observations.length >= availableObservationCount
         ? { ...selectedBatch, toSeq: claim.toSeq }
         : selectedBatch;
       let prepared = await this.prepareProjectorInput({
         input,
         claim,
-        batch: initialBatch,
-        nodeLimit: 12,
-        edgeLimit: 16
+        batch: initialBatch
       });
+      let requiresObservationPartition = false;
       if (prepared.inputBytes > PROJECTOR_INPUT_TARGET_BYTES) {
-        const compactedBatch = compactProjectionBatchForInput(initialBatch, {
-          maxObservations: terminalProjection ? 24 : PROJECTOR_MAX_OBSERVATIONS_PER_JOB,
-          maxChars: Math.floor(PROJECTOR_INPUT_TARGET_BYTES * 0.55)
-        });
-        prepared = await this.prepareProjectorInput({
-          input,
-          claim,
-          batch: compactedBatch,
-          nodeLimit: 10,
-          edgeLimit: 14,
-          artifactTextLimit: 1_200,
-          graphTextLimit: 7_000
-        });
-      }
-      if (prepared.inputBytes > PROJECTOR_INPUT_TARGET_BYTES) {
-        const compactedBatch = compactProjectionBatchForInput(initialBatch, {
-          maxObservations: terminalProjection ? 16 : Math.min(PROJECTOR_MAX_OBSERVATIONS_PER_JOB, 12),
-          maxChars: Math.floor(PROJECTOR_INPUT_TARGET_BYTES * 0.4)
-        });
-        prepared = await this.prepareProjectorInput({
-          input,
-          claim,
-          batch: compactedBatch,
-          nodeLimit: 8,
-          edgeLimit: 12,
-          artifactTextLimit: 500,
-          observationTextLimit: Math.floor(PROJECTOR_INPUT_TARGET_BYTES * 0.42),
-          graphTextLimit: 4_000,
-          goalTextLimit: 240
-        });
-      }
-      if (prepared.inputBytes > PROJECTOR_INPUT_TARGET_BYTES) {
-        const compactedBatch = compactProjectionBatchForInput(initialBatch, {
-          maxObservations: terminalProjection ? 12 : Math.min(PROJECTOR_MAX_OBSERVATIONS_PER_JOB, 8),
-          maxChars: Math.floor(PROJECTOR_INPUT_TARGET_BYTES * 0.3)
-        });
-        let observationTextLimit = Math.max(800, Math.floor(PROJECTOR_INPUT_TARGET_BYTES * 0.32));
-        do {
+        try {
+          const compactedBatch = compactProjectionBatchForInput(initialBatch, {
+            maxObservations: Math.min(maxObservations, 24),
+            maxBytes: Math.floor(PROJECTOR_INPUT_TARGET_BYTES * 0.55)
+          });
           prepared = await this.prepareProjectorInput({
             input,
             claim,
             batch: compactedBatch,
-            nodeLimit: 8,
-            edgeLimit: 12,
+            artifactTextLimit: 1_200,
+            graphTextLimit: 7_000
+          });
+        } catch (error) {
+          if (!(error instanceof ProjectionObservationEnvelopeTooLargeError)) {
+            throw error;
+          }
+          requiresObservationPartition = true;
+        }
+      }
+      if (!requiresObservationPartition && prepared.inputBytes > PROJECTOR_INPUT_TARGET_BYTES) {
+        try {
+          const compactedBatch = compactProjectionBatchForInput(initialBatch, {
+            maxObservations: Math.min(maxObservations, 16),
+            maxBytes: Math.floor(PROJECTOR_INPUT_TARGET_BYTES * 0.4)
+          });
+          prepared = await this.prepareProjectorInput({
+            input,
+            claim,
+            batch: compactedBatch,
+            artifactTextLimit: 500,
+            graphTextLimit: 4_000,
+            goalTextLimit: 240
+          });
+        } catch (error) {
+          if (!(error instanceof ProjectionObservationEnvelopeTooLargeError)) {
+            throw error;
+          }
+          requiresObservationPartition = true;
+        }
+      }
+      if (!requiresObservationPartition && prepared.inputBytes > PROJECTOR_INPUT_TARGET_BYTES) {
+        try {
+          let compactedBatch = compactProjectionBatchForInput(initialBatch, {
+            maxObservations: Math.min(maxObservations, 12),
+            maxBytes: Math.floor(PROJECTOR_INPUT_TARGET_BYTES * 0.3)
+          });
+          do {
+            prepared = await this.prepareProjectorInput({
+              input,
+              claim,
+              batch: compactedBatch,
+              artifactTextLimit: 0,
+              graphTextLimit: 2_000,
+              goalTextLimit: 120
+            });
+            if (prepared.inputBytes <= PROJECTOR_INPUT_TARGET_BYTES || compactedBatch.observations.length <= 1) {
+              break;
+            }
+            compactedBatch = compactProjectionBatchForInput(initialBatch, {
+              maxObservations: compactedBatch.observations.length - 1,
+              maxBytes: Math.floor(PROJECTOR_INPUT_TARGET_BYTES * 0.3)
+            });
+          } while (true);
+        } catch (error) {
+          if (!(error instanceof ProjectionObservationEnvelopeTooLargeError)) {
+            throw error;
+          }
+          requiresObservationPartition = true;
+        }
+      }
+      let preparedInputs = [prepared];
+      if (requiresObservationPartition || prepared.inputBytes > PROJECTOR_INPUT_TARGET_BYTES) {
+        const firstObservation = initialBatch.observations[0];
+        if (!firstObservation) {
+          throw new Error("Projector input exceeds its byte limit without an observation to partition");
+        }
+        const singleObservationBatch: ProjectionBatch = {
+          observations: [firstObservation],
+          toSeq: initialBatch.observations.length === 1 ? initialBatch.toSeq : firstObservation.seqEnd,
+          sourceEventIds: initialBatch.observations.length === 1
+            ? [...initialBatch.sourceEventIds]
+            : [...firstObservation.sourceEventIds]
+        };
+        const fragmentBatches = partitionProjectionBatchForInput(singleObservationBatch, {
+          maxObservations: Math.min(maxObservations, 12),
+          maxBytes: Math.floor(PROJECTOR_INPUT_TARGET_BYTES * 0.3)
+        });
+        preparedInputs = [];
+        for (const fragmentBatch of fragmentBatches) {
+          const fragmentInput = await this.prepareProjectorInput({
+            input,
+            claim,
+            batch: fragmentBatch,
             artifactTextLimit: 0,
-            observationTextLimit,
             graphTextLimit: 2_000,
             goalTextLimit: 120
           });
-          observationTextLimit = Math.max(400, observationTextLimit - Math.max(500, prepared.inputBytes - PROJECTOR_INPUT_TARGET_BYTES));
-        } while (prepared.inputBytes > PROJECTOR_INPUT_TARGET_BYTES && observationTextLimit > 400);
-      }
-      const projectionToSeq = prepared.batch.toSeq;
-      projectorProjectionToSeq = projectionToSeq;
-      projectorInputBytes = prepared.inputBytes;
-      projectorObservationCount = prepared.batch.observations.length;
-      expectedSourceEventIds = prepared.batch.sourceEventIds;
-      await this.executionLog.append({
-        taskId: input.taskEnvelope.taskId,
-        role: "runtime",
-        eventType: "projection_input_built",
-        summary: `observations=${prepared.batch.observations.length} bytes=${prepared.inputBytes}`,
-        payload: {
-          queueId: input.queueId,
-          reason: input.reason,
-          generation: claim.generation,
-          fromSeq: claim.fromSeq,
-          toSeq: projectionToSeq,
-          desiredSeq: claim.toSeq,
-          observationCount: prepared.batch.observations.length,
-          graphNodeCount: prepared.graphContext.nodes.length,
-          graphEdgeCount: prepared.graphContext.edges.length,
-          artifactCount: prepared.artifactCount,
-          inputBytes: prepared.inputBytes,
-          targetBytes: PROJECTOR_INPUT_TARGET_BYTES,
-          overTarget: prepared.inputBytes > PROJECTOR_INPUT_TARGET_BYTES
+          if (fragmentInput.inputBytes > PROJECTOR_INPUT_TARGET_BYTES) {
+            throw new Error(
+              `Projector fixed input envelope requires ${fragmentInput.inputBytes} UTF-8 bytes; maximum is ${PROJECTOR_INPUT_TARGET_BYTES}`
+            );
+          }
+          preparedInputs.push(fragmentInput);
         }
-      });
+      }
+      if (preparedInputs.some((item) => item.inputBytes > PROJECTOR_INPUT_TARGET_BYTES)) {
+        throw new Error(`Projector input exceeds ${PROJECTOR_INPUT_TARGET_BYTES} UTF-8 bytes before model invocation`);
+      }
+      const projectionToSeq = preparedInputs.at(-1)!.batch.toSeq;
+      projectorProjectionToSeq = projectionToSeq;
+      projectorInputBytes = Math.max(...preparedInputs.map((item) => item.inputBytes));
+      projectorObservationCount = preparedInputs.reduce((total, item) => total + item.batch.observations.length, 0);
+      expectedSourceEventIds = dedupeStrings(preparedInputs.flatMap((item) => item.batch.sourceEventIds));
+      for (const [fragmentIndex, preparedInput] of preparedInputs.entries()) {
+        await this.executionLog.append({
+          taskId: input.taskEnvelope.taskId,
+          role: "runtime",
+          eventType: "projection_input_built",
+          summary: `observations=${preparedInput.batch.observations.length} bytes=${preparedInput.inputBytes}`,
+          payload: {
+            queueId: input.queueId,
+            reason: input.reason,
+            generation: claim.generation,
+            fromSeq: claim.fromSeq,
+            toSeq: projectionToSeq,
+            desiredSeq: claim.toSeq,
+            fragmentIndex: fragmentIndex + 1,
+            fragmentCount: preparedInputs.length,
+            observationCount: preparedInput.batch.observations.length,
+            graphNodeCount: preparedInput.graphContext.nodes.length,
+            graphEdgeCount: preparedInput.graphContext.edges.length,
+            artifactCount: preparedInput.artifactCount,
+            inputBytes: preparedInput.inputBytes,
+            targetBytes: PROJECTOR_INPUT_TARGET_BYTES,
+            overTarget: false
+          }
+        });
+      }
+      prepared = preparedInputs[0]!;
       if (prepared.batch.observations.length === 0) {
         const projection: ObserverProjection = {
           graphDelta: { sourceEventIds: [], nodes: [], edges: [] },
@@ -2668,7 +3510,6 @@ export class SecurityAgentController {
         projection.graphDelta = commitResult.delta;
         projectionCommitted = true;
         projectorInvocationStatus = "completed_without_llm";
-        this.projectionRetryCountByTask.delete(input.taskEnvelope.taskId);
         await this.appendProjectionJobLog({
           taskId: input.taskEnvelope.taskId,
           eventType: "projection_job_succeeded",
@@ -2684,8 +3525,7 @@ export class SecurityAgentController {
           inputBytes: prepared.inputBytes,
           observationCount: prepared.batch.observations.length,
           remappedNodeCount: commitResult.remappedNodeCount,
-          mergedNodeCount: commitResult.mergedNodeCount,
-          orphanNodeIds: commitResult.orphanNodeIds
+          mergedNodeCount: commitResult.mergedNodeCount
         });
         return projection;
       }
@@ -2693,33 +3533,87 @@ export class SecurityAgentController {
       if (prePromptCancellationReason) {
         return this.discardProjectionJob(input, prePromptCancellationReason);
       }
-      const observerSession = await this.createObserverSessionForMode("project", input.taskEnvelope.taskId);
-      const activeProjectorSession = observerSession.session;
-      projectorSession = activeProjectorSession;
-      projectorStatsBefore = readPiSessionStats(activeProjectorSession);
-      projectorLogging = observerSession.logging;
-      this.activeProjectorSessions.add(activeProjectorSession);
-      this.activeProjectorByTask.set(input.taskEnvelope.taskId, activeProjectorSession);
-      const rawGraphDelta = this.structuredInvocationsEnabled
-        ? await invokeStructured<unknown>(activeProjectorSession, prepared.projectorInput, {
-          toolName: "graph_delta_submit",
-          idleTimeoutMs: PROJECTOR_IDLE_TIMEOUT_MS,
-          hardTimeoutMs: PROJECTOR_HARD_TIMEOUT_MS
-        })
-        : extractJsonObject<unknown>(await withTimeout(
-          promptAndCollect(activeProjectorSession, prepared.projectorInput),
-          PROJECTOR_HARD_TIMEOUT_MS,
-          () => void activeProjectorSession.abort()
-        ));
-      const postPromptCancellationReason = this.projectionWriteBlockedReason();
-      if (postPromptCancellationReason) {
-        return this.discardProjectionJob(input, postPromptCancellationReason);
+      const fragmentDeltas: GraphDelta[] = [];
+      for (const [fragmentIndex, preparedInput] of preparedInputs.entries()) {
+        const projectorGraphRefs = new ProjectorGraphRefRegistry(preparedInput.graphContext);
+        const observerSession = await this.createObserverSessionForMode(
+          "project",
+          input.taskEnvelope.taskId,
+          projectorGraphRefs
+        );
+        const activeProjectorSession = observerSession.session;
+        const fragmentStartedAt = Date.now();
+        const fragmentStatsBefore = readPiSessionStats(activeProjectorSession);
+        let fragmentStatus = "failed";
+        projectorSession = activeProjectorSession;
+        projectorStatsBefore = fragmentStatsBefore;
+        projectorLogging = observerSession.logging;
+        this.activeProjectorSessions.add(activeProjectorSession);
+        this.activeProjectorByTask.set(input.taskEnvelope.taskId, activeProjectorSession);
+        try {
+          const rawGraphDelta = this.structuredInvocationsEnabled
+            ? await invokeStructured<unknown>(activeProjectorSession, preparedInput.projectorInput, {
+              toolName: "graph_delta_submit",
+              idleTimeoutMs: PROJECTOR_IDLE_TIMEOUT_MS,
+              hardTimeoutMs: PROJECTOR_HARD_TIMEOUT_MS,
+              admission: this.providerAdmission("projector", input.admissionSignal)
+            })
+            : extractJsonObject<unknown>(await withTimeout(
+              promptAndCollect(activeProjectorSession, preparedInput.projectorInput, {
+                admission: this.providerAdmission("projector", input.admissionSignal)
+              }),
+              PROJECTOR_HARD_TIMEOUT_MS,
+              () => void activeProjectorSession.abort()
+            ));
+          const postPromptCancellationReason = this.projectionWriteBlockedReason();
+          if (postPromptCancellationReason) {
+            return this.discardProjectionJob(input, postPromptCancellationReason);
+          }
+          fragmentDeltas.push(expandProjectionDraft({
+            value: rawGraphDelta,
+            batch: preparedInput.batch,
+            graphContext: preparedInput.graphContext,
+            references: projectorGraphRefs
+          }));
+          fragmentStatus = "completed";
+        } finally {
+          await observerSession.logging?.drain();
+          observerSession.logging?.();
+          await this.appendInvocationMetrics({
+            session: activeProjectorSession,
+            before: fragmentStatsBefore,
+            invocationId: `${input.queueId ?? `projection:${claim.generation}`}:fragment:${fragmentIndex + 1}`,
+            invocationKind: "projector",
+            agentRole: "observer",
+            status: fragmentStatus,
+            startedAt: fragmentStartedAt,
+            taskId: input.taskEnvelope.taskId,
+            inputBytes: preparedInput.inputBytes,
+            details: {
+              reason: input.reason,
+              generation: claim.generation,
+              fromSeq: claim.fromSeq,
+              toSeq: projectionToSeq,
+              desiredSeq: claim.toSeq,
+              fragmentIndex: fragmentIndex + 1,
+              fragmentCount: preparedInputs.length,
+              observationCount: preparedInput.batch.observations.length,
+              projectionCommitPending: true
+            }
+          });
+          this.activeProjectorSessions.delete(activeProjectorSession);
+          if (this.activeProjectorByTask.get(input.taskEnvelope.taskId) === activeProjectorSession) {
+            this.activeProjectorByTask.delete(input.taskEnvelope.taskId);
+          }
+          disposeSession(activeProjectorSession);
+          if (projectorSession === activeProjectorSession) {
+            projectorSession = undefined;
+            projectorLogging = undefined;
+            projectorStatsBefore = undefined;
+          }
+        }
       }
-      const graphDelta = expandProjectionDraft({
-        value: rawGraphDelta,
-        batch: prepared.batch,
-        graphContext: prepared.graphContext
-      });
+      const graphDelta = mergeProjectionFragmentDeltas(fragmentDeltas);
       const projection: ObserverProjection = {
         graphDelta,
         controlSignal: CONTINUE_CONTROL_SIGNAL
@@ -2732,26 +3626,8 @@ export class SecurityAgentController {
         delta: projection.graphDelta
       });
       projection.graphDelta = commitResult.delta;
-      const orphanCandidates = dedupeStrings([
-        ...(this.projectionOrphanRefsByTask.get(input.taskEnvelope.taskId) ?? []),
-        ...commitResult.orphanNodeIds
-      ]);
-      const unresolvedOrphanNodeIds = this.graphStore.findOrphanNodeIds(orphanCandidates).slice(0, 8);
-      if (unresolvedOrphanNodeIds.length > 0) {
-        this.projectionOrphanRefsByTask.set(input.taskEnvelope.taskId, unresolvedOrphanNodeIds);
-        await this.executionLog.append({
-          taskId: input.taskEnvelope.taskId,
-          role: "runtime",
-          eventType: "projection_orphans_detected",
-          summary: `projection has ${unresolvedOrphanNodeIds.length} unconnected nodes`,
-          payload: { orphanNodeIds: unresolvedOrphanNodeIds }
-        });
-      } else {
-        this.projectionOrphanRefsByTask.delete(input.taskEnvelope.taskId);
-      }
       projectionCommitted = true;
       projectorInvocationStatus = "completed";
-      this.projectionRetryCountByTask.delete(input.taskEnvelope.taskId);
       await this.appendProjectionJobLog({
         taskId: input.taskEnvelope.taskId,
         eventType: "projection_job_succeeded",
@@ -2764,11 +3640,10 @@ export class SecurityAgentController {
         toSeq: projectionToSeq,
         desiredSeq: claim.toSeq,
         durationMs: Date.now() - projectorInvocationStartedAt,
-        inputBytes: prepared.inputBytes,
-        observationCount: prepared.batch.observations.length,
+        inputBytes: projectorInputBytes,
+        observationCount: projectorObservationCount,
         remappedNodeCount: commitResult.remappedNodeCount,
-        mergedNodeCount: commitResult.mergedNodeCount,
-        orphanNodeIds: commitResult.orphanNodeIds
+        mergedNodeCount: commitResult.mergedNodeCount
       });
       return projection;
     } catch (promptError) {
@@ -2782,7 +3657,7 @@ export class SecurityAgentController {
       if (cancellationReason) {
         return this.discardProjectionJob(input, cancellationReason);
       }
-      const failedProjection = await this.failProjectionJob(
+      return this.failProjectionJob(
         input,
         expectedSourceEventIds,
         promptError,
@@ -2798,8 +3673,6 @@ export class SecurityAgentController {
           observationCount: projectorObservationCount
         }
       );
-      this.scheduleProjectionRetry(input, promptError);
-      return failedProjection;
     } finally {
       clearInterval(projectionHeartbeat);
       await projectorLogging?.drain();
@@ -2839,133 +3712,7 @@ export class SecurityAgentController {
       if (projectorSession) {
         disposeSession(projectorSession);
       }
-      const projectionState = this.runtimeStore.getProjectionState(input.taskEnvelope.taskId);
-      if (
-        !this.projectionQueueClosed
-        && !this.projectionCancellationRequested
-        && projectionCommitted
-        && projectionState.desiredSeq > projectionState.committedSeq
-        && !this.pendingProjectionRequests.has(input.taskEnvelope.taskId)
-      ) {
-        if (!input.taskResult) {
-          this.scheduleProjectionCatchup(input);
-        }
-      }
     }
-  }
-
-  /**
-   * Debounced catch-up for the uncommitted tail left behind by a finished job.
-   * The next tool window or the task_end flush claims the same (committed, desired]
-   * range, so an immediate catch-up mostly produces tiny, full-cost projector calls.
-   * The timer re-validates the watermark and only fires when no other projection
-   * took over and the tail holds enough observations to be worth a call.
-   */
-  private scheduleProjectionCatchup(input: ObserverProjectionRequest): void {
-    const taskId = input.taskEnvelope.taskId;
-    if (this.projectionCatchupTimers.has(taskId)) {
-      return;
-    }
-    const delayMs = positiveIntegerEnv("PROJECTOR_CATCHUP_DELAY_MS", DEFAULT_PROJECTOR_CATCHUP_DELAY_MS);
-    const timer = setTimeout(() => {
-      this.projectionCatchupTimers.delete(taskId);
-      void this.fireProjectionCatchup(input);
-    }, delayMs);
-    timer.unref?.();
-    this.projectionCatchupTimers.set(taskId, timer);
-  }
-
-  private async fireProjectionCatchup(input: ObserverProjectionRequest): Promise<void> {
-    const taskId = input.taskEnvelope.taskId;
-    if (this.projectionQueueClosed || this.projectionCancellationRequested) {
-      return;
-    }
-    const projectionState = this.runtimeStore.getProjectionState(taskId);
-    if (projectionState.desiredSeq <= projectionState.committedSeq) {
-      return;
-    }
-    if (
-      projectionState.activeGeneration !== undefined
-      || this.pendingProjectionRequests.has(taskId)
-    ) {
-      return;
-    }
-    const tailEvents = await this.executionLog.range({
-      taskId,
-      afterSeq: projectionState.committedSeq,
-      toSeq: projectionState.desiredSeq,
-      roles: [...PROJECTOR_OBSERVATION_ROLES],
-      eventTypes: [...PROJECTOR_OBSERVATION_EVENT_TYPES]
-    });
-    const observationCount = selectProjectionBatch(tailEvents, {
-      fromSeq: projectionState.committedSeq,
-      maxObservations: Number.MAX_SAFE_INTEGER
-    }).observations.length;
-    const minObservations = positiveIntegerEnv("PROJECTOR_CATCHUP_MIN_OBSERVATIONS", DEFAULT_PROJECTOR_CATCHUP_MIN_OBSERVATIONS);
-    if (observationCount < minObservations) {
-      await this.executionLog.append({
-        taskId,
-        role: "runtime",
-        eventType: "projection_catchup_deferred",
-        summary: `catchup deferred: observations=${observationCount} below min=${minObservations}; tail merges into the next projection`,
-        payload: {
-          committedSeq: projectionState.committedSeq,
-          desiredSeq: projectionState.desiredSeq,
-          observationCount,
-          minObservations,
-          previousReason: input.reason
-        }
-      });
-      return;
-    }
-    await this.executionLog.append({
-      taskId,
-      role: "runtime",
-      eventType: "projection_catchup_started",
-      summary: `committed=${projectionState.committedSeq} desired=${projectionState.desiredSeq}`,
-      payload: {
-        committedSeq: projectionState.committedSeq,
-        desiredSeq: projectionState.desiredSeq,
-        observationCount,
-        delayedMs: positiveIntegerEnv("PROJECTOR_CATCHUP_DELAY_MS", DEFAULT_PROJECTOR_CATCHUP_DELAY_MS),
-        previousReason: input.reason
-      }
-    });
-    void this.requestProjection({
-      reason: "projection_catchup",
-      taskEnvelope: input.taskEnvelope,
-      taskResult: input.taskResult
-    });
-  }
-
-  private scheduleProjectionRetry(input: ObserverProjectionRequest, error: unknown): void {
-    if (this.projectionQueueClosed || this.projectionCancellationRequested) {
-      return;
-    }
-    if (!isRetryableProjectionError(error)) {
-      return;
-    }
-    const retryCount = (this.projectionRetryCountByTask.get(input.taskEnvelope.taskId) ?? 0) + 1;
-    if (retryCount > PROJECTOR_MAX_RETRIES) {
-      return;
-    }
-    this.projectionRetryCountByTask.set(input.taskEnvelope.taskId, retryCount);
-    const delayMs = 2_000 * retryCount;
-    const timer = setTimeout(() => {
-      if (this.projectionQueueClosed || this.projectionCancellationRequested) {
-        return;
-      }
-      const state = this.runtimeStore.getProjectionState(input.taskEnvelope.taskId);
-      if (state.desiredSeq <= state.committedSeq) {
-        return;
-      }
-      void this.requestProjection({
-        reason: `projection_retry:${retryCount}`,
-        taskEnvelope: input.taskEnvelope,
-        taskResult: input.taskResult
-      });
-    }, delayMs);
-    timer.unref?.();
   }
 
   private observerProjectionDiscardReason(input: ObserverProjectionRequest): string | undefined {
@@ -3081,7 +3828,6 @@ export class SecurityAgentController {
     observationCount?: number;
     remappedNodeCount?: number;
     mergedNodeCount?: number;
-    orphanNodeIds?: string[];
   }): Promise<void> {
     const nodeCounts = input.projection.graphDelta.nodes.reduce<Record<string, number>>((counts, node) => {
       const key = `${node.graphKind}:${node.type}`;
@@ -3105,7 +3851,6 @@ export class SecurityAgentController {
         observationCount: input.observationCount,
         remappedNodeCount: input.remappedNodeCount,
         mergedNodeCount: input.mergedNodeCount,
-        orphanNodeIds: input.orphanNodeIds,
         nodeCounts,
         edgeCount: input.projection.graphDelta.edges.length,
         sourceEventIds: input.projection.graphDelta.sourceEventIds,
@@ -3157,80 +3902,6 @@ export class SecurityAgentController {
       confidence: "high"
     };
     this.applyControlSignal(taskEnvelope, budgetSignal, state);
-  }
-
-  private requestSupervisorBudgetDecision(
-    taskEnvelope: TaskEnvelope,
-    event: ExecutionEvent,
-    state: ActiveTaskState
-  ): void {
-    if (state.executorStopRequested || state.budgetDecisionPending) {
-      return;
-    }
-    state.budgetDecisionPending = true;
-    void this.enqueueSupervisorCheck({
-      reason: `budget_pressure:maxTurns:${state.turnEndCount}`,
-      taskEnvelope,
-      sourceEventIds: [event.id]
-    }).then((controlSignal) => {
-      this.applyControlSignal(taskEnvelope, controlSignal, state);
-      if (!state.executorStopRequested && remainingTurns(taskEnvelope, state) <= 0) {
-        this.requestBudgetCheckpoint(taskEnvelope, event, "maxTurns", state);
-      }
-    }, () => {
-      this.requestBudgetCheckpoint(taskEnvelope, event, "maxTurns", state);
-    }).finally(() => {
-      state.budgetDecisionPending = false;
-    });
-  }
-
-  private applyBudgetExtensionFromSignal(taskEnvelope: TaskEnvelope, controlSignal: ControlSignal, state?: ActiveTaskState): boolean {
-    if (!state || controlSignal.decision !== "continue") {
-      return false;
-    }
-    const requestedDelta = controlSignal.budgetExtension?.maxTurnsDelta;
-    if (typeof requestedDelta !== "number" || !Number.isFinite(requestedDelta) || requestedDelta <= 0) {
-      return false;
-    }
-    const budget = ensureTaskBudget(taskEnvelope);
-    if (budget.maxTurns >= MAX_TASK_BUDGET.maxTurns) {
-      return false;
-    }
-    if (state.budgetExtensionCount >= MAX_BUDGET_EXTENSIONS) {
-      return false;
-    }
-    const previousMaxTurns = budget.maxTurns;
-    const extensionTurns = Math.min(Math.floor(requestedDelta), BUDGET_EXTENSION_TURNS);
-    const nextMaxTurns = Math.min(MAX_TASK_BUDGET.maxTurns, previousMaxTurns + extensionTurns);
-    if (nextMaxTurns <= previousMaxTurns) {
-      return false;
-    }
-    budget.maxTurns = nextMaxTurns;
-    state.budgetExtensionCount += 1;
-    state.controlSignal = controlSignal;
-    void this.executionLog.append({
-      taskId: taskEnvelope.taskId,
-      role: "runtime",
-      eventType: "budget_extension_granted",
-      summary: `Extended maxTurns ${previousMaxTurns}->${nextMaxTurns}: ${controlSignal.budgetExtension?.reason ?? controlSignal.reason}`,
-      payload: {
-        previousMaxTurns,
-        nextMaxTurns,
-        extensionTurns: nextMaxTurns - previousMaxTurns,
-        budgetExtensionCount: state.budgetExtensionCount,
-        maxBudgetExtensions: MAX_BUDGET_EXTENSIONS,
-        controlSignal,
-        budgetStatus: budgetStatusSnapshot(taskEnvelope, state)
-      }
-    });
-    this.publishExecutorBudgetStatusUpdate({
-      taskEnvelope,
-      state,
-      sourceEventId: controlSignal.evidenceRefs[0],
-      reason: "budget_extension_granted",
-      force: true
-    });
-    return true;
   }
 
   private publishExecutorBudgetStatusUpdate(input: {
@@ -3311,7 +3982,59 @@ export class SecurityAgentController {
       });
       return;
     }
-    this.applyBudgetExtensionFromSignal(taskEnvelope, controlSignal, state);
+    const supervisorVerdict = controlSignal as Partial<SupervisorVerdict>;
+    if (supervisorVerdict.epochRef && supervisorVerdict.epochRef !== state.epochId) {
+      void this.executionLog.append({
+        epochId: state.epochId,
+        taskId: taskEnvelope.taskId,
+        role: "runtime",
+        eventType: "stale_callback_discarded",
+        summary: `Ignored control signal for stale epoch ${supervisorVerdict.epochRef}`,
+        payload: { controlSignal, activeEpochId: state.epochId }
+      });
+      return;
+    }
+    const latestSupervisorThroughSeq = this.latestSupervisorThroughSeqByEpoch.get(state.epochId);
+    if (
+      supervisorVerdict.throughSeq !== undefined
+      && latestSupervisorThroughSeq !== undefined
+      && supervisorVerdict.throughSeq < latestSupervisorThroughSeq
+    ) {
+      void this.executionLog.append({
+        epochId: state.epochId,
+        taskId: taskEnvelope.taskId,
+        role: "runtime",
+        eventType: "supervisor_check_discarded",
+        summary: `Ignored superseded control signal throughSeq ${supervisorVerdict.throughSeq}`,
+        payload: { controlSignal, latestThroughSeq: latestSupervisorThroughSeq }
+      });
+      return;
+    }
+    if (supervisorVerdict.epochRef !== undefined && supervisorVerdict.throughSeq !== undefined) {
+      state.supervisionState.lastVerdict = {
+        decision: controlSignal.decision,
+        reason: controlSignal.reason,
+        ...(controlSignal.guidance ? { guidance: controlSignal.guidance } : {})
+      };
+    }
+    if (controlSignal.decision === "redirect") {
+      const guidance = controlSignal.guidance?.trim() || controlSignal.reason;
+      const delivered = this.queueExecutorSteer(
+        state,
+        `SUPERVISOR_REDIRECT:\n${guidance}`,
+        taskEnvelope.taskId,
+        controlSignal.reason
+      );
+      void this.executionLog.append({
+        epochId: state.epochId,
+        taskId: taskEnvelope.taskId,
+        role: "runtime",
+        eventType: "supervisor_redirect_applied",
+        summary: controlSignal.reason,
+        payload: { controlSignal, delivery: delivered ? "steer" : "none" }
+      });
+      return;
+    }
     if (!shouldStopExecutorForControlSignal(controlSignal)) {
       return;
     }
@@ -3320,53 +4043,93 @@ export class SecurityAgentController {
     }
     state.controlSignal = controlSignal;
     if (isGracefulCheckpointSignal(controlSignal)) {
-      this.requestGracefulExecutorCheckpoint(taskEnvelope, controlSignal, state);
+      void this.requestGracefulEpochStop(taskEnvelope, controlSignal, state);
       return;
     }
+    void this.requestEpochStop(taskEnvelope, controlSignal, state, "executor_stop_requested");
+  }
+
+  private requestEpochStop(
+    taskEnvelope: TaskEnvelope,
+    controlSignal: ControlSignal,
+    state: ActiveTaskState,
+    eventType: "executor_checkpoint_requested" | "executor_stop_requested"
+  ): Promise<void> {
+    if (state.terminationPromise) {
+      return state.terminationPromise;
+    }
     state.lifecycleState = "closing";
-    this.runtimeStore.transitionEpoch({ epochId: state.epochId, state: "closing" });
     state.executorStopRequested = true;
     state.abortContext = createRuntimeAbortContext(controlSignal);
-    void this.executionLog.append({
+    state.controlSignal = controlSignal;
+    state.invocationAbortController.abort(controlSignal.reason);
+    state.terminationPromise = this.terminateExecutorSession(state);
+    try {
+      this.runtimeStore.transitionEpoch({ epochId: state.epochId, state: "closing" });
+    } catch {
+    }
+    void Promise.resolve().then(() => this.executionLog.append({
+      epochId: state.epochId,
       taskId: taskEnvelope.taskId,
       role: "runtime",
-      eventType: "executor_stop_requested",
+      eventType,
       summary: controlSignal.reason,
-      payload: { controlSignal, abortContext: state.abortContext, epochId: state.epochId }
-    });
-    this.terminateExecutorSession(state);
+      payload: { controlSignal, abortContext: state.abortContext, epochId: state.epochId, delivery: "abort" }
+    })).catch(() => undefined);
+    return state.terminationPromise;
   }
 
-  private terminateExecutorSession(state: ActiveTaskState): void {
-    // Clear queued steers before aborting: the SDK auto-continues a run when
-    // messages remain queued after abort, which would resurrect the Executor
-    // past its termination point.
-    state.executorSession?.clearQueue?.();
-    void state.executorSession?.abort();
-  }
-
-  private requestGracefulExecutorCheckpoint(
+  private requestGracefulEpochStop(
     taskEnvelope: TaskEnvelope,
     controlSignal: ControlSignal,
     state: ActiveTaskState
-  ): void {
-    state.lifecycleState = "closing";
-    this.runtimeStore.transitionEpoch({ epochId: state.epochId, state: "closing" });
-    state.executorStopRequested = true;
-    state.abortContext = createRuntimeAbortContext(controlSignal);
-    const checkpointMessage = [
+  ): Promise<void> {
+    if (state.terminationPromise || state.checkpointGraceTimer) {
+      return state.terminationPromise ?? Promise.resolve();
+    }
+    const message = [
       "RUNTIME_CHECKPOINT_REQUEST:",
       controlSignal.reason,
-      "停止扩展探索。先完成进行中的取证动作（读取已确认的关键内容、保存 artifact），再调用 task_result_submit 提交当前阶段已经确认的事实、失败结论、关键响应内容和 artifact 引用。",
-      "本次 checkpoint 不代表 completed 或 blocked；状态由你的 TaskResult 和后续 Planner 决定。"
+      "立即停止扩大探索并调用 task_result_submit：全部成功条件满足时提交 completed，否则提交 partial；保留已验证事实、证据和 Artifact 引用。"
     ].join("\n");
-    const steeringQueued = this.queueExecutorSteer(
+    const delivered = this.queueExecutorSteer(
       state,
-      checkpointMessage,
+      message,
       taskEnvelope.taskId,
-      controlSignal.reason,
-      true
+      controlSignal.reason
     );
+    if (!delivered) {
+      return this.requestEpochStop(taskEnvelope, controlSignal, state, "executor_checkpoint_requested");
+    }
+    state.lifecycleState = "closing";
+    state.executorStopRequested = true;
+    state.abortContext = createRuntimeAbortContext(controlSignal);
+    state.controlSignal = controlSignal;
+    try {
+      this.runtimeStore.transitionEpoch({ epochId: state.epochId, state: "closing" });
+    } catch {
+    }
+    state.checkpointGraceTimer = setTimeout(() => {
+      state.checkpointGraceTimer = undefined;
+      if (state.lifecycleState === "closed" || state.terminationPromise) {
+        return;
+      }
+      state.terminationPromise = this.terminateExecutorSession(state);
+      void this.executionLog.append({
+        epochId: state.epochId,
+        taskId: taskEnvelope.taskId,
+        role: "runtime",
+        eventType: "executor_checkpoint_grace_expired",
+        summary: controlSignal.reason,
+        payload: {
+          controlSignal,
+          epochId: state.epochId,
+          graceMs: this.checkpointGraceMs,
+          delivery: "abort"
+        }
+      }).catch(() => undefined);
+    }, this.checkpointGraceMs);
+    state.checkpointGraceTimer.unref?.();
     void this.executionLog.append({
       epochId: state.epochId,
       taskId: taskEnvelope.taskId,
@@ -3375,29 +4138,76 @@ export class SecurityAgentController {
       summary: controlSignal.reason,
       payload: {
         controlSignal,
-        delivery: steeringQueued ? "steer" : "none",
-        graceMs: steeringQueued ? EXECUTOR_CHECKPOINT_GRACE_MS : 0
+        abortContext: state.abortContext,
+        epochId: state.epochId,
+        graceMs: this.checkpointGraceMs,
+        delivery: "steer"
       }
-    });
-    if (!steeringQueued) {
-      this.terminateExecutorSession(state);
+    }).catch(() => undefined);
+    return Promise.resolve();
+  }
+
+  private settleGracefulCheckpointRequest(state: ActiveTaskState): void {
+    if (!state.checkpointGraceTimer) {
       return;
     }
-    state.checkpointGraceTimer = setTimeout(() => {
-      if (this.getActiveTaskState(taskEnvelope.taskId) !== state || state.lifecycleState === "closed") {
-        return;
-      }
-      void this.executionLog.append({
-        epochId: state.epochId,
-        taskId: taskEnvelope.taskId,
-        role: "runtime",
-        eventType: "executor_checkpoint_timed_out",
-        summary: `Executor did not submit TaskResult within ${EXECUTOR_CHECKPOINT_GRACE_MS}ms`,
-        payload: { controlSignal, graceMs: EXECUTOR_CHECKPOINT_GRACE_MS }
+    clearTimeout(state.checkpointGraceTimer);
+    state.checkpointGraceTimer = undefined;
+  }
+
+  private terminateExecutorSession(state: ActiveTaskState): Promise<void> {
+    this.settleGracefulCheckpointRequest(state);
+    state.invocationAbortController.abort(state.abortContext?.reason ?? "Executor epoch terminated");
+    if (!state.terminationPromise) {
+      state.terminationPromise = this.abortExecutorSession(state).catch(async (error: unknown) => {
+        state.terminationFailure = errorMessageFromUnknown(error) ?? "Executor termination failed";
+        await this.executionLog.append({
+          epochId: state.epochId,
+          taskId: state.taskEnvelope.taskId,
+          role: "runtime",
+          eventType: "executor_termination_failed",
+          summary: `Executor epoch ${state.epochId} termination command failed`,
+          payload: {
+            epochId: state.epochId,
+            errorType: error instanceof Error ? error.name : "UnknownError",
+            error: state.terminationFailure
+          }
+        }).catch(() => undefined);
       });
-      this.terminateExecutorSession(state);
-    }, EXECUTOR_CHECKPOINT_GRACE_MS);
-    state.checkpointGraceTimer.unref?.();
+    }
+    return state.terminationPromise;
+  }
+
+  private async abortExecutorSession(state: ActiveTaskState): Promise<void> {
+    let clearQueueError: unknown;
+    try {
+      state.executorSession?.clearQueue?.();
+    } catch (error) {
+      clearQueueError = error;
+    }
+    let abortError: unknown;
+    try {
+      await state.executorSession?.abort();
+    } catch (error) {
+      abortError = error;
+    }
+    if (clearQueueError !== undefined || abortError !== undefined) {
+      throw new AggregateError(
+        [clearQueueError, abortError].filter((error) => error !== undefined),
+        `Failed to terminate executor epoch ${state.epochId}`
+      );
+    }
+  }
+
+  private providerAdmission(role: LlmAgentRole, signal?: AbortSignal) {
+    const globalSignal = role === "projector"
+      ? this.projectorInvocationAbortController.signal
+      : this.invocationAbortController.signal;
+    return {
+      key: providerAdmissionKey(this.llmRuntime, role),
+      maxConcurrent: LLM_PROVIDER_MAX_CONCURRENT,
+      signal: signal ? AbortSignal.any([globalSignal, signal]) : globalSignal
+    };
   }
 
   private getActiveAbortContext(taskId?: string): RuntimeAbortContext | undefined {
@@ -3549,10 +4359,15 @@ export class SecurityAgentController {
       ...submittedArtifactRefs,
       ...epochObservations.flatMap((observation) => observation.artifactRefs)
     ]);
+    const capabilityRefs = dedupeStrings([
+      ...(taskResult.capabilityRefs ?? []),
+      ...(this.connectivityRuntime?.capabilityRefsForTask(taskEnvelope.taskId) ?? [])
+    ]);
     return {
       ...taskResult,
       evidenceRefs,
       artifactRefs,
+      capabilityRefs,
       checkpointReason,
       retryable,
       attempt: state?.attempt ?? this.nextTaskAttempt(taskEnvelope.taskId),
@@ -3596,7 +4411,7 @@ export class SecurityAgentController {
         : this.graphStore.trace({ nodeId: dependencyTaskId });
       const reusableAssets = dependencyContext.nodes
         .filter((node) => node.graphKind === "operation" && [
-          "Host", "Service", "WebEndpoint", "Credential", "Session", "File"
+          "Host", "Service", "WebEndpoint", "Credential", "AgentSession", "ShellSession", "Session", "File"
         ].includes(node.type))
         .slice(0, 8)
         .map((node) => `${node.type}:${node.id}:${truncateText(node.label, 180)}`);
@@ -3617,20 +4432,34 @@ export class SecurityAgentController {
           "task_failed"
         ]
       });
-      const capabilities = capabilityDigest(buildProjectionObservations(dependencyEvents.events), 1200);
+      const outcome = this.runtimeStore.getTaskOutcome(dependencyTaskId);
+      const capabilities = outcome
+        ? outcome.capabilityRefs.join(", ")
+        : capabilityDigest(buildProjectionObservations(dependencyEvents.events), 1200);
+      const artifactRefs = outcome?.artifactRefs ?? stringArrayProperty(taskNode.properties.artifactRefs);
+      const artifactSummaries = await Promise.all(artifactRefs.map(async (artifactRef) => {
+        const artifact = await this.artifactStore.get(artifactRef);
+        return artifact
+          ? `${artifact.artifactRef} kind=${artifact.kind} mediaType=${artifact.mediaType} bytes=${artifact.byteLength} sha256=${artifact.contentHash}`
+          : `${artifactRef} unavailable`;
+      }));
       const properties = taskNode.properties;
       return [
         `${dependencyTaskId} status=${String(properties.status ?? "unknown")}`,
-        properties.resultSummary ? `  result: ${truncateText(String(properties.resultSummary), 700)}` : undefined,
-        properties.checkpointReason ? `  checkpoint: ${truncateText(String(properties.checkpointReason), 300)}` : undefined,
+        outcome?.summary
+          ? `  result: ${outcome.summary}`
+          : properties.resultSummary ? `  result: ${truncateText(String(properties.resultSummary), 700)}` : undefined,
+        outcome?.checkpoint?.reason
+          ? `  checkpoint: ${outcome.checkpoint.reason}`
+          : properties.checkpointReason ? `  checkpoint: ${truncateText(String(properties.checkpointReason), 300)}` : undefined,
         capabilities ? `  capabilities:\n${capabilities.split("\n").map((line) => `    ${line}`).join("\n")}` : undefined,
         reusableAssets.length > 0 ? `  reusable: ${reusableAssets.join("；")}` : undefined,
         reusableClaims.length > 0 ? `  confirmed: ${reusableClaims.join("；")}` : undefined,
-        stringArrayProperty(properties.evidenceRefs).length > 0
-          ? `  evidence: ${stringArrayProperty(properties.evidenceRefs).slice(0, 5).join(", ")}`
+        (outcome?.evidenceRefs.length ?? stringArrayProperty(properties.evidenceRefs).length) > 0
+          ? `  evidence: ${(outcome?.evidenceRefs ?? stringArrayProperty(properties.evidenceRefs)).join(", ")}`
           : undefined,
-        stringArrayProperty(properties.artifactRefs).length > 0
-          ? `  artifacts: ${stringArrayProperty(properties.artifactRefs).slice(0, 5).join(", ")}`
+        artifactSummaries.length > 0
+          ? `  artifacts:\n${artifactSummaries.map((summary) => `    ${summary}`).join("\n")}`
           : undefined
       ].filter((line): line is string => Boolean(line)).join("\n");
     }));
@@ -3639,12 +4468,13 @@ export class SecurityAgentController {
 
 }
 
-function admitReadyTasks(candidates: TaskEnvelope[], maxParallelTasks: number): TaskEnvelope[] {
-  if (candidates.length <= 1) {
-    return candidates.slice(0, maxParallelTasks);
-  }
+function admitReadyTasks(
+  candidates: TaskEnvelope[],
+  maxParallelTasks: number,
+  occupiedSessionRefs: Set<string> = new Set()
+): TaskEnvelope[] {
   const admitted: TaskEnvelope[] = [];
-  const occupiedSessions = new Set<string>();
+  const occupiedSessions = new Set(occupiedSessionRefs);
   for (const candidate of candidates) {
     const sessionRefs = candidate.availableSessionRefs ?? [];
     const conflicts = sessionRefs.some((sessionRef) => occupiedSessions.has(sessionRef));
@@ -3657,7 +4487,7 @@ function admitReadyTasks(candidates: TaskEnvelope[], maxParallelTasks: number): 
       break;
     }
   }
-  return admitted.length > 0 ? admitted : candidates.slice(0, 1);
+  return admitted;
 }
 
 function terminationReasonForTaskResult(
@@ -3705,6 +4535,42 @@ function normalizeGraphDelta(delta: Partial<GraphDelta>): GraphDelta {
   };
 }
 
+function mergeProjectionFragmentDeltas(deltas: GraphDelta[]): GraphDelta {
+  const nodes = new Map<string, GraphNode>();
+  const edges = new Map<string, GraphEdge>();
+  for (const delta of deltas) {
+    for (const node of delta.nodes) {
+      const previous = nodes.get(node.id);
+      nodes.set(node.id, previous ? {
+        ...previous,
+        ...node,
+        properties: { ...(previous.properties ?? {}), ...(node.properties ?? {}) },
+        evidenceRefs: dedupeStrings([...(previous.evidenceRefs ?? []), ...(node.evidenceRefs ?? [])])
+      } : node);
+    }
+    for (const edge of delta.edges) {
+      const key = edge.id ?? JSON.stringify([
+        edge.from,
+        edge.type,
+        edge.to,
+        edge.properties ?? {}
+      ]);
+      const previous = edges.get(key);
+      edges.set(key, previous ? {
+        ...previous,
+        ...edge,
+        properties: { ...(previous.properties ?? {}), ...(edge.properties ?? {}) },
+        evidenceRefs: dedupeStrings([...(previous.evidenceRefs ?? []), ...(edge.evidenceRefs ?? [])])
+      } : edge);
+    }
+  }
+  return {
+    sourceEventIds: dedupeStrings(deltas.flatMap((delta) => delta.sourceEventIds)),
+    nodes: [...nodes.values()],
+    edges: [...edges.values()]
+  };
+}
+
 export function normalizeObserverProjection(value: unknown, defaultSourceEventIds: string[] = []): ObserverProjection {
   const record = isRecord(value) ? value : {};
   const rawGraphDelta = isRecord(record.graphDelta) ? record.graphDelta : record;
@@ -3736,16 +4602,6 @@ function normalizeControlSignal(signal: Record<string, unknown> | undefined, fal
   const confidence = typeof signal?.confidence === "string" && ["low", "medium", "high"].includes(signal.confidence)
     ? signal.confidence as ControlSignal["confidence"]
     : undefined;
-  const rawBudgetExtension = isRecord(signal?.budgetExtension) ? signal.budgetExtension : undefined;
-  const maxTurnsDelta = typeof rawBudgetExtension?.maxTurnsDelta === "number" && Number.isFinite(rawBudgetExtension.maxTurnsDelta)
-    ? Math.floor(rawBudgetExtension.maxTurnsDelta)
-    : undefined;
-  const budgetExtension = maxTurnsDelta && maxTurnsDelta > 0
-    ? {
-      maxTurnsDelta,
-      reason: typeof rawBudgetExtension?.reason === "string" ? rawBudgetExtension.reason : undefined
-    }
-    : undefined;
   return {
     decision,
     reason: typeof signal?.reason === "string" && signal.reason.trim().length > 0
@@ -3755,7 +4611,9 @@ function normalizeControlSignal(signal: Record<string, unknown> | undefined, fal
       ? signal.evidenceRefs.filter((ref): ref is string => typeof ref === "string")
       : fallbackEvidenceRefs,
     confidence,
-    budgetExtension
+    guidance: typeof signal?.guidance === "string" && signal.guidance.trim().length > 0
+      ? signal.guidance.trim()
+      : undefined
   };
 }
 
@@ -3781,19 +4639,8 @@ export function shouldStopExecutorForControlSignal(controlSignal: ControlSignal)
   return ["checkpoint", "stop_executor", "need_planner"].includes(controlSignal.decision);
 }
 
-function isGracefulCheckpointSignal(controlSignal: ControlSignal): boolean {
-  return ["checkpoint", "need_planner"].includes(controlSignal.decision);
-}
-
-function isRetryableProjectionError(error: unknown): boolean {
-  if (error instanceof StructuredInvocationError) {
-    return error.code === "timeout" || error.code === "provider_error" || error.code === "missing_submit";
-  }
-  if (error instanceof PromptRuntimeError) {
-    return isRetryableLlmErrorKind(error.errorKind);
-  }
-  const message = errorMessageFromUnknown(error);
-  return Boolean(message && isRetryableLlmErrorKind(classifyLlmErrorKind(message)));
+function isGracefulCheckpointSignal(controlSignal?: ControlSignal): boolean {
+  return controlSignal !== undefined && ["checkpoint", "need_planner"].includes(controlSignal.decision);
 }
 
 export function classifyPlannerProviderFailure(error: unknown): RetryableProviderFailure {
@@ -3837,6 +4684,11 @@ function positiveIntegerEnv(name: string, fallback: number): number {
   return Number.isFinite(value) && value > 0 ? Math.floor(value) : fallback;
 }
 
+function positiveIntegerEnvironment(env: NodeJS.ProcessEnv, name: string, fallback: number): number {
+  const value = Number(env[name]);
+  return Number.isFinite(value) && value > 0 ? Math.floor(value) : fallback;
+}
+
 function createRuntimeAbortContext(controlSignal: ControlSignal): RuntimeAbortContext {
   return {
     kind: runtimeAbortKindForControlSignal(controlSignal),
@@ -3866,6 +4718,7 @@ function normalizeTaskResult(result: Partial<TaskResult>, taskEnvelope: TaskEnve
       : "Executor returned a TaskResult without summary",
     evidenceRefs: Array.isArray(result.evidenceRefs) ? result.evidenceRefs.filter((ref): ref is string => typeof ref === "string") : [],
     artifactRefs: Array.isArray(result.artifactRefs) ? result.artifactRefs.filter((ref): ref is string => typeof ref === "string") : [],
+    capabilityRefs: Array.isArray(result.capabilityRefs) ? result.capabilityRefs.filter((ref): ref is string => typeof ref === "string") : [],
     blockerReason: typeof result.blockerReason === "string" ? result.blockerReason : undefined,
     suggestedNextGoal: typeof result.suggestedNextGoal === "string" ? result.suggestedNextGoal : undefined,
     checkpointReason: typeof result.checkpointReason === "string"
@@ -3877,6 +4730,64 @@ function normalizeTaskResult(result: Partial<TaskResult>, taskEnvelope: TaskEnve
     attempt: typeof result.attempt === "number" && Number.isFinite(result.attempt) ? Math.floor(result.attempt) : undefined,
     resumeCursor: typeof result.resumeCursor === "string" ? result.resumeCursor : undefined,
     lastEventId: typeof result.lastEventId === "string" ? result.lastEventId : undefined
+  };
+}
+
+function createTaskOutcome(input: {
+  taskResult: TaskResult;
+  epochRef: string;
+  terminalSeq: number;
+}): TaskOutcome {
+  return {
+    taskRef: input.taskResult.taskId,
+    epochRef: input.epochRef,
+    status: input.taskResult.status,
+    summary: input.taskResult.summary,
+    evidenceRefs: [...input.taskResult.evidenceRefs],
+    artifactRefs: [...input.taskResult.artifactRefs],
+    capabilityRefs: [...(input.taskResult.capabilityRefs ?? [])],
+    checkpoint: input.taskResult.checkpointReason || input.taskResult.retryable || input.taskResult.resumeCursor
+      ? {
+        reason: input.taskResult.checkpointReason,
+        retryable: input.taskResult.retryable,
+        resumeCursor: input.taskResult.resumeCursor
+      }
+      : undefined,
+    terminalSeq: input.terminalSeq,
+    createdAt: new Date().toISOString()
+  };
+}
+
+function taskResultFromOutcome(outcome: TaskOutcome | undefined): TaskResult | undefined {
+  if (!outcome) {
+    return undefined;
+  }
+  return {
+    taskId: outcome.taskRef,
+    status: outcome.status,
+    summary: outcome.summary,
+    evidenceRefs: [...outcome.evidenceRefs],
+    artifactRefs: [...outcome.artifactRefs],
+    capabilityRefs: [...outcome.capabilityRefs],
+    checkpointReason: outcome.checkpoint?.reason,
+    retryable: outcome.checkpoint?.retryable,
+    resumeCursor: outcome.checkpoint?.resumeCursor
+  };
+}
+
+function projectionPlaceholder(input: ObserverProjectionRequest, reason: string): ObserverProjection {
+  return {
+    graphDelta: {
+      sourceEventIds: input.sourceEventIds ?? [],
+      nodes: [],
+      edges: []
+    },
+    controlSignal: {
+      decision: "continue",
+      reason,
+      evidenceRefs: input.sourceEventIds ?? [],
+      confidence: "low"
+    }
   };
 }
 
@@ -4017,6 +4928,7 @@ function restoreTaskSupervisionState(
 function cloneTaskSupervisionState(state: TaskSupervisionState): TaskSupervisionState {
   return {
     ...state,
+    ...(state.lastVerdict ? { lastVerdict: { ...state.lastVerdict } } : {}),
     repeatedPatterns: [...state.repeatedPatterns],
     negativeFindings: [...state.negativeFindings],
     recentFingerprints: [...state.recentFingerprints],
@@ -4133,8 +5045,14 @@ function collectTextFragments(value: unknown, output: string[], limit: number): 
   }
 }
 
-function supervisionStateForPrompt(state: TaskSupervisionState): Omit<TaskSupervisionState, "recentFingerprints"> {
-  const { recentFingerprints: _recentFingerprints, ...promptState } = state;
+function supervisionStateForPrompt(
+  state: TaskSupervisionState
+): Omit<TaskSupervisionState, "recentFingerprints" | "lastVerdict"> {
+  const {
+    recentFingerprints: _recentFingerprints,
+    lastVerdict: _lastVerdict,
+    ...promptState
+  } = state;
   return promptState;
 }
 
@@ -4155,6 +5073,143 @@ function truncateText(value: string, limit: number): string {
     return normalized;
   }
   return `${normalized.slice(0, Math.max(0, limit - 24))}...[truncated:${normalized.length}]`;
+}
+
+function attachTaskResultProjectionReferences(
+  batch: ProjectionBatch,
+  taskResult: TaskResult | undefined
+): ProjectionBatch {
+  if (!taskResult || batch.observations.length === 0) {
+    return batch;
+  }
+  const taskOutcomeIndex = batch.observations.findLastIndex((observation) => observation.kind === "task_outcome");
+  const targetIndex = taskOutcomeIndex >= 0 ? taskOutcomeIndex : batch.observations.length - 1;
+  const observations = batch.observations.map((observation, index) => index === targetIndex ? {
+    ...observation,
+    artifactRefs: dedupeStrings([...observation.artifactRefs, ...taskResult.artifactRefs]),
+    capabilityRefs: dedupeStrings([
+      ...(observation.capabilityRefs ?? []),
+      ...(taskResult.capabilityRefs ?? [])
+    ]),
+    sourceEventIds: dedupeStrings([...observation.sourceEventIds, ...taskResult.evidenceRefs])
+  } : observation);
+  return {
+    ...batch,
+    observations,
+    sourceEventIds: dedupeStrings([...batch.sourceEventIds, ...taskResult.evidenceRefs])
+  };
+}
+
+function compactProjectorConnectivityContext(
+  routes: RouteProjectionContext[],
+  observations: ProjectionObservation[],
+  maxBytes: number
+): Record<string, unknown> {
+  const anchors = dedupeStrings(observations.flatMap((observation) => observation.anchors));
+  const ordered = routes
+    .map((route, index) => ({ route, index, relevant: routeMatchesProjectionAnchors(route, anchors) }))
+    .sort((left, right) => Number(right.relevant) - Number(left.relevant) || left.index - right.index);
+  const compactedRoutes: Array<Record<string, unknown>> = [];
+  const routeDigest = createHash("sha256").update(JSON.stringify(routes)).digest("hex");
+  for (const { route } of ordered) {
+    const targetCidrs = dedupeStrings(route.targetCidrs);
+    const compactedRoute = {
+      routeRef: compactUtf8HeadTail(route.routeRef, 240),
+      connector: route.connector,
+      pivotHostRef: compactUtf8HeadTail(route.pivotHostRef, 240),
+      dialAddress: route.dialAddress ? compactUtf8HeadTail(route.dialAddress, 240) : undefined,
+      targetCidrs: targetCidrs.slice(0, 12).map((cidr) => compactUtf8HeadTail(cidr, 160)),
+      targetCidrCount: targetCidrs.length,
+      targetCidrsSha256: createHash("sha256").update(targetCidrs.join("\u0000")).digest("hex"),
+      status: route.status,
+      lastHeartbeat: compactUtf8HeadTail(route.lastHeartbeat, 80),
+      connectionRef: route.connectionRef ? compactUtf8HeadTail(route.connectionRef, 240) : undefined
+    };
+    const candidate = {
+      source: "ConnectivityStore route definitions",
+      routeCount: routes.length,
+      routeSnapshotSha256: routeDigest,
+      routes: [...compactedRoutes, compactedRoute],
+      omittedRouteCount: Math.max(0, routes.length - compactedRoutes.length - 1)
+    };
+    if (Buffer.byteLength(JSON.stringify(candidate, null, 2), "utf8") > Math.max(512, maxBytes)) {
+      break;
+    }
+    compactedRoutes.push(compactedRoute);
+  }
+  return {
+    source: "ConnectivityStore route definitions",
+    routeCount: routes.length,
+    routeSnapshotSha256: routeDigest,
+    routes: compactedRoutes,
+    omittedRouteCount: Math.max(0, routes.length - compactedRoutes.length)
+  };
+}
+
+function routeMatchesProjectionAnchors(route: RouteProjectionContext, anchors: string[]): boolean {
+  const routeText = [
+    route.routeRef,
+    route.pivotHostRef,
+    route.dialAddress ?? "",
+    route.connectionRef ?? "",
+    ...route.targetCidrs
+  ].join(" ").toLowerCase();
+  for (const anchor of anchors) {
+    const normalized = anchor.toLowerCase();
+    if (normalized && (routeText.includes(normalized) || normalized.includes(route.routeRef.toLowerCase()))) {
+      return true;
+    }
+    const addresses = anchor.match(/\b(?:\d{1,3}\.){3}\d{1,3}\b/g) ?? [];
+    if (addresses.some((address) => route.targetCidrs.some((cidr) => ipv4AddressInCidr(address, cidr)))) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function ipv4AddressInCidr(address: string, cidr: string): boolean {
+  const [network, prefixText] = cidr.split("/", 2);
+  const prefix = Number(prefixText);
+  const addressValue = ipv4AddressValue(address);
+  const networkValue = ipv4AddressValue(network ?? "");
+  if (addressValue === undefined || networkValue === undefined || !Number.isInteger(prefix) || prefix < 0 || prefix > 32) {
+    return false;
+  }
+  const mask = prefix === 0 ? 0 : (0xffffffff << (32 - prefix)) >>> 0;
+  return (addressValue & mask) === (networkValue & mask);
+}
+
+function ipv4AddressValue(value: string): number | undefined {
+  const octets = value.split(".").map(Number);
+  if (octets.length !== 4 || octets.some((octet) => !Number.isInteger(octet) || octet < 0 || octet > 255)) {
+    return undefined;
+  }
+  return octets.reduce((result, octet) => ((result << 8) | octet) >>> 0, 0);
+}
+
+function renderProjectorTaskResult(taskResult: TaskResult): string {
+  return `taskOutcome=${JSON.stringify({
+    taskRef: compactUtf8HeadTail(taskResult.taskId, 240),
+    status: taskResult.status,
+    summary: compactUtf8HeadTail(taskResult.summary, 1_200),
+    refManifest: {
+      transport: "exact refs are carried by projection observation aliases",
+      evidenceRefCount: taskResult.evidenceRefs.length,
+      artifactRefCount: taskResult.artifactRefs.length,
+      capabilityRefCount: taskResult.capabilityRefs?.length ?? 0
+    },
+    checkpoint: taskResult.checkpointReason || taskResult.retryable || taskResult.resumeCursor
+      ? {
+        reason: taskResult.checkpointReason
+          ? compactUtf8HeadTail(taskResult.checkpointReason, 480)
+          : undefined,
+        retryable: taskResult.retryable,
+        resumeCursor: taskResult.resumeCursor
+          ? compactUtf8HeadTail(taskResult.resumeCursor, 480)
+          : undefined
+      }
+      : undefined
+  })}`;
 }
 
 function truncateOneLine(value: string, limit: number): string {
@@ -4181,7 +5236,7 @@ function stringProperty(value: unknown): string | undefined {
 }
 
 function isControlSignalDecision(value: string): value is ControlSignal["decision"] {
-  return ["continue", "checkpoint", "stop_executor", "need_planner"].includes(value);
+  return ["continue", "redirect", "checkpoint", "stop_executor", "need_planner"].includes(value);
 }
 
 function isTaskResultStatus(value: unknown): value is TaskResultStatus {
@@ -4335,8 +5390,6 @@ function budgetStatusSnapshot(taskEnvelope: TaskEnvelope, state?: ActiveTaskStat
     nearTurnLimit: remaining <= BUDGET_PRESSURE_TURNS,
     stopRequested: state?.executorStopRequested ?? false,
     abortReason: state?.abortContext?.reason,
-    budgetExtensionCount: state?.budgetExtensionCount ?? 0,
-    maxBudgetExtensions: MAX_BUDGET_EXTENSIONS,
     globalRemainingMs: state?.runDeadlineAt === undefined
       ? undefined
       : Math.max(0, state.runDeadlineAt - Date.now()),
@@ -4364,7 +5417,7 @@ function budgetStatusSteerKey(
   const remaining = typeof status.remainingTurns === "number" ? status.remainingTurns : undefined;
   if (input.force) {
     const budget = status.budget as { maxTurns?: number } | undefined;
-    return `force:${input.reason}:maxTurns=${budget?.maxTurns ?? "unknown"}:extensions=${status.budgetExtensionCount ?? 0}`;
+    return `force:${input.reason}:maxTurns=${budget?.maxTurns ?? "unknown"}`;
   }
   if (remaining !== undefined && remaining > 0 && remaining <= BUDGET_PRESSURE_TURNS) {
     return `remainingTurns:${remaining}`;
@@ -4396,7 +5449,6 @@ function formatExecutorBudgetStatus(
     `globalRemainingMs: ${status.globalRemainingMs ?? "unbounded"}`,
     `epochRemainingMs: ${status.epochRemainingMs ?? "unbounded"}; epochTimeLimitMs: ${status.epochTimeLimitMs ?? "unbounded"}`,
     `nearTurnLimit: ${yesNo(status.nearTurnLimit)}`,
-    `extensions: ${status.budgetExtensionCount}/${status.maxBudgetExtensions}`,
     `stopRequested: ${yesNo(status.stopRequested)}${status.abortReason ? `; abortReason: ${status.abortReason}` : ""}`,
     "Rule: if stopRequested=yes, remaining<=0, or epochRemainingMs is near zero, immediately return a phase TaskResult; otherwise continue within scope."
   ].join("\n");

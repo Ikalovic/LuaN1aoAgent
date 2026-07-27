@@ -17,17 +17,21 @@ export type ManagedHttpTrafficScope = {
 };
 export const RAW_TRAFFIC_ATTRIBUTION_NOTICE = "Only HTTP operations executed inside a managed scope carry routeRef/sessionRef; raw or unmanaged traffic is not automatically attributed.";
 export type TrafficHistoryFilter = Partial<Pick<TrafficProxyContext, "runtime_ref" | "task_ref" | "run_ref" | "route_ref" | "session_ref">> & {
+  epoch_ref?: string;
+  replay_of?: string;
   started_after?: string;
   started_before?: string;
   mode?: string;
   method?: string;
   host?: string;
   connect_ref?: string;
+  connection_ref?: string;
   error?: string;
   status?: number;
 };
 export type TrafficHeaderEntry = { name: string; value: string; ordinal: number };
 export type TrafficReplayBody = { encoding: "base64"; data: string };
+export type TrafficFlowRef = string;
 export type TrafficReplayInput = {
   exchange_id: number;
   method?: string;
@@ -38,14 +42,15 @@ export type TrafficReplayInput = {
   session_ref?: string;
   context: TrafficProxyContext;
 };
-export type TrafficReplayResult = {
-  exchange_id: number;
-  replay_of: number;
+export type TrafficReplayResult<FlowRef extends string | number = TrafficFlowRef> = {
+  exchange_id: FlowRef;
+  replay_of: FlowRef;
   status: number;
   error_code?: string;
 };
-export type TrafficExchange = {
-  id: number;
+export type TrafficExchange<FlowRef extends string | number = TrafficFlowRef> = {
+  id: FlowRef;
+  kind?: "http" | "tcp";
   started_at: string;
   completed_at: string;
   duration_ms: number;
@@ -78,18 +83,20 @@ export type TrafficExchange = {
   attribution?: string;
   route_ref?: string;
   session_ref?: string;
+  connection_ref?: string;
+  epoch_ref?: string;
   connect_ref?: string;
   connect_authority?: string;
   connect_host?: string;
   connect_port?: string;
-  replay_of?: number;
+  replay_of?: FlowRef;
   error_code?: string;
   evicted_exchanges: number;
   request_headers?: TrafficHeaderEntry[];
   response_headers?: TrafficHeaderEntry[];
 };
-export type TrafficHistoryPage = { items: TrafficExchange[]; has_more: boolean; next_cursor?: string };
-export type TrafficHistoryBody = { exchange_id: number; side: "request" | "response"; body_ref: string; encoding: "base64"; data: string; bytes: number; truncated: boolean };
+export type TrafficHistoryPage<FlowRef extends string | number = TrafficFlowRef> = { items: TrafficExchange<FlowRef>[]; has_more: boolean; next_cursor?: string };
+export type TrafficHistoryBody<FlowRef extends string | number = TrafficFlowRef> = { exchange_id: FlowRef; side: "request" | "response"; body_ref: string; encoding: "base64"; data: string; bytes: number; truncated: boolean };
 type ControlResponse<T> = { version: number; id?: string; ok: boolean; result?: T; error?: string; error_code?: string };
 type ControlPayload = Record<string, unknown>;
 
@@ -121,16 +128,16 @@ export class TrafficProxyClient {
   async set(field: TrafficProxyField, value: string): Promise<void> { await this.request("set", { field, value }); }
   async clear(field: TrafficProxyField): Promise<void> { await this.request("clear", { field }); }
   async shutdown(): Promise<void> { await this.request("shutdown"); }
-  historyList(options: { cursor?: string; limit?: number; filter?: TrafficHistoryFilter } = {}): Promise<TrafficHistoryPage> {
+  historyList(options: { cursor?: string; limit?: number; filter?: TrafficHistoryFilter } = {}): Promise<TrafficHistoryPage<number>> {
     return this.request("history_list", options);
   }
-  historyGet(exchangeId: number): Promise<TrafficExchange> {
+  historyGet(exchangeId: number): Promise<TrafficExchange<number>> {
     return this.request("history_get", { exchange_id: exchangeId });
   }
-  historyBody(exchangeId: number, side: "request" | "response", byteLimit?: number): Promise<TrafficHistoryBody> {
+  historyBody(exchangeId: number, side: "request" | "response", byteLimit?: number): Promise<TrafficHistoryBody<number>> {
     return this.request("history_body", { exchange_id: exchangeId, side, ...(byteLimit === undefined ? {} : { byte_limit: byteLimit }) });
   }
-  replay(input: TrafficReplayInput): Promise<TrafficReplayResult> {
+  replay(input: TrafficReplayInput): Promise<TrafficReplayResult<number>> {
     return this.request("replay", input, this.replayTimeoutMs);
   }
 

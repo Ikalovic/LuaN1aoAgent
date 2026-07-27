@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
-import { Alert, Badge, Button, Card, Empty, Space, Tag, Tooltip, Typography } from "antd";
-import { ExternalLink, Pause, Play, RefreshCw, XCircle } from "lucide-react";
-import { fetchConnections, mutateConnection } from "../api";
+import { Alert, Badge, Button, Card, Empty, Popconfirm, Space, Tag, Tooltip, Typography } from "antd";
+import { ExternalLink, Pause, RefreshCw, Trash2 } from "lucide-react";
+import { fetchConnections, mutateRoute } from "../api";
 import { useLanguage } from "../language";
 import type { AuthUser, ConnectionItem } from "../types";
 import { statusLabel } from "../utils";
@@ -36,11 +36,11 @@ export function ConnectionsView({ runtimeDir, user }: { runtimeDir: string; user
     return () => controller.abort();
   }, [load]);
 
-  const changeState = async (item: ConnectionItem, action: "start" | "stop" | "close") => {
+  const changeState = async (item: ConnectionItem, action: "stop" | "reconnect" | "forget") => {
     setMutating(`${item.id}:${action}`);
     setError(undefined);
     try {
-      const updated = await mutateConnection(runtimeDir, item.id, action);
+      const updated = await mutateRoute(runtimeDir, item.id, action);
       setItems((current) => current.map((candidate) => candidate.id === updated.id ? updated : candidate));
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : String(cause));
@@ -70,19 +70,26 @@ export function ConnectionsView({ runtimeDir, user }: { runtimeDir: string; user
             <div className="connection-tags">
               <Tag>{item.direction}</Tag><Tag>{item.transport}</Tag>
               <Tag color={item.managed ? "blue" : "default"}>{t(item.managed ? "connections.managed" : "connections.unmanaged")}</Tag>
-              <Tag>{t("connections.desired")}: {statusLabel(item.desiredState, locale)}</Tag>
+              {item.desiredState ? <Tag>{t("connections.desired")}: {statusLabel(item.desiredState, locale)}</Tag> : null}
               <Tag color={item.available ? "green" : "default"}>{t(item.available ? "connections.available" : "connections.unavailable")}</Tag>
             </div>
             <dl className="connection-facts">
               <div><dt>{t("connections.heartbeat")}</dt><dd>{formatRelative(item.lastHeartbeat)}</dd></div>
               <div><dt>{t("connections.error")}</dt><dd>{item.error || "—"}</dd></div>
+              {item.routeRef ? <div><dt>Route</dt><dd><code>{item.routeRef}</code></dd></div> : null}
+              {item.connectionRef ? <div><dt>Connection</dt><dd><code>{item.connectionRef}</code></dd></div> : null}
+              {item.sessionRef && item.sessionRef !== item.connectionRef ? <div><dt>Session</dt><dd><code>{item.sessionRef}</code></dd></div> : null}
             </dl>
             <Space wrap>
-              {user.role === "admin" && item.managed && item.desiredState !== "closed" ? (
+              {user.role === "admin" && item.managed ? (
                 <>
-                  <Button size="small" icon={<Play size={14} />} loading={mutating === `${item.id}:start`} disabled={item.desiredState === "running" && item.observedState === "live"} onClick={() => void changeState(item, "start")}>{t("common.start")}</Button>
-                  <Button size="small" icon={<Pause size={14} />} loading={mutating === `${item.id}:stop`} disabled={item.desiredState === "stopped"} onClick={() => void changeState(item, "stop")}>{t("common.stop")}</Button>
-                  <Button size="small" danger icon={<XCircle size={14} />} loading={mutating === `${item.id}:close`} onClick={() => void changeState(item, "close")}>{t("common.close")}</Button>
+                  {item.actions?.includes("reconnect") ? <Button size="small" icon={<RefreshCw size={14} />} loading={mutating === `${item.id}:reconnect`} onClick={() => void changeState(item, "reconnect")}>{t("connections.reconnect")}</Button> : null}
+                  {item.actions?.includes("stop") ? <Button size="small" icon={<Pause size={14} />} loading={mutating === `${item.id}:stop`} disabled={item.desiredState === "stopped"} onClick={() => void changeState(item, "stop")}>{t("common.stop")}</Button> : null}
+                  {item.actions?.includes("forget") ? (
+                    <Popconfirm title={t("connections.forgetConfirm")} onConfirm={() => void changeState(item, "forget")}>
+                      <Button size="small" danger icon={<Trash2 size={14} />} loading={mutating === `${item.id}:forget`}>{t("connections.forget")}</Button>
+                    </Popconfirm>
+                  ) : null}
                 </>
               ) : null}
               {item.graphUrl ? <Tooltip title={t("connections.viewGraph")}><Button size="small" href={item.graphUrl} icon={<ExternalLink size={14} />}>{t("connections.graph")}</Button></Tooltip> : null}

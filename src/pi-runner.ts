@@ -2,6 +2,7 @@ import type { ExecutionLog } from "./stores/execution-log.js";
 import type { ArtifactStore } from "./stores/artifact-store.js";
 import type { AgentRole, ArtifactRecord, ExecutionEvent, JsonObject, RuntimeAbortContext } from "./types.js";
 import { RUNTIME_CONTROL_TOOL_NAMES } from "./runtime-control-tools.js";
+import type { ExtensionFactory } from "@earendil-works/pi-coding-agent";
 
 type SubscribableSession = {
   prompt(text: string, options?: unknown): Promise<void>;
@@ -9,6 +10,254 @@ type SubscribableSession = {
   abort?: () => Promise<void>;
   clearQueue?: () => unknown;
 };
+
+export type ProviderAdmissionOptions = {
+  key: string;
+  maxConcurrent?: number;
+  signal?: AbortSignal;
+  gate?: ProviderAdmissionGate;
+};
+
+type ProviderAdmissionLease = {
+  release(): void;
+};
+
+type ProviderAdmissionWaiter = {
+  resolve: (lease: ProviderAdmissionLease) => void;
+  reject: (error: unknown) => void;
+  signal?: AbortSignal;
+  abortListener?: () => void;
+};
+
+type ProviderAdmissionState = {
+  active: number;
+  cooldownUntil: number;
+  maxConcurrent: number;
+  queue: ProviderAdmissionWaiter[];
+  wakeGeneration: number;
+  wakeScheduled: boolean;
+};
+
+export class ProviderAdmissionCancelledError extends Error {
+  constructor(providerKey: string) {
+    super(`Provider admission cancelled while queued: ${providerKey}`);
+    this.name = "ProviderAdmissionCancelledError";
+  }
+}
+
+export class ProviderAdmissionGate {
+  private readonly states = new Map<string, ProviderAdmissionState>();
+  private readonly defaultMaxConcurrent: number;
+  private readonly now: () => number;
+  private readonly sleep: (delayMs: number) => Promise<void>;
+
+  constructor(input: {
+    defaultMaxConcurrent?: number;
+    now?: () => number;
+    sleep?: (delayMs: number) => Promise<void>;
+  } = {}) {
+    this.defaultMaxConcurrent = positiveInteger(input.defaultMaxConcurrent) ?? 2;
+    this.now = input.now ?? Date.now;
+    this.sleep = input.sleep ?? ((delayMs) => new Promise((resolve) => setTimeout(resolve, delayMs)));
+  }
+
+  acquire(input: {
+    key: string;
+    maxConcurrent?: number;
+    signal?: AbortSignal;
+  }): Promise<ProviderAdmissionLease> {
+    const key = input.key.trim();
+    if (!key) {
+      return Promise.reject(new Error("Provider admission key must not be empty"));
+    }
+    if (input.signal?.aborted) {
+      return Promise.reject(new ProviderAdmissionCancelledError(key));
+    }
+    const state = this.getOrCreateState(key);
+    const requestedLimit = positiveInteger(input.maxConcurrent);
+    if (requestedLimit) {
+      state.maxConcurrent = requestedLimit;
+    }
+    return new Promise<ProviderAdmissionLease>((resolve, reject) => {
+      const waiter: ProviderAdmissionWaiter = {
+        resolve,
+        reject,
+        signal: input.signal
+      };
+      if (input.signal) {
+        waiter.abortListener = () => {
+          const index = state.queue.indexOf(waiter);
+          if (index < 0) {
+            return;
+          }
+          state.queue.splice(index, 1);
+          reject(new ProviderAdmissionCancelledError(key));
+          this.pump(key, state);
+        };
+        input.signal.addEventListener("abort", waiter.abortListener, { once: true });
+      }
+      state.queue.push(waiter);
+      this.pump(key, state);
+    });
+  }
+
+  cooldown(key: string, delayMs: number): void {
+    const normalizedKey = key.trim();
+    const normalizedDelayMs = positiveTimeout(delayMs);
+    if (!normalizedKey || !normalizedDelayMs) {
+      return;
+    }
+    const state = this.getOrCreateState(normalizedKey);
+    state.cooldownUntil = Math.max(state.cooldownUntil, this.now() + normalizedDelayMs);
+    this.pump(normalizedKey, state);
+  }
+
+  observe(key: string, event: unknown): void {
+    const delayMs = providerCooldownMsFromEvent(event, this.now());
+    if (delayMs) {
+      this.cooldown(key, delayMs);
+    }
+  }
+
+  private getOrCreateState(key: string): ProviderAdmissionState {
+    const existing = this.states.get(key);
+    if (existing) {
+      return existing;
+    }
+    const state: ProviderAdmissionState = {
+      active: 0,
+      cooldownUntil: 0,
+      maxConcurrent: this.defaultMaxConcurrent,
+      queue: [],
+      wakeGeneration: 0,
+      wakeScheduled: false
+    };
+    this.states.set(key, state);
+    return state;
+  }
+
+  private pump(key: string, state: ProviderAdmissionState): void {
+    if (this.states.get(key) !== state) {
+      return;
+    }
+    const cooldownRemainingMs = state.cooldownUntil - this.now();
+    if (cooldownRemainingMs > 0) {
+      this.scheduleWake(key, state, cooldownRemainingMs);
+      return;
+    }
+    state.cooldownUntil = 0;
+    while (state.active < state.maxConcurrent && state.queue.length > 0) {
+      const waiter = state.queue.shift();
+      if (!waiter) {
+        break;
+      }
+      if (waiter.abortListener) {
+        waiter.signal?.removeEventListener("abort", waiter.abortListener);
+      }
+      if (waiter.signal?.aborted) {
+        waiter.reject(new ProviderAdmissionCancelledError(key));
+        continue;
+      }
+      state.active += 1;
+      let released = false;
+      waiter.resolve({
+        release: () => {
+          if (released) {
+            return;
+          }
+          released = true;
+          state.active = Math.max(0, state.active - 1);
+          this.pump(key, state);
+        }
+      });
+    }
+    if (state.active === 0 && state.queue.length === 0 && state.cooldownUntil === 0) {
+      this.states.delete(key);
+    }
+  }
+
+  private scheduleWake(key: string, state: ProviderAdmissionState, delayMs: number): void {
+    if (state.wakeScheduled) {
+      return;
+    }
+    state.wakeScheduled = true;
+    const generation = ++state.wakeGeneration;
+    void this.sleep(delayMs).then(() => {
+      if (this.states.get(key) !== state || state.wakeGeneration !== generation) {
+        return;
+      }
+      state.wakeScheduled = false;
+      this.pump(key, state);
+    });
+  }
+}
+
+export const providerAdmissionGate = new ProviderAdmissionGate();
+
+export function createProviderAdmissionExtension(input: ProviderAdmissionOptions): ExtensionFactory {
+  const key = input.key.trim();
+  if (!key) {
+    throw new Error("Provider admission key must not be empty");
+  }
+  const gate = input.gate ?? providerAdmissionGate;
+  return (pi) => {
+    const lifecycleAbortController = new AbortController();
+    let activeLease: ProviderAdmissionLease | undefined;
+    let activeSignalCleanup: (() => void) | undefined;
+
+    const releaseActiveLease = (): void => {
+      activeSignalCleanup?.();
+      activeSignalCleanup = undefined;
+      activeLease?.release();
+      activeLease = undefined;
+    };
+
+    pi.on("before_provider_request", async (_event, context) => {
+      releaseActiveLease();
+      const linkedSignal = linkAbortSignals([
+        input.signal,
+        context.signal,
+        lifecycleAbortController.signal
+      ]);
+      try {
+        const lease = await gate.acquire({
+          key,
+          maxConcurrent: input.maxConcurrent,
+          signal: linkedSignal.signal
+        });
+        if (linkedSignal.signal?.aborted) {
+          lease.release();
+          context.abort();
+          throw new ProviderAdmissionCancelledError(key);
+        }
+        activeLease = lease;
+        activeSignalCleanup = linkedSignal.dispose;
+        linkedSignal.signal?.addEventListener("abort", () => {
+          releaseActiveLease();
+          context.abort();
+        }, { once: true });
+      } catch (error) {
+        linkedSignal.dispose();
+        context.abort();
+        throw error;
+      }
+    });
+
+    pi.on("after_provider_response", (event) => {
+      gate.observe(key, event);
+    });
+    pi.on("message_end", () => {
+      releaseActiveLease();
+    });
+    pi.on("agent_end", () => {
+      releaseActiveLease();
+    });
+    pi.on("session_shutdown", () => {
+      lifecycleAbortController.abort();
+      releaseActiveLease();
+    });
+  };
+}
 
 export class StructuredInvocationError extends Error {
   readonly code: "timeout" | "missing_submit" | "tool_error" | "provider_error" | "invalid_submit";
@@ -33,7 +282,29 @@ export async function invokeStructured<T>(
     hardTimeoutMs?: number;
     maxTruncationSteers?: number;
     validate?: (value: unknown) => T;
+    admission?: ProviderAdmissionOptions;
   }
+): Promise<T> {
+  return withProviderAdmissionObservation(input.admission, (observeAdmissionEvent) => invokeStructuredAdmitted(
+    session,
+    prompt,
+    input,
+    observeAdmissionEvent
+  ));
+}
+
+async function invokeStructuredAdmitted<T>(
+  session: SubscribableSession,
+  prompt: string,
+  input: {
+    toolName: string;
+    timeoutMs?: number;
+    idleTimeoutMs?: number;
+    hardTimeoutMs?: number;
+    maxTruncationSteers?: number;
+    validate?: (value: unknown) => T;
+  },
+  observeAdmissionEvent: (event: unknown) => void
 ): Promise<T> {
   let settled = false;
   let providerError = "";
@@ -74,6 +345,7 @@ export async function invokeStructured<T>(
     ), true), idleTimeoutMs);
   };
   const unsubscribe = session.subscribe((event) => {
+    observeAdmissionEvent(event);
     if (settled || !isRecord(event)) {
       return;
     }
@@ -262,11 +534,28 @@ export type LlmErrorKind =
   | "missing_submit"
   | "llm_error";
 
-export async function promptAndCollect(session: SubscribableSession, prompt: string): Promise<string> {
+export async function promptAndCollect(
+  session: SubscribableSession,
+  prompt: string,
+  input: { admission?: ProviderAdmissionOptions } = {}
+): Promise<string> {
+  return withProviderAdmissionObservation(input.admission, (observeAdmissionEvent) => promptAndCollectAdmitted(
+    session,
+    prompt,
+    observeAdmissionEvent
+  ));
+}
+
+async function promptAndCollectAdmitted(
+  session: SubscribableSession,
+  prompt: string,
+  observeAdmissionEvent: (event: unknown) => void
+): Promise<string> {
   let collectedText = "";
   let finalMessageText = "";
   let finalErrorMessage = "";
   const unsubscribe = session.subscribe((event) => {
+    observeAdmissionEvent(event);
     const typedEvent = event as {
       type?: string;
       errorMessage?: string;
@@ -298,6 +587,136 @@ export async function promptAndCollect(session: SubscribableSession, prompt: str
   } finally {
     unsubscribe();
   }
+}
+
+async function withProviderAdmissionObservation<T>(
+  input: ProviderAdmissionOptions | undefined,
+  run: (observeAdmissionEvent: (event: unknown) => void) => Promise<T>
+): Promise<T> {
+  if (!input) {
+    return run(() => undefined);
+  }
+  const key = input.key.trim();
+  if (!key) {
+    return run(() => undefined);
+  }
+  const gate = input.gate ?? providerAdmissionGate;
+  try {
+    return await run((event) => gate.observe(key, event));
+  } catch (error) {
+    gate.observe(key, error);
+    throw error;
+  }
+}
+
+function linkAbortSignals(signals: Array<AbortSignal | undefined>): {
+  signal?: AbortSignal;
+  dispose(): void;
+} {
+  const activeSignals = signals.filter((signal): signal is AbortSignal => signal !== undefined);
+  if (activeSignals.length === 0) {
+    return { signal: undefined, dispose: () => undefined };
+  }
+  const controller = new AbortController();
+  const listeners: Array<{ signal: AbortSignal; listener: () => void }> = [];
+  for (const signal of activeSignals) {
+    const listener = (): void => controller.abort(signal.reason);
+    if (signal.aborted) {
+      listener();
+      break;
+    }
+    signal.addEventListener("abort", listener, { once: true });
+    listeners.push({ signal, listener });
+  }
+  return {
+    signal: controller.signal,
+    dispose: () => {
+      for (const entry of listeners) {
+        entry.signal.removeEventListener("abort", entry.listener);
+      }
+    }
+  };
+}
+
+function providerCooldownMsFromEvent(event: unknown, now: number): number | undefined {
+  if (event instanceof Error) {
+    return retryAfterMsFromText(event.message);
+  }
+  if (!isRecord(event)) {
+    return undefined;
+  }
+  if (event.type === "auto_retry_start") {
+    const retryDelayMs = positiveTimeout(numberValue(event.delayMs));
+    if (retryDelayMs) {
+      return retryDelayMs;
+    }
+  }
+  const retryAfterMs = positiveTimeout(numberValue(event.retryAfterMs));
+  if (retryAfterMs) {
+    return retryAfterMs;
+  }
+  const retryAfter = firstDefined(
+    event.retryAfter,
+    retryAfterHeader(event.headers),
+    isRecord(event.response) ? retryAfterHeader(event.response.headers) : undefined,
+    isRecord(event.message) ? event.message.retryAfter : undefined,
+    isRecord(event.message) ? retryAfterHeader(event.message.headers) : undefined
+  );
+  const headerDelayMs = retryAfterHeaderMs(retryAfter, now);
+  if (headerDelayMs) {
+    return headerDelayMs;
+  }
+  const errorMessage = extractPiErrorMessage(event);
+  return errorMessage ? retryAfterMsFromText(errorMessage) : undefined;
+}
+
+function retryAfterHeader(headers: unknown): unknown {
+  if (!isRecord(headers)) {
+    return undefined;
+  }
+  return headers["retry-after"] ?? headers["Retry-After"];
+}
+
+function retryAfterHeaderMs(value: unknown, now: number): number | undefined {
+  if (typeof value === "number" && Number.isFinite(value) && value > 0) {
+    return Math.ceil(value * 1000);
+  }
+  if (typeof value !== "string" || value.trim().length === 0) {
+    return undefined;
+  }
+  const trimmed = value.trim();
+  const seconds = Number(trimmed);
+  if (Number.isFinite(seconds) && seconds > 0) {
+    return Math.ceil(seconds * 1000);
+  }
+  const date = Date.parse(trimmed);
+  return Number.isFinite(date) && date > now ? Math.ceil(date - now) : undefined;
+}
+
+function retryAfterMsFromText(value: string): number | undefined {
+  const match = value.match(/retry[\s_-]*after(?:\s*[:=]|\s+)(\d+(?:\.\d+)?)\s*(ms|milliseconds?|s|seconds?)?/i);
+  if (!match) {
+    return undefined;
+  }
+  const amount = Number(match[1]);
+  if (!Number.isFinite(amount) || amount <= 0) {
+    return undefined;
+  }
+  return /^m/i.test(match[2] ?? "") ? Math.ceil(amount) : Math.ceil(amount * 1000);
+}
+
+function firstDefined(...values: unknown[]): unknown {
+  return values.find((value) => value !== undefined && value !== null);
+}
+
+function numberValue(value: unknown): number | undefined {
+  return typeof value === "number" ? value : undefined;
+}
+
+function positiveInteger(value: number | undefined): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) && value > 0
+    ? Math.floor(value)
+    : undefined;
 }
 
 export function classifyLlmErrorKind(message: string): LlmErrorKind {

@@ -6,7 +6,10 @@ import test from "node:test";
 import {
   attachExecutionLogging,
   classifyLlmErrorKind,
+  createProviderAdmissionExtension,
   invokeStructured,
+  ProviderAdmissionCancelledError,
+  ProviderAdmissionGate,
   promptAndCollect,
   PromptRuntimeError,
   StructuredInvocationError
@@ -349,8 +352,11 @@ test("lets Pi finish its native provider retry lifecycle before rejecting", asyn
 
 test("accepts a terminal submit after Pi recovers through native provider retry", async () => {
   const listeners: Array<(event: unknown) => void> = [];
+  const gate = new ProviderAdmissionGate({ defaultMaxConcurrent: 1 });
+  let promptCount = 0;
   const session = {
     async prompt(): Promise<void> {
+      promptCount += 1;
       emitToListeners(listeners, {
         type: "message_end",
         message: { role: "assistant", stopReason: "error", errorMessage: "HTTP 503 service unavailable", content: [] }
@@ -389,8 +395,278 @@ test("accepts a terminal submit after Pi recovers through native provider retry"
   assert.deepEqual(await invokeStructured(session, "test", {
     toolName: "planner_submit",
     idleTimeoutMs: 1_000,
-    hardTimeoutMs: 2_000
+    hardTimeoutMs: 2_000,
+    admission: { key: "provider:test", gate }
   }), { decision: "apply_commands", reason: "recovered" });
+  assert.equal(promptCount, 1);
+});
+
+test("admits provider requests in FIFO order at the configured concurrency limit", async () => {
+  const gate = new ProviderAdmissionGate({ defaultMaxConcurrent: 1 });
+  const first = await gate.acquire({ key: "provider:a" });
+  const admitted: string[] = [];
+  const secondPromise = gate.acquire({ key: "provider:a" }).then((lease) => {
+    admitted.push("second");
+    return lease;
+  });
+  const thirdPromise = gate.acquire({ key: "provider:a" }).then((lease) => {
+    admitted.push("third");
+    return lease;
+  });
+
+  await flushMicrotasks();
+  assert.deepEqual(admitted, []);
+  first.release();
+  const second = await secondPromise;
+  assert.deepEqual(admitted, ["second"]);
+  second.release();
+  const third = await thirdPromise;
+  assert.deepEqual(admitted, ["second", "third"]);
+  third.release();
+});
+
+test("isolates admission limits by provider key", async () => {
+  const gate = new ProviderAdmissionGate({ defaultMaxConcurrent: 1 });
+  const firstProviderLease = await gate.acquire({ key: "provider:a" });
+  let secondProviderAAdmitted = false;
+  const secondProviderAPromise = gate.acquire({ key: "provider:a" }).then((lease) => {
+    secondProviderAAdmitted = true;
+    return lease;
+  });
+
+  const providerBLease = await gate.acquire({ key: "provider:b" });
+  assert.equal(secondProviderAAdmitted, false);
+  providerBLease.release();
+  firstProviderLease.release();
+  const secondProviderALease = await secondProviderAPromise;
+  secondProviderALease.release();
+});
+
+test("releases provider admission before tool execution begins", async () => {
+  const gate = new ProviderAdmissionGate({ defaultMaxConcurrent: 1 });
+  const extension = await createProviderAdmissionHarness({ key: "provider:a", gate });
+  await extension.emit("before_provider_request");
+  let competingRequestAdmitted = false;
+  const competingRequest = gate.acquire({ key: "provider:a" }).then((lease) => {
+    competingRequestAdmitted = true;
+    return lease;
+  });
+
+  await flushMicrotasks();
+  assert.equal(competingRequestAdmitted, false);
+  await extension.emit("message_end", {
+    message: { role: "assistant", content: [] }
+  });
+  await extension.emit("tool_execution_start", { toolName: "bash" });
+  await flushMicrotasks();
+  assert.equal(competingRequestAdmitted, true);
+  const competingLease = await competingRequest;
+  competingLease.release();
+});
+
+test("cancels a queued request-level admission without disturbing the active request", async () => {
+  const gate = new ProviderAdmissionGate({ defaultMaxConcurrent: 1 });
+  const activeExtension = await createProviderAdmissionHarness({ key: "provider:a", gate });
+  await activeExtension.emit("before_provider_request");
+  const abortController = new AbortController();
+  const queuedExtension = await createProviderAdmissionHarness({ key: "provider:a", gate });
+  const queued = queuedExtension.emit("before_provider_request", {}, abortController.signal);
+
+  abortController.abort();
+  await assert.rejects(
+    queued,
+    (error) => error instanceof ProviderAdmissionCancelledError
+  );
+  assert.equal(queuedExtension.abortCount(), 1);
+  await activeExtension.emit("message_end", {
+    message: { role: "assistant", content: [] }
+  });
+  const nextLease = await gate.acquire({ key: "provider:a" });
+  nextLease.release();
+});
+
+test("admits request extensions in FIFO order", async () => {
+  const gate = new ProviderAdmissionGate({ defaultMaxConcurrent: 1 });
+  const firstExtension = await createProviderAdmissionHarness({ key: "provider:a", gate });
+  const secondExtension = await createProviderAdmissionHarness({ key: "provider:a", gate });
+  const thirdExtension = await createProviderAdmissionHarness({ key: "provider:a", gate });
+  const admitted: string[] = [];
+
+  await firstExtension.emit("before_provider_request");
+  const secondRequest = secondExtension.emit("before_provider_request").then(() => admitted.push("second"));
+  const thirdRequest = thirdExtension.emit("before_provider_request").then(() => admitted.push("third"));
+  await flushMicrotasks();
+  assert.deepEqual(admitted, []);
+
+  await firstExtension.emit("message_end", { message: { role: "assistant", content: [] } });
+  await secondRequest;
+  assert.deepEqual(admitted, ["second"]);
+  await secondExtension.emit("agent_end");
+  await thirdRequest;
+  assert.deepEqual(admitted, ["second", "third"]);
+  await thirdExtension.emit("session_shutdown");
+});
+
+test("does not infer admission for an unkeyed session", async () => {
+  const gate = new ProviderAdmissionGate({ defaultMaxConcurrent: 1 });
+  const activeLease = await gate.acquire({ key: "provider:a" });
+  const listeners: Array<(event: unknown) => void> = [];
+  const session = {
+    model: { provider: "provider:a" },
+    async prompt(): Promise<void> {
+      emitToListeners(listeners, {
+        type: "message_end",
+        message: { role: "assistant", content: [{ type: "text", text: "ungated" }] }
+      });
+    },
+    subscribe(listener: (event: unknown) => void): () => void {
+      listeners.push(listener);
+      return () => undefined;
+    }
+  };
+
+  assert.equal(await promptAndCollect(session, "unkeyed"), "ungated");
+  activeLease.release();
+});
+
+test("prompt-level admission observes cooldown without acquiring a provider lease", async () => {
+  const gate = new ProviderAdmissionGate({ defaultMaxConcurrent: 1 });
+  const activeLease = await gate.acquire({ key: "provider:a" });
+  const listeners: Array<(event: unknown) => void> = [];
+  let promptCount = 0;
+  const session = {
+    async prompt(): Promise<void> {
+      promptCount += 1;
+      emitToListeners(listeners, {
+        type: "message_end",
+        message: { role: "assistant", content: [{ type: "text", text: "observed" }] }
+      });
+    },
+    subscribe(listener: (event: unknown) => void): () => void {
+      listeners.push(listener);
+      return () => undefined;
+    }
+  };
+
+  assert.equal(await promptAndCollect(session, "observe", {
+    admission: { key: "provider:a", gate }
+  }), "observed");
+  assert.equal(promptCount, 1);
+  activeLease.release();
+});
+
+test("honors Retry-After cooldown before admitting the next provider request", async () => {
+  const clock = createManualClock();
+  const gate = new ProviderAdmissionGate({
+    defaultMaxConcurrent: 1,
+    now: clock.now,
+    sleep: clock.sleep
+  });
+  const activeLease = await gate.acquire({ key: "provider:a" });
+  gate.observe("provider:a", {
+    type: "message_end",
+    headers: { "retry-after": "5" }
+  });
+  activeLease.release();
+  let admitted = false;
+  const queuedPromise = gate.acquire({ key: "provider:a" }).then((lease) => {
+    admitted = true;
+    return lease;
+  });
+
+  clock.advance(4_999);
+  await flushMicrotasks();
+  assert.equal(admitted, false);
+  clock.advance(1);
+  await flushMicrotasks();
+  assert.equal(admitted, true);
+  const queuedLease = await queuedPromise;
+  queuedLease.release();
+});
+
+test("applies after_provider_response Retry-After headers to request admission", async () => {
+  const clock = createManualClock();
+  const gate = new ProviderAdmissionGate({
+    defaultMaxConcurrent: 1,
+    now: clock.now,
+    sleep: clock.sleep
+  });
+  const firstExtension = await createProviderAdmissionHarness({ key: "provider:a", gate });
+  const secondExtension = await createProviderAdmissionHarness({ key: "provider:a", gate });
+  await firstExtension.emit("before_provider_request");
+  await firstExtension.emit("after_provider_response", {
+    status: 429,
+    headers: { "retry-after": "5" }
+  });
+  await firstExtension.emit("message_end", { message: { role: "assistant", content: [] } });
+
+  let secondAdmitted = false;
+  const secondRequest = secondExtension.emit("before_provider_request").then(() => {
+    secondAdmitted = true;
+  });
+  clock.advance(4_999);
+  await flushMicrotasks();
+  assert.equal(secondAdmitted, false);
+  clock.advance(1);
+  await secondRequest;
+  assert.equal(secondAdmitted, true);
+  await secondExtension.emit("agent_end");
+});
+
+test("uses Pi native retry delay as provider cooldown without retrying prompts itself", async () => {
+  const clock = createManualClock();
+  const gate = new ProviderAdmissionGate({
+    defaultMaxConcurrent: 1,
+    now: clock.now,
+    sleep: clock.sleep
+  });
+  const listeners: Array<(event: unknown) => void> = [];
+  let firstPromptCount = 0;
+  let finishFirstPrompt: (() => void) | undefined;
+  const firstSession = {
+    async prompt(): Promise<void> {
+      firstPromptCount += 1;
+      emitToListeners(listeners, {
+        type: "auto_retry_start",
+        attempt: 1,
+        maxAttempts: 3,
+        delayMs: 2_000,
+        errorMessage: "HTTP 429 too many requests"
+      });
+      await new Promise<void>((resolve) => {
+        finishFirstPrompt = resolve;
+      });
+      emitToListeners(listeners, {
+        type: "message_end",
+        message: { role: "assistant", content: [{ type: "text", text: "recovered" }] }
+      });
+      emitToListeners(listeners, { type: "auto_retry_end", success: true, attempt: 1 });
+    },
+    subscribe(listener: (event: unknown) => void): () => void {
+      listeners.push(listener);
+      return () => undefined;
+    }
+  };
+  const firstInvocation = promptAndCollect(firstSession, "first", {
+    admission: { key: "provider:a", gate }
+  });
+  await waitForValue(() => finishFirstPrompt !== undefined);
+  let secondAdmitted = false;
+  const secondLeasePromise = gate.acquire({ key: "provider:a" }).then((lease) => {
+    secondAdmitted = true;
+    return lease;
+  });
+
+  finishFirstPrompt?.();
+  assert.equal(await firstInvocation, "recovered");
+  assert.equal(firstPromptCount, 1);
+  await flushMicrotasks();
+  assert.equal(secondAdmitted, false);
+  clock.advance(2_000);
+  await flushMicrotasks();
+  assert.equal(secondAdmitted, true);
+  const secondLease = await secondLeasePromise;
+  secondLease.release();
 });
 
 test("lets the same Pi session repair a terminal submit validation error", async () => {
@@ -901,6 +1177,37 @@ function emitToListeners(listeners: Array<(event: unknown) => void>, event: unkn
   }
 }
 
+async function createProviderAdmissionHarness(
+  input: Parameters<typeof createProviderAdmissionExtension>[0]
+): Promise<{
+  emit(type: string, event?: Record<string, unknown>, signal?: AbortSignal): Promise<void>;
+  abortCount(): number;
+}> {
+  const handlers = new Map<string, Array<(event: unknown, context: unknown) => unknown>>();
+  const extension = createProviderAdmissionExtension(input);
+  let aborts = 0;
+  await extension({
+    on(event: string, handler: (event: unknown, context: unknown) => unknown): void {
+      const registered = handlers.get(event) ?? [];
+      registered.push(handler);
+      handlers.set(event, registered);
+    }
+  } as never);
+  return {
+    async emit(type, event = {}, signal): Promise<void> {
+      for (const handler of handlers.get(type) ?? []) {
+        await handler({ type, ...event }, {
+          signal,
+          abort: () => {
+            aborts += 1;
+          }
+        });
+      }
+    },
+    abortCount: () => aborts
+  };
+}
+
 async function waitFor(predicate: () => Promise<boolean>): Promise<void> {
   const startedAt = Date.now();
   while (!(await predicate())) {
@@ -913,4 +1220,44 @@ async function waitFor(predicate: () => Promise<boolean>): Promise<void> {
 
 async function delay(ms: number): Promise<void> {
   await new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function flushMicrotasks(): Promise<void> {
+  await Promise.resolve();
+  await Promise.resolve();
+}
+
+async function waitForValue(predicate: () => boolean): Promise<void> {
+  const startedAt = Date.now();
+  while (!predicate()) {
+    if (Date.now() - startedAt > 1000) {
+      throw new Error("Timed out waiting for value");
+    }
+    await delay(1);
+  }
+}
+
+function createManualClock(): {
+  now: () => number;
+  sleep: (delayMs: number) => Promise<void>;
+  advance: (delayMs: number) => void;
+} {
+  let currentTime = 0;
+  const sleepers: Array<{ wakeAt: number; resolve: () => void }> = [];
+  return {
+    now: () => currentTime,
+    sleep: (delayMs) => new Promise<void>((resolve) => {
+      sleepers.push({ wakeAt: currentTime + delayMs, resolve });
+    }),
+    advance: (delayMs) => {
+      currentTime += delayMs;
+      for (let index = sleepers.length - 1; index >= 0; index -= 1) {
+        const sleeper = sleepers[index];
+        if (sleeper && sleeper.wakeAt <= currentTime) {
+          sleepers.splice(index, 1);
+          sleeper.resolve();
+        }
+      }
+    }
+  };
 }

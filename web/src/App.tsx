@@ -12,7 +12,7 @@ import { TrafficInspector } from "./components/TrafficInspector";
 import { TrafficView } from "./components/TrafficView";
 import { projectTaskTree } from "./graph";
 import { useLanguage, type Locale, type TranslationKey } from "./language";
-import type { AuthUser, TrafficExchange, ViewKey } from "./types";
+import type { AuthUser, TrafficExchange, TrafficFlowRef, ViewKey } from "./types";
 import { graphLabel } from "./utils";
 import { useRuntimeDashboard } from "./useRuntimeDashboard";
 
@@ -28,7 +28,7 @@ export default function App({ user, onLogout }: { user: AuthUser; onLogout: () =
   const [activeView, setActiveView] = useState<ViewKey>(initial.view);
   const [selectedTraceId, setSelectedTraceId] = useState<string>();
   const [selectedNodeId, setSelectedNodeId] = useState<string>();
-  const [selectedExchangeId, setSelectedExchangeId] = useState<number>();
+  const [selectedExchangeId, setSelectedExchangeId] = useState<TrafficFlowRef>();
   const [selectedExchange, setSelectedExchange] = useState<TrafficExchange>();
   const [trafficRefreshToken, setTrafficRefreshToken] = useState(0);
   const [roleFilter, setRoleFilter] = useState("all");

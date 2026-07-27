@@ -4,6 +4,7 @@
 #      awesome-skills-security, ctf-skills) into ./.agents/skills/
 #      (project-local skills directory)
 #   2. npm ci && npm run build
+#   3. Build the Executor and Network images when Docker is available
 set -euo pipefail
 
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -63,5 +64,15 @@ log "Running npm ci"
 npm ci --prefix "${PROJECT_ROOT}"
 log "Running npm run build"
 npm run build --prefix "${PROJECT_ROOT}"
+
+if command -v docker >/dev/null 2>&1 \
+  && docker version --format '{{.Server.Version}}' >/dev/null 2>&1; then
+  log "Building Docker executor image"
+  npm run build:executor-image --prefix "${PROJECT_ROOT}"
+  log "Building Docker network image"
+  npm run build:network-image --prefix "${PROJECT_ROOT}"
+else
+  log "Docker daemon unavailable; native sandbox backends remain available"
+fi
 
 log "Done. Start a run with: npm start -- --goal \"...\" --scope \"...\""

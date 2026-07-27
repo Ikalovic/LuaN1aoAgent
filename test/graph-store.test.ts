@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
-import { mkdtempSync } from "node:fs";
+import { mkdtempSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import test from "node:test";
 import { GraphValidationError, PlannerDecisionConflict, SQLiteGraphStore } from "../src/stores/graph-store.js";
 import { RuntimeStore } from "../src/stores/runtime-store.js";
@@ -50,6 +51,30 @@ test("upserts tri-graph nodes and reads planner view", () => {
     evidenceBackedEdgeCount: 1,
     nodesByKind: { operation: 1, reasoning: 1, task: 1 }
   });
+  graphStore.close();
+});
+
+test("graph trace returns an empty snapshot for empty or unknown focus", () => {
+  const runtimeDir = mkdtempSync(join(tmpdir(), "luanniao-graph-"));
+  const graphStore = new SQLiteGraphStore(join(runtimeDir, "state.sqlite"), join(runtimeDir, "deltas.jsonl"));
+  graphStore.upsertDelta({
+    sourceEventIds: ["event:unrelated"],
+    nodes: [{
+      id: "node:unrelated",
+      graphKind: "operation",
+      type: "Host",
+      label: "Unrelated host",
+      properties: { ip: "10.0.0.99" },
+      evidenceRefs: ["event:unrelated"]
+    }],
+    edges: []
+  });
+
+  assert.deepEqual(graphStore.trace({}).nodes, []);
+  assert.deepEqual(graphStore.trace({}).edges, []);
+  assert.deepEqual(graphStore.trace({ nodeId: "node:missing" }).nodes, []);
+  assert.deepEqual(graphStore.trace({ nodeId: "node:missing" }).edges, []);
+  assert.deepEqual(graphStore.trace({ nodeId: "node:unrelated" }).nodes.map((node) => node.id), ["node:unrelated"]);
   graphStore.close();
 });
 
@@ -141,7 +166,7 @@ test("projection graph merge and committed watermark update atomically", () => {
   const databasePath = join(runtimeDir, "state.sqlite");
   const graphStore = new SQLiteGraphStore(databasePath, join(runtimeDir, "deltas.jsonl"));
   const runtimeStore = new RuntimeStore(databasePath);
-  runtimeStore.raiseProjectionDesired("task:test", 9);
+  runtimeStore.raiseProjectionDesired("task:test", 9, 10, 9);
   const claim = runtimeStore.claimProjection("task:test");
   assert.ok(claim);
 
@@ -149,19 +174,31 @@ test("projection graph merge and committed watermark update atomically", () => {
     ...claim,
     delta: {
       sourceEventIds: ["event:9"],
-      nodes: [{
-        id: "evidence:9",
-        graphKind: "reasoning",
-        type: "Evidence",
-        label: "Projected evidence",
-        properties: {},
-        evidenceRefs: ["event:9"]
-      }],
-      edges: []
+      nodes: [
+        {
+          id: "evidence:9",
+          graphKind: "reasoning",
+          type: "Evidence",
+          label: "Projected evidence",
+          properties: {},
+          evidenceRefs: ["event:9"]
+        },
+        {
+          id: "endpoint:9",
+          graphKind: "operation",
+          type: "WebEndpoint",
+          label: "GET /projected",
+          properties: { method: "GET", path: "/projected" },
+          evidenceRefs: ["event:9"]
+        }
+      ],
+      edges: [{ from: "evidence:9", to: "endpoint:9", type: "observed_on", evidenceRefs: ["event:9"] }]
     }
   });
 
-  assert.equal(runtimeStore.getProjectionState("task:test").committedSeq, 9);
+  const projectionState = runtimeStore.getProjectionState("task:test");
+  assert.equal(projectionState.committedSeq, 9);
+  assert.equal(projectionState.terminalTargetSeq, 9);
   assert.equal(graphStore.query("reasoning", ["evidence:9"], 1).nodes[0]?.id, "evidence:9");
   runtimeStore.close();
   graphStore.close();
@@ -368,12 +405,51 @@ test("projection commits merge concurrent operation identities without losing to
   assert.deepEqual(hosts[0]?.evidenceRefs, ["event:8001", "event:8000"]);
   assert.deepEqual(new Set(ports.map((node) => node.label)), new Set(["8000/TCP", "8001/TCP"]));
   assert.equal(operation.edges.filter((edge) => edge.from === hosts[0]?.id && edge.type === "has_port").length, 2);
-  assert.equal(first.orphanNodeIds.length, 0);
-  assert.equal(second.orphanNodeIds.length, 0);
   assert.ok(first.remappedNodeCount >= 2);
   assert.ok(second.remappedNodeCount >= 2);
   assert.equal(runtimeStore.getProjectionState("task:8001").committedSeq, 83);
   assert.equal(runtimeStore.getProjectionState("task:8000").committedSeq, 115);
+  runtimeStore.close();
+  graphStore.close();
+});
+
+test("projection identity rebasing reuses operation identities incrementally indexed by ordinary deltas", () => {
+  const runtimeDir = mkdtempSync(join(tmpdir(), "luanniao-graph-"));
+  const databasePath = join(runtimeDir, "state.sqlite");
+  const graphStore = new SQLiteGraphStore(databasePath, join(runtimeDir, "deltas.jsonl"));
+  const runtimeStore = new RuntimeStore(databasePath);
+  graphStore.upsertDelta({
+    sourceEventIds: ["event:legacy"],
+    nodes: [{
+      id: "legacy:host",
+      graphKind: "operation",
+      type: "Host",
+      label: "192.0.2.44",
+      properties: { source: "legacy" }
+    }],
+    edges: []
+  });
+  runtimeStore.raiseProjectionDesired("task:incremental-identity", 2);
+  const claim = runtimeStore.claimProjection("task:incremental-identity");
+  assert.ok(claim);
+
+  const committed = graphStore.commitProjection({
+    ...claim,
+    delta: {
+      sourceEventIds: ["event:new"],
+      nodes: [{
+        id: "projected:duplicate-host",
+        graphKind: "operation",
+        type: "Host",
+        label: "192.0.2.44",
+        properties: { source: "projection" }
+      }],
+      edges: []
+    }
+  });
+
+  assert.equal(committed.delta.nodes[0]?.id, "legacy:host");
+  assert.equal(graphStore.query("operation", [], 10).nodes.filter((node) => node.type === "Host").length, 1);
   runtimeStore.close();
   graphStore.close();
 });
@@ -401,24 +477,197 @@ test("projection commit rejects dangling edges and preserves the watermark", () 
   graphStore.close();
 });
 
-test("projection commit reports newly written orphan semantic nodes", () => {
+test("graph writes reject dangling edges outside projection commits", () => {
+  const runtimeDir = mkdtempSync(join(tmpdir(), "luanniao-graph-"));
+  const graphStore = new SQLiteGraphStore(join(runtimeDir, "state.sqlite"), join(runtimeDir, "deltas.jsonl"));
+
+  assert.throws(() => graphStore.upsertDelta({
+    sourceEventIds: ["event:dangling"],
+    nodes: [{ id: "evidence:real", graphKind: "reasoning", type: "Evidence", label: "Evidence", properties: {} }],
+    edges: [{ from: "evidence:real", to: "host:missing", type: "observed_on" }]
+  }), /references missing node/);
+  assert.equal(graphStore.query("reasoning", ["evidence:real"], 1).nodes.length, 0);
+  graphStore.close();
+});
+
+test("raw task targets stay in task properties without creating placeholder edges", () => {
+  const runtimeDir = mkdtempSync(join(tmpdir(), "luanniao-graph-"));
+  const graphStore = new SQLiteGraphStore(join(runtimeDir, "state.sqlite"), join(runtimeDir, "deltas.jsonl"));
+  graphStore.upsertDelta({
+    sourceEventIds: ["event:root"],
+    nodes: [
+      { id: "goal:root", graphKind: "task", type: "Goal", label: "Goal", properties: { status: "open" } },
+      { id: "scope:root", graphKind: "task", type: "Scope", label: "Scope", properties: {} }
+    ],
+    edges: []
+  });
+
+  graphStore.createTasks([{
+    taskId: "task:raw-target",
+    goal: "Inspect one endpoint",
+    targetRefs: ["192.0.2.10:8080"],
+    scopeRef: "scope:root",
+    constraints: [],
+    successCriteria: ["Observe HTTP response"],
+    parentTaskId: "goal:root",
+    priority: 1
+  }]);
+
+  assert.deepEqual(graphStore.getTaskNode("task:raw-target")?.properties.targetRefs, ["192.0.2.10:8080"]);
+  assert.equal(
+    graphStore.query("task", ["task:raw-target"], 2).edges.some((edge) => edge.type === "requires_evidence"),
+    false
+  );
+  graphStore.close();
+});
+
+test("opening a legacy graph removes previously persisted dangling edges", () => {
+  const runtimeDir = mkdtempSync(join(tmpdir(), "luanniao-graph-"));
+  const databasePath = join(runtimeDir, "state.sqlite");
+  const deltaLogPath = join(runtimeDir, "deltas.jsonl");
+  const graphStore = new SQLiteGraphStore(databasePath, deltaLogPath);
+  graphStore.upsertDelta({
+    sourceEventIds: ["event:legacy"],
+    nodes: [{ id: "evidence:legacy", graphKind: "reasoning", type: "Evidence", label: "Legacy", properties: {} }],
+    edges: []
+  });
+  graphStore.close();
+
+  const database = new DatabaseSync(databasePath);
+  database.prepare(`
+    INSERT INTO edges (id, from_id, to_id, type, properties_json, evidence_refs_json, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
+  `).run(
+    "edge:legacy-dangling",
+    "evidence:legacy",
+    "host:missing",
+    "observed_on",
+    "{}",
+    "[]",
+    new Date().toISOString()
+  );
+  database.close();
+
+  const reopened = new SQLiteGraphStore(databasePath, deltaLogPath);
+  assert.equal(reopened.query("reasoning", ["evidence:legacy"], 2).edges.length, 0);
+  reopened.close();
+});
+
+test("opening a graph removes the retired projection repair state", () => {
+  const runtimeDir = mkdtempSync(join(tmpdir(), "luanniao-graph-"));
+  const databasePath = join(runtimeDir, "state.sqlite");
+  const deltaLogPath = join(runtimeDir, "deltas.jsonl");
+  let graphStore = new SQLiteGraphStore(databasePath, deltaLogPath);
+  graphStore.upsertDelta({
+    sourceEventIds: ["event:legacy-unresolved"],
+    nodes: [{
+      id: "evidence:legacy-unresolved",
+      graphKind: "reasoning",
+      type: "Evidence",
+      label: "Legacy unresolved evidence",
+      properties: { unresolved: true, unresolvedTaskRef: "task:legacy" },
+      evidenceRefs: ["event:legacy-unresolved"]
+    }],
+    edges: []
+  });
+  graphStore.close();
+  const database = new DatabaseSync(databasePath);
+  database.exec("CREATE TABLE projection_unresolved_nodes (node_id TEXT PRIMARY KEY)");
+  database.close();
+
+  graphStore = new SQLiteGraphStore(databasePath, deltaLogPath);
+  const restored = graphStore.query("reasoning", ["evidence:legacy-unresolved"], 1).nodes[0];
+  assert.equal(restored?.properties.unresolved, undefined);
+  assert.equal(restored?.properties.unresolvedTaskRef, undefined);
+  graphStore.close();
+
+  const verified = new DatabaseSync(databasePath);
+  assert.equal(verified.prepare(
+    "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'projection_unresolved_nodes'"
+  ).get(), undefined);
+  verified.close();
+});
+
+test("projection rejects unconnected semantic nodes atomically", () => {
   const runtimeDir = mkdtempSync(join(tmpdir(), "luanniao-graph-"));
   const databasePath = join(runtimeDir, "state.sqlite");
   const graphStore = new SQLiteGraphStore(databasePath, join(runtimeDir, "deltas.jsonl"));
   const runtimeStore = new RuntimeStore(databasePath);
-  runtimeStore.raiseProjectionDesired("task:orphan", 3);
-  const claim = runtimeStore.claimProjection("task:orphan");
+  runtimeStore.raiseProjectionDesired("task:unconnected", 3);
+  const claim = runtimeStore.claimProjection("task:unconnected");
   assert.ok(claim);
 
-  const result = graphStore.commitProjection({
+  assert.throws(() => graphStore.commitProjection({
     ...claim,
     delta: {
       sourceEventIds: ["event:3"],
-      nodes: [{ id: "projected:orphan", graphKind: "reasoning", type: "Evidence", label: "Unconnected evidence", properties: {}, evidenceRefs: ["event:3"] }],
+      nodes: [{
+        id: "projected:unconnected",
+        graphKind: "reasoning",
+        type: "Evidence",
+        label: "Unconnected evidence",
+        properties: {},
+        evidenceRefs: ["event:3"]
+      }],
       edges: []
     }
+  }), /cannot commit unconnected semantic nodes: projected:unconnected/);
+
+  assert.equal(runtimeStore.getProjectionState("task:unconnected").committedSeq, 0);
+  assert.equal(graphStore.query("reasoning", ["projected:unconnected"], 1).nodes.length, 0);
+  runtimeStore.close();
+  graphStore.close();
+});
+test("projection does not merge semantic nodes by label", () => {
+  const runtimeDir = mkdtempSync(join(tmpdir(), "luanniao-graph-"));
+  const databasePath = join(runtimeDir, "state.sqlite");
+  const graphStore = new SQLiteGraphStore(databasePath, join(runtimeDir, "deltas.jsonl"));
+  const runtimeStore = new RuntimeStore(databasePath);
+  runtimeStore.raiseProjectionDesired("task:semantic-identity", 1);
+  const claim = runtimeStore.claimProjection("task:semantic-identity");
+  assert.ok(claim);
+  const result = graphStore.commitProjection({
+    ...claim,
+    delta: {
+      sourceEventIds: ["event:semantic"],
+      nodes: [
+        {
+          id: "vulnerability:first",
+          graphKind: "reasoning",
+          type: "Vulnerability",
+          label: "Token exchange bypass",
+          properties: { variant: "first" },
+          evidenceRefs: ["event:semantic"]
+        },
+        {
+          id: "vulnerability:second",
+          graphKind: "reasoning",
+          type: "Vulnerability",
+          label: "Token exchange bypass",
+          properties: { variant: "second" },
+          evidenceRefs: ["event:semantic"]
+        },
+        {
+          id: "endpoint:semantic-target",
+          graphKind: "operation",
+          type: "WebEndpoint",
+          label: "POST /token/exchange",
+          properties: { method: "POST", path: "/token/exchange" },
+          evidenceRefs: ["event:semantic"]
+        }
+      ],
+      edges: [
+        { from: "vulnerability:first", to: "endpoint:semantic-target", type: "affects", evidenceRefs: ["event:semantic"] },
+        { from: "vulnerability:second", to: "endpoint:semantic-target", type: "affects", evidenceRefs: ["event:semantic"] }
+      ]
+    }
   });
-  assert.deepEqual(result.orphanNodeIds, ["projected:orphan"]);
+  assert.equal(result.remappedNodeCount, 0);
+  assert.equal(result.mergedNodeCount, 0);
+  assert.deepEqual(
+    new Set(graphStore.query("reasoning", ["vulnerability:first", "vulnerability:second"], 4).nodes.map((node) => node.id)),
+    new Set(["vulnerability:first", "vulnerability:second"])
+  );
   runtimeStore.close();
   graphStore.close();
 });

@@ -10,7 +10,7 @@ vi.mock("../api", () => ({
 }));
 
 const exchange: TrafficExchange = {
-  id: 41,
+  id: "legacy:41",
   started_at: "2026-07-10T17:27:20.000Z",
   completed_at: "2026-07-10T17:27:20.125Z",
   duration_ms: 125,
@@ -59,7 +59,7 @@ const analyst: AuthUser = { ...admin, id: "user:analyst", username: "analyst", r
 beforeEach(() => {
   vi.clearAllMocks();
   vi.mocked(fetchTrafficBody).mockImplementation(async (_runtimeDir, _id, side) => ({
-    exchange_id: 41,
+    exchange_id: "legacy:41",
     side,
     body_ref: side === "request" ? "body:req" : "body:res",
     encoding: "base64",
@@ -67,7 +67,7 @@ beforeEach(() => {
     bytes: side === "request" ? 13 : 2,
     truncated: side === "response"
   }));
-  vi.mocked(replayTrafficExchange).mockResolvedValue({ exchangeId: 42, replayOf: 41, status: 201 });
+  vi.mocked(replayTrafficExchange).mockResolvedValue({ exchangeId: "legacy:42", replayOf: "legacy:41", status: 201 });
 });
 
 describe("TrafficInspector", () => {
@@ -95,15 +95,15 @@ describe("TrafficInspector", () => {
     vi.mocked(fetchTrafficBody)
       .mockImplementationOnce(() => new Promise((resolve) => { resolveOld = resolve; }))
       .mockImplementationOnce(() => new Promise((resolve) => { resolveCurrent = resolve; }));
-    const currentExchange = { ...exchange, id: 42, url: "https://target.test/current" };
+    const currentExchange = { ...exchange, id: "legacy:42", url: "https://target.test/current" };
     const { rerender } = render(<TrafficInspector runtimeDir="runtime/a" exchange={exchange} user={analyst} onSelectExchange={vi.fn()} onReplayed={vi.fn()} />);
 
     fireEvent.click(within(screen.getByText("请求 Body").closest(".traffic-section") as HTMLElement).getByRole("button", { name: /加载 body/ }));
     rerender(<TrafficInspector runtimeDir="runtime/a" exchange={currentExchange} user={analyst} onSelectExchange={vi.fn()} onReplayed={vi.fn()} />);
     fireEvent.click(within(screen.getByText("请求 Body").closest(".traffic-section") as HTMLElement).getByRole("button", { name: /加载 body/ }));
-    resolveCurrent({ exchange_id: 42, side: "request", body_ref: "body:current", encoding: "base64", data: "Y3VycmVudA==", bytes: 7, truncated: false });
+    resolveCurrent({ exchange_id: "legacy:42", side: "request", body_ref: "body:current", encoding: "base64", data: "Y3VycmVudA==", bytes: 7, truncated: false });
     await screen.findByText("current");
-    resolveOld({ exchange_id: 41, side: "request", body_ref: "body:old", encoding: "base64", data: "b2xk", bytes: 3, truncated: false });
+    resolveOld({ exchange_id: "legacy:41", side: "request", body_ref: "body:old", encoding: "base64", data: "b2xk", bytes: 3, truncated: false });
 
     await waitFor(() => expect(screen.getByText("current")).toBeInTheDocument());
     expect(screen.queryByText("old")).not.toBeInTheDocument();
@@ -113,6 +113,19 @@ describe("TrafficInspector", () => {
     render(<TrafficInspector runtimeDir="runtime/a" exchange={exchange} user={analyst} onSelectExchange={vi.fn()} onReplayed={vi.fn()} />);
 
     expect(screen.getByText(/仅管理员可发送 Replay/)).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "编辑并 Replay" })).not.toBeInTheDocument();
+  });
+
+  it("never opens the HTTP replay editor for TCP flows", () => {
+    render(<TrafficInspector
+      runtimeDir="runtime/a"
+      exchange={{ ...exchange, id: "task:one:tcp-flow", kind: "tcp", method: "TCP", scheme: "tcp", protocol: "TCP" }}
+      user={admin}
+      onSelectExchange={vi.fn()}
+      onReplayed={vi.fn()}
+    />);
+
+    expect(screen.getByText(/TCP 流量仅支持检查/)).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "编辑并 Replay" })).not.toBeInTheDocument();
   });
 
@@ -156,7 +169,7 @@ describe("TrafficInspector", () => {
     expect(within(dialog).getByText(/敏感 header 与 body/)).toBeInTheDocument();
     fireEvent.click(within(dialog).getByRole("button", { name: "确认发送" }));
 
-    await waitFor(() => expect(replayTrafficExchange).toHaveBeenCalledWith(41, expect.objectContaining({
+    await waitFor(() => expect(replayTrafficExchange).toHaveBeenCalledWith("legacy:41", expect.objectContaining({
       runtimeDir: "runtime/a",
       method: "POST",
       url: exchange.url,
@@ -166,6 +179,6 @@ describe("TrafficInspector", () => {
         { name: "X-Test", value: "second", ordinal: 2 }
       ])
     })));
-    await waitFor(() => expect(onReplayed).toHaveBeenCalledWith(42));
+    await waitFor(() => expect(onReplayed).toHaveBeenCalledWith("legacy:42"));
   });
 });

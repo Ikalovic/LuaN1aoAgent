@@ -1,4 +1,5 @@
 import { mkdirSync } from "node:fs";
+import { randomUUID } from "node:crypto";
 import { dirname } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import type {
@@ -6,7 +7,8 @@ import type {
   ExecutionEpochState,
   ExecutionEpochTerminationReason,
   ProjectionClaim,
-  ProjectionState
+  ProjectionState,
+  TaskOutcome
 } from "../types.js";
 
 export type ExecutorSessionRecord = {
@@ -15,6 +17,18 @@ export type ExecutorSessionRecord = {
   resumeCount: number;
   updatedAt: string;
 };
+
+export function getOrCreateRuntimeRunRef(databasePath: string): string {
+  mkdirSync(dirname(databasePath), { recursive: true });
+  const database = new DatabaseSync(databasePath);
+  try {
+    database.exec("PRAGMA busy_timeout = 5000;");
+    ensureRuntimeMetadataTable(database);
+    return getOrCreateRunRefInDatabase(database);
+  } finally {
+    database.close();
+  }
+}
 
 type EpochRow = {
   epoch_id: string;
@@ -35,6 +49,8 @@ type ProjectionRow = {
   generation: number;
   active_generation: number | null;
   priority: number;
+  pending_since: string | null;
+  terminal_target_seq: number | null;
   updated_at: string;
 };
 
@@ -43,6 +59,14 @@ type ExecutorSessionRow = {
   session_file: string;
   resume_count: number;
   updated_at: string;
+};
+
+type TaskOutcomeRow = {
+  task_id: string;
+  epoch_id: string;
+  terminal_seq: number;
+  outcome_json: string;
+  created_at: string;
 };
 
 export class RuntimeStore {
@@ -62,6 +86,10 @@ export class RuntimeStore {
 
   close(): void {
     this.database.close();
+  }
+
+  getOrCreateRunRef(): string {
+    return getOrCreateRunRefInDatabase(this.database);
   }
 
   createEpoch(input: {
@@ -151,18 +179,48 @@ export class RuntimeStore {
     };
   }
 
-  raiseProjectionDesired(taskId: string, seq: number, priority = 0): ProjectionState {
+  raiseProjectionDesired(taskId: string, seq: number, priority = 0, terminalTargetSeq?: number): ProjectionState {
     const updatedAt = new Date().toISOString();
     this.database.prepare(`
       INSERT INTO projection_states (
-        task_id, committed_seq, desired_seq, generation, active_generation, priority, updated_at
-      ) VALUES (?, 0, ?, 0, NULL, ?, ?)
+        task_id, committed_seq, desired_seq, generation, active_generation, priority,
+        pending_since, terminal_target_seq, updated_at
+      ) VALUES (?, 0, ?, 0, NULL, ?, ?, ?, ?)
       ON CONFLICT(task_id) DO UPDATE SET
         desired_seq = MAX(projection_states.desired_seq, excluded.desired_seq),
         priority = MAX(projection_states.priority, excluded.priority),
+        pending_since = CASE
+          WHEN projection_states.desired_seq <= projection_states.committed_seq
+            AND excluded.desired_seq > projection_states.committed_seq
+          THEN excluded.pending_since
+          ELSE projection_states.pending_since
+        END,
+        terminal_target_seq = CASE
+          WHEN excluded.terminal_target_seq IS NULL THEN projection_states.terminal_target_seq
+          ELSE MAX(COALESCE(projection_states.terminal_target_seq, 0), excluded.terminal_target_seq)
+        END,
         updated_at = excluded.updated_at
-    `).run(taskId, Math.max(0, seq), Math.max(0, priority), updatedAt);
+    `).run(
+      taskId,
+      Math.max(0, seq),
+      Math.max(0, priority),
+      updatedAt,
+      terminalTargetSeq === undefined ? null : Math.max(0, terminalTargetSeq),
+      updatedAt
+    );
     return this.getProjectionState(taskId);
+  }
+
+  clearProjectionTerminalTarget(taskId: string, terminalTargetSeq: number): void {
+    this.database.prepare(`
+      UPDATE projection_states
+      SET terminal_target_seq = CASE
+        WHEN terminal_target_seq = ? THEN NULL
+        ELSE terminal_target_seq
+      END,
+      updated_at = ?
+      WHERE task_id = ?
+    `).run(Math.max(0, terminalTargetSeq), new Date().toISOString(), taskId);
   }
 
   claimProjection(taskId: string): ProjectionClaim | undefined {
@@ -228,8 +286,9 @@ export class RuntimeStore {
       const updatedAt = new Date().toISOString();
       this.database.prepare(`
         INSERT INTO projection_states (
-          task_id, committed_seq, desired_seq, generation, active_generation, priority, updated_at
-        ) VALUES (?, 0, 0, 0, NULL, 0, ?)
+          task_id, committed_seq, desired_seq, generation, active_generation, priority,
+          pending_since, terminal_target_seq, updated_at
+        ) VALUES (?, 0, 0, 0, NULL, 0, NULL, NULL, ?)
       `).run(taskId, updatedAt);
       return {
         taskId,
@@ -246,7 +305,8 @@ export class RuntimeStore {
   listPendingProjectionTasks(): ProjectionState[] {
     const rows = this.database.prepare(`
       SELECT * FROM projection_states
-      WHERE desired_seq > committed_seq AND active_generation IS NULL
+      WHERE (desired_seq > committed_seq OR terminal_target_seq IS NOT NULL)
+        AND active_generation IS NULL
       ORDER BY priority DESC, updated_at ASC
     `).all() as ProjectionRow[];
     return rows.map(projectionRowToState);
@@ -283,6 +343,39 @@ export class RuntimeStore {
     `).run(taskId);
   }
 
+  upsertTaskOutcome(outcome: TaskOutcome): TaskOutcome {
+    this.database.prepare(`
+      INSERT INTO task_outcomes (task_id, epoch_id, terminal_seq, outcome_json, created_at)
+      VALUES (?, ?, ?, ?, ?)
+      ON CONFLICT(task_id) DO UPDATE SET
+        epoch_id = excluded.epoch_id,
+        terminal_seq = excluded.terminal_seq,
+        outcome_json = excluded.outcome_json,
+        created_at = excluded.created_at
+    `).run(
+      outcome.taskRef,
+      outcome.epochRef,
+      outcome.terminalSeq,
+      JSON.stringify(outcome),
+      outcome.createdAt
+    );
+    return outcome;
+  }
+
+  getTaskOutcome(taskId: string): TaskOutcome | undefined {
+    const row = this.database.prepare(`
+      SELECT * FROM task_outcomes WHERE task_id = ?
+    `).get(taskId) as TaskOutcomeRow | undefined;
+    return row ? taskOutcomeRowToRecord(row) : undefined;
+  }
+
+  listTaskOutcomes(limit = 32): TaskOutcome[] {
+    const rows = this.database.prepare(`
+      SELECT * FROM task_outcomes ORDER BY terminal_seq DESC LIMIT ?
+    `).all(Math.max(1, Math.floor(limit))) as TaskOutcomeRow[];
+    return rows.map(taskOutcomeRowToRecord);
+  }
+
   private initialize(): void {
     this.database.exec(`
       CREATE TABLE IF NOT EXISTS execution_epochs (
@@ -307,6 +400,8 @@ export class RuntimeStore {
         generation INTEGER NOT NULL DEFAULT 0,
         active_generation INTEGER,
         priority INTEGER NOT NULL DEFAULT 0,
+        pending_since TEXT,
+        terminal_target_seq INTEGER,
         updated_at TEXT NOT NULL
       );
       CREATE TABLE IF NOT EXISTS executor_sessions (
@@ -315,7 +410,22 @@ export class RuntimeStore {
         resume_count INTEGER NOT NULL DEFAULT 0,
         updated_at TEXT NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS task_outcomes (
+        task_id TEXT PRIMARY KEY,
+        epoch_id TEXT NOT NULL,
+        terminal_seq INTEGER NOT NULL,
+        outcome_json TEXT NOT NULL,
+        created_at TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_task_outcomes_terminal_seq
+        ON task_outcomes(terminal_seq DESC);
+      CREATE TABLE IF NOT EXISTS runtime_metadata (
+        key TEXT PRIMARY KEY,
+        value TEXT NOT NULL
+      );
     `);
+    ensureColumn(this.database, "projection_states", "pending_since", "TEXT");
+    ensureColumn(this.database, "projection_states", "terminal_target_seq", "INTEGER");
   }
 
   private recoverInterruptedEpochs(): void {
@@ -336,6 +446,37 @@ export class RuntimeStore {
     `).run(new Date().toISOString());
     return Number(result.changes);
   }
+
+}
+
+function ensureRuntimeMetadataTable(database: DatabaseSync): void {
+  database.exec(`
+    CREATE TABLE IF NOT EXISTS runtime_metadata (
+      key TEXT PRIMARY KEY,
+      value TEXT NOT NULL
+    )
+  `);
+}
+
+function getOrCreateRunRefInDatabase(database: DatabaseSync): string {
+  ensureRuntimeMetadataTable(database);
+  const existing = database.prepare(`
+    SELECT value FROM runtime_metadata WHERE key = 'run_ref'
+  `).get() as { value: string } | undefined;
+  if (existing?.value) {
+    return existing.value;
+  }
+  const candidate = randomUUID();
+  database.prepare(`
+    INSERT OR IGNORE INTO runtime_metadata (key, value) VALUES ('run_ref', ?)
+  `).run(candidate);
+  const stored = database.prepare(`
+    SELECT value FROM runtime_metadata WHERE key = 'run_ref'
+  `).get() as { value: string } | undefined;
+  if (!stored?.value) {
+    throw new Error("Runtime run_ref was not persisted");
+  }
+  return stored.value;
 }
 
 function epochRowToRecord(row: EpochRow): ExecutionEpochRecord {
@@ -360,8 +501,17 @@ function projectionRowToState(row: ProjectionRow): ProjectionState {
     generation: Number(row.generation),
     activeGeneration: row.active_generation ?? undefined,
     priority: Number(row.priority),
+    pendingSince: row.pending_since ?? undefined,
+    terminalTargetSeq: row.terminal_target_seq ?? undefined,
     updatedAt: row.updated_at
   };
+}
+
+function ensureColumn(database: DatabaseSync, table: string, column: string, definition: string): void {
+  const columns = database.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>;
+  if (!columns.some((candidate) => candidate.name === column)) {
+    database.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
+  }
 }
 
 function executorSessionRowToRecord(row: ExecutorSessionRow): ExecutorSessionRecord {
@@ -370,5 +520,16 @@ function executorSessionRowToRecord(row: ExecutorSessionRow): ExecutorSessionRec
     sessionFile: row.session_file,
     resumeCount: Number(row.resume_count),
     updatedAt: row.updated_at
+  };
+}
+
+function taskOutcomeRowToRecord(row: TaskOutcomeRow): TaskOutcome {
+  const parsed = JSON.parse(row.outcome_json) as TaskOutcome;
+  return {
+    ...parsed,
+    taskRef: row.task_id,
+    epochRef: row.epoch_id,
+    terminalSeq: Number(row.terminal_seq),
+    createdAt: row.created_at
   };
 }

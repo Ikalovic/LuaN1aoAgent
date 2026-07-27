@@ -91,7 +91,7 @@ v2 使用明确的运行时边界，替代共享历史的 P-E-R 循环。
 - 读取压缩后的任务图、推理图和作战图视图。
 - 创建或修改目标级任务，而不是规定低层动作。
 - 控制依赖关系、优先级、并行组、范围和任务预算。
-- 每个规划周期调度一个确定性的准入任务波次。
+- 在图变化和任务交接后按可用容量持续调和 ready Task，不等待整个并行波次结束。
 - 通过结构化终止工具 `planner_submit` 提交决策。
 
 #### Executor
@@ -99,6 +99,7 @@ v2 使用明确的运行时边界，替代共享历史的 P-E-R 循环。
 - 接收有界 `TaskEnvelope`，独立选择工具策略。
 - 记录公开意图、工具输入、工具输出、用量、错误和最终任务结果。
 - 将大输出保存为不可变 Artifact，而不是持续膨胀 Agent 上下文。
+- 同一 Task 跨 epoch 复用持久 Pi Session lineage 与 workspace；不同 Task 始终隔离。
 - 通过结构化终止工具 `task_result_submit` 提交结果。
 
 #### Observer
@@ -185,7 +186,9 @@ Executor 在配置的沙箱边界内使用 Pi coding tools：
 - `web_fetch`：抓取公开 HTTP(S) 参考资料、公告和 PoC Writeup，并转换为有界 Markdown preview。
 - `web_search`：优先使用 `BRAVE_SEARCH_API_KEY` 或 `BRAVE_API_KEY` 调用 Brave Search；未配置时使用公开 HTML 搜索回退。
 - `vulnerability_search`：通过 NVD 与公开 Web 资料检索 CVE/公告/历史漏洞；没有命中时保留弱负面语义，避免误判为目标不存在漏洞。
-- `artifact_read` 和 `artifact_write`：保存可跨任务复用的持久材料。
+- `browser_render`：在 Executor 网络边界内检查 JavaScript 执行后的 DOM；Docker 模式中的 Chromium 与其他目标流量一样透明经过 Task Gateway。
+- `artifact_read` 和 `artifact_write`：保存可跨任务复用的持久材料，并可直接归档完整工作区文件，无需让文件内容经过模型上下文。
+- `route_open`、`route_status`、`route_stop` 和 `route_reconnect`：在 Docker 模式下管理 Runtime SSH/Chisel 可达性。
 - `task_result_submit`：结构化完成任务或提交 checkpoint。
 
 公开情报结果只作为假设或线索，Executor 必须再用沙箱工具在授权目标上验证。可选 `NVD_API_KEY` 可提升 NVD 查询限额，但不是必需项。
@@ -202,7 +205,7 @@ LuaN1ao 通过 Pi Runtime 使用 Agent Skills 约定。推荐按需安装以下�
 | [Eyadkelleh/awesome-skills-security](https://github.com/Eyadkelleh/awesome-skills-security) | Fuzzing Payload、密码与用户名字典、敏感信息模式、WebShell 样本和 LLM 安全测试资料 |
 | [ljagiello/ctf-skills](https://github.com/ljagiello/ctf-skills) | Web、Pwn、Crypto、逆向、取证、OSINT、AI/ML、恶意代码分析和 Writeup 等 CTF 与靶场工作流 |
 
-在仓库根目录执行一键安装脚本 —— 将三个推荐 Skills 集合全部安装到项目本地 `.agents/skills/`，然后执行 `npm ci` 和 `npm run build`：
+在仓库根目录执行一键安装脚本 —— 将三个推荐 Skills 集合全部安装到项目本地 `.agents/skills/`，执行 `npm ci` 和 `npm run build`，并在 Docker daemon 可用时构建两个 Docker 镜像：
 
 ```bash
 ./install.sh
@@ -222,9 +225,11 @@ npx skills add ljagiello/ctf-skills \
 
 ### 沙箱隔离
 
-- macOS 在可用时通过 `sandbox-exec` 使用 Seatbelt。
-- Linux 支持 Bubblewrap 隔离。
-- Executor 工作区和运行时根目录会被显式解析。
+- `auto` 优先使用每个 Task 独立的 Docker Executor，并与其 Gateway 共享网络命名空间；显式 `docker` 在 daemon 或所需镜像不可用时失败关闭。
+- Docker Executor 以 UID 1000 运行、无 capability、rootfs 只读，提供可执行且限额的 `/tmp` 与宿主可见、持久化的 `/workspace`。
+- Gateway 在 `cap-drop ALL` 后只增加 `NET_ADMIN`、`SETUID` 和 `SETGID`：PID 1 配置 TUN/策略路由并以专用 UID 启动 mitmproxy/connect gate，gate 随后清空 capability bounding set。
+- Docker 不可用时保留 macOS Seatbelt 和 Linux Bubblewrap；`workspace` 是显式开发回退。
+- Executor workspace 与 runtime root 会被显式解析，同一 Task 的 workspace 在 checkpoint/resume epoch 间保留。
 - 强制沙箱模式下，访问允许根目录之外的宿主路径会失败关闭。
 - Agent 运行时状态不会作为隐式上下文暴露给隔离的 Executor Session。
 
@@ -238,6 +243,9 @@ npx skills add ljagiello/ctf-skills \
 | `execution.jsonl` | 规范执行事件的追加写审计镜像 |
 | `graph-deltas.jsonl` | 可回放的图增量镜像 |
 | `artifacts/` | 大输出和持久任务 Artifact |
+| `sandboxes/` | 每个 Task 的持久 workspace 与仅宿主可见的 Pi Session root |
+| `executor-sessions/` | 同一 Task 跨 epoch 持久化的 Pi Session lineage |
+| `traffic/` | 分段 `.mitm` Flow、`.net.jsonl` 遥测、公共 CA 和 Route/Index 元数据 |
 | `web-auth.sqlite` | 本地 Web 工作台用户和 Session |
 
 ---
@@ -248,6 +256,7 @@ npx skills add ljagiello/ctf-skills \
 |---|---|---|
 | 操作系统 | macOS 或 Linux | Windows 尚未作为 v2 发布目标进行验证 |
 | Node.js | 25+ | 必须支持 v2 使用的内置 `node:sqlite` 运行时 |
+| Docker | 推荐 | 透明 Gateway 首选后端需要；仍保留原生宿主沙箱后端 |
 | LLM API | OpenAI 兼容 | 默认使用 Chat Completions，可选 Responses API |
 | 终端 | 支持 ANSI 的 TTY | 交互式 Agent 时间线所需 |
 | 浏览器 | 当前版本 Chromium、Firefox 或 Safari | 用于带认证的 Web 工作台 |
@@ -266,6 +275,10 @@ git clone https://github.com/SanMuzZzZz/LuaN1aoAgent.git
 cd LuaN1aoAgent
 npm ci
 npm run build
+
+# 首选 Docker 后端需要；./install.sh 会自动构建。
+npm run build:executor-image
+npm run build:network-image
 ```
 
 ### 2. 配置 LLM 运行时
@@ -287,8 +300,8 @@ v2 会读取本地 `.env`。该文件已被 Git 忽略，绝不能提交。
 
 ```bash
 npm start -- \
-  --goal "在授权范围内评估 http://127.0.0.1:8080" \
-  --scope "仅限 http://127.0.0.1:8080" \
+  --goal "在授权范围内评估 http://<授权且可路由的目标>:8080" \
+  --scope "仅限 http://<授权且可路由的目标>:8080" \
   --max-cycles 8 \
   --max-parallel-tasks 2
 ```
@@ -373,19 +386,19 @@ Web 工作台主要用于观察：读取持久图、事件、Artifact 和运行�
 
 所有 `/api/*` 流量与连接端点都要求有效 Session。分析员可以读取运行时元数据、敏感代理历史和连接状态，但连接生命周期变更要求管理员专属的 `connectivity:manage` capability；服务不暴露流量删除/导出端点。GET 请求豁免 CSRF，变更请求必须携带同源 double-submit token。所有 runtime 路径（包括符号链接）都会 canonicalize 并限制在配置的 `--runtime-dir` 根目录内，因此 API 不能充当任意文件系统浏览器。
 
-受管 traffic-proxy sidecar 将数据保存在 `<runtime>/traffic-proxy/data`，提供基于 cursor 的历史列表、交换详情、请求/响应捕获 body 与经过认证的公共 CA 下载 API。body 使用 base64 编码，单次读取最多 256 KiB。只能下载 `ca.crt`，私钥永不暴露。Web 启动的 Executor 会收到一份独立环境副本，其中设置 `HTTP_PROXY`、`HTTPS_PROXY`、`NO_PROXY`、`SSL_CERT_FILE` 和 `CURL_CA_BUNDLE`；`ALL_PROXY` 会被删除，同时不会修改进程全局环境，也不会强制使用 Bash。sidecar 启动/附着/停止、CA 创建和代理就绪会写入 `ExecutionLog`，且不记录路径、Secret 或证书内容。
+Docker Executor 与每个 Task 独立的 Gateway 共享网络命名空间。Executor 不接收代理变量、SOCKS 地址或 Docker 内部别名；普通 `curl`、语言原生 socket 和原始 TCP 客户端始终使用真实目标地址。IPv4 TCP 经策略路由进入 TUN connect gate，由 mitmproxy 捕获后直连，或通过受管 SSH/Chisel Route 拨号。只有真实目标连接成功后，gate 才完成 Executor 侧 TCP 握手，因此透明代理不会把拒绝端口误报为开放。UDP 和 ICMP 保持直出，并由 conntrack 遥测归因。
 
-侧边栏的 **Web Traffic** 页面提供 method、host、status、task/run reference、mode 和 error 精确过滤，以最新记录优先的 opaque cursor 分页展示，并按需加载 exchange 详情。请求和响应 body 仅在点击后读取，单次最多 256 KiB，可显示为 UTF-8/JSON、base64 或 hex；非法 UTF-8 会回退到 base64。header 和 body 以转义后的文本而非 HTML 渲染，并明确标记 metadata-only、已淘汰、best-effort 与 truncated 状态。这是安全渲染而非脱敏：获得权限的分析员仍能看到已捕获的凭据及其他敏感值。
+每个 epoch 在 `<runtime>/traffic/flows/<task>/` 下持久化独立 `.mitm` 捕获文件和 `.net.jsonl` 连接遥测。HTTP 请求/响应 body 只在持久化副本中截断，不影响实时转发。只读 Index 容器可在重启后从这些文件重建视图，因此已退出的 localhost Index 进程不是第二事实源。侧边栏的 **Web Traffic** 使用 opaque `flowRef`，区分 HTTP 与原始 TCP；body 按需加载，以转义文本展示，并明确显示截断或淘汰状态。
 
 Replay 仅限管理员；分析员可以查看 exchange，但不能 replay。端点为 `POST /api/traffic/history/:id/replay`，受 Session 授权与同源 double-submit CSRF 校验保护。`runtimeDir` 以及可选的 method、URL、header、body、route、session、task 和 run overrides 都必须位于 allowlist JSON request body，而不是 query string。Web body override 使用 base64，当前 `data` 限制为 16 KiB 字符。确认框只显示目标摘要与数量；`ExecutionLog` 通过服务端生成的用户/runtime 归因及稳定结果/错误标识记录 `traffic_replay_requested`、`traffic_replay_succeeded` 或 `traffic_replay_failed`，绝不记录 override URL、header、body 或其他请求 Secret。
 
-Replay 持久化为独立的 `mode=replay` exchange，`replay_of` 指向不可变的源 exchange。control protocol v1 提供 `replay` command，请求 frame 上限为 64 KiB、响应 frame 上限为 1 MiB；sidecar 对每个 `runtime_ref` 最多并发 4 个 replay，最多捕获 1 MiB replay 响应，并应用 30 秒 replay/control deadline；Web Server 另有全局 4 个 replay 请求的并发限制。Web control client 对 replay 使用专用的 35 秒等待时间，让 sidecar 能返回自身的 timeout 结果；其他 control command 仍使用默认 2 秒。错误使用稳定的机器可读 code 返回，不暴露底层敏感值。
+Replay 会持久化为独立 HTTP Flow，其 `replay_of` 指向不可变的源 Flow。活动 Run 复用受管网络与 Route。历史浏览使用独立只读 Index；直接 Replay 只按需启动 Run network 和一个可复用 Replay Gateway，涉及 Route 的操作才额外恢复 Connector 与 Route 定义。Replay 保留原 `routeRef` 和 `connectionRef`，原 Route 不可用时绝不回退直连；管理员重连同一个 Route 引用后可以继续 Replay。
 
-Replay 只接受绝对 HTTP(S) 目标，使用 TLS 1.2+ 严格校验证书与主机名；允许私网/RFC1918 目标，但拒绝已配置的代理 self-loop。它拒绝 `CONNECT`、URL userinfo/control character、hop-by-hop header（包括 `Connection` 指定的 header）、proxy authentication header，以及与 URL authority 冲突的 `Host`。metadata-only/passthrough、CONNECT、header/request 已截断、或捕获的 request body 缺失/不完整的源记录不可 replay。系统没有流量 export/delete endpoint。
+Replay 只接受正文完整的已捕获 HTTP 请求，并保留 method、URL、headers、body、Route 来源和 HTTP 编辑器。原始 TCP、UDP、ICMP、请求正文不完整或 payload 已淘汰的记录不可 Replay。系统不提供流量导出或删除端点。
 
-traffic manager/client 提供受管 HTTP scope，将 task/run 归因与非空 `routeRef`、`sessionRef` 组合应用。只有在该 scope 内执行的操作才携带这些 route/session reference；raw 或 unmanaged 流量仍可观测，但绝不会被自动归因。
+Connection 与 Route 独立于图投影持久化：Connection 表示命令通道，Route 表示网络可达性，并可由一个 Connection 支撑。`route_stop` 保留定义，`route_reconnect` 使用原引用恢复。Projector 消费带类型的连接事实，生成语义化 `ShellSession`、`session_on` 和已发现目标对应的 `proxy_route`；Runtime 容器和 Docker 别名永远不会成为图中的 Host。
 
-侧边栏的 **Connections** 页面展示 tunnel/session 的方向、transport、desired/observed state、heartbeat、可用性、错误与 operation graph 链接。管理员可在 UI 控制已有受管 SSH tunnel 和 SSH session 的 desired lifecycle；定义目前通过管理员专属 API 创建，分析员只能读取。请求只能提供 `credentialRef`，递归出现的明文密码、私钥、token 或其他凭据内容都会被拒绝；所有变更还受 CSRF、capability 校验和 runtime 根目录 containment 保护。Chisel adapter 已有配置与 allowlist 集成，但目前尚未接入 Web 生命周期控制；raw、unmanaged 和 Chisel 记录在该页面仅展示状态。
+侧边栏的 **Connections** 展示 Connection 与 Route 的期望/观测状态、支撑引用、心跳、目标 CIDR、失败原因和作战图链接。生命周期变更仅限管理员，并只接收 `credentialRef`，不接收明文 Secret。受管 SSH 和 Chisel Route 在活动与历史 Run 中都可停止、原引用重连；Agent 在 Bash 中自行创建的通道仍可被审计，但标记为 unmanaged，不伪造可恢复引用。
 
 ---
 
@@ -398,7 +411,7 @@ flowchart TB
     subgraph Runtime[LuaN1ao Runtime]
         Controller --> Planner
         Planner --> TaskGraph[(任务图)]
-        TaskGraph --> Scheduler[确定性波次调度器]
+        TaskGraph --> Scheduler[容量感知调和调度器]
         Scheduler --> ExecutorA[Executor Session A]
         Scheduler --> ExecutorB[Executor Session B]
         ExecutorA --> ExecutionLog[(ExecutionLog)]
@@ -438,7 +451,10 @@ LuaN1aoAgent/
 │   ├── controller.ts             # 调度、生命周期、监督与恢复
 │   ├── pi-runner.ts              # Pi 调用和规范事件记录
 │   ├── projection.ts             # 观察与图投影契约
-│   ├── executor-sandbox.ts       # macOS/Linux Executor 隔离
+│   ├── executor-sandbox.ts       # Seatbelt/Bubblewrap/workspace 宿主后端
+│   ├── executor-sandbox-docker.ts # 每个 Task 独立的 Docker Executor 后端
+│   ├── projector-coordinator.ts  # 单 owner 异步投影调度器
+│   ├── connectivity/             # ConnectivityRuntime、Gateway、Route、Replay、Index
 │   ├── stores/
 │   │   ├── execution-log.ts      # 持久事件账本
 │   │   ├── graph-store.ts        # 三图持久化与原子变更
@@ -450,6 +466,9 @@ LuaN1aoAgent/
 │   └── web-server.ts             # 带认证的工作台服务（可启动/停止任务）
 ├── web/                          # React Agent 工作台
 ├── test/                         # 运行时与迁移测试
+├── executor-image/               # Docker Executor 镜像
+├── network-image/                # Gateway/Connector/Index 镜像
+├── traffic-proxy/                # workspace 兼容显式 HTTP 代理
 ├── package.json
 └── README.md
 ```

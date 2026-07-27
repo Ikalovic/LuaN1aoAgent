@@ -237,3 +237,33 @@ test("aggregates Pi usage, invocation, projector, supervisor and tool metrics", 
   assert.equal(metrics.supervisor.decisions.checkpoint, 1);
   executionLog.close();
 });
+
+test("resolves artifact refs for evidence events in one batch", async () => {
+  const runtimeDir = mkdtempSync(join(tmpdir(), "luanniao-execution-materials-"));
+  const executionLog = new ExecutionLog(join(runtimeDir, "execution.jsonl"));
+  const withRefs = await executionLog.append({
+    taskId: "task:test",
+    role: "executor",
+    eventType: "tool_finished",
+    payload: { toolName: "artifact_write" },
+    artifactRefs: ["artifact:cookie-jar", "artifact:poc-script"]
+  });
+  const withoutRefs = await executionLog.append({
+    taskId: "task:test",
+    role: "executor",
+    eventType: "tool_finished",
+    payload: { toolName: "bash" }
+  });
+
+  const resolved = executionLog.artifactRefsForEvents([
+    withRefs.id,
+    withoutRefs.id,
+    withRefs.id,
+    "event:missing"
+  ]);
+
+  assert.deepEqual(resolved.get(withRefs.id), ["artifact:cookie-jar", "artifact:poc-script"]);
+  assert.equal(resolved.has(withoutRefs.id), false);
+  assert.equal(resolved.size, 1);
+  executionLog.close();
+});

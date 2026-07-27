@@ -16,7 +16,8 @@ import {
 } from "../src/controller.js";
 import { PromptRuntimeError } from "../src/pi-runner.js";
 import { renderPlannerInput } from "../src/prompts.js";
-import type { ControlSignal, ExecutionEvent, ObserverProjection, PlannerDecision, PlannerDecisionView, TaskEnvelope, TaskResult } from "../src/types.js";
+import type { ProjectorGraphRefRegistry } from "../src/projection.js";
+import type { ControlSignal, ExecutionEvent, GraphNode, ObserverProjection, PlannerDecision, PlannerDecisionView, TaskEnvelope, TaskResult } from "../src/types.js";
 
 type ControllerHarness = {
   agents: {
@@ -38,6 +39,8 @@ type ControllerHarness = {
   runProjectionJob: (input: unknown) => Promise<ObserverProjection>;
   runSupervisorCheck: (input: unknown) => Promise<ControlSignal>;
   applyControlSignal: (taskEnvelope: TaskEnvelope, controlSignal: ControlSignal, state?: TestActiveState) => void;
+  settleGracefulCheckpointRequest: (state: TestActiveState) => void;
+  checkpointGraceMs: number;
   handleExecutorEventPersisted: (event: ExecutionEvent) => Promise<void>;
   armEpochTimeSlice: (taskEnvelope: TaskEnvelope) => void;
   clearEpochTimeSlice: () => void;
@@ -60,7 +63,8 @@ type ControllerHarness = {
   }>;
   createObserverSessionForMode: (
     mode: "supervise" | "project",
-    taskId: string
+    taskId: string,
+    projectorGraphRefs?: ProjectorGraphRefRegistry
   ) => Promise<{ session: ReturnType<typeof createAbortableMockTextSession>; dynamicObserver: boolean }>;
   createSyntheticTaskResult: (input: {
     taskEnvelope: TaskEnvelope;
@@ -69,6 +73,9 @@ type ControllerHarness = {
     executorOutputPreview: string;
   }) => Promise<TaskResult>;
   createDependencyOutcomeBrief: (taskEnvelope: TaskEnvelope) => Promise<string>;
+  withSessionMaterialRefs: <T extends { evidenceRefs?: string[] }>(
+    nodes: T[]
+  ) => Array<T & { materialRefs?: string[] }>;
   structuredInvocationsEnabled: boolean;
   createPlannerSessionForCycle: (forceIsolated?: boolean) => Promise<{
     session: ReturnType<typeof createAbortableMockTextSession>;
@@ -83,11 +90,18 @@ type ControllerHarness = {
   finishTaskExecution: (taskId: string, reason?: string) => void;
   ensureRootGraph: (input: { userGoal: string; scopeSummary: string }) => Promise<void>;
   buildPlannerDecisionView: () => Promise<PlannerDecisionView>;
+  waitForPlannerProjectionFences: () => Promise<void>;
+  plannerProjectionTargets: Map<string, number>;
+  projectorCoordinator: {
+    waitForCommitted: (taskId: string, targetSeq: number, options?: { timeoutMs?: number }) => Promise<void>;
+    waitForSettled: (timeoutMs?: number) => Promise<boolean>;
+  };
   enrichTaskResultLifecycle: (
     taskResult: TaskResult,
     taskEnvelope: TaskEnvelope,
     state?: TestActiveState
   ) => Promise<TaskResult>;
+  disposeTaskExecutorResources: (taskId: string) => Promise<void>;
 };
 
 type TestActiveState = {
@@ -95,8 +109,12 @@ type TestActiveState = {
   lifecycleState: "created" | "running" | "closing" | "closed";
   executorSession?: { abort: () => Promise<void>; clearQueue?: () => unknown; steer?: (text: string) => Promise<void> };
   executorStopRequested: boolean;
+  checkpointGraceTimer?: NodeJS.Timeout;
+  terminationPromise?: Promise<void>;
+  terminationFailure?: string;
   supervisionState: {
     progressDigest: string;
+    lastVerdict?: Pick<ControlSignal, "decision" | "reason" | "guidance">;
     repeatedPatterns: string[];
     negativeFindings: string[];
     recentFingerprints: string[];
@@ -204,17 +222,17 @@ test("preserves checkpoint observer signal and marks it as stop-worthy", () => {
 
 test("normalizes pure Supervisor ControlSignal output", () => {
   const signal = normalizeSupervisorControlSignal({
-    decision: "checkpoint",
-    reason: "enough progress for planner",
+    decision: "redirect",
+    reason: "change the current strategy",
     evidenceRefs: ["event:5"],
     confidence: "high",
-    budgetExtension: { maxTurnsDelta: 4, reason: "ignored because checkpoint stops" }
+    guidance: "stop repeating the same probe and test the remaining hypothesis"
   }, ["event:fallback"]);
 
-  assert.equal(signal.decision, "checkpoint");
+  assert.equal(signal.decision, "redirect");
   assert.deepEqual(signal.evidenceRefs, ["event:5"]);
-  assert.deepEqual(signal.budgetExtension, { maxTurnsDelta: 4, reason: "ignored because checkpoint stops" });
-  assert.equal(shouldStopExecutorForControlSignal(signal), true);
+  assert.equal(signal.guidance, "stop repeating the same probe and test the remaining hypothesis");
+  assert.equal(shouldStopExecutorForControlSignal(signal), false);
 });
 
 test("continues executor when observer signal is continue", async () => {
@@ -233,9 +251,35 @@ test("continues executor when observer signal is continue", async () => {
   harness.controller.close();
 });
 
-test("requests graceful TaskResult handoff when observer requests checkpoint", async () => {
+test("Supervisor checkpoint asks Executor to submit before aborting", async () => {
   const harness = createControllerHarness();
   const taskEnvelope = makeTaskEnvelope();
+  const state = harness.controllerHarness.beginTaskExecution(taskEnvelope);
+  state.executorSession = harness.controllerHarness.agents.executor;
+  harness.controllerHarness.checkpointGraceMs = 25;
+
+  harness.controllerHarness.applyControlSignal(taskEnvelope, {
+    decision: "checkpoint",
+    reason: "handoff to planner",
+    evidenceRefs: ["event:checkpoint"],
+    confidence: "high"
+  });
+
+  await waitFor(() => harness.steers().some((message) => message.includes("RUNTIME_CHECKPOINT_REQUEST")));
+  assert.equal(harness.abortCount(), 0);
+  assert.ok((await harness.controller.executionLog.readAll()).some((event) =>
+    event.eventType === "executor_checkpoint_requested" && event.payload.delivery === "steer"
+  ));
+  harness.controllerHarness.settleGracefulCheckpointRequest(state);
+  await new Promise((resolve) => setTimeout(resolve, 35));
+  assert.equal(harness.abortCount(), 0);
+  harness.controller.close();
+});
+
+test("Supervisor checkpoint aborts only after the graceful handoff expires", async () => {
+  const harness = createControllerHarness();
+  const taskEnvelope = makeTaskEnvelope();
+  harness.controllerHarness.checkpointGraceMs = 5;
   activateTask(harness.controllerHarness, taskEnvelope);
 
   harness.controllerHarness.applyControlSignal(taskEnvelope, {
@@ -245,8 +289,10 @@ test("requests graceful TaskResult handoff when observer requests checkpoint", a
     confidence: "high"
   });
 
-  await waitFor(async () => harness.steers().some((message) => message.includes("RUNTIME_CHECKPOINT_REQUEST")));
-  assert.equal(harness.abortCount(), 0);
+  await waitFor(() => harness.abortCount() === 1);
+  assert.ok((await harness.controller.executionLog.readAll()).some((event) =>
+    event.eventType === "executor_checkpoint_grace_expired"
+  ));
   harness.controller.close();
 });
 
@@ -358,6 +404,32 @@ test("requestStop clears queued steers before aborting the executor", async () =
   await harness.controller.close({ drainProjectionJobs: false });
 });
 
+test("requestStop overrides a pending graceful checkpoint", async () => {
+  const harness = createControllerHarness();
+  const taskEnvelope = makeTaskEnvelope();
+  const state = harness.controllerHarness.beginTaskExecution(taskEnvelope);
+  harness.controllerHarness.checkpointGraceMs = 1_000;
+  const calls: string[] = [];
+  state.executorSession = {
+    async steer() { calls.push("steer"); },
+    clearQueue() { calls.push("clearQueue"); },
+    async abort() { calls.push("abort"); }
+  };
+
+  harness.controllerHarness.applyControlSignal(taskEnvelope, {
+    decision: "checkpoint",
+    reason: "handoff to planner",
+    evidenceRefs: ["event:checkpoint"]
+  }, state);
+  await waitFor(() => calls.includes("steer"));
+
+  await harness.controller.requestStop("Received SIGTERM");
+
+  assert.deepEqual(calls, ["steer", "clearQueue", "abort"]);
+  assert.equal(state.checkpointGraceTimer, undefined);
+  await harness.controller.close({ drainProjectionJobs: false });
+});
+
 test("stop_executor control signal clears queued steers before aborting the executor", async () => {
   const harness = createControllerHarness();
   const taskEnvelope = makeTaskEnvelope();
@@ -376,6 +448,81 @@ test("stop_executor control signal clears queued steers before aborting the exec
   await waitForSettled();
 
   assert.deepEqual(calls, ["clearQueue", "abort"]);
+  await harness.controller.close({ drainProjectionJobs: false });
+});
+
+test("stop_executor terminates even when the audit append fails", async () => {
+  const harness = createControllerHarness();
+  const taskEnvelope = makeTaskEnvelope();
+  const state = harness.controllerHarness.beginTaskExecution(taskEnvelope);
+  const calls: string[] = [];
+  state.executorSession = {
+    clearQueue() { calls.push("clearQueue"); },
+    async abort() { calls.push("abort"); }
+  };
+  const executionLogHarness = harness.controller.executionLog as unknown as {
+    append: typeof harness.controller.executionLog.append;
+  };
+  const originalAppend = executionLogHarness.append;
+  let appendAttempted = false;
+  executionLogHarness.append = async () => {
+    appendAttempted = true;
+    throw new Error("audit unavailable");
+  };
+
+  harness.controllerHarness.applyControlSignal(taskEnvelope, {
+    decision: "stop_executor",
+    reason: "supervisor stop",
+    evidenceRefs: ["event:stop"]
+  }, state);
+
+  assert.deepEqual(calls, ["clearQueue", "abort"]);
+  assert.ok(state.terminationPromise);
+  await state.terminationPromise;
+  await waitFor(() => appendAttempted);
+  assert.equal(state.executorStopRequested, true);
+
+  executionLogHarness.append = originalAppend;
+  await harness.controller.close({ drainProjectionJobs: false });
+});
+
+test("executor termination command failures are persisted and block later steers", async () => {
+  const harness = createControllerHarness();
+  const taskEnvelope = makeTaskEnvelope();
+  const state = harness.controllerHarness.beginTaskExecution(taskEnvelope);
+  let steerCount = 0;
+  state.executorSession = {
+    clearQueue() { throw new Error("clear failed"); },
+    async abort() { throw new Error("abort failed"); },
+    async steer() { steerCount += 1; }
+  };
+
+  harness.controllerHarness.applyControlSignal(taskEnvelope, {
+    decision: "stop_executor",
+    reason: "supervisor stop",
+    evidenceRefs: ["event:stop"]
+  }, state);
+  await state.terminationPromise;
+
+  assert.equal(state.lifecycleState, "closing");
+  assert.equal(state.executorStopRequested, true);
+  assert.match(state.terminationFailure ?? "", /Failed to terminate executor epoch/);
+  assert.ok((await harness.controller.executionLog.readAll()).some((event) =>
+    event.eventType === "executor_termination_failed"
+      && event.epochId === state.epochId
+      && event.payload.errorType === "AggregateError"
+  ));
+
+  harness.controllerHarness.applyControlSignal(taskEnvelope, {
+    decision: "redirect",
+    reason: "late redirect",
+    guidance: "continue probing",
+    evidenceRefs: ["event:late"]
+  }, state);
+  await waitForSettled();
+  assert.equal(steerCount, 0);
+
+  harness.controllerHarness.finishTaskExecution(taskEnvelope.taskId, "supervisor_checkpoint");
   await harness.controller.close({ drainProjectionJobs: false });
 });
 
@@ -398,7 +545,7 @@ test("checkpoint without steer support terminates immediately with queue cleared
 
   assert.deepEqual(calls, ["clearQueue", "abort"]);
   assert.ok((await harness.controller.executionLog.readAll()).some((event) =>
-    event.eventType === "executor_checkpoint_requested" && event.payload.delivery === "none"
+    event.eventType === "executor_checkpoint_requested" && event.payload.delivery === "abort"
   ));
   await harness.controller.close({ drainProjectionJobs: false });
 });
@@ -570,6 +717,11 @@ test("runtime grounds submitted TaskResult with current epoch observations and a
     },
     artifactRefs: [artifact.artifactRef]
   });
+  (harness.controller as unknown as { connectivityRuntime?: { capabilityRefsForTask(taskId: string): string[] } }).connectivityRuntime = {
+    capabilityRefsForTask: (taskId) => taskId === taskEnvelope.taskId
+      ? ["route:task-route", "connection:task-connection"]
+      : []
+  };
 
   const enriched = await harness.controllerHarness.enrichTaskResultLifecycle({
     taskId: taskEnvelope.taskId,
@@ -584,11 +736,13 @@ test("runtime grounds submitted TaskResult with current epoch observations and a
   assert.ok(enriched.evidenceRefs.includes(started.id));
   assert.ok(enriched.evidenceRefs.includes(finished.id));
   assert.deepEqual(enriched.artifactRefs, [artifact.artifactRef]);
+  assert.deepEqual(enriched.capabilityRefs, ["route:task-route", "connection:task-connection"]);
+  delete (harness.controller as unknown as { connectivityRuntime?: unknown }).connectivityRuntime;
   harness.controllerHarness.finishTaskExecution(taskEnvelope.taskId, "executor_submitted");
   harness.controller.close();
 });
 
-test("extends turn budget when Supervisor grants a budget extension", async () => {
+test("does not let Supervisor extend the runtime-owned turn budget", async () => {
   const harness = createObserverControllerHarness(JSON.stringify({
     decision: "continue",
     reason: "recent execution is still making high-value progress",
@@ -612,16 +766,17 @@ test("extends turn budget when Supervisor grants a budget extension", async () =
   }
 
   await waitFor(async () => (await harness.controller.executionLog.readAll())
-    .some((event) => event.eventType === "budget_extension_granted"));
-  assert.ok((taskEnvelope.budget?.maxTurns ?? 0) > 1);
+    .some((event) => event.eventType === "executor_checkpoint_requested"));
+  assert.equal(taskEnvelope.budget?.maxTurns, MIN_TASK_BUDGET.maxTurns);
   assert.equal((await harness.controller.executionLog.readAll())
-    .some((event) => event.eventType === "executor_stop_requested"), false);
+    .some((event) => event.eventType === "budget_extension_granted"), false);
   harness.controller.close();
 });
 
 test("forces checkpoint when maxTurns budget is reached", async () => {
   const harness = createControllerHarness();
   const taskEnvelope = makeTaskEnvelope({ budget: { maxTurns: MIN_TASK_BUDGET.maxTurns } });
+  harness.controllerHarness.checkpointGraceMs = 5;
   activateTask(harness.controllerHarness, taskEnvelope);
 
   for (let index = 0; index < MIN_TASK_BUDGET.maxTurns; index += 1) {
@@ -635,10 +790,12 @@ test("forces checkpoint when maxTurns budget is reached", async () => {
 
   await waitFor(async () => (await harness.controller.executionLog.readAll())
     .some((event) => event.eventType === "executor_checkpoint_requested"));
-  assert.equal(harness.abortCount(), 0);
-  assert.ok(harness.steers().some((message) => message.includes(
+  await waitFor(() => harness.abortCount() === 1);
+  assert.equal(harness.abortCount(), 1);
+  assert.equal(harness.observerPromptCount(), 1);
+  assert.equal(harness.steers().some((message) => message.includes(
     `Task budget reached: maxTurns=${MIN_TASK_BUDGET.maxTurns}`
-  )));
+  )), true);
   harness.controller.close();
 });
 
@@ -726,6 +883,7 @@ test("supervisor checkpoint signal requests graceful executor handoff from turn 
   }));
   const taskEnvelope = makeTaskEnvelope({ budget: { ...DEFAULT_TASK_BUDGET } });
   activateTask(harness.controllerHarness, taskEnvelope);
+  harness.controllerHarness.checkpointGraceMs = 50;
 
   for (let index = 0; index < 8; index += 1) {
     harness.controllerHarness.handleExecutorEventPersisted(makeExecutionEvent(
@@ -741,6 +899,9 @@ test("supervisor checkpoint signal requests graceful executor handoff from turn 
   const eventTypes = (await harness.controller.executionLog.readAll()).map((event) => event.eventType);
   assert.ok(eventTypes.includes("supervisor_check_started"));
   assert.ok(eventTypes.includes("supervisor_check_succeeded"));
+  assert.ok((await harness.controller.executionLog.readAll()).some((event) =>
+    event.eventType === "executor_checkpoint_requested" && event.payload.delivery === "steer"
+  ));
   harness.controller.close();
 });
 
@@ -996,13 +1157,15 @@ test("supervisor checks use fresh sessions without previous prompt history", asy
     return { session, dynamicObserver: true };
   };
   const taskEnvelope = makeTaskEnvelope();
-  activateTask(controllerHarness, taskEnvelope);
+  const state = controllerHarness.beginTaskExecution(taskEnvelope);
+  state.executorSession = controllerHarness.agents.executor;
 
-  await controllerHarness.runSupervisorCheck({
+  const firstVerdict = await controllerHarness.runSupervisorCheck({
     reason: "manual:first",
     taskEnvelope,
     sourceEventIds: ["event:first"]
   });
+  controllerHarness.applyControlSignal(taskEnvelope, firstVerdict, state);
   await controllerHarness.runSupervisorCheck({
     reason: "manual:second",
     taskEnvelope,
@@ -1012,8 +1175,155 @@ test("supervisor checks use fresh sessions without previous prompt history", asy
   assert.equal(sessions.length, 2);
   assert.equal(sessions[0].promptCount(), 1);
   assert.equal(sessions[1].promptCount(), 1);
-  assert.doesNotMatch(sessions[1].prompts()[0] ?? "", /first-check-marker|manual:first|event:first/);
+  assert.match(sessions[1].prompts()[0] ?? "", /最近监督信号：[\s\S]*first-check-marker/);
+  assert.doesNotMatch(sessions[1].prompts()[0] ?? "", /manual:first|event:first/);
   controller.close();
+});
+
+test("superseded in-flight Supervisor verdict cannot redirect while the latest verdict applies", async () => {
+  const runtimeDir = mkdtempSync(join(tmpdir(), "luanniao-controller-"));
+  const controller = createControllerWithTestLlmEnv(runtimeDir);
+  const controllerHarness = controller as unknown as ControllerHarness;
+  const firstRelease = createDeferred<void>();
+  const executorSession = createAbortableMockTextSession("{}");
+  const delayedFirstSession = createDelayedAbortableMockTextSession(async () => {
+    await firstRelease.promise;
+    return JSON.stringify({
+      decision: "redirect",
+      reason: "old verdict",
+      guidance: "follow the old path",
+      evidenceRefs: [],
+      confidence: "high"
+    });
+  });
+  let firstAbortCount = 0;
+  const firstSession = {
+    ...delayedFirstSession,
+    async abort(): Promise<void> {
+      firstAbortCount += 1;
+    },
+    dispose(): void {}
+  };
+  const latestSession = createAbortableMockTextSession(JSON.stringify({
+    decision: "redirect",
+    reason: "latest verdict",
+    guidance: "follow the latest path",
+    evidenceRefs: [],
+    confidence: "high"
+  }));
+  let sessionIndex = 0;
+  controllerHarness.agents = {
+    planner: createMockTextSession("{}"),
+    executor: executorSession,
+    observer: latestSession
+  };
+  controllerHarness.createObserverSessionForMode = async () => ({
+    session: sessionIndex++ === 0 ? firstSession : latestSession,
+    dynamicObserver: true
+  });
+  const taskEnvelope = makeTaskEnvelope();
+  const state = controllerHarness.beginTaskExecution(taskEnvelope);
+  state.executorSession = executorSession;
+
+  const firstVerdictPromise = controllerHarness.enqueueSupervisorCheck({
+    reason: "manual:first",
+    taskEnvelope,
+    sourceEventIds: ["event:first"],
+    epochRef: state.epochId,
+    throughSeq: 10
+  });
+  await waitFor(() => firstSession.promptCount() === 1);
+  const latestVerdictPromise = controllerHarness.enqueueSupervisorCheck({
+    reason: "manual:latest",
+    taskEnvelope,
+    sourceEventIds: ["event:latest"],
+    epochRef: state.epochId,
+    throughSeq: 20
+  });
+  await waitFor(() => firstAbortCount === 1);
+  firstRelease.resolve();
+
+  const [firstVerdict, latestVerdict] = await Promise.all([firstVerdictPromise, latestVerdictPromise]);
+  controllerHarness.applyControlSignal(taskEnvelope, firstVerdict, state);
+  controllerHarness.applyControlSignal(taskEnvelope, latestVerdict, state);
+  await waitForSettled();
+
+  assert.equal(firstVerdict.decision, "continue");
+  assert.match(firstVerdict.reason, /superseded supervisor window/);
+  assert.equal(firstAbortCount, 1);
+  assert.equal(latestVerdict.decision, "redirect");
+  assert.deepEqual(executorSession.steers(), ["SUPERVISOR_REDIRECT:\nfollow the latest path"]);
+  const events = await controller.executionLog.readAll();
+  assert.ok(events.some((event) => event.eventType === "supervisor_check_discarded"
+    && String(event.summary).includes("superseded supervisor window")));
+  await controller.close({ drainProjectionJobs: false });
+});
+
+test("control application rejects a Supervisor verdict older than the latest requested sequence", async () => {
+  const runtimeDir = mkdtempSync(join(tmpdir(), "luanniao-controller-"));
+  const controller = createControllerWithTestLlmEnv(runtimeDir);
+  const controllerHarness = controller as unknown as ControllerHarness;
+  const latestRelease = createDeferred<void>();
+  const executorSession = createAbortableMockTextSession("{}");
+  const firstSession = createAbortableMockTextSession(JSON.stringify({
+    decision: "redirect",
+    reason: "first verdict",
+    guidance: "follow the first path",
+    evidenceRefs: [],
+    confidence: "high"
+  }));
+  const latestSession = createDelayedAbortableMockTextSession(async () => {
+    await latestRelease.promise;
+    return JSON.stringify({
+      decision: "redirect",
+      reason: "latest verdict",
+      guidance: "follow the latest path",
+      evidenceRefs: [],
+      confidence: "high"
+    });
+  });
+  let sessionIndex = 0;
+  controllerHarness.agents = {
+    planner: createMockTextSession("{}"),
+    executor: executorSession,
+    observer: latestSession
+  };
+  controllerHarness.createObserverSessionForMode = async () => ({
+    session: sessionIndex++ === 0 ? firstSession : latestSession,
+    dynamicObserver: true
+  });
+  const taskEnvelope = makeTaskEnvelope();
+  const state = controllerHarness.beginTaskExecution(taskEnvelope);
+  state.executorSession = executorSession;
+
+  const firstVerdict = await controllerHarness.enqueueSupervisorCheck({
+    reason: "manual:first",
+    taskEnvelope,
+    sourceEventIds: ["event:first"],
+    epochRef: state.epochId,
+    throughSeq: 10
+  });
+  const latestVerdictPromise = controllerHarness.enqueueSupervisorCheck({
+    reason: "manual:latest",
+    taskEnvelope,
+    sourceEventIds: ["event:latest"],
+    epochRef: state.epochId,
+    throughSeq: 20
+  });
+  await waitFor(() => latestSession.promptCount() === 1);
+  controllerHarness.applyControlSignal(taskEnvelope, firstVerdict, state);
+  await waitForSettled();
+  assert.deepEqual(executorSession.steers(), []);
+
+  latestRelease.resolve();
+  const latestVerdict = await latestVerdictPromise;
+  controllerHarness.applyControlSignal(taskEnvelope, latestVerdict, state);
+  await waitForSettled();
+
+  assert.deepEqual(executorSession.steers(), ["SUPERVISOR_REDIRECT:\nfollow the latest path"]);
+  assert.ok((await controller.executionLog.readAll()).some((event) => event.eventType === "supervisor_check_discarded"
+    && String(event.summary).includes("Ignored superseded control signal")));
+  await controller.close({ drainProjectionJobs: false });
 });
 
 test("supervisor check is discarded after executor stop without LLM call", async () => {
@@ -1170,6 +1480,8 @@ test("projector input uses compact artifact index and graph context", async () =
   assert.match(prompt, /10\.0\.0\.9/);
   assert.match(prompt, /executor_interpretation: 确认 middle-breakthrough-marker/);
   assert.match(prompt, /middle-breakthrough-marker/);
+  assert.match(prompt, /taskOutcome=.*"status":"partial"/);
+  assert.ok(prompt.includes(artifactRefs.at(-1)!));
   assert.doesNotMatch(prompt, /  head:|  tail:/);
   assert.doesNotMatch(prompt, /ARTIFACT_MANIFEST:|CURRENT_GRAPH_SLICE:/);
   assert.doesNotMatch(prompt, /artifact:graph-noise/);
@@ -1180,6 +1492,54 @@ test("projector input uses compact artifact index and graph context", async () =
     .find((event) => event.eventType === "projection_input_built");
   assert.equal(inputEvent?.payload.observationCount, 2);
   assert.ok(Number(inputEvent?.payload.inputBytes) < 10_000);
+  harness.controller.close();
+});
+
+test("projector artifact index exposes unmatched artifacts as references without fixed previews", async () => {
+  const harness = createObserverControllerHarness(observerProjectionJson());
+  const taskEnvelope = makeTaskEnvelope();
+  const artifact = await harness.controller.artifactStore.write({
+    taskId: taskEnvelope.taskId,
+    kind: "text",
+    mediaType: "text/plain",
+    data: `private-prefix-${"x".repeat(600)}-private-suffix`
+  });
+  const controllerHarness = harness.controller as unknown as {
+    loadProjectorArtifactIndex(input: {
+      taskEnvelope: TaskEnvelope;
+      observations: Array<{
+        ref: string;
+        kind: "action";
+        seqStart: number;
+        seqEnd: number;
+        action: string;
+        outcomeDigest: string;
+        status: "ok";
+        artifactRefs: string[];
+        anchors: string[];
+        sourceEventIds: string[];
+      }>;
+    }): Promise<{ text: string }>;
+  };
+
+  const index = await controllerHarness.loadProjectorArtifactIndex({
+    taskEnvelope,
+    observations: [{
+      ref: "o1",
+      kind: "action",
+      seqStart: 1,
+      seqEnd: 1,
+      action: "bash",
+      outcomeDigest: "unrelated observation",
+      status: "ok",
+      artifactRefs: [artifact.artifactRef],
+      anchors: ["unrelated-anchor"],
+      sourceEventIds: ["event:1"]
+    }]
+  });
+
+  assert.match(index.text, new RegExp(artifact.artifactRef.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+  assert.doesNotMatch(index.text, /private-prefix|private-suffix|  head:|  tail:/);
   harness.controller.close();
 });
 
@@ -1202,6 +1562,150 @@ test("projection job remains independent after executor stop", async () => {
   assert.ok(eventTypes.includes("projection_job_started"));
   assert.ok(eventTypes.includes("projection_job_succeeded"));
   harness.controller.close();
+});
+
+test("projector consumes typed connectivity facts without skipping their watermark", async () => {
+  const harness = createObserverControllerHarness(observerProjectionJson());
+  const taskEnvelope = makeTaskEnvelope();
+  const connectivityEvent = await harness.controller.executionLog.append({
+    taskId: taskEnvelope.taskId,
+    role: "runtime",
+    eventType: "connectivity_observation",
+    summary: "SSH route became active",
+    payload: {
+      observationKind: "route",
+      transition: "route_opened",
+      status: "active",
+      routeRef: "route:ssh-1",
+      connectionRef: "connection:ssh-1",
+      pivotHostRef: "host:dmz",
+      dialAddress: "10.0.0.8",
+      targetCidrs: ["172.31.0.0/24"]
+    }
+  });
+
+  await harness.controllerHarness.enqueueProjectionJob({
+    reason: "task_end",
+    taskEnvelope,
+    sourceEventIds: [connectivityEvent.id]
+  });
+
+  const prompt = harness.observerPrompts()[0] ?? "";
+  assert.match(prompt, /route_opened/);
+  assert.match(prompt, /route:ssh-1/);
+  assert.match(prompt, /172\.31\.0\.0\/24/);
+  const state = harness.controller.runtimeStore.getProjectionState(taskEnvelope.taskId);
+  assert.equal(state.committedSeq, connectivityEvent.seq);
+  assert.equal(state.desiredSeq, connectivityEvent.seq);
+  await harness.controller.close();
+});
+
+test("typed live command connection projects one stable ShellSession on the real pivot host", async () => {
+  const harness = createObserverControllerHarness(JSON.stringify({
+    sourceEventIds: ["o1"],
+    nodes: [{
+      id: "new:1",
+      graphKind: "operation",
+      type: "Host",
+      label: "10.0.0.8",
+      properties: { ip: "10.0.0.8" },
+      evidenceRefs: ["o1"]
+    }, {
+      id: "new:2",
+      graphKind: "operation",
+      type: "ShellSession",
+      label: "SSH on 10.0.0.8",
+      properties: { sessionId: "connection:ssh-1", status: "live", transport: "ssh" },
+      evidenceRefs: ["o1"]
+    }],
+    edges: [{
+      from: "new:2",
+      to: "new:1",
+      type: "session_on",
+      evidenceRefs: ["o1"]
+    }]
+  }));
+  const taskEnvelope = makeTaskEnvelope();
+  const connectivityEvent = await harness.controller.executionLog.append({
+    taskId: taskEnvelope.taskId,
+    role: "runtime",
+    eventType: "connectivity_observation",
+    summary: "ssh connection connection:ssh-1 is live",
+    payload: {
+      observationKind: "session",
+      transition: "opened",
+      connectionRef: "connection:ssh-1",
+      sessionType: "shell",
+      hostRef: "host:dmz",
+      transport: "ssh",
+      status: "live",
+      dialAddress: "10.0.0.8"
+    }
+  });
+
+  await harness.controllerHarness.enqueueProjectionJob({
+    reason: "project_window:connectivity",
+    taskEnvelope,
+    sourceEventIds: [connectivityEvent.id]
+  });
+
+  const operation = harness.controller.graphStore.query("operation", [], 20);
+  const session = operation.nodes.find((node) => node.type === "ShellSession");
+  const host = operation.nodes.find((node) => node.type === "Host");
+  assert.equal(session?.properties.sessionId, "connection:ssh-1");
+  assert.equal(host?.properties.ip, "10.0.0.8");
+  assert.ok(operation.edges.some((edge) => edge.type === "session_on" && edge.from === session?.id && edge.to === host?.id));
+  await harness.controller.close();
+});
+
+test("projector receives active route references when an internal host is discovered later", async () => {
+  const harness = createObserverControllerHarness(observerProjectionJson());
+  const taskEnvelope = makeTaskEnvelope();
+  const connectivityRuntime = {
+    routeProjectionSnapshot: () => [{
+      routeRef: "route:ssh-existing",
+      connector: "ssh" as const,
+      pivotHostRef: "host:dmz",
+      dialAddress: "10.0.0.8",
+      targetCidrs: ["172.31.0.0/24"],
+      status: "live" as const,
+      lastHeartbeat: "2026-07-26T00:00:00.000Z",
+      connectionRef: "connection:ssh-existing"
+    }]
+  };
+  (harness.controller as unknown as { connectivityRuntime?: typeof connectivityRuntime }).connectivityRuntime = connectivityRuntime;
+  const hostDiscoveryEvent = await harness.controller.executionLog.append({
+    taskId: taskEnvelope.taskId,
+    role: "executor",
+    eventType: "tool_finished",
+    summary: "HTTP 200 from newly discovered internal host 172.31.0.20",
+    payload: {
+      toolCallId: "call:internal-host",
+      toolName: "bash",
+      result: {
+        content: [{ type: "text", text: "HTTP 200 from http://172.31.0.20/" }]
+      }
+    }
+  });
+
+  await harness.controllerHarness.enqueueProjectionJob({
+    reason: "project_window:host_discovery",
+    taskEnvelope,
+    sourceEventIds: [hostDiscoveryEvent.id]
+  });
+
+  const prompt = harness.observerPrompts()[0] ?? "";
+  const observations = prompt.match(/<observations>\n([\s\S]*?)\n<\/observations>/)?.[1] ?? "";
+  const connectivityContext = prompt.match(/<connectivity_context format="json">\n([\s\S]*?)\n<\/connectivity_context>/)?.[1] ?? "";
+  assert.match(observations, /172\.31\.0\.20/);
+  assert.doesNotMatch(observations, /route:ssh-existing/);
+  assert.match(connectivityContext, /route:ssh-existing/);
+  assert.match(connectivityContext, /host:dmz/);
+  assert.match(connectivityContext, /172\.31\.0\.0\/24/);
+  assert.match(prompt, /不能独立证明 Host、Session、Evidence 或关系/);
+  assert.equal(harness.controller.runtimeStore.getProjectionState(taskEnvelope.taskId).committedSeq, hostDiscoveryEvent.seq);
+  delete (harness.controller as unknown as { connectivityRuntime?: unknown }).connectivityRuntime;
+  await harness.controller.close();
 });
 
 test("tool windows queue asynchronous projector every sixteen tool results without invoking supervisor", async () => {
@@ -1264,7 +1768,7 @@ test("active projector does not chase events below the next tool window", async 
   harness.controller.close();
 });
 
-test("projection catchup debounces then projects the accumulated tail", async (t) => {
+test("projector max-age scheduling projects an accumulated live tail", async (t) => {
   process.env.PROJECTOR_CATCHUP_DELAY_MS = "20";
   process.env.PROJECTOR_CATCHUP_MIN_OBSERVATIONS = "1";
   t.after(() => {
@@ -1298,17 +1802,14 @@ test("projection catchup debounces then projects the accumulated tail", async (t
   harness.controller.runtimeStore.raiseProjectionDesired(taskEnvelope.taskId, tailSeq, 0);
 
   releaseProjection.resolve();
-  await waitFor(async () => (await harness.controller.executionLog.readAll())
-    .some((event) => event.eventType === "projection_catchup_started"));
   await waitFor(async () => projectorSession.promptCount() === 2);
+  await waitFor(() => harness.controller.runtimeStore.getProjectionState(taskEnvelope.taskId).committedSeq === tailSeq);
   const events = await harness.controller.executionLog.readAll();
-  const catchup = events.find((event) => event.eventType === "projection_catchup_started");
-  assert.ok(Number(catchup?.payload.observationCount) >= 1);
-  assert.equal(events.some((event) => event.eventType === "projection_catchup_deferred"), false);
+  assert.equal(events.filter((event) => event.eventType === "projection_job_started").length, 2);
   harness.controller.close();
 });
 
-test("projection catchup defers a tiny tail instead of spending a projector call", async (t) => {
+test("projector max-age scheduling eventually projects a tiny live tail", async (t) => {
   process.env.PROJECTOR_CATCHUP_DELAY_MS = "20";
   t.after(() => {
     delete process.env.PROJECTOR_CATCHUP_DELAY_MS;
@@ -1336,16 +1837,14 @@ test("projection catchup defers a tiny tail instead of spending a projector call
   harness.controller.runtimeStore.raiseProjectionDesired(taskEnvelope.taskId, tailEvent.seq ?? 0, 0);
 
   releaseProjection.resolve();
-  await waitFor(async () => (await harness.controller.executionLog.readAll())
-    .some((event) => event.eventType === "projection_catchup_deferred"));
-  await waitForSettled();
+  await waitFor(async () => projectorSession.promptCount() === 2);
+  await waitFor(() => harness.controller.runtimeStore.getProjectionState(taskEnvelope.taskId).committedSeq === tailEvent.seq);
   const events = await harness.controller.executionLog.readAll();
-  assert.equal(events.some((event) => event.eventType === "projection_catchup_started"), false);
-  assert.equal(projectorSession.promptCount(), 1);
+  assert.equal(events.filter((event) => event.eventType === "projection_job_started").length, 2);
   harness.controller.close();
 });
 
-test("terminal projection consumes its remaining tail in one job", async () => {
+test("terminal projection continuously drains its remaining tail", async () => {
   const harness = createObserverControllerHarness(observerProjectionJson());
   const taskEnvelope = makeTaskEnvelope({ budget: { ...DEFAULT_TASK_BUDGET, maxTurns: 20 } });
   let lastSeq = 0;
@@ -1355,7 +1854,7 @@ test("terminal projection consumes its remaining tail in one job", async () => {
   }
   harness.controller.runtimeStore.raiseProjectionDesired(taskEnvelope.taskId, lastSeq, 0);
 
-  await harness.controllerHarness.runProjectionJob({
+  await harness.controllerHarness.enqueueProjectionJob({
     reason: "task_end",
     taskEnvelope,
     taskResult: {
@@ -1370,8 +1869,8 @@ test("terminal projection consumes its remaining tail in one job", async () => {
   const state = harness.controller.runtimeStore.getProjectionState(taskEnvelope.taskId);
   assert.equal(state.committedSeq, state.desiredSeq);
   const events = await harness.controller.executionLog.readAll();
-  assert.equal(events.filter((event) => event.eventType === "projection_job_started").length, 1);
-  assert.equal(events.some((event) => event.eventType === "projection_terminal_drain_started"), false);
+  assert.ok(events.filter((event) => event.eventType === "projection_job_started").length >= 1);
+  assert.equal(state.terminalTargetSeq, undefined);
   await harness.controller.close();
 });
 
@@ -1390,7 +1889,7 @@ test("terminal projection compacts an oversized tail without input-limit failure
   }
   harness.controller.runtimeStore.raiseProjectionDesired(taskEnvelope.taskId, lastSeq, 0);
 
-  await harness.controllerHarness.runProjectionJob({
+  await harness.controllerHarness.enqueueProjectionJob({
     reason: "task_end",
     taskEnvelope,
     taskResult: {
@@ -1404,12 +1903,208 @@ test("terminal projection compacts an oversized tail without input-limit failure
 
   const state = harness.controller.runtimeStore.getProjectionState(taskEnvelope.taskId);
   assert.equal(state.committedSeq, state.desiredSeq);
-  assert.equal(harness.observerPromptCount(), 1);
+  assert.ok(harness.observerPromptCount() >= 2);
   const events = await harness.controller.executionLog.readAll();
   assert.equal(events.some((event) => event.eventType === "projection_job_failed"), false);
-  const input = events.find((event) => event.eventType === "projection_input_built");
-  assert.ok(Number(input?.payload.inputBytes) <= Number(input?.payload.targetBytes));
-  assert.ok(Number(input?.payload.observationCount) <= 24);
+  const inputs = events.filter((event) => event.eventType === "projection_input_built");
+  assert.ok(inputs.every((input) => Number(input.payload.inputBytes) <= Number(input.payload.targetBytes)));
+  assert.ok(inputs.every((input) => Number(input.payload.observationCount) <= 32));
+  const prompts = harness.observerPrompts().join("\n");
+  for (let index = 0; index < 80; index += 1) {
+    assert.match(prompts, new RegExp(`terminal-${index}\\b`));
+  }
+  assert.equal(Number(inputs[0]?.payload.fromSeq), 0);
+  for (let index = 1; index < inputs.length; index += 1) {
+    assert.equal(
+      Number(inputs[index]?.payload.fromSeq),
+      Number(inputs[index - 1]?.payload.toSeq)
+    );
+  }
+  assert.equal(Number(inputs.at(-1)?.payload.toSeq), state.desiredSeq);
+  await harness.controller.close();
+});
+
+test("projector partitions one huge parallel action group and commits its cursor only after every fragment", async () => {
+  const harness = createObserverControllerHarness(observerProjectionJson());
+  const taskEnvelope = makeTaskEnvelope();
+  const fragmentSession = createPromptAwareMockTextSession((_prompt, fragmentIndex) => {
+    assert.equal(harness.controller.runtimeStore.getProjectionState(taskEnvelope.taskId).committedSeq, 0);
+    return JSON.stringify({
+      graphDelta: {
+        sourceEventIds: [],
+        nodes: Array.from({ length: 20 }, (_, nodeIndex) => ({
+          id: `new:${nodeIndex + 1}`,
+          graphKind: "reasoning",
+          type: "Evidence",
+          label: `fragment ${fragmentIndex + 1} evidence ${nodeIndex + 1}`,
+          properties: { fragmentIndex: fragmentIndex + 1, nodeIndex: nodeIndex + 1 },
+          evidenceRefs: ["o1"]
+        })),
+        edges: Array.from({ length: 30 }, (_, edgeIndex) => ({
+          from: `new:${(edgeIndex % 20) + 1}`,
+          to: `new:${((edgeIndex + 1 + Math.floor(edgeIndex / 20)) % 20) + 1}`,
+          type: "supports",
+          properties: { fragmentIndex: fragmentIndex + 1, edgeIndex: edgeIndex + 1 },
+          evidenceRefs: ["o1"]
+        }))
+      }
+    });
+  });
+  harness.controllerHarness.createObserverSessionForMode = async () => ({
+    session: fragmentSession,
+    dynamicObserver: true
+  });
+  let seq = 0;
+  await harness.controller.executionLog.append({
+    taskId: taskEnvelope.taskId,
+    role: "executor",
+    eventType: "assistant_intent",
+    summary: "parallel target validation",
+    payload: { text: "并行验证全部候选，再统一解释结果。" }
+  });
+  seq += 1;
+  for (let index = 0; index < 60; index += 1) {
+    await harness.controller.executionLog.append({
+      taskId: taskEnvelope.taskId,
+      role: "executor",
+      eventType: "tool_started",
+      summary: `started ${index}`,
+      payload: {
+        toolCallId: `call:${index}`,
+        toolName: "bash",
+        args: { command: `curl http://10.0.0.${index + 1}/candidate/${index}` }
+      }
+    });
+    seq += 1;
+  }
+  const artifactRefs: string[] = [];
+  for (let index = 0; index < 60; index += 1) {
+    const artifactRef = `artifact:${index}:${"evidence".repeat(36)}`;
+    artifactRefs.push(artifactRef);
+    await harness.controller.executionLog.append({
+      taskId: taskEnvelope.taskId,
+      role: "executor",
+      eventType: "tool_finished",
+      summary: `finished ${index}`,
+      payload: {
+        toolCallId: `call:${index}`,
+        toolName: "bash",
+        result: { content: [{ type: "text", text: `HTTP 200 from 10.0.0.${index + 1}` }] }
+      },
+      artifactRefs: [artifactRef]
+    });
+    seq += 1;
+  }
+  const interpretation = await harness.controller.executionLog.append({
+    taskId: taskEnvelope.taskId,
+    role: "executor",
+    eventType: "assistant_intent",
+    summary: "all candidates interpreted",
+    payload: { text: "全部候选已经验证，分别保留成功目标和对应证据。" }
+  });
+  seq += 1;
+  assert.equal(interpretation.seq, seq);
+  harness.controller.runtimeStore.raiseProjectionDesired(taskEnvelope.taskId, seq, 0);
+
+  await harness.controllerHarness.runProjectionJob({
+    reason: "task_end",
+    taskEnvelope,
+    sourceEventIds: [interpretation.id],
+    taskResult: {
+      taskId: taskEnvelope.taskId,
+      status: "partial",
+      summary: "parallel group reached a bounded checkpoint",
+      evidenceRefs: [interpretation.id],
+      artifactRefs: []
+    },
+    maxObservations: 16
+  });
+
+  const prompts = fragmentSession.prompts();
+  assert.ok(prompts.length > 1);
+  assert.ok(prompts.every((prompt) => Buffer.byteLength(prompt, "utf8") <= 32_000));
+  assert.ok(prompts.every((prompt) => /taskOutcome=.*"status":"partial"/.test(prompt)));
+  const combinedPrompts = prompts.join("\n");
+  for (const artifactRef of artifactRefs) {
+    assert.match(combinedPrompts, new RegExp(artifactRef.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+  }
+  const state = harness.controller.runtimeStore.getProjectionState(taskEnvelope.taskId);
+  assert.equal(state.committedSeq, seq);
+  assert.equal(state.desiredSeq, seq);
+  const events = await harness.controller.executionLog.readAll();
+  const inputs = events.filter((event) => event.eventType === "projection_input_built");
+  assert.equal(inputs.length, prompts.length);
+  assert.ok(inputs.every((event) => Number(event.payload.inputBytes) <= 32_000));
+  assert.ok(inputs.every((event) => Number(event.payload.fragmentCount) === prompts.length));
+  const succeeded = events.findLast((event) => event.eventType === "projection_job_succeeded");
+  assert.equal(Number((succeeded?.payload.nodeCounts as Record<string, number> | undefined)?.["reasoning:Evidence"]), prompts.length * 20);
+  assert.equal(Number(succeeded?.payload.edgeCount), prompts.length * 30);
+  assert.ok(Number((succeeded?.payload.nodeCounts as Record<string, number> | undefined)?.["reasoning:Evidence"]) > 24);
+  assert.ok(Number(succeeded?.payload.edgeCount) > 40);
+  const projectedSourceIds = new Set((succeeded?.payload.sourceEventIds ?? []) as string[]);
+  const actionEvents = events.filter((event) => event.role === "executor" && [
+    "assistant_intent", "tool_started", "tool_finished"
+  ].includes(event.eventType));
+  assert.ok(actionEvents.every((event) => (
+    event.id === interpretation.id || projectedSourceIds.has(event.id)
+  )));
+  await harness.controller.close();
+});
+
+test("projector carries an oversized TaskOutcome manifest through bounded observation fragments", async () => {
+  const harness = createObserverControllerHarness(observerProjectionJson());
+  const taskEnvelope = makeTaskEnvelope();
+  const sourceEvent = await persistExecutorEvent(
+    harness.controller,
+    taskEnvelope.taskId,
+    "tool_finished",
+    "bounded observation"
+  );
+  harness.controller.runtimeStore.raiseProjectionDesired(taskEnvelope.taskId, sourceEvent.seq ?? 0, 0);
+  const oversizedEvidenceRefs = Array.from(
+    { length: 240 },
+    (_, index) => `event:fixed-envelope:${index}:${"x".repeat(160)}`
+  );
+  const oversizedArtifactRefs = Array.from(
+    { length: 80 },
+    (_, index) => `artifact:fixed-envelope:${index}:${"a".repeat(120)}`
+  );
+  const oversizedCapabilityRefs = Array.from(
+    { length: 80 },
+    (_, index) => `route:fixed-envelope:${index}:${"c".repeat(120)}`
+  );
+
+  await harness.controllerHarness.runProjectionJob({
+    reason: "task_end",
+    taskEnvelope,
+    sourceEventIds: [sourceEvent.id],
+    taskResult: {
+      taskId: taskEnvelope.taskId,
+      status: "partial",
+      summary: "fixed envelope must remain complete",
+      evidenceRefs: oversizedEvidenceRefs,
+      artifactRefs: oversizedArtifactRefs,
+      capabilityRefs: oversizedCapabilityRefs
+    }
+  });
+
+  assert.ok(harness.observerPromptCount() > 0);
+  assert.ok(harness.observerPrompts().every((prompt) => Buffer.byteLength(prompt, "utf8") <= 32_000));
+  const combinedPrompts = harness.observerPrompts().join("\n");
+  for (const ref of [...oversizedArtifactRefs, ...oversizedCapabilityRefs]) {
+    assert.match(combinedPrompts, new RegExp(ref.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+  }
+  const state = harness.controller.runtimeStore.getProjectionState(taskEnvelope.taskId);
+  assert.equal(state.committedSeq, sourceEvent.seq);
+  assert.equal(state.desiredSeq, sourceEvent.seq);
+  assert.equal(state.activeGeneration, undefined);
+  const events = await harness.controller.executionLog.readAll();
+  assert.equal(events.some((event) => event.eventType === "projection_job_failed"), false);
+  const succeeded = events.findLast((event) => event.eventType === "projection_job_succeeded");
+  assert.deepEqual(
+    new Set((succeeded?.payload.sourceEventIds ?? []) as string[]),
+    new Set([sourceEvent.id, ...oversizedEvidenceRefs])
+  );
   await harness.controller.close();
 });
 
@@ -1461,7 +2156,7 @@ test("projector consumes legacy non-semantic runtime tail without empty catch-up
   harness.controller.close();
 });
 
-test("projector coalesces same-task windows and discards superseded writes", async () => {
+test("projector coalesces same-task windows behind one in-flight job", async () => {
   const harness = createObserverControllerHarness(observerProjectionJson());
   const taskEnvelope = makeTaskEnvelope();
   activateTask(harness.controllerHarness, taskEnvelope);
@@ -1503,12 +2198,10 @@ test("projector coalesces same-task windows and discards superseded writes", asy
     sourceEventIds: [latestEvent.id]
   });
 
-  const supersededProjection = await supersededWindow;
-  assert.match(supersededProjection.controlSignal.reason, /superseded/);
   firstRelease.resolve();
   await waitFor(async () => projectorSession.promptCount() === 2);
   secondRelease.resolve();
-  await Promise.all([firstWindow, latestWindow]);
+  await Promise.all([firstWindow, supersededWindow, latestWindow]);
 
   const events = await harness.controller.executionLog.readAll();
   const startedReasons = events
@@ -1518,7 +2211,7 @@ test("projector coalesces same-task windows and discards superseded writes", asy
   assert.ok(startedReasons.some((summary) => summary.startsWith("project_window:9")));
   assert.equal(startedReasons.some((summary) => summary.startsWith("project_window:6")), false);
   assert.ok(events.some((event) => event.eventType === "projection_request_coalesced"));
-  assert.ok(events.some((event) => event.eventType === "projection_request_superseded"));
+  assert.equal(events.some((event) => event.eventType === "projection_request_superseded"), false);
   const reasoningLabels = harness.controller.graphStore.query("reasoning").nodes.map((node) => node.label);
   assert.ok(reasoningLabels.includes("evidence:old-window"));
   assert.ok(reasoningLabels.includes("evidence:latest-window"));
@@ -1527,7 +2220,7 @@ test("projector coalesces same-task windows and discards superseded writes", asy
   harness.controller.close();
 });
 
-test("task_end supersedes only pending window and does not preempt active projection", async () => {
+test("task_end raises the terminal target without preempting active projection", async () => {
   const harness = createObserverControllerHarness(observerProjectionJson());
   const taskEnvelope = makeTaskEnvelope();
   activateTask(harness.controllerHarness, taskEnvelope);
@@ -1576,12 +2269,10 @@ test("task_end supersedes only pending window and does not preempt active projec
     }
   });
 
-  const pendingProjection = await pendingWindow;
-  assert.match(pendingProjection.controlSignal.reason, /task_end superseded pending project_window:6/);
   firstRelease.resolve();
   await waitFor(async () => projectorSession.promptCount() === 2);
   finalRelease.resolve();
-  await Promise.all([activeWindow, finalProjection]);
+  await Promise.all([activeWindow, pendingWindow, finalProjection]);
 
   const events = await harness.controller.executionLog.readAll();
   const startedReasons = events
@@ -1598,7 +2289,7 @@ test("task_end supersedes only pending window and does not preempt active projec
   harness.controller.close();
 });
 
-test("task_end queues projector without blocking next planner cycle", async () => {
+test("completed task waits for terminal projection before the next planner cycle", async () => {
   const runtimeDir = mkdtempSync(join(tmpdir(), "luanniao-controller-"));
   const controller = createControllerWithTestLlmEnv(runtimeDir);
   const controllerHarness = controller as unknown as ControllerHarness;
@@ -1667,22 +2358,25 @@ test("task_end queues projector without blocking next planner cycle", async () =
     dynamicObserver: true
   });
 
-  const result = await withTestTimeout(controller.runUntilDone({
-    userGoal: "Do not block on projector",
+  const runPromise = controller.runUntilDone({
+    userGoal: "Wait for completed-task knowledge",
     scopeSummary: "Authorized target only",
     maxPlannerCycles: 2
-  }), 500);
+  });
+
+  await waitFor(() => projectorPromptStarted);
+  await waitForSettled();
+  const eventsBeforeRelease = await controller.executionLog.readAll();
+  assert.equal(eventsBeforeRelease.filter((event) => event.eventType === "planner_prompt_completed").length, 1);
+  projectorRelease.resolve();
+  const result = await withTestTimeout(runPromise, 500);
 
   assert.equal(result.cycles.length, 2);
   assert.equal(result.cycles[1].plannerDecision.decision, "apply_commands");
   assert.equal(result.completed, true);
   assert.equal(projectorPromptStarted, true);
   assert.equal((await controller.executionLog.readAll())
-    .some((event) => event.eventType === "projection_job_succeeded"), false);
-
-  projectorRelease.resolve();
-  await waitFor(async () => (await controller.executionLog.readAll())
-    .some((event) => event.eventType === "projection_job_succeeded"));
+    .some((event) => event.eventType === "projection_job_succeeded"), true);
   controller.close();
 });
 
@@ -2037,6 +2731,26 @@ test("executor dependency brief carries partial predecessor capabilities and reu
   harness.controller.close();
 });
 
+test("executor session refs surface evidence-backed artifact refs", async () => {
+  const harness = createControllerHarness();
+  const materialEvent = await harness.controller.executionLog.append({
+    taskId: "task:recon",
+    role: "executor",
+    eventType: "tool_finished",
+    payload: { toolName: "artifact_write" },
+    artifactRefs: ["artifact:cookie-jar"]
+  });
+
+  const enriched = harness.controllerHarness.withSessionMaterialRefs([
+    { id: "projected:credential", type: "Credential", evidenceRefs: [materialEvent.id] },
+    { id: "projected:session", type: "Session", evidenceRefs: ["event:missing"] }
+  ]);
+
+  assert.deepEqual(enriched[0]?.materialRefs, ["artifact:cookie-jar"]);
+  assert.equal(enriched[1]?.materialRefs, undefined);
+  harness.controller.close();
+});
+
 test("root graph initialization preserves an existing completed goal", async () => {
   const harness = createControllerHarness();
   harness.controller.graphStore.upsertDelta({
@@ -2134,6 +2848,65 @@ test("planner decision view includes unprojected observation outcomes", async ()
   assert.match(digest, /admin_token=internal_admin_token_2024/);
   assert.match(prompt, /admin_token=internal_admin_token_2024/);
   harness.controller.close();
+});
+
+test("planner sees every persisted outcome and an explicit degraded terminal projection", async () => {
+  const harness = createControllerHarness();
+  const degradedTaskId = "task:degraded-terminal";
+  for (let index = 0; index < 14; index += 1) {
+    const taskId = index === 0 ? degradedTaskId : `task:outcome-${index}`;
+    harness.controller.runtimeStore.upsertTaskOutcome({
+      taskRef: taskId,
+      epochRef: `epoch:${index}`,
+      status: index === 0 ? "partial" : "completed",
+      summary: index === 0 ? "Confirmed reusable internal route" : `Completed outcome ${index}`,
+      evidenceRefs: index === 0 ? ["event:route-confirmed"] : [],
+      artifactRefs: index === 0 ? ["artifact:route-transcript"] : [],
+      capabilityRefs: index === 0 ? ["route:internal"] : [],
+      checkpoint: index === 0 ? {
+        reason: "projection timed out after task completion",
+        retryable: true,
+        resumeCursor: "resume from verified route"
+      } : undefined,
+      terminalSeq: index + 1,
+      createdAt: new Date(2026, 0, index + 1).toISOString()
+    });
+  }
+  harness.controller.runtimeStore.raiseProjectionDesired(degradedTaskId, 21, 10, 21);
+  harness.controllerHarness.plannerProjectionTargets.set(degradedTaskId, 21);
+  harness.controllerHarness.projectorCoordinator.waitForCommitted = async () => {
+    throw new Error("terminal projection timed out");
+  };
+
+  await harness.controllerHarness.waitForPlannerProjectionFences();
+  const view = await harness.controllerHarness.buildPlannerDecisionView();
+  const prompt = renderPlannerInput({
+    userGoal: "Continue from durable executor knowledge",
+    scopeSummary: "Authorized target only",
+    plannerDecisionView: view
+  });
+
+  assert.equal(view.taskOutcomes?.length, 14);
+  assert.ok(view.taskOutcomes?.some((outcome) => outcome.taskRef === "task:outcome-13"));
+  assert.deepEqual(view.projectionDegradations, [{
+    taskRef: degradedTaskId,
+    status: "degraded",
+    reason: "terminal_projection_incomplete",
+    committedSeq: 0,
+    desiredSeq: 21,
+    terminalTargetSeq: 21,
+    taskOutcome: harness.controller.runtimeStore.getTaskOutcome(degradedTaskId)
+  }]);
+  assert.match(prompt, /"projectionDegradations":\[/);
+  assert.match(prompt, /"status":"degraded"/);
+  assert.match(prompt, /artifact:route-transcript/);
+  assert.match(prompt, /route:internal/);
+  assert.match(prompt, /resume from verified route/);
+  assert.ok((await harness.controller.executionLog.readAll()).some((event) =>
+    event.eventType === "planner_projection_degraded"
+    && event.payload.taskOutcome !== undefined
+  ));
+  await harness.controller.close({ drainProjectionJobs: false });
 });
 
 test("planner decision view finds pending runtime tails beyond the first ledger entries", async () => {
@@ -2289,12 +3062,120 @@ test("skips task_end projector for pure retryable provider failure without execu
   assert.equal(result.taskResult?.status, "failed");
   assert.equal(result.taskResult?.retryable, true);
   assert.match(result.taskResult?.checkpointReason ?? "", /Concurrency limit exceeded/);
-  assert.equal(executorSession.promptCount(), 3);
+  assert.ok(executorSession.promptCount() >= 3);
   const events = await controller.executionLog.readAll();
   assert.equal(events.some((event) => event.eventType === "projection_job_queued"), false);
   assert.ok(events.some((event) => event.eventType === "projection_job_skipped"));
-  assert.equal(controller.graphStore.getTaskNode("task:pure-provider-failure")?.properties.status, "open");
-  controller.close();
+  assert.equal(controller.graphStore.getTaskNode("task:pure-provider-failure")?.properties.status, "failed");
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  assert.equal(executorSession.promptCount(), 3);
+  const schedulerState = controller as unknown as {
+    activeTaskRuns: Map<string, unknown>;
+    awaitingPlannerTaskIds: Set<string>;
+  };
+  assert.equal(schedulerState.activeTaskRuns.has("task:pure-provider-failure"), false);
+  assert.equal(schedulerState.awaitingPlannerTaskIds.has("task:pure-provider-failure"), true);
+  await controller.close();
+  const reopened = createControllerWithTestLlmEnv(runtimeDir);
+  await reopened.initialize();
+  assert.equal(reopened.graphStore.getTaskNode("task:pure-provider-failure")?.properties.status, "failed");
+  assert.equal(reopened.graphStore.listReadyTasks().some((task) => task.taskId === "task:pure-provider-failure"), false);
+  await reopened.close();
+});
+
+test("pure provider failure does not create a Planner projection fence", async () => {
+  const runtimeDir = mkdtempSync(join(tmpdir(), "luanniao-controller-"));
+  const controller = createControllerWithTestLlmEnv(runtimeDir);
+  const controllerHarness = controller as unknown as ControllerHarness & {
+    runExecutorTask: (taskEnvelope: TaskEnvelope) => Promise<{
+      taskEnvelope: TaskEnvelope;
+      taskResult: TaskResult;
+      terminalSeq: number;
+      controlSignal: ControlSignal;
+    }>;
+  };
+  const plannerSession = createMockTextSessionSequence([
+    JSON.stringify({
+      decision: "apply_commands",
+      commands: [{
+        kind: "create_tasks",
+        tasks: [{
+          id: "task:pure-provider-failure-fence",
+          goal: "Exercise a provider failure without projection input",
+          targetRefs: ["goal:root"],
+          scopeRef: "scope:root",
+          constraints: [],
+          successCriteria: ["failure handed back"],
+          priority: 1
+        }],
+        reason: "Start the provider-failure task",
+        basedOnRefs: ["goal:root"]
+      }],
+      reason: "Start the provider-failure task",
+      basedOnRefs: ["goal:root"]
+    }),
+    JSON.stringify({
+      decision: "apply_commands",
+      commands: [{
+        kind: "set_node_status",
+        nodeId: "goal:root",
+        status: "achieved",
+        reason: "The provider failure was handed back without a projection dependency"
+      }],
+      reason: "Finish after receiving the persisted task outcome",
+      basedOnRefs: ["task:pure-provider-failure-fence"]
+    })
+  ]);
+  controllerHarness.agents = {
+    planner: plannerSession,
+    executor: createAbortableMockTextSession("{}"),
+    observer: createAbortableMockTextSession(observerProjectionJson())
+  };
+  controllerHarness.runExecutorTask = async (taskEnvelope) => {
+    const taskResult: TaskResult = {
+      taskId: taskEnvelope.taskId,
+      status: "failed",
+      summary: "Provider rejected the invocation before any execution evidence",
+      evidenceRefs: [],
+      artifactRefs: [],
+      retryable: true,
+      checkpointReason: "provider concurrency"
+    };
+    controller.graphStore.markTaskStatus({
+      taskId: taskEnvelope.taskId,
+      status: "open",
+      properties: { resultSummary: taskResult.summary, retryable: true }
+    });
+    return {
+      taskEnvelope,
+      taskResult,
+      terminalSeq: 99,
+      controlSignal: {
+        decision: "need_planner",
+        reason: taskResult.summary,
+        evidenceRefs: []
+      }
+    };
+  };
+
+  const stopTimer = setTimeout(() => {
+    void controller.requestStop("projection fence regression timeout");
+  }, 500);
+  const result = await controller.runUntilDone({
+    userGoal: "Verify provider failure handoff",
+    scopeSummary: "Authorized target only",
+    maxPlannerCycles: 2,
+    maxParallelTasks: 1
+  });
+  clearTimeout(stopTimer);
+
+  assert.equal(result.completed, true);
+  assert.equal(plannerSession.promptCount(), 2);
+  assert.equal(
+    (await controller.executionLog.readAll()).some((event) => event.eventType === "planner_projection_degraded"),
+    false
+  );
+  await controller.close({ drainProjectionJobs: false });
 });
 
 test("provider failure after execution evidence preserves and resumes the same Executor session", async () => {
@@ -2376,6 +3257,7 @@ test("provider failure after execution evidence preserves and resumes the same E
       disposeCount += 1;
     }
   };
+  const observerSession = createAbortableMockTextSession(observerProjectionJson());
   controllerHarness.agents = {
     planner: createMockTextSessionSequence([
       JSON.stringify({
@@ -2412,8 +3294,12 @@ test("provider failure after execution evidence preserves and resumes the same E
       })
     ]),
     executor: createAbortableMockTextSession("{}"),
-    observer: createAbortableMockTextSession(observerProjectionJson())
+    observer: observerSession
   };
+  controllerHarness.createObserverSessionForMode = async () => ({
+    session: observerSession,
+    dynamicObserver: true
+  });
   controllerHarness.createExecutorSessionForTask = async () => {
     executorFactoryCount += 1;
     return {
@@ -2566,7 +3452,10 @@ test("close drains pending terminal projections after active projector slots set
   await Promise.all([...projectionPromises, closePromise]);
 
   assert.equal(projectorSessionCount, 3);
-  assert.ok(projectionStatesAtClose.every((state) => state.committedSeq === state.desiredSeq));
+  assert.ok(
+    projectionStatesAtClose.every((state) => state.committedSeq === state.desiredSeq),
+    JSON.stringify(projectionStatesAtClose)
+  );
 });
 
 test("close without drain cancels and joins projector before closing stores", async () => {
@@ -2576,11 +3465,12 @@ test("close without drain cancels and joins projector before closing stores", as
   const projectorRelease = createDeferred<void>();
   let graphStoreClosed = false;
   let activeGenerationAtClose: number | undefined;
+  let committedSeqAtClose = -1;
   const originalClose = harness.controller.graphStore.close.bind(harness.controller.graphStore);
   harness.controller.graphStore.close = (): void => {
-    activeGenerationAtClose = harness.controller.runtimeStore
-      .getProjectionState(taskEnvelope.taskId)
-      .activeGeneration;
+    const projectionState = harness.controller.runtimeStore.getProjectionState(taskEnvelope.taskId);
+    activeGenerationAtClose = projectionState.activeGeneration;
+    committedSeqAtClose = projectionState.committedSeq;
     graphStoreClosed = true;
     originalClose();
   };
@@ -2620,6 +3510,173 @@ test("close without drain cancels and joins projector before closing stores", as
   assert.equal(closeResolved, true);
   assert.equal(graphStoreClosed, true);
   assert.equal(activeGenerationAtClose, undefined);
+  assert.equal(committedSeqAtClose, 0);
+});
+
+test("close keeps stores open when cancelled projector work misses the grace period", async () => {
+  const harness = createObserverControllerHarness(JSON.stringify({ nodes: [], edges: [] }));
+  const taskEnvelope = makeTaskEnvelope({ taskId: "task:late-projector-close" });
+  activateTask(harness.controllerHarness, taskEnvelope);
+  const projectorRelease = createDeferred<void>();
+  let graphStoreClosed = false;
+  const originalClose = harness.controller.graphStore.close.bind(harness.controller.graphStore);
+  harness.controller.graphStore.close = (): void => {
+    graphStoreClosed = true;
+    originalClose();
+  };
+  const projectorSession = createDelayedAbortableMockTextSession(async () => {
+    await projectorRelease.promise;
+    return JSON.stringify({ nodes: [], edges: [] });
+  });
+  harness.controllerHarness.createObserverSessionForMode = async () => ({
+    session: projectorSession,
+    dynamicObserver: true
+  });
+  const sourceEvent = await persistExecutorEvent(
+    harness.controller,
+    taskEnvelope.taskId,
+    "tool_finished",
+    "late projector result"
+  );
+  void harness.controllerHarness.enqueueProjectionJob({
+    reason: "task_end",
+    taskEnvelope,
+    sourceEventIds: [sourceEvent.id]
+  });
+  await waitFor(() => projectorSession.promptCount() === 1);
+
+  await assert.rejects(
+    harness.controller.close({ drainProjectionJobs: false, projectionCancelGraceMs: 5 }),
+    /stores remain open/
+  );
+  assert.equal(graphStoreClosed, false);
+  assert.equal(await harness.controllerHarness.projectorCoordinator.waitForSettled(0), false);
+
+  projectorRelease.resolve();
+  assert.equal(await harness.controllerHarness.projectorCoordinator.waitForSettled(1_000), true);
+  await harness.controller.close({ drainProjectionJobs: false, projectionCancelGraceMs: 5 });
+  assert.equal(graphStoreClosed, true);
+});
+
+test("close joins active task runs before closing stores", async () => {
+  const runtimeDir = mkdtempSync(join(tmpdir(), "luanniao-controller-"));
+  const controller = createControllerWithTestLlmEnv(runtimeDir);
+  const taskEnvelope = makeTaskEnvelope({ taskId: "task:close-settle" });
+  const taskRelease = createDeferred<void>();
+  let taskSettled = false;
+  const taskPromise = (async () => {
+    await taskRelease.promise;
+    await controller.executionLog.append({
+      taskId: taskEnvelope.taskId,
+      role: "runtime",
+      eventType: "task_close_settled",
+      summary: "Task promise settled before stores closed",
+      payload: {}
+    });
+    taskSettled = true;
+    return {
+      taskEnvelope,
+      taskResult: {
+        taskId: taskEnvelope.taskId,
+        status: "partial" as const,
+        summary: "Stopped during close",
+        evidenceRefs: [],
+        artifactRefs: []
+      },
+      terminalSeq: 0,
+      controlSignal: {
+        decision: "checkpoint" as const,
+        reason: "Controller shutdown",
+        evidenceRefs: []
+      }
+    };
+  })();
+  const closeHarness = controller as unknown as {
+    activeTaskRuns: Map<string, { taskEnvelope: TaskEnvelope; promise: typeof taskPromise }>;
+  };
+  closeHarness.activeTaskRuns.set(taskEnvelope.taskId, { taskEnvelope, promise: taskPromise });
+
+  let closeResolved = false;
+  const closePromise = controller.close({ drainProjectionJobs: false }).then(() => {
+    closeResolved = true;
+  });
+  await waitForSettled();
+  assert.equal(closeResolved, false);
+  assert.equal(taskSettled, false);
+
+  taskRelease.resolve();
+  await closePromise;
+  assert.equal(taskSettled, true);
+  assert.equal(closeResolved, true);
+});
+
+test("close drains a task-end projection raised while an active task settles", async () => {
+  const harness = createObserverControllerHarness(JSON.stringify({ nodes: [], edges: [] }));
+  const taskEnvelope = makeTaskEnvelope({ taskId: "task:close-terminal-raise" });
+  const sourceEvent = await persistExecutorEvent(
+    harness.controller,
+    taskEnvelope.taskId,
+    "task_partial",
+    "Task stopped during controller close"
+  );
+  const taskRelease = createDeferred<void>();
+  let projectionStateAtClose: { committedSeq: number; desiredSeq: number; terminalTargetSeq?: number } | undefined;
+  const originalClose = harness.controller.graphStore.close.bind(harness.controller.graphStore);
+  harness.controller.graphStore.close = (): void => {
+    const state = harness.controller.runtimeStore.getProjectionState(taskEnvelope.taskId);
+    projectionStateAtClose = {
+      committedSeq: state.committedSeq,
+      desiredSeq: state.desiredSeq,
+      terminalTargetSeq: state.terminalTargetSeq
+    };
+    originalClose();
+  };
+  const taskPromise = (async () => {
+    await taskRelease.promise;
+    await harness.controllerHarness.enqueueProjectionJob({
+      reason: "task_end",
+      taskEnvelope,
+      sourceEventIds: [sourceEvent.id],
+      taskResult: {
+        taskId: taskEnvelope.taskId,
+        status: "partial",
+        summary: "Stopped during close",
+        evidenceRefs: [sourceEvent.id],
+        artifactRefs: []
+      }
+    });
+    return {
+      taskEnvelope,
+      taskResult: {
+        taskId: taskEnvelope.taskId,
+        status: "partial" as const,
+        summary: "Stopped during close",
+        evidenceRefs: [sourceEvent.id],
+        artifactRefs: []
+      },
+      terminalSeq: sourceEvent.seq ?? 0,
+      controlSignal: {
+        decision: "checkpoint" as const,
+        reason: "Controller shutdown",
+        evidenceRefs: [sourceEvent.id]
+      }
+    };
+  })();
+  const closeHarness = harness.controller as unknown as {
+    activeTaskRuns: Map<string, { taskEnvelope: TaskEnvelope; promise: typeof taskPromise }>;
+  };
+  closeHarness.activeTaskRuns.set(taskEnvelope.taskId, { taskEnvelope, promise: taskPromise });
+
+  const closePromise = harness.controller.close({ projectionDrainTimeoutMs: 1_000 });
+  await waitForSettled();
+  taskRelease.resolve();
+  await closePromise;
+
+  assert.deepEqual(projectionStateAtClose, {
+    committedSeq: sourceEvent.seq,
+    desiredSeq: sourceEvent.seq,
+    terminalTargetSeq: undefined
+  });
 });
 
 test("discarded projector preparation releases its projection claim", async () => {
@@ -3341,34 +4398,23 @@ test("same partial task resumes the existing Executor session with Root Goal and
       executorDisposeCount += 1;
     }
   };
+  const observerSession = createAbortableMockTextSession(observerProjectionJson());
   controllerHarness.agents = {
     planner: createMockTextSessionSequence([
       JSON.stringify({
         decision: "apply_commands",
         commands: [{
           kind: "create_tasks",
-          tasks: [
-            {
-              id: "task:primary",
-              goal: "Validate the primary application capability",
-              targetRefs: ["goal:root"],
-              scopeRef: "scope:root",
-              constraints: ["authorized target only"],
-              successCriteria: ["recover the target artifact"],
-              budget: { maxTurns: 10 },
-              priority: 1
-            },
-            {
-              id: "task:obsolete-file-search",
-              goal: "Broad file search that may become redundant",
-              targetRefs: ["goal:root"],
-              scopeRef: "scope:root",
-              constraints: ["authorized target only"],
-              successCriteria: ["find target artifact"],
-              budget: { maxTurns: 10 },
-              priority: 2
-            }
-          ],
+          tasks: [{
+            id: "task:primary",
+            goal: "Validate the primary application capability",
+            targetRefs: ["goal:root"],
+            scopeRef: "scope:root",
+            constraints: ["authorized target only"],
+            successCriteria: ["recover the target artifact"],
+            budget: { maxTurns: 10 },
+            priority: 1
+          }],
           reason: "Create the initial tasks",
           basedOnRefs: ["goal:root"]
         }],
@@ -3378,13 +4424,6 @@ test("same partial task resumes the existing Executor session with Root Goal and
       JSON.stringify({
         decision: "apply_commands",
         commands: [
-          {
-            kind: "set_task_status",
-            taskId: "task:obsolete-file-search",
-            status: "archived",
-            reason: "The confirmed primary capability supersedes this overlapping search.",
-            basedOnRefs: ["task:primary"]
-          },
           {
             kind: "patch_task",
             taskId: "task:primary",
@@ -3405,8 +4444,12 @@ test("same partial task resumes the existing Executor session with Root Goal and
       })
     ]),
     executor: createAbortableMockTextSession("{}"),
-    observer: createMockTextSession(observerProjectionJson())
+    observer: observerSession
   };
+  controllerHarness.createObserverSessionForMode = async () => ({
+    session: observerSession,
+    dynamicObserver: true
+  });
   controllerHarness.createExecutorSessionForTask = async () => {
     executorFactoryCount += 1;
     return {
@@ -3433,9 +4476,17 @@ test("same partial task resumes the existing Executor session with Root Goal and
   assert.match(prompts[1] ?? "", /继续执行同一个 Task/);
   assert.match(prompts[1] ?? "", /<planner_hint>[\s\S]*confirmed file-read capability/);
   assert.match(prompts[1] ?? "", /turns: 0\/16/);
-  assert.ok(!events.some((event) => event.eventType === "epoch_transition" && event.taskId === "task:obsolete-file-search"));
-  assert.equal(controller.graphStore.getTaskNode("task:obsolete-file-search")?.properties.status, "archived");
   assert.equal(executorDisposeCount, 2);
+  const firstPartialIndex = events.findIndex((event) => event.eventType === "task_partial" && event.taskId === "task:primary");
+  const reopenIndex = events.findIndex((event) => event.eventType === "planner_status_applied"
+    && event.taskId === "task:primary"
+    && event.payload.status === "open");
+  const secondEpochIndex = events.findIndex((event, index) => index > firstPartialIndex
+    && event.eventType === "epoch_transition"
+    && event.taskId === "task:primary");
+  assert.ok(firstPartialIndex >= 0);
+  assert.ok(reopenIndex > firstPartialIndex);
+  assert.ok(secondEpochIndex > reopenIndex);
   await controller.close({ drainProjectionJobs: false, projectionCancelGraceMs: 100 });
 });
 
@@ -3617,12 +4668,24 @@ test("runtime-aborted epoch remains resumable on the same Executor session", asy
   let abortCount = 0;
   let disposeCount = 0;
   let executorFactoryCount = 0;
+  let currentTaskEnvelope: TaskEnvelope | undefined;
   const executorSession = {
     isStreaming: false,
     async prompt(text: string): Promise<void> {
       prompts.push(text);
       promptCount += 1;
       if (promptCount === 1) {
+        assert.ok(currentTaskEnvelope);
+        const epochId = controllerHarness.activeEpochIdByTask?.get(currentTaskEnvelope.taskId);
+        const state = epochId
+          ? controllerHarness.activeEpochs?.get(epochId) as TestActiveState | undefined
+          : undefined;
+        controllerHarness.applyControlSignal(currentTaskEnvelope, {
+          decision: "checkpoint",
+          reason: "Epoch time slice reached: test checkpoint",
+          evidenceRefs: [],
+          confidence: "high"
+        }, state);
         throw new Error("Request was aborted");
       }
       for (const listener of [...listeners]) {
@@ -3696,31 +4759,15 @@ test("runtime-aborted epoch remains resumable on the same Executor session", asy
     executor: createAbortableMockTextSession("{}"),
     observer: createMockTextSession(observerProjectionJson())
   };
-  controllerHarness.createExecutorSessionForTask = async () => {
+  controllerHarness.createExecutorSessionForTask = async (taskEnvelope) => {
     executorFactoryCount += 1;
+    currentTaskEnvelope = taskEnvelope;
     return {
       session: executorSession as never,
       dynamicExecutor: true,
       resumed: executorFactoryCount > 1,
       resumeCount: executorFactoryCount > 1 ? 1 : 0
     };
-  };
-  let timeSliceArmCount = 0;
-  controllerHarness.armEpochTimeSlice = (taskEnvelope) => {
-    timeSliceArmCount += 1;
-    if (timeSliceArmCount !== 1) {
-      return;
-    }
-    const epochId = controllerHarness.activeEpochIdByTask?.get(taskEnvelope.taskId);
-    const state = epochId
-      ? controllerHarness.activeEpochs?.get(epochId) as TestActiveState | undefined
-      : undefined;
-    controllerHarness.applyControlSignal(taskEnvelope, {
-      decision: "checkpoint",
-      reason: "Epoch time slice reached: test checkpoint",
-      evidenceRefs: [],
-      confidence: "high"
-    }, state);
   };
 
   const result = await controller.runUntilDone({
@@ -3767,6 +4814,10 @@ test("planner command targets ignore basedOnRefs and reason task mentions", asyn
   controller.graphStore.markTaskStatus({ taskId: "task:intended", status: "partial" });
   controller.graphStore.markTaskStatus({ taskId: "task:referenced-only", status: "partial" });
   const controllerHarness = controller as unknown as ControllerHarness;
+  const cleanedTaskIds: string[] = [];
+  controller.runtimeStore.upsertExecutorSession({ taskId: "task:intended", sessionFile: "/tmp/task-intended.jsonl" });
+  controller.runtimeStore.upsertExecutorSession({ taskId: "task:referenced-only", sessionFile: "/tmp/task-referenced.jsonl" });
+  controllerHarness.disposeTaskExecutorResources = async (taskId) => { cleanedTaskIds.push(taskId); };
   controllerHarness.agents = {
     planner: createMockTextSession(JSON.stringify({
       decision: "apply_commands",
@@ -3802,10 +4853,13 @@ test("planner command targets ignore basedOnRefs and reason task mentions", asyn
     controller.graphStore.query("task", ["task:referenced-only"], 1).nodes[0]?.properties.status,
     "partial"
   );
+  assert.deepEqual(cleanedTaskIds, ["task:intended"]);
+  assert.equal(controller.runtimeStore.getExecutorSession("task:intended"), undefined);
+  assert.ok(controller.runtimeStore.getExecutorSession("task:referenced-only"));
   controller.close();
 });
 
-test("runs one admitted wave per planner cycle and honors dependencies", async () => {
+test("wakes Planner on the first completion while independent work and dependencies continue", async () => {
   const runtimeDir = mkdtempSync(join(tmpdir(), "luanniao-controller-"));
   const controller = createControllerWithTestLlmEnv(runtimeDir);
   const controllerHarness = controller as unknown as ControllerHarness;
@@ -3888,7 +4942,9 @@ test("runs one admitted wave per planner cycle and honors dependencies", async (
       activePrompts += 1;
       maxActivePrompts = Math.max(maxActivePrompts, activePrompts);
       promptOrder.push(taskEnvelope.taskId);
-      await new Promise((resolve) => setTimeout(resolve, taskEnvelope.taskId === "task:exploit" ? 1 : 30));
+      await new Promise((resolve) => setTimeout(resolve, taskEnvelope.taskId === "task:recon-a"
+        ? 10
+        : taskEnvelope.taskId === "task:recon-b" ? 40 : 1));
       activePrompts -= 1;
       return JSON.stringify({
         taskId: taskEnvelope.taskId,
@@ -3916,8 +4972,9 @@ test("runs one admitted wave per planner cycle and honors dependencies", async (
   const events = await controller.executionLog.readAll();
 
   assert.equal(result.cycles[0].plannerDecision.decision, "apply_commands");
-  assert.equal(result.cycles[0].taskResults?.length, 2);
+  assert.deepEqual(result.cycles[0].taskResults?.map((taskResult) => taskResult.taskId), ["task:recon-a"]);
   assert.equal(result.cycles[1].taskResults?.length, 1);
+  assert.equal(result.cycles[1].taskResults?.[0]?.taskId, "task:recon-b");
   assert.equal(maxActivePrompts, 2);
   assert.deepEqual(promptOrder.slice(0, 2).sort(), ["task:recon-a", "task:recon-b"]);
   assert.equal(promptOrder[2], "task:exploit");
@@ -3931,8 +4988,164 @@ test("runs one admitted wave per planner cycle and honors dependencies", async (
     controller.graphStore.query("task", ["task:exploit"], 1).nodes[0]?.properties.status,
     "completed"
   );
+  const firstReconCompleted = events.findIndex((event) => event.eventType === "task_completed"
+    && event.taskId === "task:recon-a");
+  const secondPlannerStarted = events.findIndex((event, index) => index > firstReconCompleted
+    && event.eventType === "planner_prompt_started");
+  const secondReconCompleted = events.findIndex((event) => event.eventType === "task_completed"
+    && event.taskId === "task:recon-b");
+  assert.ok(firstReconCompleted >= 0);
+  assert.ok(secondPlannerStarted > firstReconCompleted);
+  assert.ok(secondReconCompleted > secondPlannerStarted);
   assert.ok(events.some((event) => event.eventType === "task_wave_started"));
   controller.close();
+});
+
+test("Planner repairs active Task mutation while still creating a dependent Task", async () => {
+  const runtimeDir = mkdtempSync(join(tmpdir(), "luanniao-controller-"));
+  const controller = createControllerWithTestLlmEnv(runtimeDir);
+  const controllerHarness = controller as unknown as ControllerHarness & {
+    activeTaskRuns: Map<string, unknown>;
+  };
+  const slowRelease = createDeferred<void>();
+  const plannerSession = createMockTextSessionSequence([
+    JSON.stringify({
+      decision: "apply_commands",
+      commands: [{
+        kind: "create_tasks",
+        tasks: [
+          {
+            id: "task:fast-owned",
+            goal: "Complete the fast branch",
+            targetRefs: ["goal:root"],
+            scopeRef: "scope:root",
+            constraints: [],
+            successCriteria: ["fast branch completed"],
+            priority: 1
+          },
+          {
+            id: "task:slow-owned",
+            goal: "Complete the slow branch",
+            targetRefs: ["goal:root"],
+            scopeRef: "scope:root",
+            constraints: [],
+            successCriteria: ["slow branch completed"],
+            priority: 1
+          }
+        ],
+        reason: "Start independent branches",
+        basedOnRefs: ["goal:root"]
+      }],
+      reason: "Start independent branches",
+      basedOnRefs: ["goal:root"]
+    }),
+    JSON.stringify({
+      decision: "apply_commands",
+      commands: [
+        {
+          kind: "patch_task",
+          taskId: "task:slow-owned",
+          patch: { priority: 8 },
+          reason: "Attempt to mutate a running task",
+          basedOnRefs: ["task:fast-owned"]
+        },
+        {
+          kind: "set_task_status",
+          taskId: "task:slow-owned",
+          status: "archived",
+          reason: "Attempt to stop a running task from Planner",
+          basedOnRefs: ["task:fast-owned"]
+        },
+        {
+          kind: "create_tasks",
+          tasks: [{
+            id: "task:after-slow",
+            goal: "Use the slow branch outcome",
+            targetRefs: ["goal:root"],
+            scopeRef: "scope:root",
+            constraints: [],
+            successCriteria: ["dependent branch completed"],
+            dependsOnTaskRefs: ["task:slow-owned"],
+            priority: 2
+          }],
+          reason: "Create a dependent task",
+          basedOnRefs: ["task:slow-owned"]
+        }
+      ],
+      reason: "Incorrectly mutate the running task while planning its successor",
+      basedOnRefs: ["task:fast-owned", "task:slow-owned"]
+    }),
+    JSON.stringify({
+      decision: "apply_commands",
+      commands: [{
+        kind: "create_tasks",
+        tasks: [{
+          id: "task:after-slow",
+          goal: "Use the slow branch outcome",
+          targetRefs: ["goal:root"],
+          scopeRef: "scope:root",
+          constraints: [],
+          successCriteria: ["dependent branch completed"],
+          dependsOnTaskRefs: ["task:slow-owned"],
+          priority: 2
+        }],
+        reason: "Create a successor without mutating the running predecessor",
+        basedOnRefs: ["task:slow-owned"]
+      }],
+      reason: "Keep the running Task owned by its Executor",
+      basedOnRefs: ["task:slow-owned"]
+    })
+  ]);
+  controllerHarness.agents = {
+    planner: plannerSession,
+    executor: createAbortableMockTextSession("{}"),
+    observer: createAbortableMockTextSession(observerProjectionJson())
+  };
+  controllerHarness.createExecutorSessionForTask = async (taskEnvelope) => ({
+    dynamicExecutor: true,
+    resumed: false,
+    resumeCount: 0,
+    session: createDelayedAbortableMockTextSession(async () => {
+      if (taskEnvelope.taskId === "task:slow-owned") {
+        await slowRelease.promise;
+      }
+      return JSON.stringify({
+        taskId: taskEnvelope.taskId,
+        status: "completed",
+        summary: `${taskEnvelope.taskId} completed`,
+        evidenceRefs: [],
+        artifactRefs: []
+      });
+    })
+  });
+
+  const runPromise = controller.runUntilDone({
+    userGoal: "Preserve active Task ownership",
+    scopeSummary: "Authorized target only",
+    maxPlannerCycles: 2,
+    maxParallelTasks: 2,
+    maxRunTimeMs: 60_000
+  });
+  await waitFor(async () => (await controller.executionLog.readAll()).some((event) => (
+    event.eventType === "planner_decision_rejected"
+    && String(event.summary).includes("cannot mutate active Task")
+  )));
+  assert.equal(controllerHarness.activeTaskRuns.has("task:slow-owned"), true);
+  slowRelease.resolve();
+  const result = await runPromise;
+  const events = await controller.executionLog.readAll();
+
+  assert.equal(result.stoppedReason, "Reached max planner cycles: 2");
+  assert.equal(plannerSession.promptCount(), 3);
+  assert.equal(controller.graphStore.getTaskNode("task:slow-owned")?.properties.status, "completed");
+  assert.equal(controller.graphStore.getTaskNode("task:after-slow")?.properties.status, "completed");
+  assert.equal(events.some((event) => event.eventType === "planner_task_patched"
+    && event.taskId === "task:slow-owned"), false);
+  assert.equal(events.some((event) => event.eventType === "planner_status_applied"
+    && event.taskId === "task:slow-owned"), false);
+  assert.equal(events.filter((event) => event.eventType === "task_created"
+    && event.taskId === "task:after-slow").length, 1);
+  await controller.close({ drainProjectionJobs: false });
 });
 
 test("empty apply_commands schedules existing open tasks", async () => {
@@ -3973,15 +5186,114 @@ test("empty apply_commands schedules existing open tasks", async () => {
     maxPlannerCycles: 1,
     maxParallelTasks: 1
   });
+  const events = await controller.executionLog.readAll();
 
   assert.equal(result.cycles[0].plannerDecision.decision, "apply_commands");
   assert.deepEqual(result.cycles[0].plannerDecision.commands, []);
-  assert.equal(result.cycles[0].taskResult?.taskId, "task:ready-existing");
+  assert.equal(result.cycles[0].taskResult, undefined);
+  assert.ok(events.some((event) => event.eventType === "task_completed"
+    && event.taskId === "task:ready-existing"));
   assert.equal(
     controller.graphStore.query("task", ["task:ready-existing"], 1).nodes[0]?.properties.status,
     "completed"
   );
   controller.close();
+});
+
+test("max Planner cycles drains already scheduled parallel tasks", async () => {
+  const runtimeDir = mkdtempSync(join(tmpdir(), "luanniao-controller-"));
+  const controller = createControllerWithTestLlmEnv(runtimeDir);
+  const controllerHarness = controller as unknown as ControllerHarness & {
+    runExecutorTask: (taskEnvelope: TaskEnvelope) => Promise<{
+      taskEnvelope: TaskEnvelope;
+      taskResult: TaskResult;
+      terminalSeq: number;
+      controlSignal: ControlSignal;
+    }>;
+    activeTaskRuns: Map<string, unknown>;
+  };
+  const slowRelease = createDeferred<void>();
+  let slowSettled = false;
+  controllerHarness.agents = {
+    planner: createMockTextSession(JSON.stringify({
+      decision: "apply_commands",
+      commands: [{
+        kind: "create_tasks",
+        tasks: [
+          {
+            id: "task:fast-drain",
+            goal: "Complete the fast branch",
+            targetRefs: ["goal:root"],
+            scopeRef: "scope:root",
+            constraints: [],
+            successCriteria: ["fast branch completed"],
+            priority: 1
+          },
+          {
+            id: "task:slow-drain",
+            goal: "Complete the slow branch",
+            targetRefs: ["goal:root"],
+            scopeRef: "scope:root",
+            constraints: [],
+            successCriteria: ["slow branch completed"],
+            priority: 1
+          }
+        ],
+        reason: "Run both independent branches",
+        basedOnRefs: ["goal:root"]
+      }],
+      reason: "Run both independent branches",
+      basedOnRefs: ["goal:root"]
+    })),
+    executor: createAbortableMockTextSession("{}"),
+    observer: createAbortableMockTextSession(observerProjectionJson())
+  };
+  controllerHarness.runExecutorTask = async (taskEnvelope) => {
+    if (taskEnvelope.taskId === "task:slow-drain") {
+      await slowRelease.promise;
+      slowSettled = true;
+    }
+    const taskResult: TaskResult = {
+      taskId: taskEnvelope.taskId,
+      status: "completed",
+      summary: `${taskEnvelope.taskId} completed`,
+      evidenceRefs: [],
+      artifactRefs: []
+    };
+    controller.graphStore.markTaskStatus({
+      taskId: taskEnvelope.taskId,
+      status: "completed",
+      properties: { resultSummary: taskResult.summary }
+    });
+    return {
+      taskEnvelope,
+      taskResult,
+      terminalSeq: taskEnvelope.taskId === "task:slow-drain" ? 20 : 10,
+      controlSignal: {
+        decision: "continue",
+        reason: taskResult.summary,
+        evidenceRefs: []
+      }
+    };
+  };
+  const releaseTimer = setTimeout(() => slowRelease.resolve(), 40);
+
+  const result = await controller.runUntilDone({
+    userGoal: "Drain admitted work",
+    scopeSummary: "Authorized target only",
+    maxPlannerCycles: 1,
+    maxParallelTasks: 2,
+    maxRunTimeMs: 1_000
+  });
+  clearTimeout(releaseTimer);
+
+  assert.equal(result.completed, false);
+  assert.equal(result.stoppedReason, "Reached max planner cycles: 1");
+  assert.equal(slowSettled, true);
+  assert.equal(controllerHarness.activeTaskRuns.size, 0);
+  assert.equal(controller.graphStore.getTaskNode("task:fast-drain")?.properties.status, "completed");
+  assert.equal(controller.graphStore.getTaskNode("task:slow-drain")?.properties.status, "completed");
+  await controller.close({ drainProjectionJobs: false });
 });
 
 test("runUntilDone continues planning after task graph command cycles", async () => {
@@ -4075,12 +5387,14 @@ function createControllerHarness(): {
   controller: SecurityAgentController;
   controllerHarness: ControllerHarness;
   abortCount: () => number;
+  observerPromptCount: () => number;
   steers: () => string[];
 } {
   const runtimeDir = mkdtempSync(join(tmpdir(), "luanniao-controller-"));
   const controller = createControllerWithTestLlmEnv(runtimeDir);
   const controllerHarness = controller as unknown as ControllerHarness;
   let abortCount = 0;
+  let observerPromptCount = 0;
   const steerTexts: string[] = [];
   controllerHarness.agents = {
     planner: {},
@@ -4094,12 +5408,15 @@ function createControllerHarness(): {
       }
     }
   };
-  controllerHarness.enqueueSupervisorCheck = async () => ({
-    decision: "continue",
-    reason: "no supervision intervention",
-    evidenceRefs: [],
-    confidence: "low"
-  });
+  controllerHarness.enqueueSupervisorCheck = async () => {
+    observerPromptCount += 1;
+    return {
+      decision: "continue",
+      reason: "no supervision intervention",
+      evidenceRefs: [],
+      confidence: "low"
+    };
+  };
   controllerHarness.enqueueProjectionJob = async () => ({
     graphDelta: {
       sourceEventIds: [],
@@ -4117,6 +5434,7 @@ function createControllerHarness(): {
     controller,
     controllerHarness,
     abortCount: () => abortCount,
+    observerPromptCount: () => observerPromptCount,
     steers: () => [...steerTexts]
   };
 }
@@ -4135,6 +5453,7 @@ function createObserverControllerHarness(observerOutput: string): {
     planner: createMockTextSession("{}"),
     observer: observerSession,
     executor: {
+      async steer(): Promise<void> {},
       async abort(): Promise<void> {}
     }
   };
@@ -4160,7 +5479,13 @@ function createControllerWithTestLlmEnv(runtimeDir: string): SecurityAgentContro
   process.env.LLM_API_KEY = previousEnv.LLM_API_KEY ?? "test-key";
   process.env.LLM_DEFAULT_MODEL = previousEnv.LLM_DEFAULT_MODEL ?? "test-model";
   try {
-    return new SecurityAgentController({ cwd: process.cwd(), runtimeDir });
+    const controller = new SecurityAgentController({ cwd: process.cwd(), runtimeDir });
+    const controllerHarness = controller as unknown as ControllerHarness;
+    controllerHarness.createObserverSessionForMode = async () => ({
+      session: createAbortableMockTextSession(observerProjectionJson()),
+      dynamicObserver: true
+    });
+    return controller;
   } finally {
     restoreEnv("LLM_API_BASE_URL", previousEnv.LLM_API_BASE_URL);
     restoreEnv("LLM_API_KEY", previousEnv.LLM_API_KEY);
@@ -4235,6 +5560,30 @@ async function persistExecutorEvent(
   });
 }
 
+function seedProjectionOrphans(
+  controller: SecurityAgentController,
+  taskId: string,
+  nodes: GraphNode[]
+): void {
+  controller.runtimeStore.raiseProjectionDesired(taskId, 1);
+  const claim = controller.runtimeStore.claimProjection(taskId);
+  assert.ok(claim);
+  controller.graphStore.commitProjection({
+    ...claim,
+    delta: {
+      sourceEventIds: nodes.flatMap((node) => node.evidenceRefs ?? []),
+      nodes,
+      edges: []
+    }
+  });
+}
+
+function aliasForProjectionLabel(prompt: string, label: string): string | undefined {
+  return prompt.split("\n")
+    .find((line) => line.includes(` ${label} `) || line.endsWith(` ${label}`))
+    ?.match(/^(existing:\d+)/)?.[1];
+}
+
 function observerProjectionJson(): string {
   return JSON.stringify({
     graphDelta: {
@@ -4254,15 +5603,30 @@ function observerProjectionJson(): string {
 function projectionDeltaJson(nodeId: string, sourceEventId: string): string {
   return JSON.stringify({
     sourceEventIds: [sourceEventId],
-    nodes: [{
-      id: "new:1",
-      graphKind: "reasoning",
-      type: "Evidence",
-      label: nodeId,
-      properties: {},
+    nodes: [
+      {
+        id: "new:1",
+        graphKind: "reasoning",
+        type: "Evidence",
+        label: nodeId,
+        properties: {},
+        evidenceRefs: [sourceEventId]
+      },
+      {
+        id: "new:2",
+        graphKind: "operation",
+        type: "WebEndpoint",
+        label: `endpoint for ${nodeId}`,
+        properties: {},
+        evidenceRefs: [sourceEventId]
+      }
+    ],
+    edges: [{
+      from: "new:1",
+      to: "new:2",
+      type: "observed_on",
       evidenceRefs: [sourceEventId]
-    }],
-    edges: []
+    }]
   });
 }
 
@@ -4428,6 +5792,51 @@ function createDelayedAbortableMockTextSession(
   };
 }
 
+function createPromptAwareMockTextSession(
+  outputFactory: (prompt: string, index: number) => string | Promise<string>
+): ReturnType<typeof createMockTextSession> & { abort: () => Promise<void> } {
+  const listeners: Array<(event: unknown) => void> = [];
+  const promptTexts: string[] = [];
+  const steerTexts: string[] = [];
+  return {
+    async prompt(text: string): Promise<void> {
+      const index = promptTexts.length;
+      promptTexts.push(text);
+      const output = await outputFactory(text, index);
+      for (const listener of [...listeners]) {
+        listener({
+          type: "message_end",
+          message: {
+            content: [{ type: "text", text: output }]
+          }
+        });
+      }
+    },
+    async steer(text: string): Promise<void> {
+      steerTexts.push(text);
+    },
+    subscribe(listener: (event: unknown) => void): () => void {
+      listeners.push(listener);
+      return () => {
+        const index = listeners.indexOf(listener);
+        if (index >= 0) {
+          listeners.splice(index, 1);
+        }
+      };
+    },
+    promptCount(): number {
+      return promptTexts.length;
+    },
+    prompts(): string[] {
+      return [...promptTexts];
+    },
+    steers(): string[] {
+      return [...steerTexts];
+    },
+    async abort(): Promise<void> {}
+  };
+}
+
 function createStructuredToolSession(
   toolName: string,
   details: Record<string, unknown>
@@ -4438,6 +5847,52 @@ function createStructuredToolSession(
   return {
     async prompt(text: string): Promise<void> {
       promptTexts.push(text);
+      for (const listener of [...listeners]) {
+        listener({
+          type: "tool_execution_end",
+          toolName,
+          isError: false,
+          result: { details }
+        });
+      }
+    },
+    async steer(text: string): Promise<void> {
+      steerTexts.push(text);
+    },
+    subscribe(listener: (event: unknown) => void): () => void {
+      listeners.push(listener);
+      return () => {
+        const index = listeners.indexOf(listener);
+        if (index >= 0) {
+          listeners.splice(index, 1);
+        }
+      };
+    },
+    promptCount(): number {
+      return promptTexts.length;
+    },
+    prompts(): string[] {
+      return [...promptTexts];
+    },
+    steers(): string[] {
+      return [...steerTexts];
+    },
+    async abort(): Promise<void> {}
+  };
+}
+
+function createPromptAwareStructuredToolSession(
+  toolName: string,
+  detailsFactory: (prompt: string, index: number) => Record<string, unknown> | Promise<Record<string, unknown>>
+): ReturnType<typeof createMockTextSession> & { abort: () => Promise<void> } {
+  const listeners: Array<(event: unknown) => void> = [];
+  const promptTexts: string[] = [];
+  const steerTexts: string[] = [];
+  return {
+    async prompt(text: string): Promise<void> {
+      const index = promptTexts.length;
+      promptTexts.push(text);
+      const details = await detailsFactory(text, index);
       for (const listener of [...listeners]) {
         listener({
           type: "tool_execution_end",

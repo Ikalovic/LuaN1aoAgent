@@ -111,7 +111,6 @@ export type ProjectionCommitResult = {
   delta: GraphDelta;
   remappedNodeCount: number;
   mergedNodeCount: number;
-  orphanNodeIds: string[];
 };
 
 export class SQLiteGraphStore {
@@ -147,7 +146,6 @@ export class SQLiteGraphStore {
     let committedDelta = input.delta;
     let remappedNodeCount = 0;
     let mergedNodeCount = 0;
-    let orphanNodeIds: string[] = [];
     this.database.exec("BEGIN IMMEDIATE");
     try {
       const state = this.database.prepare(`
@@ -180,13 +178,16 @@ export class SQLiteGraphStore {
       committedDelta = rebased.delta;
       remappedNodeCount = rebased.remappedNodeCount;
       mergedNodeCount = rebased.mergedNodeCount;
+      this.assertProjectionSemanticConnectivityInTransaction(committedDelta);
       this.applyDeltaInTransaction(committedDelta, [], true);
-      orphanNodeIds = this.findOrphanNodeIds(committedDelta.nodes.map((node) => node.id));
       const updated = this.database.prepare(`
         UPDATE projection_states
-        SET committed_seq = ?, active_generation = NULL, updated_at = ?
+        SET committed_seq = ?, active_generation = NULL,
+            pending_since = CASE WHEN ? >= desired_seq THEN NULL ELSE pending_since END,
+            updated_at = ?
         WHERE task_id = ? AND committed_seq = ? AND active_generation = ?
       `).run(
+        input.toSeq,
         input.toSeq,
         new Date().toISOString(),
         input.taskId,
@@ -202,29 +203,65 @@ export class SQLiteGraphStore {
       throw error;
     }
     appendDeltaLog(this.deltaLogPath, committedDelta);
-    return { delta: committedDelta, remappedNodeCount, mergedNodeCount, orphanNodeIds };
+    return { delta: committedDelta, remappedNodeCount, mergedNodeCount };
   }
+
+  private assertProjectionSemanticConnectivityInTransaction(delta: GraphDelta): void {
+    const edgeEndpointIds = new Set(delta.edges.flatMap((edge) => [edge.from, edge.to]));
+    const hasPersistedEdge = this.database.prepare(`
+      SELECT 1 FROM edges WHERE from_id = ? OR to_id = ? LIMIT 1
+    `);
+    const hasPersistedNode = this.database.prepare("SELECT 1 FROM nodes WHERE id = ?");
+    const unconnectedNodeIds = delta.nodes
+      .filter((node) => node.graphKind === "reasoning")
+      .filter((node) => (
+        !hasPersistedNode.get(node.id)
+        && !edgeEndpointIds.has(node.id)
+        && !hasPersistedEdge.get(node.id, node.id)
+      ))
+      .map((node) => node.id);
+    if (unconnectedNodeIds.length > 0) {
+      throw new GraphValidationError(
+        `Projection cannot commit unconnected semantic nodes: ${unconnectedNodeIds.join(", ")}`
+      );
+    }
+  }
+
 
   private rebaseProjectionDeltaInTransaction(delta: GraphDelta): {
     delta: GraphDelta;
     remappedNodeCount: number;
     mergedNodeCount: number;
   } {
-    this.refreshOperationIdentityIndexInTransaction();
-    const existingNodes = (this.database.prepare(`
-      SELECT id, graph_kind, type, label, properties_json, evidence_refs_json FROM nodes
-    `).all() as StoredNodeRow[]).map(rowToNode);
-    const existingEdges = (this.database.prepare(`
-      SELECT id, from_id, to_id, type, properties_json, evidence_refs_json FROM edges
-    `).all() as StoredEdgeRow[]).map(rowToEdge);
+    const relevantNodeIds = dedupeStringValues([
+      ...delta.nodes.map((node) => node.id),
+      ...delta.edges.flatMap((edge) => [edge.from, edge.to])
+    ]);
+    const readNode = this.database.prepare(`
+      SELECT id, graph_kind, type, label, properties_json, evidence_refs_json FROM nodes WHERE id = ?
+    `);
+    const existingNodes = relevantNodeIds.flatMap((nodeId) => {
+      const row = readNode.get(nodeId) as StoredNodeRow | undefined;
+      return row ? [rowToNode(row)] : [];
+    });
     const combinedNodes = [...new Map([...existingNodes, ...delta.nodes].map((node) => [node.id, node])).values()];
-    const combinedEdges = [...new Map(
-      [...existingEdges, ...delta.edges].map((edge) => [edgeIdFor(edge), edge])
-    ).values()];
-    const identityKeys = operationIdentityKeys(combinedNodes, combinedEdges);
+    const existingIdentity = this.database.prepare(`
+      SELECT identity_key FROM operation_identities WHERE node_id = ? ORDER BY updated_at DESC LIMIT 1
+    `);
+    const initialIdentityKeys = new Map<string, string>();
+    for (const nodeId of relevantNodeIds) {
+      const row = existingIdentity.get(nodeId) as { identity_key: string } | undefined;
+      if (row) initialIdentityKeys.set(nodeId, row.identity_key);
+    }
+    const identityKeys = operationIdentityKeys(combinedNodes, delta.edges, initialIdentityKeys);
     const nodeIdMap = new Map<string, string>();
     const claimedIdentityIds = new Map<string, string>();
     const existingNodeIds = new Set(existingNodes.map((node) => node.id));
+    const nodeExists = this.database.prepare("SELECT 1 FROM nodes WHERE id = ?");
+    const upsertIdentity = this.database.prepare(`
+      INSERT INTO operation_identities (identity_key, node_id, updated_at) VALUES (?, ?, ?)
+      ON CONFLICT(identity_key) DO UPDATE SET node_id = excluded.node_id, updated_at = excluded.updated_at
+    `);
     let remappedNodeCount = 0;
     let mergedNodeCount = 0;
 
@@ -249,10 +286,11 @@ export class SQLiteGraphStore {
       nodeIdMap.set(node.id, resolvedId);
       if (resolvedId !== node.id) {
         remappedNodeCount += 1;
-        if (existingNodeIds.has(resolvedId) || alreadyClaimed) {
+        if (existingNodeIds.has(resolvedId) || alreadyClaimed || Boolean(nodeExists.get(resolvedId))) {
           mergedNodeCount += 1;
         }
       }
+      upsertIdentity.run(identityKey, resolvedId, new Date().toISOString());
     }
 
     const nodesById = new Map<string, GraphNode>();
@@ -296,7 +334,7 @@ export class SQLiteGraphStore {
     };
   }
 
-  private refreshOperationIdentityIndexInTransaction(): void {
+  private bootstrapOperationIdentityIndex(): void {
     const nodes = (this.database.prepare(`
       SELECT id, graph_kind, type, label, properties_json, evidence_refs_json
       FROM nodes WHERE graph_kind = 'operation' ORDER BY id
@@ -319,23 +357,6 @@ export class SQLiteGraphStore {
     }
   }
 
-  findOrphanNodeIds(nodeIds: string[]): string[] {
-    const uniqueIds = dedupeStringValues(nodeIds);
-    const orphanIds: string[] = [];
-    const query = this.database.prepare(`
-      SELECT n.id
-      FROM nodes n
-      WHERE n.id = ?
-        AND n.graph_kind IN ('operation', 'reasoning')
-        AND NOT EXISTS (SELECT 1 FROM edges e WHERE e.from_id = n.id OR e.to_id = n.id)
-    `);
-    for (const nodeId of uniqueIds) {
-      if (query.get(nodeId)) {
-        orphanIds.push(nodeId);
-      }
-    }
-    return orphanIds;
-  }
 
   private applyDelta(
     delta: GraphDelta,
@@ -356,7 +377,7 @@ export class SQLiteGraphStore {
   private applyDeltaInTransaction(
     delta: GraphDelta,
     edgeReplacements: Array<{ from: string; type: string }>,
-    requireEdgeEndpoints = false
+    requireEdgeEndpoints = true
   ): void {
     for (const replacement of edgeReplacements) {
       this.database.prepare("DELETE FROM edges WHERE from_id = ? AND type = ?")
@@ -463,6 +484,7 @@ export class SQLiteGraphStore {
         new Date().toISOString()
       );
     }
+    this.indexOperationIdentitiesForDeltaInTransaction(delta);
     this.database.prepare(`
       INSERT INTO graph_deltas (id, source_event_ids_json, delta_json, created_at)
       VALUES (?, ?, ?, ?)
@@ -472,6 +494,52 @@ export class SQLiteGraphStore {
       JSON.stringify(delta),
       new Date().toISOString()
     );
+  }
+
+  private indexOperationIdentitiesForDeltaInTransaction(delta: GraphDelta): void {
+    const operationNodeIds = delta.nodes
+      .filter((node) => node.graphKind === "operation")
+      .map((node) => node.id);
+    if (operationNodeIds.length === 0) return;
+    const relevantNodeIds = dedupeStringValues([
+      ...operationNodeIds,
+      ...delta.edges.flatMap((edge) => [edge.from, edge.to])
+    ]);
+    const readNode = this.database.prepare(`
+      SELECT id, graph_kind, type, label, properties_json, evidence_refs_json FROM nodes WHERE id = ?
+    `);
+    const nodes = relevantNodeIds.flatMap((nodeId) => {
+      const row = readNode.get(nodeId) as StoredNodeRow | undefined;
+      return row ? [rowToNode(row)] : [];
+    });
+    const edgesById = new Map<string, GraphEdge>();
+    const readEdges = this.database.prepare(`
+      SELECT id, from_id, to_id, type, properties_json, evidence_refs_json
+      FROM edges WHERE from_id = ? OR to_id = ?
+    `);
+    for (const nodeId of operationNodeIds) {
+      for (const row of readEdges.all(nodeId, nodeId) as StoredEdgeRow[]) {
+        const edge = rowToEdge(row);
+        edgesById.set(edgeIdFor(edge), edge);
+      }
+    }
+    const initialKeys = new Map<string, string>();
+    const readIdentity = this.database.prepare(`
+      SELECT identity_key FROM operation_identities WHERE node_id = ? ORDER BY updated_at DESC LIMIT 1
+    `);
+    for (const nodeId of relevantNodeIds) {
+      const row = readIdentity.get(nodeId) as { identity_key: string } | undefined;
+      if (row) initialKeys.set(nodeId, row.identity_key);
+    }
+    const identities = operationIdentityKeys(nodes, [...edgesById.values()], initialKeys);
+    const insert = this.database.prepare(`
+      INSERT OR IGNORE INTO operation_identities (identity_key, node_id, updated_at) VALUES (?, ?, ?)
+    `);
+    const now = new Date().toISOString();
+    for (const nodeId of operationNodeIds) {
+      const identityKey = identities.get(nodeId);
+      if (identityKey) insert.run(identityKey, nodeId, now);
+    }
   }
 
   query(view: GraphView, focusNodeIds: string[] = [], limit = 200): GraphSnapshot {
@@ -546,14 +614,22 @@ export class SQLiteGraphStore {
 
   trace(input: { nodeId?: string; evidenceId?: string }): GraphSnapshot {
     const focusNodeIds = input.nodeId ? [input.nodeId] : input.evidenceId ? [input.evidenceId] : [];
+    if (focusNodeIds.length === 0) {
+      return { view: "planner", nodes: [], edges: [], summary: { focusNodeIds } };
+    }
     const directNodes = this.readNodes({ focusNodeIds, limit: 50 });
+    if (directNodes.length === 0) {
+      return { view: "planner", nodes: [], edges: [], summary: { focusNodeIds } };
+    }
     const connectedEdges = this.readEdgesForNodes(directNodes.map((node) => node.id), 100);
     const connectedIds = new Set<string>();
     for (const edge of connectedEdges) {
       connectedIds.add(edge.from);
       connectedIds.add(edge.to);
     }
-    const connectedNodes = this.readNodes({ focusNodeIds: [...connectedIds], limit: 100 });
+    const connectedNodes = connectedIds.size > 0
+      ? this.readNodes({ focusNodeIds: [...connectedIds], limit: 100 })
+      : [];
     const nodes = withDerivedTaskDependencies(dedupeNodes([...directNodes, ...connectedNodes]), connectedEdges);
     return {
       view: "planner",
@@ -795,15 +871,15 @@ export class SQLiteGraphStore {
     }));
     const edges: GraphEdge[] = inputs.flatMap((input) => {
       const taskEdges: GraphEdge[] = [
-        { from: input.taskId, to: input.scopeRef, type: "within_scope" },
-        ...input.targetRefs.map((targetRef) => ({ from: input.taskId, to: targetRef, type: "requires_evidence" })),
+        ...this.existingReferenceEdges(input.taskId, [input.scopeRef], "within_scope", [], newTaskIds),
+        ...this.existingReferenceEdges(input.taskId, input.targetRefs, "requires_evidence", [], newTaskIds),
         ...(dependencyOverrides.get(input.taskId) ?? []).map((dependencyRef) => ({
           from: input.taskId,
           to: dependencyRef,
           type: "depends_on"
         }))
       ];
-      if (input.parentTaskId) {
+      if (input.parentTaskId && this.referenceExists(input.parentTaskId, newTaskIds)) {
         taskEdges.push({ from: input.parentTaskId, to: input.taskId, type: "decomposes_to" });
       }
       return taskEdges;
@@ -1070,9 +1146,23 @@ export class SQLiteGraphStore {
     });
     const finalById = new Map(finalNodes.map((node) => [node.id, node]));
     const creationEdges: GraphEdge[] = input.createTasks.flatMap((task) => [
-      { from: task.taskId, to: task.scopeRef, type: "within_scope", evidenceRefs: input.sourceEventIds },
-      ...task.targetRefs.map((targetRef) => ({ from: task.taskId, to: targetRef, type: "requires_evidence", evidenceRefs: input.sourceEventIds })),
-      ...(task.parentTaskId ? [{ from: task.parentTaskId, to: task.taskId, type: "decomposes_to", evidenceRefs: input.sourceEventIds }] : [])
+      ...this.existingReferenceEdges(
+        task.taskId,
+        [task.scopeRef],
+        "within_scope",
+        input.sourceEventIds,
+        newTaskIds
+      ),
+      ...this.existingReferenceEdges(
+        task.taskId,
+        task.targetRefs,
+        "requires_evidence",
+        input.sourceEventIds,
+        newTaskIds
+      ),
+      ...(task.parentTaskId && this.referenceExists(task.parentTaskId, newTaskIds)
+        ? [{ from: task.parentTaskId, to: task.taskId, type: "decomposes_to", evidenceRefs: input.sourceEventIds } as GraphEdge]
+        : [])
     ]);
     const dependencyEdges = [...dependencyOverrides.entries()].flatMap(([taskId, dependencies]) => (
       dependencies.map((dependencyTaskId) => ({
@@ -1160,6 +1250,7 @@ export class SQLiteGraphStore {
         resultSummary: input.taskResult.summary,
         evidenceRefs: mergeStrings(stringArray(task.properties.evidenceRefs), input.taskResult.evidenceRefs),
         artifactRefs: mergeStrings(stringArray(task.properties.artifactRefs), input.taskResult.artifactRefs),
+        capabilityRefs: mergeStrings(stringArray(task.properties.capabilityRefs), input.taskResult.capabilityRefs ?? []),
         blockerReason: input.taskResult.blockerReason,
         suggestedNextGoal: input.taskResult.suggestedNextGoal,
         checkpointReason: input.taskResult.checkpointReason,
@@ -1177,13 +1268,18 @@ export class SQLiteGraphStore {
       sourceEventIds: input.sourceEventIds,
       nodes: [nextTask],
       edges: [
-        { from: input.taskEnvelope.taskId, to: input.taskEnvelope.scopeRef, type: "within_scope", evidenceRefs: input.sourceEventIds },
-        ...input.taskEnvelope.targetRefs.map((targetRef) => ({
-          from: input.taskEnvelope.taskId,
-          to: targetRef,
-          type: "requires_evidence",
-          evidenceRefs: input.sourceEventIds
-        })),
+        ...this.existingReferenceEdges(
+          input.taskEnvelope.taskId,
+          [input.taskEnvelope.scopeRef],
+          "within_scope",
+          input.sourceEventIds
+        ),
+        ...this.existingReferenceEdges(
+          input.taskEnvelope.taskId,
+          input.taskEnvelope.targetRefs,
+          "requires_evidence",
+          input.sourceEventIds
+        ),
         ...dependsOnTaskRefs.map((dependencyRef) => ({
           from: input.taskEnvelope.taskId,
           to: dependencyRef,
@@ -1198,6 +1294,25 @@ export class SQLiteGraphStore {
       { from: input.taskEnvelope.taskId, type: "depends_on" }
     ]);
     return delta;
+  }
+
+  private existingReferenceEdges(
+    from: string,
+    references: string[],
+    type: GraphEdge["type"],
+    evidenceRefs: string[] = [],
+    additionalNodeIds: ReadonlySet<string> = new Set()
+  ): GraphEdge[] {
+    return references
+      .filter((reference) => this.referenceExists(reference, additionalNodeIds))
+      .map((reference) => ({ from, to: reference, type, evidenceRefs }));
+  }
+
+  private referenceExists(reference: string, additionalNodeIds: ReadonlySet<string> = new Set()): boolean {
+    if (additionalNodeIds.has(reference)) {
+      return true;
+    }
+    return this.database.prepare("SELECT 1 FROM nodes WHERE id = ?").get(reference) !== undefined;
   }
 
   patchTask(input: {
@@ -1555,6 +1670,8 @@ export class SQLiteGraphStore {
         generation INTEGER NOT NULL DEFAULT 0,
         active_generation INTEGER,
         priority INTEGER NOT NULL DEFAULT 0,
+        pending_since TEXT,
+        terminal_target_seq INTEGER,
         updated_at TEXT NOT NULL
       );
       CREATE INDEX IF NOT EXISTS idx_nodes_kind_type ON nodes(graph_kind, type);
@@ -1562,13 +1679,25 @@ export class SQLiteGraphStore {
       CREATE INDEX IF NOT EXISTS idx_edges_to ON edges(to_id);
       CREATE INDEX IF NOT EXISTS idx_operation_identities_node ON operation_identities(node_id);
     `);
+    ensureGraphStoreColumn(this.database, "projection_states", "pending_since", "TEXT");
+    ensureGraphStoreColumn(this.database, "projection_states", "terminal_target_seq", "INTEGER");
     this.database.exec(`
       UPDATE nodes SET graph_kind = 'task', type = 'Task' WHERE id LIKE 'task:%' AND type <> 'Task';
       UPDATE nodes SET graph_kind = 'task', type = 'Goal' WHERE id LIKE 'goal:%' AND type <> 'Goal';
       UPDATE nodes SET graph_kind = 'task', type = 'Scope' WHERE id LIKE 'scope:%' AND type <> 'Scope';
       UPDATE nodes SET graph_kind = 'task', type = 'Milestone' WHERE id LIKE 'milestone:%' AND type <> 'Milestone';
       UPDATE nodes SET graph_kind = 'task', type = 'Blocker' WHERE id LIKE 'blocker:%' AND type <> 'Blocker';
+      DELETE FROM edges
+      WHERE from_id NOT IN (SELECT id FROM nodes)
+         OR to_id NOT IN (SELECT id FROM nodes);
+      DELETE FROM operation_identities WHERE node_id NOT IN (SELECT id FROM nodes);
+      UPDATE nodes
+      SET properties_json = json_remove(properties_json, '$.unresolved', '$.unresolvedTaskRef')
+      WHERE json_type(properties_json, '$.unresolved') IS NOT NULL
+         OR json_type(properties_json, '$.unresolvedTaskRef') IS NOT NULL;
+      DROP TABLE IF EXISTS projection_unresolved_nodes;
     `);
+    this.bootstrapOperationIdentityIndex();
   }
 
   private queryPlannerView(limit: number): GraphSnapshot {
@@ -1725,6 +1854,10 @@ function validateGraphDelta(delta: GraphDelta): void {
   }
 }
 
+function isSemanticGraphNode(node: GraphNode): boolean {
+  return node.graphKind === "operation" || node.graphKind === "reasoning";
+}
+
 function validateGraphNodeCategory(node: GraphNode): void {
   const expectedGraphKind = expectedGraphKindForNodeType(node.type);
   if (expectedGraphKind && node.graphKind !== expectedGraphKind) {
@@ -1817,7 +1950,10 @@ function buildTaskLedger(taskNodes: GraphNode[]): PlannerTaskLedgerItem[] {
       retryable: booleanProperty(node.properties.retryable),
       attempt: numberProperty(node.properties.attempt),
       priority: numberProperty(node.properties.priority),
-      dependsOnTaskRefs: stringArray(node.properties.dependsOnTaskRefs)
+      dependsOnTaskRefs: stringArray(node.properties.dependsOnTaskRefs),
+      evidenceRefs: stringArray(node.properties.evidenceRefs),
+      artifactRefs: stringArray(node.properties.artifactRefs),
+      capabilityRefs: stringArray(node.properties.capabilityRefs)
     }))
     .sort(compareLedgerItems);
 }
@@ -2246,4 +2382,16 @@ function mergeStrings(left: string[], right: string[]): string[] {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function ensureGraphStoreColumn(
+  database: DatabaseSync,
+  table: string,
+  column: string,
+  definition: string
+): void {
+  const columns = database.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>;
+  if (!columns.some((candidate) => candidate.name === column)) {
+    database.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
+  }
 }

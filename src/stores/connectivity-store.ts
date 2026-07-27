@@ -170,6 +170,19 @@ export class ConnectivityStore {
     return rows.map(definitionFromRow);
   }
 
+  deleteDefinition(id: string): boolean {
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      this.database.prepare("DELETE FROM connectivity_leases WHERE session_id = ?").run(id);
+      const deleted = Number(this.database.prepare("DELETE FROM connectivity_definitions WHERE id = ?").run(id).changes) > 0;
+      this.database.exec("COMMIT");
+      return deleted;
+    } catch (error) {
+      this.database.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
   updateStatus(id: string, status: OperationalStatus, heartbeat = false): ConnectivityDefinition {
     this.database.exec("BEGIN IMMEDIATE");
     try {

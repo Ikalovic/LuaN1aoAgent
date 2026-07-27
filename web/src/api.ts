@@ -1,5 +1,5 @@
 import { translate } from "./language";
-import type { ActiveRunsResponse, ArtifactContent, AuthResponse, ConnectionItem, ConnectionsResponse, CreateSshTunnelInput, RuntimeState, SessionsResponse, StartRunInput, StartRunResponse, StopRunResponse, TrafficExchange, TrafficHistoryBody, TrafficHistoryFilters, TrafficHistoryPage, TrafficReplayInput, TrafficReplayResponse } from "./types";
+import type { ActiveRunsResponse, ArtifactContent, AuthResponse, ConnectionItem, ConnectionsResponse, RuntimeState, SessionsResponse, StartRunInput, StartRunResponse, StopRunResponse, TrafficExchange, TrafficFlowRef, TrafficHistoryBody, TrafficHistoryFilters, TrafficHistoryPage, TrafficReplayInput, TrafficReplayResponse } from "./types";
 
 export class ApiError extends Error {
   constructor(message: string, readonly status: number, readonly code?: string) {
@@ -96,24 +96,24 @@ export function fetchTrafficHistory(
   return requestJson(`/api/traffic/history?${params}`, { signal });
 }
 
-export function fetchTrafficExchange(runtimeDir: string, exchangeId: number, signal?: AbortSignal): Promise<TrafficExchange> {
+export function fetchTrafficExchange(runtimeDir: string, exchangeId: TrafficFlowRef, signal?: AbortSignal): Promise<TrafficExchange> {
   const params = new URLSearchParams({ runtimeDir });
-  return requestJson(`/api/traffic/history/${exchangeId}?${params}`, { signal });
+  return requestJson(`/api/traffic/history/${encodeURIComponent(exchangeId)}?${params}`, { signal });
 }
 
 export function fetchTrafficBody(
   runtimeDir: string,
-  exchangeId: number,
+  exchangeId: TrafficFlowRef,
   side: "request" | "response",
   byteLimit = 256 * 1024,
   signal?: AbortSignal
 ): Promise<TrafficHistoryBody> {
   const params = new URLSearchParams({ runtimeDir, side, byteLimit: String(Math.min(256 * 1024, Math.max(1, byteLimit))) });
-  return requestJson(`/api/traffic/history/${exchangeId}/body?${params}`, { signal });
+  return requestJson(`/api/traffic/history/${encodeURIComponent(exchangeId)}/body?${params}`, { signal });
 }
 
-export function replayTrafficExchange(exchangeId: number, input: TrafficReplayInput): Promise<TrafficReplayResponse> {
-  return requestJson(`/api/traffic/history/${exchangeId}/replay`, {
+export function replayTrafficExchange(exchangeId: TrafficFlowRef, input: TrafficReplayInput): Promise<TrafficReplayResponse> {
+  return requestJson(`/api/traffic/history/${encodeURIComponent(exchangeId)}/replay`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(input)
@@ -152,15 +152,11 @@ export function fetchConnections(runtimeDir: string, signal?: AbortSignal): Prom
   return requestJson(`/api/connectivity?runtimeDir=${encodeURIComponent(runtimeDir)}`, { signal });
 }
 
-export function createSshTunnel(input: CreateSshTunnelInput): Promise<ConnectionItem> {
-  return requestJson("/api/connectivity/tunnels", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(input)
-  });
-}
-
-export function mutateConnection(runtimeDir: string, connectionId: string, action: "start" | "stop" | "close"): Promise<ConnectionItem> {
+export function mutateRoute(
+  runtimeDir: string,
+  connectionId: string,
+  action: "status" | "stop" | "reconnect" | "forget"
+): Promise<ConnectionItem> {
   return requestJson(`/api/connectivity/${encodeURIComponent(connectionId)}/${action}`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },

@@ -1,36 +1,37 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { randomUUID } from "node:crypto";
 import { createReadStream, existsSync } from "node:fs";
-import { open, readFile, stat } from "node:fs/promises";
+import { open, readFile, readdir, stat } from "node:fs/promises";
 import { basename, extname, join, relative, resolve, sep } from "node:path";
+import { createInterface } from "node:readline";
 import { DatabaseSync } from "node:sqlite";
 import { WebAuthError, WebAuthService, type WebUser } from "./web-auth.js";
 import { SecurityAgentController } from "./controller.js";
 import { loadLocalEnvFile } from "./llm-config.js";
+import { stableSessionNodeId } from "./operation-identity.js";
 import {
   bootstrapAgentRuntime,
   createAgentTrafficProxyRegistry,
   type AgentRuntimeLifecycle
 } from "./agent-runtime-bootstrap.js";
 import {
-  ConnectivitySupervisor,
-  ConnectivitySupervisorRegistry
-} from "./connectivity/connectivity-supervisor.js";
-import {
   TrafficProxyClient,
   TrafficProxyControlError,
+  type TrafficExchange,
   type TrafficHeaderEntry,
   type TrafficProxyContext,
   type TrafficReplayInput,
   type TrafficReplayResult
 } from "./connectivity/traffic-proxy-client.js";
+import { closeHistoricalMitmIndexes, MitmFlowClient } from "./connectivity/mitm-flow-client.js";
+import {
+  HistoricalConnectivityRuntimeRegistry,
+  type HistoricalConnectivityRuntime
+} from "./connectivity/connectivity-runtime-registry.js";
+import { ConnectivityRuntimeOwnershipError } from "./connectivity/connectivity-runtime.js";
 import { TrafficProxyManager } from "./connectivity/traffic-proxy-manager.js";
-import { SessionBroker, type SshSessionDefinition } from "./connectivity/session-broker.js";
-import { TunnelManager, type SshForward, type SshTunnelDefinition } from "./connectivity/tunnel-manager.js";
-import { OperationalTopology } from "./operational-topology.js";
 import { ConnectivityStore, type ConnectivityDefinition } from "./stores/connectivity-store.js";
 import { ExecutionLog } from "./stores/execution-log.js";
-import { SQLiteGraphStore } from "./stores/graph-store.js";
 import { discoverRuntimeSessionDirs } from "./runtime-session-discovery.js";
 import { RuntimePathPolicy, RuntimePathPolicyError } from "./runtime-path-policy.js";
 import {
@@ -165,7 +166,6 @@ type ActiveRun = {
   startedAt: string;
   controller: SecurityAgentController;
   agentRuntime: AgentRuntimeLifecycle;
-  connectivitySupervisor: ConnectivitySupervisor;
   completion?: Promise<void>;
 };
 
@@ -182,33 +182,7 @@ const sessionCookieName = "luanniao_session";
 const MAX_CONCURRENT_TRAFFIC_REPLAYS = 4;
 let activeTrafficReplays = 0;
 const activeRuns = new Map<string, ActiveRun>();
-const connectivityManagers = new Map<string, {
-  store: ConnectivityStore;
-  graphStore: SQLiteGraphStore;
-  tunnels: TunnelManager;
-  sessions: SessionBroker;
-}>();
-const connectivitySupervisorResources = new WeakMap<ConnectivitySupervisor, {
-  store: ConnectivityStore;
-  graphStore: SQLiteGraphStore;
-  executionLog: ExecutionLog;
-}>();
-const connectivityRegistry = new ConnectivitySupervisorRegistry((runtimeDir) => {
-  const databasePath = join(runtimeDir, "state.sqlite");
-  const store = new ConnectivityStore(databasePath);
-  const graphStore = new SQLiteGraphStore(databasePath, join(runtimeDir, "graph-deltas.jsonl"));
-  const executionLog = new ExecutionLog(join(runtimeDir, "execution.jsonl"), databasePath);
-  const supervisor = new ConnectivitySupervisor(store, new OperationalTopology(graphStore), executionLog);
-  connectivitySupervisorResources.set(supervisor, { store, graphStore, executionLog });
-  return supervisor;
-}, (supervisor) => {
-  const resources = connectivitySupervisorResources.get(supervisor);
-  if (!resources) return;
-  connectivitySupervisorResources.delete(supervisor);
-  resources.executionLog.close();
-  resources.graphStore.close();
-  resources.store.close();
-});
+const historicalConnectivityRuntimes = new HistoricalConnectivityRuntimeRegistry();
 const trafficProxyRegistry = createAgentTrafficProxyRegistry();
 
 const server = createServer(async (request, response) => {
@@ -272,7 +246,11 @@ const server = createServer(async (request, response) => {
         return;
       }
       requireRuntimeAccess(user!, "viewer:metadata");
-      await sendJson(response, await readConnectivity(url, hasCapability(user!, "admin:credential")));
+      await sendJson(response, await readConnectivity(
+        url,
+        hasCapability(user!, "admin:credential"),
+        hasCapability(user!, "connectivity:manage")
+      ));
       return;
     }
     if (url.pathname === "/api/connectivity/tunnels" || url.pathname === "/api/connectivity/sessions") {
@@ -281,17 +259,26 @@ const server = createServer(async (request, response) => {
         return;
       }
       requireRuntimeAccess(user!, "connectivity:manage");
-      await handleCreateConnectivity(request, response, url.pathname.endsWith("/tunnels") ? "tunnel" : "session");
-      return;
+      await readJsonBody(request);
+      throw new HttpError(410, "connectivity_definition_api_removed", "连接由活动 Runtime 创建，Web 不再维护独立连接生命周期");
     }
-    const connectivityActionRoute = /^\/api\/connectivity\/([^/]+)\/(start|stop|close)$/.exec(url.pathname);
+    const connectivityActionRoute = /^\/api\/connectivity\/([^/]+)\/(status|stop|reconnect|forget)$/.exec(url.pathname);
     if (connectivityActionRoute) {
       if (request.method !== "POST") {
         await sendJson(response, { error: { code: "method_not_allowed", message: "仅支持 POST" } }, 405);
         return;
       }
-      requireRuntimeAccess(user!, "connectivity:manage");
-      await handleConnectivityAction(request, response, decodeURIComponent(connectivityActionRoute[1]), connectivityActionRoute[2] as "start" | "stop" | "close");
+      requireRuntimeAccess(
+        user!,
+        connectivityActionRoute[2] === "forget" ? "admin:delete" : "connectivity:manage"
+      );
+      await handleConnectivityAction(
+        request,
+        response,
+        decodeURIComponent(connectivityActionRoute[1]),
+        connectivityActionRoute[2] as WebConnectivityAction,
+        hasCapability(user!, "admin:credential")
+      );
       return;
     }
     if (url.pathname === "/api/traffic/history") {
@@ -312,24 +299,24 @@ const server = createServer(async (request, response) => {
       await sendPublicCa(response, url);
       return;
     }
-    const trafficReplayRoute = /^\/api\/traffic\/history\/(\d+)\/replay$/.exec(url.pathname);
+    const trafficReplayRoute = /^\/api\/traffic\/history\/([^/]+)\/replay$/.exec(url.pathname);
     if (trafficReplayRoute) {
       if (request.method !== "POST") {
         await sendJson(response, { error: { code: "method_not_allowed", message: "仅支持 POST" } }, 405);
         return;
       }
       requireRuntimeAccess(user!, "traffic:replay");
-      await handleTrafficReplay(request, response, user!, Number(trafficReplayRoute[1]));
+      await handleTrafficReplay(request, response, user!, decodedFlowRef(trafficReplayRoute[1]));
       return;
     }
-    const trafficRoute = /^\/api\/traffic\/history\/(\d+)(\/body)?$/.exec(url.pathname);
+    const trafficRoute = /^\/api\/traffic\/history\/([^/]+)(\/body)?$/.exec(url.pathname);
     if (trafficRoute) {
       if (request.method !== "GET") {
         await sendJson(response, { error: { code: "method_not_allowed", message: "仅支持 GET" } }, 405);
         return;
       }
       requireRuntimeAccess(user!, "traffic:read-sensitive");
-      await sendJson(response, await readTrafficExchange(url, Number(trafficRoute[1]), Boolean(trafficRoute[2])));
+      await sendJson(response, await readTrafficExchange(url, decodedFlowRef(trafficRoute[1]), Boolean(trafficRoute[2])));
       return;
     }
     if (url.pathname === "/api/artifact") {
@@ -387,8 +374,8 @@ const shutdown = (signal: NodeJS.Signals): Promise<void> => {
     await Promise.allSettled(runs.map((run) => withTimeout(run.completion ?? Promise.resolve(), 5_000)));
     await Promise.allSettled([
       ...runs.map((run) => cleanupRun(run)),
-      closeConnectivityManagers(),
-      connectivityRegistry.closeAll()
+      historicalConnectivityRuntimes.closeAll(),
+      closeHistoricalMitmIndexes()
     ]);
     await trafficProxyRegistry.closeAll();
     authService.close();
@@ -457,55 +444,86 @@ async function handleAuthRequest(request: IncomingMessage, response: ServerRespo
 type WebConnection = {
   id: string;
   externalId: string;
-  kind: ConnectivityDefinition["kind"];
+  kind: ConnectivityDefinition["kind"] | "connection";
+  layer: "definition" | "observation";
   direction: string;
   transport: string;
   managed: boolean;
-  desiredState: ConnectivityDefinition["desiredState"];
+  actions?: WebConnectivityAction[];
+  desiredState?: ConnectivityDefinition["desiredState"];
   observedState: ConnectivityDefinition["status"];
   lastHeartbeat?: string;
   error?: string;
   available: boolean;
   credentialRef?: string;
   graphUrl?: string;
+  routeRef?: string;
+  connectionRef?: string;
+  sessionRef?: string;
+  taskRef?: string;
+  runRef?: string;
+  epochRef?: string;
 };
 
-async function readConnectivity(url: URL, includeCredentialRef: boolean): Promise<JsonRecord> {
+type WebConnectivityAction = "status" | "stop" | "reconnect" | "forget";
+
+async function readConnectivity(
+  url: URL,
+  includeCredentialRef: boolean,
+  allowManage: boolean
+): Promise<JsonRecord> {
   const runtimeInput = url.searchParams.get("runtimeDir") ?? defaultRuntimeDir;
   const runtimeDir = await runtimePathPolicy.resolveRuntime(runtimeInput, "existing");
+  const controller = activeRuns.get(runtimeDir)?.controller;
+  const historicalRuntime = controller?.hasConnectivityRuntime()
+    ? undefined
+    : await historicalConnectivityRuntimes.getExisting(runtimeDir).catch(() => undefined);
+  const runtimeManaged = (controller?.hasConnectivityRuntime() ?? false) || Boolean(historicalRuntime);
+  let runtimeError: string | undefined;
+  if (controller?.hasConnectivityRuntime()) {
+    try {
+      await controller.routeStatus();
+    } catch {
+      runtimeError = "活动 Runtime 暂时无法刷新 Route 状态";
+    }
+  } else if (historicalRuntime) {
+    try {
+      await historicalRuntime.routeStatus();
+    } catch {
+      runtimeError = "历史 Runtime 暂时无法刷新 Route 状态";
+    }
+  }
   const databasePath = join(runtimeDir, "state.sqlite");
-  if (!existsSync(databasePath)) {
-    return { runtimeDir: runtimeInput, loadedAt: new Date().toISOString(), connections: [] };
-  }
-  const store = new ConnectivityStore(databasePath);
-  try {
-    return {
-      runtimeDir: runtimeInput,
-      loadedAt: new Date().toISOString(),
-      connections: store.listDefinitions().map((definition) => webConnection(definition, runtimeInput, includeCredentialRef))
-    };
-  } finally {
-    store.close();
-  }
+  const definitions = existsSync(databasePath) ? readConnectivityDefinitions(databasePath) : [];
+  const observations = await readNetworkConnections(runtimeDir);
+  return {
+    runtimeDir: runtimeInput,
+    loadedAt: new Date().toISOString(),
+    runtimeControl: {
+      active: runtimeManaged,
+      mode: controller?.hasConnectivityRuntime() ? "controller" : historicalRuntime ? "historical" : "read_only",
+      ...(runtimeError ? { error: runtimeError } : {})
+    },
+    connections: [
+      ...definitions.map((definition) => webConnection(
+        definition,
+        runtimeInput,
+        includeCredentialRef,
+        runtimeManaged,
+        includeCredentialRef,
+        allowManage
+      )),
+      ...observations
+    ]
+  };
 }
 
-async function handleCreateConnectivity(
-  request: IncomingMessage,
-  response: ServerResponse,
-  kind: "tunnel" | "session"
-): Promise<void> {
-  const body = await readJsonBody(request);
-  rejectSensitiveConnectivityInput(body);
-  const runtimeInput = requiredBodyString(body, "runtimeDir");
-  const runtimeDir = await runtimePathPolicy.resolveRuntime(runtimeInput, "existing");
-  const managers = connectivityManagerFor(runtimeDir);
+function readConnectivityDefinitions(databasePath: string): ConnectivityDefinition[] {
+  const store = new ConnectivityStore(databasePath);
   try {
-    const definition = kind === "tunnel"
-      ? managers.tunnels.define(validateWebTunnel(body))
-      : managers.sessions.defineSsh(validateWebSession(body));
-    await sendJson(response, webConnection(definition, runtimeInput), 201);
-  } catch (error) {
-    throw connectivityInputError(error);
+    return store.listDefinitions();
+  } finally {
+    store.close();
   }
 }
 
@@ -513,162 +531,219 @@ async function handleConnectivityAction(
   request: IncomingMessage,
   response: ServerResponse,
   id: string,
-  action: "start" | "stop" | "close"
+  action: WebConnectivityAction,
+  includeCredentialRef: boolean
 ): Promise<void> {
   const body = await readJsonBody(request);
-  rejectSensitiveConnectivityInput(body);
   assertExactKeys(body, ["runtimeDir"]);
   const runtimeInput = requiredBodyString(body, "runtimeDir");
   const runtimeDir = await runtimePathPolicy.resolveRuntime(runtimeInput, "existing");
-  const managers = connectivityManagerFor(runtimeDir);
-  const current = managers.store.getDefinition(id);
-  if (!current) throw new HttpError(404, "connectivity_not_found", "连接不存在");
-  if (!isManagedConnection(current)) throw new HttpError(409, "connectivity_unmanaged", "该连接不受 Web 生命周期管理");
-  try {
-    let updated: ConnectivityDefinition;
-    if (current.kind === "tunnel") {
-      if (action === "start") {
-        managers.store.updateDesiredState(id, "running");
-        updated = await managers.tunnels.start(id);
-      } else {
-        updated = await managers.tunnels.stop(id, action === "close");
-      }
-    } else {
-      updated = managers.store.updateDesiredState(id, action === "close" ? "closed" : action === "stop" ? "stopped" : "running");
-    }
-    await sendJson(response, webConnection(updated, runtimeInput));
-  } catch (error) {
-    throw connectivityInputError(error, 409);
-  }
-}
-
-function connectivityManagerFor(runtimeDir: string): {
-  store: ConnectivityStore;
-  graphStore: SQLiteGraphStore;
-  tunnels: TunnelManager;
-  sessions: SessionBroker;
-} {
-  const existing = connectivityManagers.get(runtimeDir);
-  if (existing) return existing;
   const databasePath = join(runtimeDir, "state.sqlite");
-  const store = new ConnectivityStore(databasePath);
-  const graphStore = new SQLiteGraphStore(databasePath, join(runtimeDir, "graph-deltas.jsonl"));
-  const topology = new OperationalTopology(graphStore);
-  const managers = {
-    store,
-    graphStore,
-    tunnels: new TunnelManager(store, topology, runtimeDir),
-    sessions: new SessionBroker(store, topology, runtimeDir)
-  };
-  connectivityManagers.set(runtimeDir, managers);
-  return managers;
+  const store = existsSync(databasePath) ? new ConnectivityStore(databasePath) : undefined;
+  const current = store?.getDefinition(id);
+  store?.close();
+  if (!current) throw new HttpError(404, "connectivity_not_found", "连接不存在");
+  if (current.kind !== "route" || current.definition.runtimeManaged !== true) {
+    throw new HttpError(409, "connectivity_unmanaged", "该连接不受 Runtime Route 生命周期管理");
+  }
+  const controller = activeRuns.get(runtimeDir)?.controller;
+  let historicalRuntime: Awaited<ReturnType<HistoricalConnectivityRuntimeRegistry["get"]>> | undefined;
+  if (!controller?.hasConnectivityRuntime()) {
+    try {
+      historicalRuntime = await historicalConnectivityRuntimes.get(runtimeDir);
+    } catch (error) {
+      console.error(`[historical connectivity runtime failed] ${runtimeDir}:`, error instanceof Error ? error.message : String(error));
+      if (error instanceof ConnectivityRuntimeOwnershipError) {
+        throw new HttpError(409, error.code, "该运行已有活动网络 Runtime");
+      }
+      throw new HttpError(503, "connectivity_runtime_unavailable", "历史 Runtime 恢复失败");
+    }
+  }
+  let forgottenAt: string | undefined;
+  try {
+    if (controller?.hasConnectivityRuntime()) {
+      if (action === "status") await controller.routeStatus(current.externalId);
+      else if (action === "stop") await controller.routeStop(current.externalId);
+      else if (action === "reconnect") await controller.routeReconnect(current.externalId);
+      else forgottenAt = (await controller.routeForget(current.externalId)).lastHeartbeat;
+    } else if (historicalRuntime) {
+      if (action === "status") await historicalRuntime.routeStatus(current.externalId);
+      else if (action === "stop") await historicalRuntime.stopRoute(current.externalId);
+      else if (action === "reconnect") await historicalRuntime.reconnectRoute(current.externalId);
+      else forgottenAt = (await historicalRuntime.forgetRoute(current.externalId)).lastHeartbeat;
+    }
+  } catch (error) {
+    const notFound = error instanceof Error && /not found/i.test(error.message);
+    throw new HttpError(notFound ? 404 : 409, notFound ? "connectivity_not_found" : "connectivity_action_failed", notFound ? "连接不存在" : "Route 操作失败");
+  }
+  const updated = readConnectivityDefinitions(databasePath).find((definition) => definition.id === id);
+  if (!updated && forgottenAt) {
+    await sendJson(response, webConnection({
+      ...current,
+      desiredState: "closed",
+      status: "closed",
+      lastHeartbeat: forgottenAt,
+      updatedAt: forgottenAt
+    }, runtimeInput, includeCredentialRef, false, includeCredentialRef));
+    return;
+  }
+  if (!updated) throw new HttpError(404, "connectivity_not_found", "连接不存在");
+  await sendJson(response, webConnection(updated, runtimeInput, includeCredentialRef, true, includeCredentialRef));
 }
 
-function webConnection(definition: ConnectivityDefinition, runtimeInput: string, includeCredentialRef = true): WebConnection {
+function webConnection(
+  definition: ConnectivityDefinition,
+  runtimeInput: string,
+  includeCredentialRef = true,
+  runtimeAvailable = false,
+  allowForget = includeCredentialRef,
+  allowManage = true
+): WebConnection {
   const transport = typeof definition.definition.transport === "string"
     ? definition.definition.transport
     : typeof definition.definition.adapter === "string" ? definition.definition.adapter : "raw";
   const failure = definition.definition.lastFailureReason;
+  const targetCidrs = stringArray(definition.definition.targetCidrs);
+  const dialAddress = stringProperty(definition.definition.dialAddress);
+  const pivotHostRef = stringProperty(definition.definition.pivotHostRef) ?? definition.hostRef;
+  const connectionRef = definition.kind === "session"
+    ? definition.externalId
+    : stringProperty(definition.definition.connectionRef);
+  const routeRef = definition.kind === "route" ? definition.externalId : stringProperty(definition.definition.routeRef);
   const direction = definition.kind === "tunnel"
     ? `${definition.fromHostRef ?? "?"} → ${definition.toHostRef ?? "?"}`
-    : definition.kind === "session" ? `host: ${definition.hostRef ?? "?"}` : "route";
+    : definition.kind === "session"
+      ? `host: ${dialAddress ?? definition.hostRef ?? "?"}`
+      : `${dialAddress ?? pivotHostRef ?? "?"} → ${targetCidrs.join(", ") || "?"}`;
   const graphKind = "operation";
+  const managed = definition.kind === "route"
+    && definition.definition.runtimeManaged === true
+    && definition.desiredState !== "closed";
+  const sessionNodeId = definition.kind === "session" && definition.definition.runtimeManaged === true
+    ? stableSessionNodeId({ type: "ShellSession", properties: { sessionId: definition.externalId } })
+    : undefined;
   return {
     id: definition.id,
     externalId: definition.externalId,
-    kind: definition.kind,
+    kind: definition.kind === "session" ? "connection" : definition.kind,
+    layer: "definition",
     direction,
     transport,
-    managed: isManagedConnection(definition),
+    managed,
+    ...(managed && allowManage
+      ? { actions: ["status", "stop", "reconnect", ...(allowForget ? ["forget" as const] : [])] }
+      : {}),
     desiredState: definition.desiredState,
     observedState: definition.status,
     lastHeartbeat: definition.lastHeartbeat,
     error: typeof failure === "string" ? failure : undefined,
-    available: definition.desiredState === "running" && definition.status === "live",
+    available: runtimeAvailable && managed && definition.desiredState === "running" && definition.status === "live",
     ...(includeCredentialRef && definition.credentialRef ? { credentialRef: definition.credentialRef } : {}),
-    graphUrl: `?runtimeDir=${encodeURIComponent(runtimeInput)}&view=${graphKind}&nodeId=${encodeURIComponent(definition.id)}`
+    ...(routeRef ? { routeRef } : {}),
+    ...(connectionRef ? { connectionRef } : {}),
+    ...(sessionNodeId
+      ? { graphUrl: `?runtimeDir=${encodeURIComponent(runtimeInput)}&view=${graphKind}&nodeId=${encodeURIComponent(sessionNodeId)}` }
+      : {})
   };
 }
 
-function isManagedConnection(definition: ConnectivityDefinition): boolean {
-  const transport = definition.definition.transport ?? definition.definition.adapter;
-  return (definition.kind === "tunnel" || definition.kind === "session")
-    && transport === "ssh"
-    && definition.definition.unmanaged !== true;
-}
-
-function validateWebTunnel(body: JsonRecord): SshTunnelDefinition {
-  assertExactKeys(body, ["runtimeDir", "externalId", "fromHostRef", "toHostRef", "host", "port", "user", "credentialRef", "desiredState", "controlMaster", "forwards"]);
-  if (!Array.isArray(body.forwards) || body.forwards.length === 0 || body.forwards.length > 32) {
-    throw new HttpError(400, "invalid_connectivity", "forwards 必须包含 1 到 32 项");
-  }
-  const forwards = body.forwards.map((value, index) => validateWebForward(value, index));
-  const desiredState = body.desiredState === undefined ? undefined : body.desiredState;
-  if (desiredState !== undefined && desiredState !== "running" && desiredState !== "stopped") {
-    throw new HttpError(400, "invalid_connectivity", "desiredState 无效");
-  }
-  return {
-    externalId: requiredBodyString(body, "externalId"),
-    fromHostRef: requiredBodyString(body, "fromHostRef"),
-    toHostRef: requiredBodyString(body, "toHostRef"),
-    host: requiredBodyString(body, "host"),
-    port: optionalPort(body.port, "port"),
-    user: optionalBodyString(body, "user"),
-    credentialRef: optionalBodyString(body, "credentialRef"),
-    controlMaster: optionalBoolean(body.controlMaster, "controlMaster"),
-    desiredState,
-    forwards
-  };
-}
-
-function validateWebForward(value: unknown, index: number): SshForward {
-  if (!value || typeof value !== "object" || Array.isArray(value)) {
-    throw new HttpError(400, "invalid_connectivity", `forwards[${index}] 无效`);
-  }
-  const forward = value as JsonRecord;
-  assertExactKeys(forward, ["mode", "bindHost", "bindPort", "targetHost", "targetPort"]);
-  const mode = forward.mode;
-  if (mode !== "local" && mode !== "remote" && mode !== "dynamic") {
-    throw new HttpError(400, "invalid_connectivity", `forwards[${index}].mode 无效`);
-  }
-  const common = {
-    bindHost: optionalBodyString(forward, "bindHost"),
-    bindPort: requiredPort(forward.bindPort, `forwards[${index}].bindPort`)
-  };
-  if (mode === "dynamic") return { mode, ...common };
-  return {
-    mode,
-    ...common,
-    targetHost: requiredBodyString(forward, "targetHost"),
-    targetPort: requiredPort(forward.targetPort, `forwards[${index}].targetPort`)
-  };
-}
-
-function validateWebSession(body: JsonRecord): SshSessionDefinition {
-  assertExactKeys(body, ["runtimeDir", "externalId", "sessionType", "hostRef", "host", "port", "user", "credentialRef", "concurrencySafe"]);
-  if (body.sessionType !== undefined && body.sessionType !== "agent" && body.sessionType !== "shell") {
-    throw new HttpError(400, "invalid_connectivity", "sessionType 无效");
-  }
-  return {
-    externalId: requiredBodyString(body, "externalId"),
-    sessionType: body.sessionType as "agent" | "shell" | undefined,
-    hostRef: requiredBodyString(body, "hostRef"),
-    host: requiredBodyString(body, "host"),
-    port: optionalPort(body.port, "port"),
-    user: optionalBodyString(body, "user"),
-    credentialRef: optionalBodyString(body, "credentialRef"),
-    concurrencySafe: optionalBoolean(body.concurrencySafe, "concurrencySafe")
-  };
-}
-
-function rejectSensitiveConnectivityInput(value: unknown): void {
-  if (!value || typeof value !== "object") return;
-  for (const [key, child] of Object.entries(value)) {
-    if (/(?:secret|token|password|passphrase|private.?key|api.?key|access.?key|authorization|cookie)/i.test(key)) {
-      throw new HttpError(400, "inline_credential_forbidden", "仅允许 credentialRef，不得提交凭据正文");
+async function readNetworkConnections(runtimeDir: string): Promise<WebConnection[]> {
+  const files = await findFiles(join(runtimeDir, "traffic", "flows"), ".net.jsonl");
+  const closedEpochRefs = readClosedEpochRefs(join(runtimeDir, "state.sqlite"));
+  const latest = new Map<string, JsonRecord>();
+  for (const file of files) {
+    const lines = createInterface({ input: createReadStream(file, { encoding: "utf8" }), crlfDelay: Infinity });
+    for await (const line of lines) {
+      let record: JsonRecord;
+      try {
+        record = JSON.parse(line) as JsonRecord;
+      } catch {
+        continue;
+      }
+      const networkRef = stringProperty(record.network_ref) ?? stringProperty(record.connection_ref);
+      if (!networkRef) continue;
+      const previous = latest.get(networkRef);
+      const observedAt = stringProperty(record.observed_at) ?? "";
+      if (!previous || observedAt >= (stringProperty(previous.observed_at) ?? "")) latest.set(networkRef, record);
     }
-    rejectSensitiveConnectivityInput(child);
   }
+  return [...latest.values()]
+    .sort((left, right) => (stringProperty(right.observed_at) ?? "").localeCompare(stringProperty(left.observed_at) ?? ""))
+    .map((record) => networkConnection(record, closedEpochRefs));
+}
+
+function networkConnection(record: JsonRecord, closedEpochRefs: ReadonlySet<string>): WebConnection {
+  const networkRef = stringProperty(record.network_ref) ?? stringProperty(record.connection_ref)!;
+  const connectionRef = stringProperty(record.connection_ref);
+  const source = objectProperty(record.source);
+  const destination = objectProperty(record.destination);
+  const event = stringProperty(record.event);
+  const epochRef = stringProperty(record.epoch_ref);
+  const closed = event === "destroy" || Boolean(epochRef && closedEpochRefs.has(epochRef));
+  const routeRef = stringProperty(record.route_ref);
+  const sessionRef = stringProperty(record.session_ref);
+  return {
+    id: `network:${networkRef}`,
+    externalId: networkRef,
+    kind: "connection",
+    layer: "observation",
+    direction: `${networkEndpoint(source)} → ${networkEndpoint(destination)}`,
+    transport: stringProperty(record.protocol) ?? "raw",
+    managed: false,
+    observedState: closed ? "closed" : "live",
+    lastHeartbeat: stringProperty(record.observed_at),
+    available: !closed,
+    ...(routeRef ? { routeRef } : {}),
+    ...(connectionRef ? { connectionRef } : {}),
+    ...(sessionRef && sessionRef !== connectionRef ? { sessionRef } : {}),
+    ...(stringProperty(record.task_ref) ? { taskRef: stringProperty(record.task_ref) } : {}),
+    ...(stringProperty(record.run_ref) ? { runRef: stringProperty(record.run_ref) } : {}),
+    ...(epochRef ? { epochRef } : {})
+  };
+}
+
+function readClosedEpochRefs(databasePath: string): Set<string> {
+  if (!existsSync(databasePath)) return new Set();
+  const database = new DatabaseSync(databasePath, { readOnly: true });
+  try {
+    const rows = database.prepare("SELECT epoch_id FROM execution_epochs WHERE state = 'closed'")
+      .all() as Array<{ epoch_id: string }>;
+    return new Set(rows.map((row) => row.epoch_id));
+  } catch {
+    return new Set();
+  } finally {
+    database.close();
+  }
+}
+
+async function findFiles(root: string, suffix: string): Promise<string[]> {
+  let entries;
+  try {
+    entries = await readdir(root, { withFileTypes: true });
+  } catch {
+    return [];
+  }
+  const nested = await Promise.all(entries.map(async (entry) => {
+    const path = join(root, entry.name);
+    if (entry.isDirectory()) return findFiles(path, suffix);
+    return entry.isFile() && entry.name.endsWith(suffix) ? [path] : [];
+  }));
+  return nested.flat();
+}
+
+function networkEndpoint(value: JsonRecord | undefined): string {
+  if (!value) return "?";
+  const host = stringProperty(value.host) ?? "?";
+  const port = typeof value.port === "number" ? value.port : undefined;
+  return port ? `${host}:${port}` : host;
+}
+
+function objectProperty(value: unknown): JsonRecord | undefined {
+  return value && typeof value === "object" && !Array.isArray(value) ? value as JsonRecord : undefined;
+}
+
+function stringProperty(value: unknown): string | undefined {
+  return typeof value === "string" && value ? value : undefined;
 }
 
 function assertExactKeys(body: JsonRecord, allowed: readonly string[]): void {
@@ -684,42 +759,55 @@ function requiredBodyString(body: JsonRecord, key: string): string {
   return value.trim();
 }
 
-function optionalBodyString(body: JsonRecord, key: string): string | undefined {
-  return body[key] === undefined ? undefined : requiredBodyString(body, key);
-}
+type TrafficBackend =
+  | { kind: "mitm"; runtimeDir: string; client: MitmFlowClient }
+  | { kind: "legacy"; runtimeDir: string; manager: TrafficProxyManager }
+  | { kind: "empty"; runtimeDir: string };
 
-function requiredPort(value: unknown, key: string): number {
-  if (!Number.isInteger(value) || Number(value) < 1 || Number(value) > 65_535) {
-    throw new HttpError(400, "invalid_connectivity", `${key} 无效`);
-  }
-  return Number(value);
-}
-
-function optionalPort(value: unknown, key: string): number | undefined {
-  return value === undefined ? undefined : requiredPort(value, key);
-}
-
-function optionalBoolean(value: unknown, key: string): boolean | undefined {
-  if (value === undefined) return undefined;
-  if (typeof value !== "boolean") throw new HttpError(400, "invalid_connectivity", `${key} 无效`);
-  return value;
-}
-
-function connectivityInputError(error: unknown, statusCode = 400): HttpError {
-  if (error instanceof HttpError) return error;
-  const message = error instanceof Error && /not found/i.test(error.message) ? "连接不存在" : "连接配置或状态无效";
-  return new HttpError(message === "连接不存在" ? 404 : statusCode, message === "连接不存在" ? "connectivity_not_found" : "invalid_connectivity", message);
-}
-
-async function trafficManagerForUrl(url: URL): Promise<TrafficProxyManager> {
+async function trafficBackendForUrl(url: URL, flowRef?: string): Promise<TrafficBackend> {
   const runtimeInput = url.searchParams.get("runtimeDir") ?? defaultRuntimeDir;
   const runtimeDir = await runtimePathPolicy.resolveRuntime(runtimeInput, "existing");
+  return trafficBackendForRuntime(runtimeDir, flowRef);
+}
+
+async function trafficBackendForRuntime(runtimeDir: string, flowRef?: string): Promise<TrafficBackend> {
+  const trafficRoot = join(runtimeDir, "traffic");
+  const hasMitmFlows = existsSync(join(trafficRoot, "flows"))
+    && (await findFiles(join(trafficRoot, "flows"), ".mitm")).length > 0;
+  const hasMitmIndex = existsSync(join(trafficRoot, "index.token"))
+    || existsSync(join(trafficRoot, "index.json"));
+  const legacyFlow = flowRef?.startsWith("legacy:") === true;
+  if (!legacyFlow && (hasMitmFlows || (flowRef !== undefined && hasMitmIndex))) {
+    try {
+      return { kind: "mitm", runtimeDir, client: await MitmFlowClient.open(runtimeDir) };
+    } catch {
+      throw new HttpError(503, "traffic_index_unavailable", "流量索引暂不可用");
+    }
+  }
   try {
-    return await trafficProxyRegistry.getExisting(runtimeDir)
-      ?? await trafficProxyRegistry.get(runtimeDir);
+    const manager = await trafficProxyRegistry.getExisting(runtimeDir);
+    if (manager) return { kind: "legacy", runtimeDir, manager };
   } catch {
     throw new HttpError(503, "traffic_proxy_unavailable", "流量代理暂不可用");
   }
+  if (!legacyFlow && hasMitmIndex) {
+    try {
+      return { kind: "mitm", runtimeDir, client: await MitmFlowClient.open(runtimeDir) };
+    } catch {
+      throw new HttpError(503, "traffic_index_unavailable", "流量索引暂不可用");
+    }
+  }
+  return { kind: "empty", runtimeDir };
+}
+
+async function replayFlowSource(runtimeDir: string, flowRef: string): Promise<"legacy" | "mitm" | "missing"> {
+  if (flowRef.startsWith("legacy:")) return "legacy";
+  const trafficRoot = join(runtimeDir, "traffic");
+  const hasMitmState = (existsSync(join(trafficRoot, "flows"))
+      && (await findFiles(join(trafficRoot, "flows"), ".mitm")).length > 0)
+    || existsSync(join(trafficRoot, "index.token"))
+    || existsSync(join(trafficRoot, "index.json"));
+  return hasMitmState ? "mitm" : "missing";
 }
 
 type WebReplayOverrides = {
@@ -746,24 +834,23 @@ async function handleTrafficReplay(
   request: IncomingMessage,
   response: ServerResponse,
   user: WebUser,
-  exchangeId: number
+  flowRef: string
 ): Promise<void> {
-  if (!Number.isSafeInteger(exchangeId) || exchangeId <= 0) {
-    throw new HttpError(400, "invalid_request", "exchange id 无效");
-  }
-  const input = validateReplayBody(await readJsonBody(request));
+  const input = validateReplayBody(await readJsonBody(request, 2 << 20));
   const runtimeDir = await runtimePathPolicy.resolveRuntime(input.runtimeDir, "existing");
   const runtime = toRuntimeInput(runtimeDir);
   const actor = { actorId: user.id, actorUsername: user.username };
   const auditBase = {
     ...actor,
-    sourceExchangeId: exchangeId,
+    sourceFlowRef: flowRef,
     runtime,
     ...(input.taskRef === undefined ? {} : { taskRef: input.taskRef }),
     ...(input.runRef === undefined ? {} : { runRef: input.runRef })
   };
   const executionLog = new ExecutionLog(join(runtimeDir, "execution.jsonl"), join(runtimeDir, "state.sqlite"));
   let acquired = false;
+  let responseBody: JsonRecord | undefined;
+  let responseStatus = 200;
   try {
     await executionLog.append({
       role: "runtime",
@@ -777,48 +864,124 @@ async function handleTrafficReplay(
     activeTrafficReplays += 1;
     acquired = true;
 
-    let manager: TrafficProxyManager;
-    try {
-      manager = await trafficProxyRegistry.getExisting(runtimeDir)
-        ?? await trafficProxyRegistry.get(runtimeDir);
-    } catch {
-      throw new HttpError(503, "traffic_proxy_unavailable", "流量代理暂不可用");
+    let runtimeRef: string;
+    let result: TrafficReplayResult;
+    const flowSource = await replayFlowSource(runtimeDir, flowRef);
+    if (flowSource === "missing") {
+      throw new HttpError(404, "traffic_flow_not_found", "流量记录不存在");
     }
-    let runtimeRef = manager.runtimeRef;
-    if (!runtimeRef) {
-      const hello = await manager.client.hello();
-      runtimeRef = hello.runtime_ref;
-      manager.runtimeRef = runtimeRef;
+    if (flowSource === "mitm") {
+      const replayRuntime = await acquireReplayRuntime(runtimeDir);
+      const replayClient = await MitmFlowClient.open(runtimeDir).catch(() => {
+        throw new HttpError(503, "traffic_index_unavailable", "流量索引暂不可用");
+      });
+      const source = await replayClient.historyGet(flowRef).catch((error) => {
+        throw mapTrafficReadError(error);
+      });
+      if (source.kind !== "http") {
+        throw new HttpError(409, "traffic_replay_source_not_replayable", "只有 HTTP Flow 可以 Replay");
+      }
+      const sourceConnectionRef = source.connection_ref || source.session_ref || "";
+      if (input.routeRef !== undefined && input.routeRef !== (source.route_ref || "")) {
+        throw new HttpError(400, "traffic_replay_route_mismatch", "Replay 必须沿用原始 Flow 的 routeRef");
+      }
+      if (input.sessionRef !== undefined && input.sessionRef !== sourceConnectionRef) {
+        throw new HttpError(400, "traffic_replay_connection_mismatch", "Replay 必须沿用原始 Flow 的 connectionRef");
+      }
+      const routeRef = source.route_ref || "";
+      if (source.request_truncated || source.request_capture_state === "truncated") {
+        throw new HttpError(409, "traffic_replay_source_not_replayable", "原始 HTTP 请求正文不完整，无法 Replay");
+      }
+      const replayBody = input.body ?? await sourceReplayBody(replayClient, flowRef, source);
+      const routeConnectionRef = await validateReplayRoute(replayRuntime, routeRef, sourceConnectionRef);
+      const connectionRef = sourceConnectionRef || routeConnectionRef;
+      const sessionRef = source.session_ref || connectionRef || input.sessionRef || "";
+      runtimeRef = source.runtime_ref || source.run_ref || basename(runtimeDir);
+      const context: TrafficProxyContext = {
+        runtime_ref: runtimeRef,
+        task_ref: source.task_ref ?? input.taskRef ?? "",
+        run_ref: source.run_ref ?? input.runRef ?? "",
+        attribution: `web-user:${user.id}:${user.username}`,
+        route_ref: routeRef,
+        session_ref: sessionRef
+      };
+      const replayUrl = input.url ?? source.url;
+      const replayHeaders = prepareGatewayReplayHeaders(
+        input.headers ?? source.request_headers ?? [],
+        input.headers !== undefined,
+        source.url,
+        replayUrl,
+        input.body !== undefined
+      );
+      result = await replayRuntime.replayTraffic(replayClient, {
+        flowRef,
+        method: input.method ?? source.method,
+        url: replayUrl,
+        headers: replayHeaders,
+        ...(replayBody ? { body: replayBody } : {}),
+        ...(routeRef ? { routeRef } : {}),
+        context: { ...context, connection_ref: connectionRef }
+      });
+    } else {
+      const backend = await trafficBackendForRuntime(runtimeDir, flowRef);
+      if (backend.kind === "empty") {
+        throw new HttpError(404, "traffic_flow_not_found", "流量记录不存在");
+      }
+      if (backend.kind !== "legacy") {
+        throw new HttpError(503, "traffic_index_unavailable", "流量索引暂不可用");
+      }
+      const exchangeId = decodeLegacyFlowRef(flowRef);
+      const source = await backend.manager.client.historyGet(exchangeId).catch((error) => {
+        throw mapTrafficReadError(error);
+      });
+      if (input.routeRef !== undefined && input.routeRef !== (source.route_ref ?? "")) {
+        throw new HttpError(400, "traffic_replay_route_mismatch", "Replay 必须沿用原始 Flow 的 routeRef");
+      }
+      const sourceConnectionRef = source.connection_ref || source.session_ref || "";
+      if (input.sessionRef !== undefined && input.sessionRef !== sourceConnectionRef) {
+        throw new HttpError(400, "traffic_replay_connection_mismatch", "Replay 必须沿用原始 Flow 的 connectionRef");
+      }
+      const routeRef = source.route_ref ?? "";
+      if (isRuntimeManagedConnectivityRef(runtimeDir, routeRef, sourceConnectionRef)) {
+        throw new HttpError(
+          409,
+          "traffic_replay_routed_legacy_unsupported",
+          "旧版显式代理无法保证受路由 Flow 原路 Replay，请使用透明 Gateway 流量"
+        );
+      }
+      const sessionRef = sourceConnectionRef;
+      let managerRuntimeRef = backend.manager.runtimeRef;
+      if (!managerRuntimeRef) {
+        const hello = await backend.manager.client.hello();
+        managerRuntimeRef = hello.runtime_ref;
+        backend.manager.runtimeRef = managerRuntimeRef;
+      }
+      runtimeRef = managerRuntimeRef;
+      result = encodeLegacyReplayResult(await backend.manager.client.replay({
+        exchange_id: exchangeId,
+        ...(input.method === undefined ? {} : { method: input.method }),
+        ...(input.url === undefined ? {} : { url: input.url }),
+        ...(input.headers === undefined ? {} : { headers: input.headers }),
+        ...(input.body === undefined ? {} : { body: input.body }),
+        ...(routeRef ? { route_ref: routeRef } : {}),
+        ...(sessionRef ? { session_ref: sessionRef } : {}),
+        context: {
+          runtime_ref: runtimeRef,
+          task_ref: source.task_ref ?? input.taskRef ?? "",
+          run_ref: source.run_ref ?? input.runRef ?? "",
+          attribution: `web-user:${user.id}:${user.username}`,
+          route_ref: routeRef,
+          session_ref: sessionRef
+        }
+      } satisfies TrafficReplayInput));
     }
-    const routeRef = input.routeRef ?? "web-replay";
-    const sessionRef = input.sessionRef ?? "";
-    const context: TrafficProxyContext = {
-      runtime_ref: runtimeRef,
-      task_ref: input.taskRef ?? "",
-      run_ref: input.runRef ?? "",
-      attribution: `web-user:${user.id}:${user.username}`,
-      route_ref: routeRef,
-      session_ref: sessionRef
-    };
-    const replayInput: TrafficReplayInput = {
-      exchange_id: exchangeId,
-      ...(input.method === undefined ? {} : { method: input.method }),
-      ...(input.url === undefined ? {} : { url: input.url }),
-      ...(input.headers === undefined ? {} : { headers: input.headers }),
-      ...(input.body === undefined ? {} : { body: input.body }),
-      route_ref: routeRef,
-      session_ref: sessionRef,
-      context
-    };
-    const result = await manager.client.replay(replayInput);
-    const responseBody = replayResultBody(result);
+    responseBody = replayResultBody(result);
     await executionLog.append({
       role: "runtime",
       eventType: "traffic_replay_succeeded",
       summary: "Traffic replay succeeded",
       payload: { ...auditBase, runtimeRef, exchangeId: result.exchange_id, replayOf: result.replay_of }
     });
-    await sendJson(response, responseBody);
   } catch (error) {
     const mapped = mapReplayError(error);
     await executionLog.append({
@@ -831,15 +994,123 @@ async function handleTrafficReplay(
         ...(mapped.result ? { exchangeId: mapped.result.exchange_id, replayOf: mapped.result.replay_of } : {})
       }
     });
-    await sendJson(response, {
+    responseStatus = mapped.statusCode;
+    responseBody = {
       error: { code: mapped.code, message: mapped.message },
       errorCode: mapped.errorCode,
       ...(mapped.result ? { exchangeId: mapped.result.exchange_id, replayOf: mapped.result.replay_of } : {})
-    }, mapped.statusCode);
+    };
   } finally {
     if (acquired) activeTrafficReplays -= 1;
     await executionLog.drain();
     executionLog.close();
+  }
+  if (!responseBody) throw new Error("Traffic replay completed without a response");
+  await sendJson(response, responseBody, responseStatus);
+}
+
+type ReplayConnectivityRuntime = Pick<HistoricalConnectivityRuntime, "routeStatus" | "replayTraffic">;
+
+async function acquireReplayRuntime(runtimeDir: string): Promise<ReplayConnectivityRuntime> {
+  const controller = activeRuns.get(runtimeDir)?.controller;
+  if (controller?.hasConnectivityRuntime()) return controller;
+  try {
+    return await historicalConnectivityRuntimes.get(runtimeDir);
+  } catch (error) {
+    if (error instanceof ConnectivityRuntimeOwnershipError) {
+      throw new HttpError(409, error.code, "该运行已有活动网络 Runtime");
+    }
+    throw new HttpError(503, "connectivity_runtime_unavailable", "Replay 网络 Runtime 恢复失败");
+  }
+}
+
+async function validateReplayRoute(
+  runtime: ReplayConnectivityRuntime,
+  routeRef: string,
+  sourceConnectionRef = ""
+): Promise<string> {
+  if (!routeRef) return "";
+  try {
+    const routes = await runtime.routeStatus(routeRef);
+    const route = routes.find((candidate) => candidate.routeRef === routeRef);
+    if (!route || route.desiredState !== "running" || route.status !== "live") {
+      throw new HttpError(409, "traffic_replay_route_reconnect_required", "原始 Route 当前不可用，请先重连");
+    }
+    const routeConnectionRef = route.connectionRef || "";
+    if (sourceConnectionRef && routeConnectionRef !== sourceConnectionRef) {
+      throw new HttpError(409, "traffic_replay_route_reconnect_required", "原始 Route 的 Connection 已变化，请先恢复原连接");
+    }
+    return sourceConnectionRef || routeConnectionRef;
+  } catch (error) {
+    if (error instanceof HttpError) throw error;
+    throw new HttpError(503, "connectivity_runtime_unavailable", "Replay 网络 Runtime 状态读取失败");
+  }
+}
+
+async function sourceReplayBody(
+  client: MitmFlowClient,
+  flowRef: string,
+  source: TrafficExchange
+): Promise<{ encoding: "base64"; data: string } | undefined> {
+  if (!source.request_body_ref && source.request_captured_bytes === 0) return undefined;
+  const body = await client.historyBody(flowRef, "request", 1 << 20).catch((error) => {
+    throw mapTrafficReadError(error);
+  });
+  if (body.truncated || body.bytes !== source.request_captured_bytes) {
+    throw new HttpError(409, "traffic_replay_source_not_replayable", "原始 HTTP 请求正文不完整，无法 Replay");
+  }
+  return { encoding: "base64", data: body.data };
+}
+
+const REPLAY_HOP_BY_HOP_HEADERS = new Set([
+  "connection",
+  "keep-alive",
+  "proxy-authenticate",
+  "proxy-authorization",
+  "proxy-connection",
+  "te",
+  "trailer",
+  "transfer-encoding",
+  "upgrade"
+]);
+
+function prepareGatewayReplayHeaders(
+  headers: TrafficHeaderEntry[],
+  headersOverridden: boolean,
+  sourceUrl: string,
+  replayUrl: string,
+  bodyOverridden: boolean
+): TrafficHeaderEntry[] {
+  if (headers.some((header) => header.name.toLowerCase() === "x-luanniao-replay-context")) {
+    throw new HttpError(400, "traffic_replay_invalid", "Replay 请求包含保留 Header");
+  }
+  const explicitHost = headersOverridden && headers.some((header) => header.name.toLowerCase() === "host");
+  const connectionTokens = new Set(headers
+    .filter((header) => header.name.toLowerCase() === "connection")
+    .flatMap((header) => header.value.split(","))
+    .map((token) => token.trim().toLowerCase())
+    .filter(Boolean));
+  return headers.flatMap((header) => {
+    const name = header.name.toLowerCase();
+    if (REPLAY_HOP_BY_HOP_HEADERS.has(name) || connectionTokens.has(name)) return [];
+    if (bodyOverridden && name === "content-length") return [];
+    if (sourceUrl !== replayUrl && !explicitHost && name === "host") return [];
+    return [{ ...header, ordinal: 0 }];
+  }).map((header, ordinal) => ({ ...header, ordinal }));
+}
+
+function isRuntimeManagedConnectivityRef(runtimeDir: string, routeRef: string, connectionRef: string): boolean {
+  if (!routeRef && !connectionRef) return false;
+  const databasePath = join(runtimeDir, "state.sqlite");
+  if (!existsSync(databasePath)) return false;
+  const store = new ConnectivityStore(databasePath);
+  try {
+    return store.listDefinitions().some((definition) => (
+      definition.definition.runtimeManaged === true
+      && (definition.externalId === routeRef || definition.externalId === connectionRef)
+    ));
+  } finally {
+    store.close();
   }
 }
 
@@ -884,7 +1155,11 @@ function validateReplayBody(body: JsonRecord): WebReplayOverrides {
     if (body.body.encoding !== "base64" || typeof body.body.data !== "string") {
       throw new HttpError(400, "invalid_request", "body 必须使用 base64 encoding 和字符串 data");
     }
-    if (body.body.data.length > 16 * 1024 || !validBase64(body.body.data)) {
+    if (
+      body.body.data.length > Math.ceil((1 << 20) / 3) * 4
+      || !validBase64(body.body.data)
+      || Buffer.from(body.body.data, "base64").length > 1 << 20
+    ) {
       throw new HttpError(400, "invalid_request", "body.data 不是有效或允许大小内的 base64");
     }
     replayBody = { encoding: "base64", data: body.body.data };
@@ -945,6 +1220,9 @@ function mapReplayError(error: unknown): ReplayHttpError {
     if (errorCode === "source_not_replayable") {
       return { statusCode: 409, code: "traffic_replay_source_not_replayable", message: "原始流量记录不可 replay", errorCode, result };
     }
+    if (errorCode === "route_unavailable") {
+      return { statusCode: 409, code: "traffic_replay_route_reconnect_required", message: "原始 Route 当前不可用，请先重连", errorCode, result };
+    }
     if (errorCode === "replay_busy") {
       return { statusCode: 429, code: "traffic_replay_sidecar_busy", message: "流量代理 replay 繁忙，请稍后重试", errorCode, result };
     }
@@ -964,17 +1242,80 @@ function mapReplayError(error: unknown): ReplayHttpError {
 
 function replayErrorResult(value: unknown): TrafficReplayResult | undefined {
   if (!isRecord(value)) return undefined;
-  if (!Number.isSafeInteger(value.exchange_id) || (value.exchange_id as number) <= 0 || !Number.isSafeInteger(value.replay_of) || (value.replay_of as number) <= 0 || typeof value.status !== "number") return undefined;
+  const exchangeId = publicFlowRef(value.exchange_id);
+  const replayOf = publicFlowRef(value.replay_of);
+  if (!exchangeId || !replayOf || typeof value.status !== "number") return undefined;
   return {
-    exchange_id: value.exchange_id as number,
-    replay_of: value.replay_of as number,
+    exchange_id: exchangeId,
+    replay_of: replayOf,
     status: value.status,
     ...(typeof value.error_code === "string" ? { error_code: value.error_code } : {})
   };
 }
 
+function decodedFlowRef(value: string): string {
+  let decoded: string;
+  try {
+    decoded = decodeURIComponent(value);
+  } catch {
+    throw new HttpError(400, "invalid_request", "flowRef 无效");
+  }
+  if (!decoded || decoded.length > 1024 || /^\d+$/.test(decoded) || /[\u0000-\u001f\u007f]/.test(decoded)) {
+    throw new HttpError(400, "invalid_request", "flowRef 无效");
+  }
+  return decoded;
+}
+
+function decodeLegacyFlowRef(flowRef: string): number {
+  const match = /^legacy:([1-9]\d*)$/.exec(flowRef);
+  if (!match) throw new HttpError(400, "invalid_request", "legacy flowRef 无效");
+  const exchangeId = Number(match[1]);
+  if (!Number.isSafeInteger(exchangeId)) throw new HttpError(400, "invalid_request", "exchange id 无效");
+  return exchangeId;
+}
+
+function encodeLegacyFlowRef(exchangeId: number): string {
+  if (!Number.isSafeInteger(exchangeId) || exchangeId <= 0) {
+    throw new Error("Legacy traffic proxy returned an invalid exchange id");
+  }
+  return `legacy:${exchangeId}`;
+}
+
+function publicFlowRef(value: unknown): string | undefined {
+  if (Number.isSafeInteger(value) && (value as number) > 0) return encodeLegacyFlowRef(value as number);
+  return typeof value === "string" && Boolean(value) && value.length <= 1024 && !/[\u0000-\u001f\u007f]/.test(value)
+    ? value
+    : undefined;
+}
+
+function encodeLegacyExchange(exchange: TrafficExchange<number>): TrafficExchange {
+  const { id, replay_of: replayOf, ...rest } = exchange;
+  return {
+    ...rest,
+    id: encodeLegacyFlowRef(id),
+    ...(replayOf === undefined ? {} : { replay_of: encodeLegacyFlowRef(replayOf) })
+  };
+}
+
+function encodeLegacyReplayResult(result: TrafficReplayResult<number>): TrafficReplayResult {
+  return {
+    ...result,
+    exchange_id: encodeLegacyFlowRef(result.exchange_id),
+    replay_of: encodeLegacyFlowRef(result.replay_of)
+  };
+}
+
+function mapTrafficReadError(error: unknown): HttpError {
+  if (error instanceof HttpError) return error;
+  if (error instanceof TrafficProxyControlError && ["not_found", "source_not_found"].includes(error.errorCode)) {
+    return new HttpError(404, "traffic_flow_not_found", "流量记录不存在");
+  }
+  return new HttpError(502, "traffic_history_error", "无法读取流量记录");
+}
+
 async function readTrafficHistory(url: URL): Promise<unknown> {
-  const manager = await trafficManagerForUrl(url);
+  const backend = await trafficBackendForUrl(url);
+  if (backend.kind === "empty") return { items: [], has_more: false };
   const cursor = boundedQuery(url, "cursor", 512);
   const limit = integerQuery(url, "limit", 50, 1, 100);
   const statusValue = url.searchParams.get("status");
@@ -989,37 +1330,50 @@ async function readTrafficHistory(url: URL): Promise<unknown> {
     ...optionalFilter(url, "mode"),
     ...optionalFilter(url, "method"),
     ...optionalFilter(url, "host"),
-    ...optionalFilter(url, "connect_ref"),
+    ...optionalFilter(url, backend.kind === "legacy" ? "connect_ref" : "connection_ref", "connect_ref"),
     ...optionalFilter(url, "error"),
     ...(statusValue === null ? {} : { status: integerValue(statusValue, "status", 0, 999) })
   };
   try {
-    return await manager.client.historyList({ ...(cursor ? { cursor } : {}), limit, filter });
-  } catch {
-    throw new HttpError(502, "traffic_history_error", "无法读取流量历史");
+    if (backend.kind === "mitm") {
+      return await backend.client.historyList({ ...(cursor ? { cursor } : {}), limit, filter });
+    }
+    const page = await backend.manager.client.historyList({ ...(cursor ? { cursor } : {}), limit, filter });
+    return { ...page, items: page.items.map(encodeLegacyExchange) };
+  } catch (error) {
+    throw mapTrafficReadError(error);
   }
 }
 
-async function readTrafficExchange(url: URL, exchangeId: number, body: boolean): Promise<unknown> {
-  if (!Number.isSafeInteger(exchangeId) || exchangeId <= 0) throw new HttpError(400, "invalid_request", "exchange id 无效");
-  const manager = await trafficManagerForUrl(url);
+async function readTrafficExchange(url: URL, flowRef: string, body: boolean): Promise<unknown> {
+  const backend = await trafficBackendForUrl(url, flowRef);
+  if (backend.kind === "empty") throw new HttpError(404, "traffic_flow_not_found", "流量记录不存在");
   try {
-    if (!body) return await manager.client.historyGet(exchangeId);
+    if (!body) {
+      return backend.kind === "mitm"
+        ? await backend.client.historyGet(flowRef)
+        : encodeLegacyExchange(await backend.manager.client.historyGet(decodeLegacyFlowRef(flowRef)));
+    }
     const side = url.searchParams.get("side");
     if (side !== "request" && side !== "response") throw new HttpError(400, "invalid_request", "side 必须为 request 或 response");
     const byteLimit = integerQuery(url, "byteLimit", 256 * 1024, 1, 256 * 1024);
-    return await manager.client.historyBody(exchangeId, side, byteLimit);
+    if (backend.kind === "mitm") return await backend.client.historyBody(flowRef, side, byteLimit);
+    const legacyBody = await backend.manager.client.historyBody(decodeLegacyFlowRef(flowRef), side, byteLimit);
+    return { ...legacyBody, exchange_id: encodeLegacyFlowRef(legacyBody.exchange_id) };
   } catch (error) {
     if (error instanceof HttpError) throw error;
-    throw new HttpError(502, "traffic_history_error", "无法读取流量记录");
+    throw mapTrafficReadError(error);
   }
 }
 
 async function sendPublicCa(response: ServerResponse, url: URL): Promise<void> {
-  const manager = await trafficManagerForUrl(url);
+  const backend = await trafficBackendForUrl(url);
+  if (backend.kind === "empty") throw new HttpError(404, "ca_certificate_not_found", "公共 CA 证书不可用");
   let certificate: string;
   try {
-    certificate = await readFile(manager.caCertPath, "utf8");
+    certificate = await readFile(backend.kind === "mitm"
+      ? join(backend.runtimeDir, "traffic", "ca", "mitmproxy-ca-cert.pem")
+      : backend.manager.caCertPath, "utf8");
   } catch {
     throw new HttpError(404, "ca_certificate_not_found", "公共 CA 证书不可用");
   }
@@ -1035,8 +1389,8 @@ async function sendPublicCa(response: ServerResponse, url: URL): Promise<void> {
   response.end(certificate);
 }
 
-function optionalFilter(url: URL, name: string): Record<string, string> {
-  const value = boundedQuery(url, name, 512);
+function optionalFilter(url: URL, name: string, queryName = name): Record<string, string> {
+  const value = boundedQuery(url, queryName, 512);
   return value ? { [name]: value } : {};
 }
 
@@ -1087,7 +1441,6 @@ async function handleStartRun(request: IncomingMessage, response: ServerResponse
       trafficProxyRegistry
     });
     const { controller } = agentRuntime;
-    const connectivitySupervisor = await connectivityRegistry.get(runtimeDir);
 
     run = {
       runtimeDir,
@@ -1096,8 +1449,7 @@ async function handleStartRun(request: IncomingMessage, response: ServerResponse
       scope,
       startedAt: new Date().toISOString(),
       controller,
-      agentRuntime,
-      connectivitySupervisor
+      agentRuntime
     };
     activeRuns.set(runtimeDir, run);
 
@@ -1130,12 +1482,7 @@ async function handleStartRun(request: IncomingMessage, response: ServerResponse
   } catch (error) {
     activeRuns.delete(runtimeDir);
     if (run) await cleanupRun(run);
-    else {
-      await Promise.allSettled([
-        agentRuntime?.close() ?? Promise.resolve(),
-        connectivityRegistry.close(runtimeDir)
-      ]);
-    }
+    else await agentRuntime?.close();
     throw error;
   }
 }
@@ -1178,31 +1525,10 @@ function cleanupRun(run: ActiveRun): Promise<void> {
   if (existing) return existing;
   const cleanup = (async () => {
     activeRuns.delete(run.runtimeDir);
-    try {
-      run.connectivitySupervisor.finishRun(run.controller.runId);
-    } catch {
-      // Continue closing independent resources.
-    }
-    await Promise.allSettled([
-      withTimeout(run.agentRuntime.close(), 12_000),
-      withTimeout(connectivityRegistry.close(run.runtimeDir), 5_000)
-    ]);
+    await withTimeout(run.agentRuntime.close(), 12_000);
   })();
   runCleanupPromises.set(run, cleanup);
   return cleanup;
-}
-
-async function closeConnectivityManagers(): Promise<void> {
-  const entries = [...connectivityManagers.entries()];
-  connectivityManagers.clear();
-  await Promise.allSettled(entries.map(async ([, managers]) => {
-    const tunnels = managers.store.listDefinitions().filter((definition) =>
-      definition.kind === "tunnel" && isManagedConnection(definition) && definition.status !== "closed"
-    );
-    await Promise.allSettled(tunnels.map((definition) => withTimeout(managers.tunnels.stop(definition.id), 2_000)));
-    managers.graphStore.close();
-    managers.store.close();
-  }));
 }
 
 function withTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
@@ -2340,13 +2666,13 @@ async function sendStatic(pathname: string, response: ServerResponse): Promise<v
   }
 }
 
-async function readJsonBody(request: IncomingMessage): Promise<JsonRecord> {
+async function readJsonBody(request: IncomingMessage, maximumBytes = 32 * 1024): Promise<JsonRecord> {
   const chunks: Buffer[] = [];
   let byteLength = 0;
   for await (const chunk of request) {
     const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
     byteLength += buffer.length;
-    if (byteLength > 32 * 1024) throw new WebAuthError("请求体过大", 413, "payload_too_large");
+    if (byteLength > maximumBytes) throw new WebAuthError("请求体过大", 413, "payload_too_large");
     chunks.push(buffer);
   }
   if (!chunks.length) return {};

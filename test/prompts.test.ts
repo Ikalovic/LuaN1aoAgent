@@ -34,7 +34,7 @@ test("executor prompt uses bounded experimental method and runtime steering", ()
     operationGraphSlice: emptyGraph,
     reasoningGraphSlice: { ...emptyGraph, view: "reasoning" },
     sessionRefs: [],
-    toolCatalog: ["read", "bash", "grep", "find", "ls", "artifact_read", "artifact_write"],
+    toolCatalog: ["read", "bash", "grep", "find", "ls", "browser_render", "artifact_read", "artifact_write"],
     executionBrief: "No previous execution events.",
     dependencyOutcomes: "task:recon status=completed\n  result: upload endpoint confirmed",
     runtimeBudgetStatus: "turns: 0/12; remaining: 12"
@@ -48,6 +48,7 @@ test("executor prompt uses bounded experimental method and runtime steering", ()
   assert.match(EXECUTOR_SYSTEM_PROMPT, /确认实验用于已有可复现基线的机制/);
   assert.match(EXECUTOR_SYSTEM_PROMPT, /页面本来就存在的说明文字/);
   assert.match(EXECUTOR_SYSTEM_PROMPT, /请求脚本自己打印的标签不能证明/);
+  assert.match(EXECUTOR_SYSTEM_PROMPT, /使用 browser_render/);
   assert.match(EXECUTOR_SYSTEM_PROMPT, /只改变一个变量/);
   assert.match(EXECUTOR_SYSTEM_PROMPT, /正负对照/);
   assert.match(EXECUTOR_SYSTEM_PROMPT, /调用 vulnerability_search 检索历史漏洞/);
@@ -56,6 +57,9 @@ test("executor prompt uses bounded experimental method and runtime steering", ()
   assert.match(EXECUTOR_SYSTEM_PROMPT, /只能标记为 inconclusive/);
   assert.match(EXECUTOR_SYSTEM_PROMPT, /原始响应写入 artifact/);
   assert.match(EXECUTOR_SYSTEM_PROMPT, /末尾用一句自然语言总结/);
+  assert.match(EXECUTOR_SYSTEM_PROMPT, /可复用材料（Cookie、凭据、密钥、PoC、solver 脚本）必须及时用 artifact_write 归档/);
+  assert.match(EXECUTOR_SYSTEM_PROMPT, /summary 中提到这些材料时给出精确 artifactRef/);
+  assert.match(EXECUTOR_SYSTEM_PROMPT, /artifact_read 的 materialize=true/);
   assert.match(EXECUTOR_SYSTEM_PROMPT, /<example name="discriminating-test">/);
   assert.match(EXECUTOR_SYSTEM_PROMPT, /<example name="causal-boundary-and-oracle">/);
   assert.match(EXECUTOR_SYSTEM_PROMPT, /<example name="fingerprint-to-vulnerability-research">/);
@@ -167,11 +171,17 @@ test("planner prompt preserves the latest active TaskResult beyond the old 160 c
   assert.ok(input.length < 8_000, `Planner prompt too large: ${input.length}`);
 });
 
+test("planner prompt explains how to use degraded projection outcomes", () => {
+  assert.match(PLANNER_SYSTEM_PROMPT, /projectionDegradations 表示对应 Task 的语义图尚未追平/);
+  assert.match(PLANNER_SYSTEM_PROMPT, /完整、持久化的 taskOutcome/);
+});
+
 test("projector prompt requests semantic changes instead of one node per observation", () => {
   assert.match(OBSERVER_PROJECTOR_SYSTEM_PROMPT, /语义变化集/);
   assert.match(OBSERVER_PROJECTOR_SYSTEM_PROMPT, /多个 observation 支持同一事实时合并/);
   assert.match(OBSERVER_PROJECTOR_SYSTEM_PROMPT, /已有节点已表达该事实时更新 existing 别名/);
   assert.match(OBSERVER_PROJECTOR_SYSTEM_PROMPT, /禁止写入或连接 Task、Milestone、Blocker、Goal、Scope/);
+  assert.match(OBSERVER_PROJECTOR_SYSTEM_PROMPT, /session opened\/reconnected.*必须创建或更新一个 ShellSession.*sessionId 必须等于 connectionRef.*session_on/s);
   assert.match(OBSERVER_PROJECTOR_SYSTEM_PROMPT, /Evidence 只描述 observation 直接支持的事实/);
   assert.match(OBSERVER_PROJECTOR_SYSTEM_PROMPT, /错误投影：Evidence 声称“确认后端调用 request\.json\.get\('url'\)”/);
   assert.match(OBSERVER_PROJECTOR_SYSTEM_PROMPT, /直接 GET 返回 404 不能证明文件在所有访问方式下不存在/);
@@ -179,10 +189,18 @@ test("projector prompt requests semantic changes instead of one node per observa
   assert.match(OBSERVER_PROJECTOR_SYSTEM_PROMPT, /不得据此创建“该机制无效”/);
   assert.match(OBSERVER_PROJECTOR_SYSTEM_PROMPT, /executor_interpretation 是 Executor/);
   assert.match(OBSERVER_PROJECTOR_SYSTEM_PROMPT, /不能单独作为 Evidence/);
+  assert.match(OBSERVER_PROJECTOR_SYSTEM_PROMPT, /artifact:\* 引用必须原样保留到对应节点的 properties\.artifactRef/);
+  assert.match(OBSERVER_PROJECTOR_SYSTEM_PROMPT, /引用是持久材料的指针，不是秘密值/);
+  assert.match(OBSERVER_PROJECTOR_SYSTEM_PROMPT, /只允许 id、graphKind、type、label、properties、evidenceRefs 六个顶层键/);
+  assert.match(OBSERVER_PROJECTOR_SYSTEM_PROMPT, /operation 节点 type 只能是 Host、Port、Service、WebEndpoint、Parameter、Credential、AgentSession、ShellSession、Session、File、Process/);
+  assert.match(OBSERVER_PROJECTOR_SYSTEM_PROMPT, /只修正错误信息点名的节点或边，其余内容原样重交/);
   assert.match(OBSERVER_PROJECTOR_SYSTEM_PROMPT, /<example name="semantic-merge">/);
   assert.match(OBSERVER_SUPERVISOR_SYSTEM_PROMPT, /检查近期实验是否真正减少不确定性/);
   assert.match(OBSERVER_SUPERVISOR_SYSTEM_PROMPT, /同时改变多个独立条件后统一失败/);
   assert.match(OBSERVER_SUPERVISOR_SYSTEM_PROMPT, /新的 URL、payload、字段名、工具输出或不同 stdout 指纹本身不等于进展/);
   assert.match(OBSERVER_SUPERVISOR_SYSTEM_PROMPT, /页面静态说明、全局关键词、请求脚本自己打印的标签不能证明/);
   assert.match(OBSERVER_SUPERVISOR_SYSTEM_PROMPT, /只评价当前因果边界最近窗口的进展/);
+  assert.match(OBSERVER_SUPERVISOR_SYSTEM_PROMPT, /任务阶段是否完成以及下一阶段做什么仍由 Planner 决定/);
+  assert.match(OBSERVER_SUPERVISOR_SYSTEM_PROMPT, /成功条件尚未满足且当前路径仍在有效减少不确定性时，应继续或 redirect/);
+  assert.doesNotMatch(OBSERVER_SUPERVISOR_SYSTEM_PROMPT, /高价值状态变化已经足够交回 Planner/);
 });

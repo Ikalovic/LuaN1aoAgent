@@ -1,11 +1,14 @@
 import assert from "node:assert/strict";
 import { spawn, type ChildProcess } from "node:child_process";
-import { access, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { access, chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { createServer as createHttpServer } from "node:http";
 import { createServer } from "node:net";
 import { join, resolve } from "node:path";
 import test from "node:test";
-import { ConnectivityStore } from "../src/stores/connectivity-store.js";
+import { ArtifactStore } from "../src/stores/artifact-store.js";
+import { ConnectivityStore, stableConnectivityId } from "../src/stores/connectivity-store.js";
 import { SQLiteGraphStore } from "../src/stores/graph-store.js";
+import { RuntimeStore } from "../src/stores/runtime-store.js";
 import { WebAuthService } from "../src/web-auth.js";
 
 type Fixture = {
@@ -15,6 +18,10 @@ type Fixture = {
   adminCookie: string;
   analystCookie: string;
   process: ChildProcess;
+  indexServer: import("node:http").Server;
+  historyIndexServer: import("node:http").Server;
+  historyIndexRequests: string[];
+  dockerLog: string;
 };
 
 let fixture: Fixture;
@@ -49,9 +56,17 @@ test("connectivity routes require authentication, admin capability, and CSRF", a
   });
   assert.equal(adminWithoutCsrf.status, 403);
   assert.equal((await json(adminWithoutCsrf)).error.code, "csrf_token_missing");
+
+  const routeForget = await mutate(
+    fixture.analystCookie,
+    `/api/connectivity/${encodeURIComponent(stableConnectivityId("route", "route:test-one"))}/forget`,
+    { runtimeDir: fixture.runtimeDir },
+    true
+  );
+  assert.equal(routeForget.status, 403);
 });
 
-test("connectivity GET stays read-only while traffic history restores the runtime sidecar", async () => {
+test("connectivity and empty traffic history stay read-only", async () => {
   const emptyRuntime = join(fixture.root, "empty-runtime");
   await mkdir(emptyRuntime);
   const response = await fetch(`${fixture.baseUrl}/api/connectivity?runtimeDir=${encodeURIComponent(emptyRuntime)}`, {
@@ -68,101 +83,489 @@ test("connectivity GET stays read-only while traffic history restores the runtim
   });
   assert.equal(traffic.status, 200);
   assert.deepEqual((await json(traffic)).items, []);
-  await access(join(emptyRuntime, "traffic-proxy", "data", "traffic.sqlite"));
+  await assert.rejects(access(join(emptyRuntime, "traffic-proxy", "data", "traffic.sqlite")));
 });
 
-test("admin creates managed SSH tunnels and receives safe status DTOs", async () => {
-  const created = await mutate(fixture.adminCookie, "/api/connectivity/tunnels", tunnelBody(), true);
-  assert.equal(created.status, 201);
-  const connection = await json(created);
-  assert.equal(connection.kind, "tunnel");
-  assert.equal(connection.transport, "ssh");
-  assert.equal(connection.managed, true);
-  assert.equal(connection.credentialRef, "credential:ssh:test");
-  assert.equal(connection.desiredState, "stopped");
-  assert.equal(typeof connection.observedState, "string");
-  assert.equal(typeof connection.available, "boolean");
-  assert.match(connection.graphUrl, /view=operation/);
-  assert.equal(connection.definition, undefined);
-
-  const listed = await authenticatedGet(fixture.adminCookie, "/api/connectivity");
-  assert.equal(listed.status, 200);
-  const listBody = await json(listed);
-  const item = listBody.connections.find((candidate: Record<string, unknown>) => candidate.id === connection.id);
-  assert(item);
-  for (const field of ["direction", "transport", "managed", "desiredState", "observedState", "available", "graphUrl"]) {
-    assert.ok(Object.hasOwn(item, field), field);
+test("legacy Web connectivity creation is retired without creating a second owner", async () => {
+  for (const path of ["/api/connectivity/tunnels", "/api/connectivity/sessions"]) {
+    const response = await mutate(fixture.adminCookie, path, tunnelBody(), true);
+    assert.equal(response.status, 410);
+    assert.equal((await json(response)).error.code, "connectivity_definition_api_removed");
   }
-  assert.equal(item.definition, undefined);
-  assert.equal(item.credentialRef, "credential:ssh:test");
+  const store = new ConnectivityStore(join(fixture.runtimeDir, "state.sqlite"));
+  assert.deepEqual(store.listDefinitions(), []);
+  store.close();
+});
 
-  const analystListed = await authenticatedGet(fixture.analystCookie, "/api/connectivity");
-  const analystItem = (await json(analystListed)).connections.find((candidate: Record<string, unknown>) => candidate.id === connection.id);
-  assert(analystItem);
-  assert.equal(Object.hasOwn(analystItem, "credentialRef"), false);
+test("connections combine route definitions with distinct network observations and real refs", async () => {
+  const trafficDir = join(fixture.runtimeDir, "traffic", "flows", "task-one");
+  await mkdir(trafficDir, { recursive: true });
+  const firstObservation = {
+    kind: "network_connection",
+    network_ref: "net:socket-one",
+    connection_ref: "connection:ssh-one",
+    session_ref: "connection:ssh-one",
+    route_ref: "route:test-one",
+    event: "new",
+    protocol: "tcp",
+    source: { host: "192.168.1.20", port: 43120 },
+    destination: { host: "172.31.0.20", port: 80 },
+    observed_at: "2026-07-25T10:00:00Z",
+    task_ref: "task:one",
+    run_ref: "run:one",
+    epoch_ref: "epoch:one"
+  };
+  const secondObservation = {
+    ...firstObservation,
+    network_ref: "net:socket-two",
+    source: { host: "192.168.1.20", port: 43121 },
+    destination: { host: "172.31.0.21", port: 443 },
+    observed_at: "2026-07-25T10:00:01Z"
+  };
+  await writeFile(join(trafficDir, "epoch-one.net.jsonl"), `${JSON.stringify(firstObservation)}\n${JSON.stringify(secondObservation)}\n`);
+  const runtimeStore = new RuntimeStore(join(fixture.runtimeDir, "state.sqlite"));
+  runtimeStore.createEpoch({ epochId: "epoch:one", taskId: "task:one", attempt: 1 });
+  runtimeStore.transitionEpoch({ epochId: "epoch:one", state: "closed", terminationReason: "executor_submitted" });
+  runtimeStore.close();
+  const store = new ConnectivityStore(join(fixture.runtimeDir, "state.sqlite"));
+  const artifacts = new ArtifactStore(join(fixture.runtimeDir, "artifacts"), join(fixture.runtimeDir, "state.sqlite"));
+  const credential = await artifacts.write({
+    taskId: "task:one",
+    kind: "text",
+    mediaType: "text/plain",
+    data: "ops:route-password\n"
+  });
+  artifacts.close();
+  store.upsertDefinition({
+    kind: "route",
+    externalId: "route:test-one",
+    desiredState: "running",
+    status: "live",
+    hostRef: "host:dmz",
+    processRef: "connector:test-one",
+    credentialRef: credential.artifactRef,
+    definition: {
+      runtimeManaged: true,
+      transport: "ssh",
+      pivotHostRef: "host:dmz",
+      dialAddress: "10.0.0.5",
+      targetCidrs: ["172.31.0.0/24"],
+      connectionRef: "connection:ssh-one",
+      connectorRef: "connector:test-one",
+      dialPort: 22,
+      dialUser: "ops",
+      ownerTaskId: "task:one"
+    }
+  });
+  store.upsertDefinition({
+    kind: "session",
+    externalId: "connection:ssh-one",
+    desiredState: "running",
+    status: "live",
+    sessionType: "shell",
+    hostRef: "host:dmz",
+    processRef: "connector:test-one",
+    definition: {
+      runtimeManaged: true,
+      transport: "ssh",
+      routeRef: "route:test-one",
+      dialAddress: "10.0.0.5"
+    }
+  });
+  store.close();
 
-  const analystState = await authenticatedGet(fixture.analystCookie, "/api/state");
-  assert.equal(analystState.status, 200);
-  assert.equal(JSON.stringify(await json(analystState)).includes("credential:ssh:test"), false);
+  const response = await authenticatedGet(fixture.analystCookie, "/api/connectivity");
+  assert.equal(response.status, 200);
+  const connections = (await json(response)).connections as Array<Record<string, unknown>>;
+  assert.deepEqual((await json(await authenticatedGet(fixture.adminCookie, "/api/connectivity"))).runtimeControl, {
+    active: false,
+    mode: "read_only"
+  });
+  const route = connections.find((item) => item.kind === "route" && item.externalId === "route:test-one");
+  assert(route);
+  assert.equal(route.direction, "10.0.0.5 → 172.31.0.0/24");
+  assert.equal(route.routeRef, "route:test-one");
+  assert.equal(route.connectionRef, "connection:ssh-one");
+  assert.equal(route.managed, true);
+  assert.equal(route.available, false);
+  assert.equal(route.graphUrl, undefined);
+  assert.equal(route.actions, undefined);
+  assert.equal(route.credentialRef, undefined);
+  const managedConnection = connections.find((item) => item.layer === "definition" && item.externalId === "connection:ssh-one");
+  assert(managedConnection);
+  assert.equal(managedConnection.kind, "connection");
+  assert.equal(managedConnection.connectionRef, "connection:ssh-one");
+  assert.equal(managedConnection.sessionRef, undefined);
+  assert.equal(
+    managedConnection.graphUrl,
+    `?runtimeDir=${encodeURIComponent(fixture.runtimeDir)}&view=operation&nodeId=${encodeURIComponent("shell-session:connection%3Assh-one")}`
+  );
+  assert.equal(connections.some((item) => item.kind === "session"), false);
+  const observation = connections.find((item) => item.id === "network:net:socket-one");
+  assert(observation);
+  assert.equal(observation.layer, "observation");
+  assert.equal(observation.direction, "192.168.1.20:43120 → 172.31.0.20:80");
+  assert.equal(observation.routeRef, "route:test-one");
+  assert.equal(observation.connectionRef, "connection:ssh-one");
+  assert.equal(observation.sessionRef, undefined);
+  assert.equal(observation.observedState, "closed");
+  assert.equal(observation.available, false);
+  assert.equal(connections.filter((item) => item.layer === "observation" && item.kind === "connection" && item.connectionRef === "connection:ssh-one").length, 2);
 
-  const stopped = await mutate(
+  const adminConnections = (await json(await authenticatedGet(fixture.adminCookie, "/api/connectivity"))).connections as Array<Record<string, unknown>>;
+  assert.equal(adminConnections.find((item) => item.externalId === "route:test-one")?.credentialRef, credential.artifactRef);
+  assert.deepEqual(adminConnections.find((item) => item.externalId === "route:test-one")?.actions, ["status", "stop", "reconnect", "forget"]);
+});
+
+test("historical actions return 409 without touching Docker when another process owns the runtime", async () => {
+  const runtimeDir = join(fixture.root, "externally-owned-runtime");
+  await mkdir(runtimeDir, { recursive: true });
+  await writeFile(join(runtimeDir, "execution.jsonl"), "");
+  const store = new ConnectivityStore(join(runtimeDir, "state.sqlite"));
+  store.upsertDefinition({
+    kind: "route",
+    externalId: "route:externally-owned",
+    desiredState: "running",
+    status: "live",
+    hostRef: "host:dmz",
+    definition: {
+      runtimeManaged: true,
+      transport: "ssh",
+      pivotHostRef: "host:dmz",
+      targetCidrs: ["172.31.0.0/24"],
+      connectorRef: "connector:externally-owned",
+      ownerTaskId: "task:external"
+    }
+  });
+  store.close();
+  const leaseDir = join(runtimeDir, ".connectivity-runtime-owner");
+  await mkdir(leaseDir, { mode: 0o700 });
+  await writeFile(join(leaseDir, "owner.json"), JSON.stringify({
+    version: 1,
+    token: "external-owner",
+    pid: process.pid,
+    acquiredAt: new Date().toISOString()
+  }));
+  const dockerBefore = await readFile(fixture.dockerLog, "utf8");
+  const response = await mutate(
     fixture.adminCookie,
-    `/api/connectivity/${encodeURIComponent(connection.id)}/stop`,
+    `/api/connectivity/${encodeURIComponent(stableConnectivityId("route", "route:externally-owned"))}/status`,
+    { runtimeDir },
+    true
+  );
+
+  assert.equal(response.status, 409);
+  assert.equal((await json(response)).error.code, "connectivity_runtime_owned");
+  assert.equal(await readFile(fixture.dockerLog, "utf8"), dockerBefore);
+  assert.equal(JSON.parse(await readFile(join(leaseDir, "owner.json"), "utf8")).token, "external-owner");
+});
+
+test("active Runtime lease maps an unhealthy flow index to stable 503 without revival", async () => {
+  const runtimeDir = join(fixture.root, "active-index-unavailable");
+  const trafficRoot = join(runtimeDir, "traffic");
+  await mkdir(join(trafficRoot, "flows", "task-one"), { recursive: true });
+  await writeFile(join(trafficRoot, "flows", "task-one", "epoch-one.mitm"), "captured");
+  const token = "c".repeat(64);
+  const descriptor = { url: "http://127.0.0.1:1", token };
+  await writeFile(join(trafficRoot, "index.token"), token);
+  await writeFile(join(trafficRoot, "index.json"), JSON.stringify(descriptor));
+  const leaseDir = join(runtimeDir, ".connectivity-runtime-owner");
+  await mkdir(leaseDir, { mode: 0o700 });
+  await writeFile(join(leaseDir, "owner.json"), JSON.stringify({
+    version: 1,
+    token: "active-runtime-owner",
+    pid: process.pid,
+    acquiredAt: new Date().toISOString()
+  }));
+  const dockerBefore = await readFile(fixture.dockerLog, "utf8");
+
+  const response = await fetch(
+    `${fixture.baseUrl}/api/traffic/history?runtimeDir=${encodeURIComponent(runtimeDir)}`,
+    { headers: { cookie: fixture.analystCookie } }
+  );
+
+  assert.equal(response.status, 503);
+  assert.equal((await json(response)).error.code, "traffic_index_unavailable");
+  assert.equal(await readFile(fixture.dockerLog, "utf8"), dockerBefore);
+  assert.deepEqual(JSON.parse(await readFile(join(trafficRoot, "index.json"), "utf8")), descriptor);
+});
+
+test("historical route actions lazily reuse one runtime and preserve the route identity through reconnect", async () => {
+  const id = stableConnectivityId("route", "route:test-one");
+  const analystStatus = await mutate(
+    fixture.analystCookie,
+    `/api/connectivity/${encodeURIComponent(id)}/status`,
     { runtimeDir: fixture.runtimeDir },
     true
   );
-  assert.equal(stopped.status, 200);
-  assert.equal((await json(stopped)).desiredState, "stopped");
-});
-
-test("managed SSH session desired lifecycle supports start, stop, and close", async () => {
-  const created = await mutate(fixture.adminCookie, "/api/connectivity/sessions", {
-    runtimeDir: fixture.runtimeDir,
-    externalId: "web-session-test",
-    sessionType: "agent",
-    hostRef: "host:target",
-    host: "target.example",
-    user: "operator",
-    credentialRef: "credential:ssh:session",
-    concurrencySafe: false
-  }, true);
-  assert.equal(created.status, 201);
-  const connection = await json(created);
-  assert.equal(connection.kind, "session");
-  assert.equal(connection.managed, true);
-
-  for (const [action, desiredState] of [["start", "running"], ["stop", "stopped"], ["close", "closed"]] as const) {
+  const analystStatusBody = await json(analystStatus);
+  assert.equal(analystStatus.status, 403, JSON.stringify(analystStatusBody));
+  assert.equal(analystStatusBody.error.code, "authorization_forbidden");
+  for (const [action, expectedState] of [
+    ["status", "live"],
+    ["stop", "stale"],
+    ["reconnect", "live"],
+    ["forget", "closed"]
+  ] as const) {
     const response = await mutate(
       fixture.adminCookie,
-      `/api/connectivity/${encodeURIComponent(connection.id)}/${action}`,
+      `/api/connectivity/${encodeURIComponent(id)}/${action}`,
       { runtimeDir: fixture.runtimeDir },
       true
     );
     assert.equal(response.status, 200, action);
-    assert.equal((await json(response)).desiredState, desiredState);
+    const body = await json(response);
+    assert.equal(body.routeRef, "route:test-one");
+    assert.equal(body.observedState, expectedState);
+    if (action === "status") {
+      const refreshed = await json(await authenticatedGet(fixture.adminCookie, "/api/connectivity"));
+      assert.deepEqual(refreshed.runtimeControl, { active: true, mode: "historical" });
+    }
+  }
+  const dockerCommands = (await readFile(fixture.dockerLog, "utf8")).trim().split("\n");
+  const runCommands = dockerCommands.filter((command) => command.startsWith("run "));
+  assert.equal(runCommands.length, 1);
+  assert.equal(runCommands.some((command) => /luanniao\.role=connector/.test(command)), true);
+  assert.equal(runCommands.some((command) => /luanniao\.role=index/.test(command)), false);
+  assert.equal(runCommands.some((command) => /luanniao\.role=history-index/.test(command)), false);
+  const store = new ConnectivityStore(join(fixture.runtimeDir, "state.sqlite"));
+  const route = store.getDefinition(id);
+  store.close();
+  assert.equal(route, undefined);
+});
+
+test("opaque mitm flows stay HTTP typed and routed replay fails closed until the route is live", async () => {
+  const runtimeDir = join(fixture.root, "mitm-runtime");
+  const trafficRoot = join(runtimeDir, "traffic");
+  await mkdir(join(trafficRoot, "flows", "task-one"), { recursive: true });
+  await writeFile(join(trafficRoot, "flows", "task-one", "epoch-one.mitm"), "captured");
+  await writeFile(join(runtimeDir, "execution.jsonl"), "");
+  await writeFile(join(runtimeDir, "graph-deltas.jsonl"), "");
+  const token = "b".repeat(64);
+  const httpFlowRef = "task:one:flow/http";
+  const tcpFlowRef = "task:one:flow/tcp";
+  const indexServer = createHttpServer(async (request, response) => {
+    assert.equal(request.headers.authorization, `Bearer ${token}`);
+    const url = new URL(request.url ?? "/", "http://127.0.0.1");
+    if (url.pathname === "/health") return sendIndex(response, { status: "ok" });
+    if (request.method === "POST") return sendIndex(response, { error: "index_is_read_only" }, 405);
+    if (url.pathname === "/history") {
+      const replayOf = url.searchParams.get("replay_of");
+      const epochRef = url.searchParams.get("epoch_ref") ?? "";
+      return sendIndex(response, {
+        records: replayOf ? [{ ...flowRecord("web-replay:one", "http"), mode: "replay", replay_of: replayOf, epoch_ref: epochRef }] : [flowRecord(httpFlowRef, "http")],
+        has_more: false
+      });
+    }
+    const suffix = decodeURIComponent(url.pathname.slice("/history/".length));
+    const body = suffix.endsWith("/body");
+    const flowRef = body ? suffix.slice(0, -"/body".length) : suffix;
+    if (body) return sendIndex(response, { exchange_id: flowRef, side: url.searchParams.get("side"), body_ref: `${flowRef}:request`, encoding: "base64", data: "dGVzdA==", bytes: 4, truncated: false });
+    if (flowRef === httpFlowRef) return sendIndex(response, { record: flowRecord(httpFlowRef, "http") });
+    if (flowRef === tcpFlowRef) return sendIndex(response, { record: flowRecord(tcpFlowRef, "tcp") });
+    return sendIndex(response, { error: "not_found" }, 404);
+  });
+  await new Promise<void>((resolveListen) => indexServer.listen(0, "127.0.0.1", resolveListen));
+  try {
+    const address = indexServer.address();
+    assert(address && typeof address === "object");
+    await writeFile(join(trafficRoot, "index.token"), token);
+    await writeFile(join(trafficRoot, "index.json"), JSON.stringify({ url: `http://127.0.0.1:${address.port}`, token }));
+    const runtimeArtifacts = new ArtifactStore(join(runtimeDir, "artifacts"), join(runtimeDir, "state.sqlite"));
+    const credential = await runtimeArtifacts.write({
+      taskId: "task:one",
+      kind: "text",
+      mediaType: "text/plain",
+      data: "ops:route-password\n"
+    });
+    runtimeArtifacts.close();
+    const store = new ConnectivityStore(join(runtimeDir, "state.sqlite"));
+    store.upsertDefinition({
+      kind: "session", externalId: "connection:ssh-one", desiredState: "stopped", status: "stale",
+      sessionType: "shell", hostRef: "host:dmz", definition: { transport: "ssh", routeOwned: true }
+    });
+    store.upsertDefinition({
+      kind: "route", externalId: "route:test-one", desiredState: "stopped", status: "stale", hostRef: "host:dmz",
+      processRef: "connector:test-one", credentialRef: credential.artifactRef,
+      definition: {
+        runtimeManaged: true,
+        transport: "ssh",
+        pivotHostRef: "host:dmz",
+        targetCidrs: ["172.31.0.0/24"],
+        connectionRef: "connection:ssh-one",
+        connectorRef: "connector:test-one",
+        dialAddress: "192.0.2.10",
+        dialPort: 22,
+        dialUser: "ops",
+        ownerTaskId: "task:one"
+      }
+    });
+    store.close();
+
+    const detail = await fetch(`${fixture.baseUrl}/api/traffic/history/${encodeURIComponent(httpFlowRef)}?runtimeDir=${encodeURIComponent(runtimeDir)}`, { headers: { cookie: fixture.analystCookie } });
+    const detailBody = await json(detail);
+    assert.equal(detail.status, 200, JSON.stringify(detailBody));
+    assert.equal(detailBody.kind, "http");
+    const body = await fetch(`${fixture.baseUrl}/api/traffic/history/${encodeURIComponent(httpFlowRef)}/body?runtimeDir=${encodeURIComponent(runtimeDir)}&side=request`, { headers: { cookie: fixture.analystCookie } });
+    assert.equal(body.status, 200);
+    assert.equal((await json(body)).exchange_id, httpFlowRef);
+
+    const mismatchedConnection = await mutate(fixture.adminCookie, `/api/traffic/history/${encodeURIComponent(httpFlowRef)}/replay`, {
+      runtimeDir,
+      session_ref: "connection:other"
+    }, true);
+    assert.equal(mismatchedConnection.status, 400);
+    assert.equal((await json(mismatchedConnection)).error.code, "traffic_replay_connection_mismatch");
+
+    const stoppedReplay = await mutate(fixture.adminCookie, `/api/traffic/history/${encodeURIComponent(httpFlowRef)}/replay`, { runtimeDir }, true);
+    assert.equal(stoppedReplay.status, 409);
+    assert.equal((await json(stoppedReplay)).error.code, "traffic_replay_route_reconnect_required");
+
+    const routeOnlyStore = new ConnectivityStore(join(runtimeDir, "state.sqlite"));
+    routeOnlyStore.upsertDefinition({ kind: "route", externalId: "route:test-one", desiredState: "running", status: "live" });
+    routeOnlyStore.close();
+    const missingConnectionReplay = await mutate(fixture.adminCookie, `/api/traffic/history/${encodeURIComponent(httpFlowRef)}/replay`, { runtimeDir }, true);
+    assert.equal(missingConnectionReplay.status, 409);
+    assert.equal((await json(missingConnectionReplay)).error.code, "traffic_replay_route_reconnect_required");
+
+    const liveStore = new ConnectivityStore(join(runtimeDir, "state.sqlite"));
+    liveStore.upsertDefinition({ kind: "session", externalId: "connection:ssh-one", desiredState: "running", status: "live" });
+    liveStore.close();
+    const routeId = stableConnectivityId("route", "route:test-one");
+    const reconnected = await mutate(
+      fixture.adminCookie,
+      `/api/connectivity/${encodeURIComponent(routeId)}/reconnect`,
+      { runtimeDir },
+      true
+    );
+    assert.equal(reconnected.status, 200);
+    assert.equal((await json(reconnected)).observedState, "live");
+    await writeFile(join(trafficRoot, "index.json"), JSON.stringify({
+      url: `http://127.0.0.1:${address.port}`,
+      token,
+      network: "luanniao-net-0123456789abcdef"
+    }));
+    const replayed = await mutate(fixture.adminCookie, `/api/traffic/history/${encodeURIComponent(httpFlowRef)}/replay`, {
+      runtimeDir,
+      task_ref: "task:override",
+      run_ref: "run:override",
+      url: "http://172.31.0.20/replayed",
+      headers: [
+        { name: "Host", value: "virtual.internal", ordinal: 0 },
+        { name: "Content-Length", value: "999", ordinal: 1 },
+        { name: "Connection", value: "X-Hop", ordinal: 2 },
+        { name: "X-Hop", value: "secret", ordinal: 3 },
+        { name: "X-End-To-End", value: "kept", ordinal: 4 }
+      ],
+      body: { encoding: "base64", data: "dGVzdA==" }
+    }, true);
+    const replayedBody = await json(replayed);
+    assert.equal(replayed.status, 200, JSON.stringify({ replayedBody }));
+    assert.deepEqual(replayedBody, { exchangeId: "web-replay:one", replayOf: httpFlowRef, status: 200 });
+    const replayInput = JSON.parse(await readFile(join(fixture.root, "replay-input.json"), "utf8")) as Record<string, unknown>;
+    const replayContext = replayInput.context as Record<string, unknown>;
+    assert.match(String(replayContext.attribution), /^web-user:.+:admin$/);
+    assert.deepEqual({ ...replayInput, context: { ...replayContext, attribution: "web-user:test:admin" } }, {
+      method: "GET",
+      url: "http://172.31.0.20/replayed",
+      headers: [
+        { name: "Host", value: "virtual.internal" },
+        { name: "X-End-To-End", value: "kept" }
+      ],
+      body: "dGVzdA==",
+      context: {
+        replayOf: httpFlowRef,
+        runtimeRef: "run:one",
+        taskRef: "task:one",
+        runRef: "run:one",
+        routeRef: "route:test-one",
+        connectionRef: "connection:ssh-one",
+        attribution: "web-user:test:admin"
+      },
+      targetCidrs: ["172.31.0.0/24"]
+    });
+    const dockerLog = await readFile(fixture.dockerLog, "utf8");
+    assert.match(dockerLog, /exec -i --user 1000:1000 luanniao-replay-gateway-/);
+    assert.match(dockerLog, /gatewayctl epoch\.begin/);
+    assert.match(dockerLog, /\.mitm/);
+    assert.match(dockerLog, /\.net\.jsonl/);
+
+    const tcpReplay = await mutate(fixture.adminCookie, `/api/traffic/history/${encodeURIComponent(tcpFlowRef)}/replay`, { runtimeDir }, true);
+    assert.equal(tcpReplay.status, 409);
+    assert.equal((await json(tcpReplay)).error.code, "traffic_replay_source_not_replayable");
+  } finally {
+    indexServer.closeAllConnections();
+    await new Promise<void>((resolveClose) => indexServer.close(() => resolveClose()));
   }
 });
 
-test("connectivity input rejects path breakout and inline credentials without leaks", async () => {
-  const breakout = await mutate(fixture.adminCookie, "/api/connectivity/tunnels", {
-    ...tunnelBody(),
-    runtimeDir: "../outside"
-  }, true);
-  assert.equal(breakout.status, 403);
-  const breakoutText = await breakout.text();
-  assert.match(breakoutText, /runtime_path_outside_root/);
-  assert.doesNotMatch(breakoutText, new RegExp(escapeRegExp(fixture.root)));
+test("replay refreshes the flow client after the historical index hands ownership to the runtime", async () => {
+  const runtimeDir = join(fixture.root, "mitm-handoff-runtime");
+  const trafficRoot = join(runtimeDir, "traffic");
+  await mkdir(join(trafficRoot, "flows", "task-handoff"), { recursive: true });
+  await writeFile(join(trafficRoot, "flows", "task-handoff", "epoch-one.mitm"), "captured");
+  const token = "c".repeat(64);
+  const historyIndexAddress = fixture.historyIndexServer.address();
+  assert(historyIndexAddress && typeof historyIndexAddress === "object");
+  await writeFile(join(trafficRoot, "index.token"), token);
+  await writeFile(join(trafficRoot, "index.json"), JSON.stringify({
+    url: `http://127.0.0.1:${historyIndexAddress.port}`,
+    token
+  }));
+  await writeFile(join(runtimeDir, "execution.jsonl"), "");
+  await writeFile(join(runtimeDir, "graph-deltas.jsonl"), "");
+  const historyRequestCount = fixture.historyIndexRequests.length;
 
-  for (const body of [
-    { ...tunnelBody(), password: "VERY_SECRET" },
-    { ...tunnelBody(), metadata: { privateKey: "PRIVATE_KEY_SECRET" } }
-  ]) {
-    const response = await mutate(fixture.adminCookie, "/api/connectivity/tunnels", body, true);
-    assert.equal(response.status, 400);
-    const text = await response.text();
-    assert.match(text, /inline_credential_forbidden/);
-    assert.doesNotMatch(text, /VERY_SECRET|PRIVATE_KEY_SECRET/);
-  }
+  const replayed = await mutate(
+    fixture.adminCookie,
+    `/api/traffic/history/${encodeURIComponent("task:handoff:flow/http")}/replay`,
+    { runtimeDir },
+    true
+  );
+  const replayedBody = await json(replayed);
+  assert.equal(replayed.status, 200, JSON.stringify(replayedBody));
+  assert.deepEqual(replayedBody, {
+    exchangeId: "web-replay:handoff",
+    replayOf: "task:handoff:flow/http",
+    status: 200
+  });
+  const runtimeIndexAddress = fixture.indexServer.address();
+  assert(runtimeIndexAddress && typeof runtimeIndexAddress === "object");
+  const runtimeDescriptor = JSON.parse(await readFile(join(trafficRoot, "index.json"), "utf8")) as Record<string, unknown>;
+  assert.equal(runtimeDescriptor.url, `http://127.0.0.1:${runtimeIndexAddress.port}`);
+  assert.notEqual(runtimeDescriptor.url, `http://127.0.0.1:${historyIndexAddress.port}`);
+  assert.equal(runtimeDescriptor.token, token);
+  assert.equal(fixture.historyIndexRequests.length, historyRequestCount);
+});
+
+test("missing opaque replay flow returns 404 without starting a network runtime", async () => {
+  const runtimeDir = join(fixture.root, "missing-mitm-runtime");
+  await mkdir(runtimeDir, { recursive: true });
+  await writeFile(join(runtimeDir, "execution.jsonl"), "");
+  await writeFile(join(runtimeDir, "graph-deltas.jsonl"), "");
+  const dockerBefore = await readFile(fixture.dockerLog, "utf8");
+
+  const response = await mutate(
+    fixture.adminCookie,
+    `/api/traffic/history/${encodeURIComponent("task:missing:flow/http")}/replay`,
+    { runtimeDir },
+    true
+  );
+
+  assert.equal(response.status, 404);
+  assert.equal((await json(response)).error.code, "traffic_flow_not_found");
+  assert.equal(await readFile(fixture.dockerLog, "utf8"), dockerBefore);
+});
+
+test("retired connectivity APIs return a stable error without echoing submitted secrets", async () => {
+  const response = await mutate(fixture.adminCookie, "/api/connectivity/tunnels", {
+    ...tunnelBody(),
+    password: "VERY_SECRET"
+  }, true);
+  assert.equal(response.status, 410);
+  const text = await response.text();
+  assert.match(text, /connectivity_definition_api_removed/);
+  assert.doesNotMatch(text, /VERY_SECRET/);
 });
 
 function tunnelBody(): Record<string, unknown> {
@@ -177,6 +580,56 @@ function tunnelBody(): Record<string, unknown> {
     desiredState: "stopped",
     forwards: [{ mode: "local", bindHost: "127.0.0.1", bindPort: 18080, targetHost: "127.0.0.1", targetPort: 8080 }]
   };
+}
+
+function flowRecord(flowRef: string, kind: "http" | "tcp", routed = true): Record<string, unknown> {
+  return {
+    id: flowRef,
+    kind,
+    method: kind === "http" ? "GET" : "TCP",
+    url: kind === "http" ? "http://172.31.0.20/flag.html" : "tcp://172.31.0.20:22",
+    host: kind === "http" ? "172.31.0.20" : "172.31.0.20:22",
+    scheme: kind,
+    protocol: kind === "http" ? "HTTP/1.1" : "TCP",
+    mode: kind === "http" ? "mitm" : "passthrough",
+    status: 200,
+    started_at: "2026-07-25T10:00:00Z",
+    completed_at: "2026-07-25T10:00:01Z",
+    duration_ms: 1000,
+    request_observed_bytes: kind === "http" ? 0 : 4,
+    response_observed_bytes: 0,
+    request_captured_bytes: kind === "http" ? 0 : 4,
+    response_captured_bytes: 0,
+    request_capture_state: kind === "http" ? "none" : "captured",
+    response_capture_state: "none",
+    request_truncated: false,
+    response_truncated: false,
+    headers_truncated: false,
+    quota_pressure: false,
+    evicted_exchanges: 0,
+    request_headers: [],
+    route_ref: kind === "http" && routed ? "route:test-one" : "",
+    session_ref: "",
+    connection_ref: kind === "http" && routed ? "connection:ssh-one" : "",
+    task_ref: "task:one",
+    run_ref: "run:one"
+  };
+}
+
+function handoffFlowRecord(): Record<string, unknown> {
+  return {
+    ...flowRecord("task:handoff:flow/http", "http", false),
+    request_observed_bytes: 4,
+    request_captured_bytes: 4,
+    request_capture_state: "captured",
+    request_body_ref: "task:handoff:flow/http:request"
+  };
+}
+
+function sendIndex(response: import("node:http").ServerResponse, value: Record<string, unknown>, status = 200): void {
+  const body = JSON.stringify(value);
+  response.writeHead(status, { "content-type": "application/json", "content-length": Buffer.byteLength(body) });
+  response.end(body);
 }
 
 async function authenticatedGet(cookie: string, pathname: string): Promise<Response> {
@@ -229,6 +682,104 @@ async function createFixture(): Promise<Fixture> {
   const analyst = await auth.register({ username: "analyst", displayName: "Analyst", password: "analyst-password-456" });
   auth.close();
 
+  const historyIndexRequests: string[] = [];
+  const historyIndexServer = createHttpServer((request, response) => {
+    historyIndexRequests.push(request.url ?? "/");
+    const url = new URL(request.url ?? "/", "http://127.0.0.1");
+    if (url.pathname === "/health") return sendIndex(response, { status: "ok" });
+    if (url.pathname === "/history") {
+      return sendIndex(response, {
+        records: url.searchParams.has("replay_of")
+          ? []
+          : [flowRecord("task:one:flow/http", "http"), handoffFlowRecord()],
+        has_more: false
+      });
+    }
+    const suffix = decodeURIComponent(url.pathname.slice("/history/".length));
+    const body = suffix.endsWith("/body");
+    const flowRef = body ? suffix.slice(0, -"/body".length) : suffix;
+    if (body) return sendIndex(response, { exchange_id: flowRef, side: url.searchParams.get("side"), body_ref: `${flowRef}:request`, encoding: "base64", data: "dGVzdA==", bytes: 4, truncated: false });
+    if (flowRef === "task:one:flow/http") return sendIndex(response, { record: flowRecord(flowRef, "http") });
+    if (flowRef === "task:handoff:flow/http") return sendIndex(response, { record: handoffFlowRecord() });
+    return sendIndex(response, { error: "not_found" }, 404);
+  });
+  await new Promise<void>((resolveListen) => historyIndexServer.listen(0, "127.0.0.1", resolveListen));
+  const historyIndexAddress = historyIndexServer.address();
+  assert(historyIndexAddress && typeof historyIndexAddress === "object");
+
+  const indexServer = createHttpServer((request, response) => {
+    const url = new URL(request.url ?? "/", "http://127.0.0.1");
+    if (url.pathname === "/health") return sendIndex(response, { status: "ok" });
+    if (url.pathname === "/history") {
+      const replayOf = url.searchParams.get("replay_of");
+      const epochRef = url.searchParams.get("epoch_ref") ?? "";
+      return sendIndex(response, {
+        records: replayOf
+          ? [{
+              ...flowRecord(replayOf === "task:handoff:flow/http" ? "web-replay:handoff" : "web-replay:one", "http", replayOf !== "task:handoff:flow/http"),
+              mode: "replay",
+              replay_of: replayOf,
+              epoch_ref: epochRef
+            }]
+          : [flowRecord("task:one:flow/http", "http"), handoffFlowRecord()],
+        has_more: false
+      });
+    }
+    const suffix = decodeURIComponent(url.pathname.slice("/history/".length));
+    const body = suffix.endsWith("/body");
+    const flowRef = body ? suffix.slice(0, -"/body".length) : suffix;
+    if (body) return sendIndex(response, { exchange_id: flowRef, side: url.searchParams.get("side"), body_ref: `${flowRef}:request`, encoding: "base64", data: "dGVzdA==", bytes: 4, truncated: false });
+    if (flowRef === "task:one:flow/http") return sendIndex(response, { record: flowRecord(flowRef, "http") });
+    if (flowRef === "task:one:flow/tcp") return sendIndex(response, { record: flowRecord(flowRef, "tcp") });
+    if (flowRef === "task:handoff:flow/http") return sendIndex(response, { record: handoffFlowRecord() });
+    return sendIndex(response, { error: "not_found" }, 404);
+  });
+  await new Promise<void>((resolveListen) => indexServer.listen(0, "127.0.0.1", resolveListen));
+  const indexAddress = indexServer.address();
+  assert(indexAddress && typeof indexAddress === "object");
+  const fakeBin = join(root, "fake-bin");
+  await mkdir(fakeBin);
+  const fakeDocker = join(fakeBin, "docker");
+  const dockerLog = join(root, "docker.log");
+  const replayInput = join(root, "replay-input.json");
+  await writeFile(dockerLog, "");
+  await writeFile(fakeDocker, `#!/bin/sh
+printf '%s\\n' "$*" >> "$FAKE_DOCKER_LOG"
+case "$1" in
+  network)
+    case "$2" in
+      inspect)
+        case "$*" in
+          *luanniao-net-0123456789abcdef*) exit 0 ;;
+          *) exit 1 ;;
+        esac ;;
+      *) exit 0 ;;
+    esac ;;
+  inspect)
+    case "$*" in
+      *NetworkSettings.Networks*) printf '172.28.0.2\\n'; exit 0 ;;
+      *luanniao-history-index-*)
+        case "$*" in
+          *State.Running*) exit 1 ;;
+          *) printf 'true|history-index\\n'; exit 0 ;;
+        esac ;;
+      *) exit 1 ;;
+    esac ;;
+  exec)
+    case "$*" in
+      *gatewayctl*) printf '{"ok":true}\\n' ;;
+      *replay_client.py*) cat > "$FAKE_DOCKER_REPLAY_INPUT"; printf '{"ok":true,"status":200}\\n' ;;
+    esac ;;
+  port)
+    case "$2" in
+      luanniao-history-index-*) printf '127.0.0.1:%s\\n' "$FAKE_DOCKER_HISTORY_INDEX_PORT" ;;
+      *) printf '127.0.0.1:%s\\n' "$FAKE_DOCKER_INDEX_PORT" ;;
+    esac ;;
+  *) exit 0 ;;
+esac
+`);
+  await chmod(fakeDocker, 0o755);
+
   const port = await reservePort();
   const child = spawn(process.execPath, [
     resolve("dist/src/web-server.js"),
@@ -236,7 +787,18 @@ async function createFixture(): Promise<Fixture> {
     "--port", String(port),
     "--runtime-dir", root,
     "--auth-db", join(root, "auth.sqlite")
-  ], { cwd: process.cwd(), stdio: ["ignore", "pipe", "pipe"] });
+  ], {
+    cwd: process.cwd(),
+    stdio: ["ignore", "pipe", "pipe"],
+    env: {
+      ...process.env,
+      PATH: `${fakeBin}:${process.env.PATH ?? ""}`,
+      FAKE_DOCKER_INDEX_PORT: String(indexAddress.port),
+      FAKE_DOCKER_HISTORY_INDEX_PORT: String(historyIndexAddress.port),
+      FAKE_DOCKER_LOG: dockerLog,
+      FAKE_DOCKER_REPLAY_INPUT: replayInput
+    }
+  });
   const baseUrl = `http://127.0.0.1:${port}`;
   await waitForServer(child, baseUrl);
   return {
@@ -245,7 +807,11 @@ async function createFixture(): Promise<Fixture> {
     runtimeDir,
     adminCookie: `luanniao_session=${encodeURIComponent(admin.token)}`,
     analystCookie: `luanniao_session=${encodeURIComponent(analyst.token)}`,
-    process: child
+    process: child,
+    indexServer,
+    historyIndexServer,
+    historyIndexRequests,
+    dockerLog
   };
 }
 
@@ -257,6 +823,10 @@ async function destroyFixture(value: Fixture): Promise<void> {
       setTimeout(resolveExit, 3_000).unref();
     });
   }
+  value.indexServer.closeAllConnections();
+  await new Promise<void>((resolveClose) => value.indexServer.close(() => resolveClose()));
+  value.historyIndexServer.closeAllConnections();
+  await new Promise<void>((resolveClose) => value.historyIndexServer.close(() => resolveClose()));
   await rm(value.root, { recursive: true, force: true });
 }
 
@@ -287,8 +857,4 @@ async function waitForServer(child: ChildProcess, baseUrl: string): Promise<void
     await new Promise((resolveDelay) => setTimeout(resolveDelay, 50));
   }
   throw new Error(`timed out waiting for web server: ${stderr}`);
-}
-
-function escapeRegExp(value: string): string {
-  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }

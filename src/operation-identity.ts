@@ -1,13 +1,18 @@
 import { createHash } from "node:crypto";
+import { isIP } from "node:net";
 import type { GraphEdge, GraphNode } from "./types.js";
 
 const SESSION_TYPES = new Set(["AgentSession", "ShellSession", "Session"]);
 
-export function operationIdentityKeys(nodes: GraphNode[], edges: GraphEdge[]): Map<string, string> {
+export function operationIdentityKeys(
+  nodes: GraphNode[],
+  edges: GraphEdge[],
+  initialKeys: ReadonlyMap<string, string> = new Map()
+): Map<string, string> {
   const operationNodes = new Map(nodes
     .filter((node) => node.graphKind === "operation")
     .map((node) => [node.id, node]));
-  const keys = new Map<string, string>();
+  const keys = new Map<string, string>(initialKeys);
 
   for (const node of operationNodes.values()) {
     const direct = directOperationIdentityKey(node);
@@ -204,10 +209,21 @@ function normalizedHost(value: unknown): string | undefined {
     return undefined;
   }
   const trimmed = value.trim();
+  const address = trimmed.replace(/^\[|\]$/g, "");
+  if (isIP(address) > 0) {
+    return address.toLowerCase();
+  }
   const parsed = normalizedUrl(trimmed.includes("://") ? trimmed : `http://${trimmed}`);
-  const host = parsed?.hostname || trimmed.replace(/^\[|\]$/g, "").split(":")[0];
-  const normalized = host.trim().toLowerCase().replace(/\.$/, "");
-  return normalized || undefined;
+  const normalized = parsed?.hostname.trim().toLowerCase().replace(/^\[|\]$/g, "").replace(/\.$/, "");
+  if (!normalized) {
+    return undefined;
+  }
+  if (isIP(normalized) > 0) {
+    return normalized;
+  }
+  return /^(?=.{1,253}$)[a-z0-9](?:[a-z0-9_-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9_-]{0,61}[a-z0-9])?)*$/.test(normalized)
+    ? normalized
+    : undefined;
 }
 
 function normalizedPort(value: unknown): string | undefined {

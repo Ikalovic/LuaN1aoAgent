@@ -1,8 +1,8 @@
 import { randomUUID } from "node:crypto";
 import { stableSessionNodeId } from "./operation-identity.js";
-import type { ExecutionEvent, GraphDelta, GraphEdge, GraphNode } from "./types.js";
+import type { ExecutionEvent, GraphDelta, GraphEdge, GraphNode, GraphSnapshot } from "./types.js";
 
-export type ProjectionObservationKind = "action" | "task_outcome" | "runtime_error";
+export type ProjectionObservationKind = "action" | "task_outcome" | "connectivity" | "runtime_error";
 
 const TASK_OUTCOME_EVENT_TYPES = new Set([
   "task_completed",
@@ -13,6 +13,23 @@ const TASK_OUTCOME_EVENT_TYPES = new Set([
 
 const LEGACY_RAW_RESULT_INTERPRETATION = "No recorded Executor interpretation; use only the raw result as evidence.";
 const MISSING_RESULT_INTERPRETATION = "Executor continued without recording a conclusion for the previous result; treat it as inconclusive.";
+const MAX_REPEATED_ACTIONS_PER_OBSERVATION = 16;
+export const PROJECTOR_MAX_DELTA_NODES = 24;
+export const PROJECTOR_MAX_DELTA_EDGES = 40;
+export const PROJECTOR_MAX_DELTA_BYTES = 128 * 1024;
+
+const PROJECTION_NODE_KEYS = new Set(["id", "graphKind", "type", "label", "properties", "evidenceRefs"]);
+const PROJECTION_EDGE_KEYS = new Set(["from", "to", "type", "properties", "evidenceRefs"]);
+const PROJECTION_NODE_TYPES: Record<string, readonly string[]> = {
+  operation: ["Host", "Port", "Service", "WebEndpoint", "Parameter", "Credential", "AgentSession", "ShellSession", "Session", "File", "Process"],
+  reasoning: ["Evidence", "Hypothesis", "Vulnerability", "Exploit"]
+};
+const PROJECTION_EDGE_TYPES: readonly string[] = [
+  "supports", "contradicts", "confirms", "promoted_to", "exploited_by", "produces_evidence",
+  "observed_on", "affects", "has_port", "runs_service", "exposes_endpoint", "has_parameter",
+  "authenticates_to", "creates_session", "session_on", "tunnels_to", "proxy_route",
+  "contains_file", "spawns_process"
+];
 
 export type ProjectionObservation = {
   ref: string;
@@ -26,6 +43,7 @@ export type ProjectionObservation = {
   outcomeDigest: string;
   status: "ok" | "error" | "incomplete";
   artifactRefs: string[];
+  capabilityRefs?: string[];
   anchors: string[];
   sourceEventIds: string[];
   repeatCount?: number;
@@ -34,7 +52,14 @@ export type ProjectionObservation = {
     inputDigest?: string;
     outcomeDigest: string;
     status: "ok" | "error" | "incomplete";
+    seqStart?: number;
+    seqEnd?: number;
+    artifactRefs?: string[];
+    anchors?: string[];
+    sourceEventIds?: string[];
   }>;
+  fragmentIndex?: number;
+  fragmentCount?: number;
 };
 
 export type ProjectionBatch = {
@@ -42,6 +67,27 @@ export type ProjectionBatch = {
   toSeq: number;
   sourceEventIds: string[];
 };
+
+export class ProjectionObservationEnvelopeTooLargeError extends Error {
+  constructor(readonly minimumBytes: number, readonly maxBytes: number) {
+    super(`Projection observation envelope requires ${minimumBytes} UTF-8 bytes; maximum is ${maxBytes}`);
+    this.name = "ProjectionObservationEnvelopeTooLargeError";
+  }
+}
+
+export class ProjectionDeltaLimitError extends Error {
+  constructor(readonly field: "nodes" | "edges", readonly actual: number, readonly maximum: number) {
+    super(`Projection delta ${field} contains ${actual} items; maximum per submission is ${maximum}`);
+    this.name = "ProjectionDeltaLimitError";
+  }
+}
+
+export class ProjectionDraftIntegrityError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "ProjectionDraftIntegrityError";
+  }
+}
 
 export type ProjectionGraphContext = {
   nodes: Array<{
@@ -61,7 +107,136 @@ export type ProjectionGraphContext = {
     properties: Record<string, unknown>;
   }>;
   nodeAliases: Map<string, string>;
+  sourceNodeCount: number;
+  sourceEdgeCount: number;
 };
+
+export type ProjectionExistingAliasContext = ReadonlyMap<string, {
+  graphKind: GraphNode["graphKind"];
+  type: string;
+}>;
+
+export type ProjectionDraftValidationOptions = {
+  existingAliases?: ProjectionExistingAliasContext;
+};
+
+export class ProjectorGraphRefRegistry {
+  private readonly nodesByAlias = new Map<string, GraphNode>();
+  private readonly aliasesByNodeId = new Map<string, string>();
+  private readonly aliases = new Map<string, { graphKind: GraphNode["graphKind"]; type: string }>();
+  private nextAliasIndex = 1;
+
+  constructor(context: ProjectionGraphContext) {
+    for (const node of context.nodes) {
+      this.register(node.ref, {
+        id: node.id,
+        graphKind: node.graphKind,
+        type: node.type,
+        label: node.label,
+        properties: node.properties,
+        evidenceRefs: node.evidenceRefs
+      });
+    }
+  }
+
+  aliasContext(): ProjectionExistingAliasContext {
+    return this.aliases;
+  }
+
+  resolveNodeId(ref: string): string {
+    if (!ref.startsWith("existing:")) {
+      return ref;
+    }
+    const node = this.nodesByAlias.get(ref);
+    if (!node) {
+      throw new ProjectionDraftIntegrityError(`Unknown Projector graph alias ${ref}`);
+    }
+    return node.id;
+  }
+
+  resolveSearchQuery(query: string): string {
+    return query.replace(/existing:[1-9][0-9]*/g, (alias) => this.resolveNodeId(alias));
+  }
+
+  intern(node: GraphNode): string {
+    const existingAlias = this.aliasesByNodeId.get(node.id);
+    if (existingAlias) {
+      this.register(existingAlias, node);
+      return existingAlias;
+    }
+    const alias = `existing:${this.nextAliasIndex}`;
+    this.register(alias, node);
+    return alias;
+  }
+
+  nodeEntries(): Array<[string, GraphNode]> {
+    return [...this.nodesByAlias.entries()].map(([alias, node]) => [alias, { ...node }]);
+  }
+
+  aliasSnapshot(snapshot: GraphSnapshot): GraphSnapshot {
+    for (const node of snapshot.nodes) {
+      this.intern(node);
+    }
+    const nodes = snapshot.nodes.map((node) => ({
+      ...node,
+      id: this.intern(node),
+      label: this.aliasValue(node.label) as string,
+      properties: this.aliasValue(node.properties) as Record<string, unknown>,
+      evidenceRefs: this.aliasValue(node.evidenceRefs) as string[] | undefined
+    }));
+    const edges = snapshot.edges.map((edge) => ({
+      from: this.aliasesByNodeId.get(edge.from) ?? edge.from,
+      to: this.aliasesByNodeId.get(edge.to) ?? edge.to,
+      type: edge.type,
+      properties: this.aliasValue(edge.properties) as Record<string, unknown> | undefined,
+      evidenceRefs: this.aliasValue(edge.evidenceRefs) as string[] | undefined
+    }));
+    return {
+      ...snapshot,
+      nodes,
+      edges,
+      summary: this.aliasValue(snapshot.summary) as Record<string, unknown>
+    };
+  }
+
+  private register(alias: string, node: GraphNode): void {
+    const currentNode = this.nodesByAlias.get(alias);
+    if (currentNode && currentNode.id !== node.id) {
+      throw new ProjectionDraftIntegrityError(`Projector graph alias ${alias} is already assigned to ${currentNode.id}`);
+    }
+    const currentAlias = this.aliasesByNodeId.get(node.id);
+    if (currentAlias && currentAlias !== alias) {
+      throw new ProjectionDraftIntegrityError(`Projector graph node ${node.id} is already assigned to ${currentAlias}`);
+    }
+    this.nodesByAlias.set(alias, { ...node });
+    this.aliasesByNodeId.set(node.id, alias);
+    this.aliases.set(alias, { graphKind: node.graphKind, type: node.type });
+    const aliasIndex = Number(alias.slice("existing:".length));
+    if (Number.isInteger(aliasIndex)) {
+      this.nextAliasIndex = Math.max(this.nextAliasIndex, aliasIndex + 1);
+    }
+  }
+
+  private aliasValue(value: unknown): unknown {
+    if (typeof value === "string") {
+      let aliased = value;
+      const nodeIds = [...this.aliasesByNodeId.keys()].sort((left, right) => right.length - left.length);
+      for (const nodeId of nodeIds) {
+        aliased = aliased.split(nodeId).join(this.aliasesByNodeId.get(nodeId)!);
+      }
+      return aliased;
+    }
+    if (Array.isArray(value)) {
+      return value.map((entry) => this.aliasValue(entry));
+    }
+    if (value && typeof value === "object") {
+      return Object.fromEntries(
+        Object.entries(value as Record<string, unknown>).map(([key, entry]) => [key, this.aliasValue(entry)])
+      );
+    }
+    return value;
+  }
+}
 
 type PendingAction = {
   seqStart: number;
@@ -95,7 +270,7 @@ export function buildProjectionObservations(events: ExecutionEvent[]): Projectio
       observation.anchors = dedupeStrings([
         ...observation.anchors,
         ...extractAnchors(normalizedInterpretation)
-      ]).slice(0, 6);
+      ]);
       return;
     }
     const grouped = openIndexes.map((index) => observations[index]!);
@@ -114,13 +289,18 @@ export function buildProjectionObservations(events: ExecutionEvent[]): Projectio
       anchors: dedupeStrings([
         ...grouped.flatMap((observation) => observation.anchors),
         ...extractAnchors(normalizedInterpretation)
-      ]).slice(0, 8),
+      ]),
       sourceEventIds: dedupeStrings(grouped.flatMap((observation) => observation.sourceEventIds)),
       actions: grouped.map((observation) => ({
         action: observation.action ?? "unknown",
         inputDigest: observation.inputDigest,
         outcomeDigest: observation.outcomeDigest,
-        status: observation.status
+        status: observation.status,
+        seqStart: observation.seqStart,
+        seqEnd: observation.seqEnd,
+        artifactRefs: [...observation.artifactRefs],
+        anchors: [...observation.anchors],
+        sourceEventIds: [...observation.sourceEventIds]
       }))
     };
     const removedIndexes = new Set(openIndexes.slice(1));
@@ -202,6 +382,7 @@ export function buildProjectionObservations(events: ExecutionEvent[]): Projectio
 
     if (TASK_OUTCOME_EVENT_TYPES.has(event.eventType)) {
       closeOpenActions(compactTaskOutcome(event), event.id);
+      const taskResult = isRecord(event.payload.taskResult) ? event.payload.taskResult : undefined;
       observations.push({
         ref: "",
         kind: "task_outcome",
@@ -210,7 +391,26 @@ export function buildProjectionObservations(events: ExecutionEvent[]): Projectio
         outcomeDigest: compactTaskOutcome(event),
         status: event.eventType === "task_failed" || event.eventType === "task_blocked" ? "error" : "ok",
         artifactRefs: eventArtifactRefs(event),
+        capabilityRefs: stringArray(taskResult?.capabilityRefs),
         anchors: extractAnchors(`${event.summary ?? ""}\n${compactValue(event.payload, 700) ?? ""}`),
+        sourceEventIds: dedupeStrings([event.id, ...stringArray(taskResult?.evidenceRefs)])
+      });
+      continue;
+    }
+
+    if (event.eventType === "connectivity_observation") {
+      const status = textProperty(event.payload.status);
+      observations.push({
+        ref: "",
+        kind: "connectivity",
+        seqStart: seq,
+        seqEnd: seq,
+        action: textProperty(event.payload.transition) ?? "connectivity_observation",
+        inputDigest: textProperty(event.payload.observationKind),
+        outcomeDigest: compactValue(event.payload, 900) ?? event.summary ?? "Connectivity state changed",
+        status: status === "degraded" || event.payload.failureReason ? "error" : "ok",
+        artifactRefs: eventArtifactRefs(event),
+        anchors: connectivityAnchors(event.payload),
         sourceEventIds: [event.id]
       });
       continue;
@@ -302,15 +502,64 @@ export function aliasProjectionGraphContext(input: {
   return {
     nodes,
     edges,
-    nodeAliases
+    nodeAliases,
+    sourceNodeCount: nodes.length,
+    sourceEdgeCount: edges.length
   };
+}
+
+export function compactProjectionGraphContextForInput(
+  context: ProjectionGraphContext,
+  maxBytes: number
+): ProjectionGraphContext {
+  const sourceNodeCount = context.sourceNodeCount;
+  const sourceEdgeCount = context.sourceEdgeCount;
+  const compacted: ProjectionGraphContext = {
+    nodes: [],
+    edges: [],
+    nodeAliases: new Map(),
+    sourceNodeCount,
+    sourceEdgeCount
+  };
+  const byteLimit = Math.max(256, Math.floor(maxBytes));
+  const nodeByteLimit = Math.max(192, Math.floor(byteLimit * 0.7));
+  for (const node of context.nodes) {
+    const candidate: ProjectionGraphContext = {
+      ...compacted,
+      nodes: [...compacted.nodes, node],
+      nodeAliases: new Map([...compacted.nodeAliases, [node.ref, node.id]])
+    };
+    if (Buffer.byteLength(renderProjectionGraphContext(candidate), "utf8") > nodeByteLimit) {
+      break;
+    }
+    compacted.nodes = candidate.nodes;
+    compacted.nodeAliases = candidate.nodeAliases;
+  }
+  const visibleRefs = new Set(compacted.nodes.map((node) => node.ref));
+  for (const edge of context.edges) {
+    if (!visibleRefs.has(edge.from) || !visibleRefs.has(edge.to)) {
+      continue;
+    }
+    const candidate = { ...compacted, edges: [...compacted.edges, edge] };
+    if (Buffer.byteLength(renderProjectionGraphContext(candidate), "utf8") > byteLimit) {
+      break;
+    }
+    compacted.edges = candidate.edges;
+  }
+  return compacted;
 }
 
 export function expandProjectionDraft(input: {
   value: unknown;
   batch: ProjectionBatch;
   graphContext: ProjectionGraphContext;
+  references?: ProjectorGraphRefRegistry;
+  validationOptions?: Omit<ProjectionDraftValidationOptions, "existingAliases">;
 }): GraphDelta {
+  validateProjectionDraftIntegrity(input.value, {
+    existingAliases: input.references?.aliasContext() ?? projectionExistingAliasContext(input.graphContext),
+    ...input.validationOptions
+  });
   const record = isRecord(input.value) ? input.value : {};
   const draft = isRecord(record.graphDelta) ? record.graphDelta : record;
   const observationRefs = new Map(input.batch.observations.map((observation) => [observation.ref, observation.sourceEventIds]));
@@ -318,41 +567,61 @@ export function expandProjectionDraft(input: {
   const resolveEvidenceRefs = (value: unknown): string[] => dedupeStrings(
     stringArray(value).flatMap((ref) => observationRefs.get(ref) ?? (sourceEventIds.has(ref) ? [ref] : []))
   );
-  const existingNodesById = new Map(input.graphContext.nodes.map((node) => [node.id, node]));
+  const referenceEntries = input.references?.nodeEntries()
+    ?? input.graphContext.nodes.map((node) => [node.ref, {
+      id: node.id,
+      graphKind: node.graphKind,
+      type: node.type,
+      label: node.label,
+      properties: node.properties,
+      evidenceRefs: node.evidenceRefs
+    } as GraphNode] as [string, GraphNode]);
+  const existingNodesById = new Map(referenceEntries.map(([, node]) => [node.id, node]));
+  const staticNodeAliases = input.references ? undefined : input.graphContext.nodeAliases;
   const submittedNodeRefs = new Map<string, string>();
   const resolveNodeRef = (value: unknown): string => {
     const ref = String(value ?? "").trim();
     if (!ref) {
       return "";
     }
-    const existingId = input.graphContext.nodeAliases.get(ref);
-    if (existingId) {
-      return existingId;
+    if (ref.startsWith("existing:")) {
+      return input.references?.resolveNodeId(ref) ?? staticNodeAliases?.get(ref) ?? "";
     }
     return submittedNodeRefs.get(ref) ?? "";
   };
   const nodesById = new Map<string, GraphNode>();
-  if (Array.isArray(draft.nodes)) {
-    for (const node of draft.nodes.filter(isRecord).slice(0, 12)) {
+  const submittedNodes = Array.isArray(draft.nodes) ? draft.nodes.filter(isRecord) : [];
+  if (submittedNodes.length > PROJECTOR_MAX_DELTA_NODES) {
+    throw new ProjectionDeltaLimitError("nodes", submittedNodes.length, PROJECTOR_MAX_DELTA_NODES);
+  }
+  if (submittedNodes.length > 0) {
+    for (const node of submittedNodes) {
       const submittedRef = String(node.id ?? "").trim();
-      const existingId = input.graphContext.nodeAliases.get(submittedRef);
+      const existingId = submittedRef.startsWith("existing:")
+        ? input.references?.resolveNodeId(submittedRef) ?? staticNodeAliases?.get(submittedRef)
+        : undefined;
+      const submittedGraphKind = normalizeGraphKind(node.graphKind);
+      if (submittedGraphKind === "task" || (existingId && existingNodesById.get(existingId)?.graphKind === "task")) {
+        throw new ProjectionDraftIntegrityError(
+          `Projection node alias ${submittedRef || "<empty>"} targets the task graph; no part of the delta was accepted`
+        );
+      }
       const resolvedId = existingId ?? (submittedRef.startsWith("new:")
           ? stableOperationNodeId(node) ?? `projected:${randomUUID()}`
           : "");
       if (!resolvedId) {
-        continue;
+        throw new ProjectionDraftIntegrityError(
+          `Projection node references unknown existing alias ${submittedRef || "<empty>"}; no part of the delta was accepted`
+        );
       }
       if (!existingId) {
         submittedNodeRefs.set(submittedRef, resolvedId);
       }
       const existing = existingNodesById.get(resolvedId);
       const type = existing?.type ?? String(node.type ?? "Evidence");
-      if (existing?.graphKind === "task" || normalizeGraphKind(node.graphKind) === "task") {
-        continue;
-      }
       const nextNode: GraphNode = {
         id: resolvedId,
-        graphKind: existing?.graphKind ?? normalizeGraphKind(node.graphKind),
+        graphKind: existing?.graphKind ?? submittedGraphKind,
         type,
         label: truncate(String(node.label ?? existing?.label ?? node.id ?? "Observation"), 500),
         properties: compactSubmittedProperties(node.properties),
@@ -378,24 +647,46 @@ export function expandProjectionDraft(input: {
     }] as const),
     ...nodes.map((node) => [node.id, node] as const)
   ]);
-  const edges = Array.isArray(draft.edges)
-    ? draft.edges.filter(isRecord).slice(0, 20).map((edge) => {
+  const submittedEdges = Array.isArray(draft.edges) ? draft.edges.filter(isRecord) : [];
+  if (submittedEdges.length > PROJECTOR_MAX_DELTA_EDGES) {
+    throw new ProjectionDeltaLimitError("edges", submittedEdges.length, PROJECTOR_MAX_DELTA_EDGES);
+  }
+  const edges = submittedEdges.length > 0
+    ? submittedEdges.map((edge): GraphEdge => {
       const type = String(edge.type ?? "supports");
       const properties = compactSubmittedProperties(edge.properties);
+      const submittedFrom = String(edge.from ?? "").trim();
+      const submittedTo = String(edge.to ?? "").trim();
+      const from = resolveNodeRef(submittedFrom);
+      const to = resolveNodeRef(submittedTo);
+      if (!from || !to) {
+        throw new ProjectionDraftIntegrityError(
+          `Projection edge references unknown existing alias: ${submittedFrom || "<empty>"} -> ${submittedTo || "<empty>"}; no part of the delta was accepted`
+        );
+      }
+      const id = stableOperationalEdgeId(type, properties);
       return {
-        id: stableOperationalEdgeId(type, properties),
-        from: resolveNodeRef(edge.from),
-        to: resolveNodeRef(edge.to),
+        ...(id ? { id } : {}),
+        from,
+        to,
         type,
         properties,
         evidenceRefs: resolveEvidenceRefs(edge.evidenceRefs)
       };
-    }).filter((edge) => {
+    }).map((edge): GraphEdge => {
       const fromNode = nodeById.get(edge.from);
       const toNode = nodeById.get(edge.to);
-      return Boolean(fromNode && toNode)
-        && fromNode?.graphKind !== "task"
-        && toNode?.graphKind !== "task";
+      if (!fromNode || !toNode) {
+        throw new ProjectionDraftIntegrityError(
+          `Projection edge resolved to unavailable endpoints ${edge.from} -> ${edge.to}; no part of the delta was accepted`
+        );
+      }
+      if (fromNode.graphKind === "task" || toNode.graphKind === "task") {
+        throw new ProjectionDraftIntegrityError(
+          `Projection edge resolved to the task graph ${edge.from} -> ${edge.to}; no part of the delta was accepted`
+        );
+      }
+      return edge;
     })
     : [];
   return {
@@ -405,107 +696,449 @@ export function expandProjectionDraft(input: {
   };
 }
 
+export function validateProjectionDraftIntegrity(
+  value: unknown,
+  options: ProjectionDraftValidationOptions = {}
+): void {
+  const record = isRecord(value) ? value : undefined;
+  const draft = record && isRecord(record.graphDelta) ? record.graphDelta : record;
+  if (!draft) {
+    throw new ProjectionDraftIntegrityError("Projection delta must be an object; no part of the delta was accepted");
+  }
+  if (!Array.isArray(draft.nodes) || !Array.isArray(draft.edges)) {
+    throw new ProjectionDraftIntegrityError(
+      "Projection delta must contain both nodes and edges arrays; no part of the delta was accepted"
+    );
+  }
+  const serializedBytes = Buffer.byteLength(JSON.stringify(draft), "utf8");
+  if (serializedBytes > PROJECTOR_MAX_DELTA_BYTES) {
+    throw new ProjectionDraftIntegrityError(
+      `Projection delta requires ${serializedBytes} UTF-8 bytes; maximum is ${PROJECTOR_MAX_DELTA_BYTES}`
+    );
+  }
+  if (draft.nodes.length > PROJECTOR_MAX_DELTA_NODES) {
+    throw new ProjectionDeltaLimitError("nodes", draft.nodes.length, PROJECTOR_MAX_DELTA_NODES);
+  }
+  if (draft.edges.length > PROJECTOR_MAX_DELTA_EDGES) {
+    throw new ProjectionDeltaLimitError("edges", draft.edges.length, PROJECTOR_MAX_DELTA_EDGES);
+  }
+
+  const declaredAliases = new Set<string>();
+  const unknownExistingAliases = new Set<string>();
+  const taskGraphAliases = new Map<string, string>();
+  const conflictingExistingAliases = new Set<string>();
+  for (const [index, valueNode] of draft.nodes.entries()) {
+    if (!isRecord(valueNode)) {
+      throw new ProjectionDraftIntegrityError(
+        `Projection node at index ${index} is not an object; no part of the delta was accepted`
+      );
+    }
+    const unexpectedNodeKeys = Object.keys(valueNode).filter((key) => !PROJECTION_NODE_KEYS.has(key));
+    if (unexpectedNodeKeys.length > 0) {
+      throw new ProjectionDraftIntegrityError(
+        `Projection node at index ${index} has unexpected top-level keys [${unexpectedNodeKeys.join(", ")}]; nodes only allow id, graphKind, type, label, properties, evidenceRefs — move metadata such as status/target/description into properties. No part of the delta was accepted`
+      );
+    }
+    const nodeGraphKind = String(valueNode.graphKind ?? "");
+    const allowedNodeTypes = PROJECTION_NODE_TYPES[nodeGraphKind];
+    if (!allowedNodeTypes) {
+      throw new ProjectionDraftIntegrityError(
+        `Projection node at index ${index} has graphKind ${JSON.stringify(valueNode.graphKind ?? null)}; expected "operation" or "reasoning". No part of the delta was accepted`
+      );
+    }
+    const nodeType = String(valueNode.type ?? "");
+    if (!allowedNodeTypes.includes(nodeType)) {
+      throw new ProjectionDraftIntegrityError(
+        `Projection node at index ${index} (${nodeGraphKind}) has type ${JSON.stringify(valueNode.type ?? null)}; valid ${nodeGraphKind} types: ${allowedNodeTypes.join(", ")}. No part of the delta was accepted`
+      );
+    }
+    const alias = String(valueNode.id ?? "").trim();
+    if (!/^(existing|new):[1-9][0-9]*$/.test(alias)) {
+      throw new ProjectionDraftIntegrityError(
+        `Projection node at index ${index} has invalid alias ${alias || "<empty>"}; no part of the delta was accepted`
+      );
+    }
+    if (declaredAliases.has(alias)) {
+      throw new ProjectionDraftIntegrityError(
+        `Projection node alias ${alias} is declared more than once; no part of the delta was accepted`
+      );
+    }
+    declaredAliases.add(alias);
+    if (alias.startsWith("existing:") && options.existingAliases) {
+      const existing = options.existingAliases.get(alias);
+      if (!existing) {
+        unknownExistingAliases.add(alias);
+      } else if (existing.graphKind === "task") {
+        taskGraphAliases.set(alias, existing.type);
+      } else if (valueNode.graphKind !== existing.graphKind || valueNode.type !== existing.type) {
+        conflictingExistingAliases.add(
+          `${alias} expected ${existing.graphKind}/${existing.type}, received ${String(valueNode.graphKind)}/${String(valueNode.type)}`
+        );
+      }
+    }
+  }
+
+  const missingNewAliases = new Set<string>();
+  const referencedNewAliases = new Set<string>();
+  for (const [index, valueEdge] of draft.edges.entries()) {
+    if (!isRecord(valueEdge)) {
+      throw new ProjectionDraftIntegrityError(
+        `Projection edge at index ${index} is not an object; no part of the delta was accepted`
+      );
+    }
+    const unexpectedEdgeKeys = Object.keys(valueEdge).filter((key) => !PROJECTION_EDGE_KEYS.has(key));
+    if (unexpectedEdgeKeys.length > 0) {
+      throw new ProjectionDraftIntegrityError(
+        `Projection edge at index ${index} has unexpected top-level keys [${unexpectedEdgeKeys.join(", ")}]; edges only allow from, to, type, properties, evidenceRefs. No part of the delta was accepted`
+      );
+    }
+    const edgeType = String(valueEdge.type ?? "");
+    if (!PROJECTION_EDGE_TYPES.includes(edgeType)) {
+      throw new ProjectionDraftIntegrityError(
+        `Projection edge at index ${index} has type ${JSON.stringify(valueEdge.type ?? null)}; valid edge types: ${PROJECTION_EDGE_TYPES.join(", ")}. No part of the delta was accepted`
+      );
+    }
+    for (const endpoint of [valueEdge.from, valueEdge.to]) {
+      const alias = String(endpoint ?? "").trim();
+      if (!/^(existing|new):[1-9][0-9]*$/.test(alias)) {
+        throw new ProjectionDraftIntegrityError(
+          `Projection edge at index ${index} has invalid endpoint alias ${alias || "<empty>"}; no part of the delta was accepted`
+        );
+      }
+      if (alias.startsWith("new:") && !declaredAliases.has(alias)) {
+        missingNewAliases.add(alias);
+      }
+      if (alias.startsWith("new:")) {
+        referencedNewAliases.add(alias);
+      }
+      if (alias.startsWith("existing:") && options.existingAliases) {
+        const existing = options.existingAliases.get(alias);
+        if (!existing) {
+          unknownExistingAliases.add(alias);
+        } else if (existing.graphKind === "task") {
+          taskGraphAliases.set(alias, existing.type);
+        }
+      }
+    }
+  }
+  if (missingNewAliases.size > 0) {
+    throw new ProjectionDraftIntegrityError(
+      `Projection delta is incomplete: edges reference undeclared new aliases ${[...missingNewAliases].join(", ")}; re-submit the complete nodes and edges together. No part of the delta was accepted`
+    );
+  }
+  if (unknownExistingAliases.size > 0) {
+    throw new ProjectionDraftIntegrityError(
+      `Projection delta references unknown existing aliases ${[...unknownExistingAliases].join(", ")}; use only existing aliases from this graph context. No part of the delta was accepted`
+    );
+  }
+  if (taskGraphAliases.size > 0) {
+    throw new ProjectionDraftIntegrityError(
+      `Projection delta cannot mutate task graph aliases ${[...taskGraphAliases].map(([alias, type]) => `${alias}(${type})`).join(", ")}; no part of the delta was accepted`
+    );
+  }
+  if (conflictingExistingAliases.size > 0) {
+    throw new ProjectionDraftIntegrityError(
+      `Projection delta conflicts with existing node identity: ${[...conflictingExistingAliases].join(", ")}; no part of the delta was accepted`
+    );
+  }
+  const unconnectedSemanticAliases = [...declaredAliases].filter((alias) => {
+    const node = (draft.nodes as unknown[]).find((candidate: unknown) => (
+      isRecord(candidate) && candidate.id === alias
+    ));
+    return alias.startsWith("new:")
+      && isRecord(node)
+      && node.graphKind === "reasoning"
+      && !referencedNewAliases.has(alias);
+  });
+  if (unconnectedSemanticAliases.length > 0) {
+    throw new ProjectionDraftIntegrityError(
+      `Projection delta contains unconnected semantic nodes ${unconnectedSemanticAliases.join(", ")}; connect each node with evidence-backed edges or omit it, then re-submit the complete delta. No part of the delta was accepted`
+    );
+  }
+}
+
+export function projectionExistingAliasContext(
+  context: ProjectionGraphContext
+): Map<string, { graphKind: GraphNode["graphKind"]; type: string }> {
+  return new Map(context.nodes.map((node) => [node.ref, {
+    graphKind: node.graphKind,
+    type: node.type
+  }]));
+}
+
 export function renderProjectionObservations(observations: ProjectionObservation[]): string {
   if (observations.length === 0) {
     return "无可投影 observation。";
   }
   return observations.map((observation) => [
     `${observation.ref} [${observation.kind}] seq=${observation.seqStart}-${observation.seqEnd} status=${observation.status}`,
+    observation.fragmentCount && observation.fragmentCount > 1
+      ? `  fragment: ${observation.fragmentIndex ?? 1}/${observation.fragmentCount}`
+      : undefined,
     observation.intent ? `  intent: ${observation.intent}` : undefined,
     observation.action ? `  action: ${observation.action}` : undefined,
     ...(observation.actions ?? []).flatMap((action, index) => [
       `  tool[${index + 1}]: ${action.action} status=${action.status}`,
       action.inputDigest ? `    input: ${action.inputDigest}` : undefined,
-      `    outcome: ${action.outcomeDigest}`
+      action.outcomeDigest ? `    outcome: ${action.outcomeDigest}` : undefined
     ]),
     (observation.repeatCount ?? 1) > 1 ? `  repeated: ${observation.repeatCount}` : undefined,
     !observation.actions && observation.inputDigest ? `  input: ${observation.inputDigest}` : undefined,
-    !observation.actions ? `  outcome: ${observation.outcomeDigest}` : undefined,
+    !observation.actions && observation.outcomeDigest ? `  outcome: ${observation.outcomeDigest}` : undefined,
     observation.interpretation ? `  executor_interpretation: ${observation.interpretation}` : undefined,
     observation.artifactRefs.length > 0 ? `  artifacts: ${observation.artifactRefs.join(", ")}` : undefined,
+    (observation.capabilityRefs ?? []).length > 0
+      ? `  capabilities: ${(observation.capabilityRefs ?? []).join(", ")}`
+      : undefined,
     observation.anchors.length > 0 ? `  anchors: ${observation.anchors.join(", ")}` : undefined
   ].filter((line): line is string => Boolean(line)).join("\n")).join("\n");
 }
 
 export function compactProjectionBatchForInput(
   batch: ProjectionBatch,
-  options: { maxObservations: number; maxChars: number }
+  options: { maxObservations: number; maxBytes: number }
 ): ProjectionBatch {
   const maxObservations = Math.max(1, options.maxObservations);
-  const maxChars = Math.max(800, options.maxChars);
-  const taskOutcome = [...batch.observations]
-    .filter((observation) => observation.kind === "task_outcome")
-    .sort((left, right) => right.seqEnd - left.seqEnd)[0];
-  const remaining = batch.observations.filter((observation) => observation !== taskOutcome);
-  const bucketLimit = Math.max(1, maxObservations - (taskOutcome ? 1 : 0));
-  const grouped = remaining.length <= bucketLimit
-    ? remaining
-    : groupProjectionObservations(remaining, bucketLimit);
-  const selected = taskOutcome ? [...grouped, taskOutcome] : grouped;
-  const perObservationChars = Math.max(180, Math.floor(maxChars / Math.max(1, selected.length)) - 100);
-  const observations = selected
-    .sort((left, right) => left.seqEnd - right.seqEnd)
-    .map((observation, index) => compactProjectionObservation(observation, perObservationChars, `o${index + 1}`));
-  return {
-    observations,
-    toSeq: batch.toSeq,
-    sourceEventIds: batch.sourceEventIds
-  };
+  const maxBytes = Math.max(128, options.maxBytes);
+  if (batch.observations.length === 0) {
+    return batch;
+  }
+  const candidates = batch.observations.slice(0, maxObservations);
+  for (let count = candidates.length; count >= 1; count -= 1) {
+    const selected = candidates.slice(0, count);
+    const observations = compactProjectionObservationsToBytes(selected, maxBytes);
+    if (observations) {
+      const coveredWholeBatch = count === batch.observations.length;
+      return {
+        observations,
+        toSeq: coveredWholeBatch ? batch.toSeq : observations.at(-1)!.seqEnd,
+        sourceEventIds: coveredWholeBatch
+          ? [...batch.sourceEventIds]
+          : dedupeStrings(observations.flatMap((observation) => observation.sourceEventIds))
+      };
+    }
+  }
+  const minimum = compactProjectionObservation(batch.observations[0]!, 0, "o1");
+  throw new ProjectionObservationEnvelopeTooLargeError(
+    projectionObservationBytes([minimum]),
+    maxBytes
+  );
 }
 
-function groupProjectionObservations(
-  observations: ProjectionObservation[],
-  bucketLimit: number
+export function partitionProjectionBatchForInput(
+  batch: ProjectionBatch,
+  options: { maxObservations: number; maxBytes: number }
+): ProjectionBatch[] {
+  if (batch.observations.length === 0) {
+    return [batch];
+  }
+  const maxObservations = Math.max(1, options.maxObservations);
+  const maxBytes = Math.max(128, options.maxBytes);
+  const fragments = batch.observations.flatMap((observation) => (
+    splitProjectionObservationForInput(observation, maxBytes)
+  ));
+  const chunks: ProjectionBatch[] = [];
+  let offset = 0;
+  while (offset < fragments.length) {
+    const candidates = fragments.slice(offset, offset + maxObservations);
+    let selected: ProjectionObservation[] | undefined;
+    for (let count = candidates.length; count >= 1; count -= 1) {
+      selected = compactProjectionObservationsToBytes(candidates.slice(0, count), maxBytes);
+      if (selected) {
+        break;
+      }
+    }
+    if (!selected) {
+      const minimum = compactProjectionObservation(candidates[0]!, 0, "o1");
+      throw new ProjectionObservationEnvelopeTooLargeError(
+        projectionObservationBytes([minimum]),
+        maxBytes
+      );
+    }
+    chunks.push({
+      observations: selected,
+      toSeq: batch.toSeq,
+      sourceEventIds: dedupeStrings(selected.flatMap((observation) => observation.sourceEventIds))
+    });
+    offset += selected.length;
+  }
+  const representedSourceEventIds = new Set(chunks.flatMap((chunk) => chunk.sourceEventIds));
+  const unassignedSourceEventIds = batch.sourceEventIds.filter((eventId) => !representedSourceEventIds.has(eventId));
+  if (unassignedSourceEventIds.length > 0) {
+    const lastChunk = chunks.at(-1)!;
+    lastChunk.sourceEventIds = dedupeStrings([...lastChunk.sourceEventIds, ...unassignedSourceEventIds]);
+  }
+  return chunks;
+}
+
+function splitProjectionObservationForInput(
+  observation: ProjectionObservation,
+  maxBytes: number
 ): ProjectionObservation[] {
-  const bucketSize = Math.ceil(observations.length / bucketLimit);
-  const grouped: ProjectionObservation[] = [];
-  for (let index = 0; index < observations.length; index += bucketSize) {
-    const bucket = observations.slice(index, index + bucketSize);
-    grouped.push({
-      ref: "",
-      kind: bucket.some((observation) => observation.kind === "runtime_error") ? "runtime_error" : "action",
-      seqStart: Math.min(...bucket.map((observation) => observation.seqStart)),
-      seqEnd: Math.max(...bucket.map((observation) => observation.seqEnd)),
-      interpretation: "多个连续 observation 为适配 Projector 输入预算合并，按其中的因果摘要投影。",
-      action: "observation_group",
-      outcomeDigest: causalObservationDigest(bucket, 900),
-      status: bucket.some((observation) => observation.status === "error") ? "error" : "ok",
-      artifactRefs: dedupeStrings(bucket.flatMap((observation) => observation.artifactRefs)).slice(0, 8),
-      anchors: dedupeStrings(bucket.flatMap((observation) => observation.anchors)).slice(0, 12),
-      sourceEventIds: dedupeStrings(bucket.flatMap((observation) => observation.sourceEventIds)),
-      repeatCount: bucket.length
+  const base: ProjectionObservation = {
+    ...observation,
+    ref: "",
+    artifactRefs: [],
+    capabilityRefs: [],
+    anchors: [],
+    sourceEventIds: [],
+    actions: undefined,
+    fragmentIndex: undefined,
+    fragmentCount: undefined
+  };
+  const fragments: ProjectionObservation[] = [];
+  for (const action of observation.actions ?? []) {
+    fragments.push({
+      ...base,
+      actions: [{ ...action }],
+      seqStart: action.seqStart ?? observation.seqStart,
+      seqEnd: action.seqEnd ?? observation.seqEnd,
+      artifactRefs: [...(action.artifactRefs ?? [])],
+      anchors: [...(action.anchors ?? [])],
+      sourceEventIds: [...(action.sourceEventIds ?? [])]
     });
   }
-  return grouped;
+  if (fragments.length === 0) {
+    fragments.push({ ...base });
+  }
+
+  const assignedArtifactRefs = new Set(fragments.flatMap((fragment) => fragment.artifactRefs));
+  const assignedCapabilityRefs = new Set(fragments.flatMap((fragment) => fragment.capabilityRefs ?? []));
+  const assignedAnchors = new Set(fragments.flatMap((fragment) => fragment.anchors));
+  const assignedSourceEventIds = new Set(fragments.flatMap((fragment) => fragment.sourceEventIds));
+  distributeRenderedStructuralValues(
+    fragments,
+    observation.artifactRefs.filter((ref) => !assignedArtifactRefs.has(ref)),
+    "artifactRefs",
+    base,
+    maxBytes
+  );
+  distributeRenderedStructuralValues(
+    fragments,
+    (observation.capabilityRefs ?? []).filter((ref) => !assignedCapabilityRefs.has(ref)),
+    "capabilityRefs",
+    base,
+    maxBytes
+  );
+  distributeRenderedStructuralValues(
+    fragments,
+    observation.anchors.filter((anchor) => !assignedAnchors.has(anchor)),
+    "anchors",
+    base,
+    maxBytes
+  );
+  const unassignedSourceEventIds = observation.sourceEventIds
+    .filter((eventId) => !assignedSourceEventIds.has(eventId));
+  for (const [index, eventId] of unassignedSourceEventIds.entries()) {
+    const target = fragments[index % fragments.length]!;
+    target.sourceEventIds = dedupeStrings([...target.sourceEventIds, eventId]);
+  }
+
+  for (const fragment of fragments) {
+    const minimum = compactProjectionObservation(fragment, 0, "o1");
+    const minimumBytes = projectionObservationBytes([minimum]);
+    if (minimumBytes > maxBytes) {
+      throw new ProjectionObservationEnvelopeTooLargeError(minimumBytes, maxBytes);
+    }
+  }
+  return fragments.map((fragment, index) => ({
+    ...fragment,
+    fragmentIndex: index + 1,
+    fragmentCount: fragments.length
+  }));
+}
+
+function distributeRenderedStructuralValues(
+  fragments: ProjectionObservation[],
+  values: string[],
+  key: "artifactRefs" | "capabilityRefs" | "anchors",
+  base: ProjectionObservation,
+  maxBytes: number
+): void {
+  for (const value of values) {
+    let target = fragments.at(-1)!;
+    const candidate = { ...target, [key]: [...(target[key] ?? []), value] };
+    const minimum = compactProjectionObservation(candidate, 0, "o1");
+    if (projectionObservationBytes([minimum]) > maxBytes) {
+      target = { ...base };
+      fragments.push(target);
+    }
+    target[key] = dedupeStrings([...(target[key] ?? []), value]);
+  }
+}
+
+function compactProjectionObservationsToBytes(
+  observations: ProjectionObservation[],
+  maxBytes: number
+): ProjectionObservation[] | undefined {
+  const normalized = observations.map((observation, index) => ({
+    ...observation,
+    ref: `o${index + 1}`
+  }));
+  if (projectionObservationBytes(normalized) <= maxBytes) {
+    return normalized;
+  }
+  const minimum = normalized.map((observation, index) => (
+    compactProjectionObservation(observation, 0, `o${index + 1}`)
+  ));
+  if (projectionObservationBytes(minimum) > maxBytes) {
+    return undefined;
+  }
+  let lowerBound = 0;
+  let upperBound = maxBytes;
+  let best = minimum;
+  while (lowerBound <= upperBound) {
+    const textBytes = Math.floor((lowerBound + upperBound) / 2);
+    const candidate = normalized.map((observation, index) => (
+      compactProjectionObservation(observation, textBytes, `o${index + 1}`)
+    ));
+    if (projectionObservationBytes(candidate) <= maxBytes) {
+      best = candidate;
+      lowerBound = textBytes + 1;
+    } else {
+      upperBound = textBytes - 1;
+    }
+  }
+  return best;
 }
 
 function compactProjectionObservation(
   observation: ProjectionObservation,
-  maxChars: number,
+  textBytes: number,
   ref: string
 ): ProjectionObservation {
-  const fieldLimit = Math.max(60, Math.floor(maxChars / 3));
-  const actions = observation.actions?.slice(0, 8).map((action) => ({
+  const actions = observation.actions?.map((action) => ({
     ...action,
-    inputDigest: action.inputDigest ? compactHeadTail(action.inputDigest, Math.max(50, Math.floor(fieldLimit / 2))) : undefined,
-    outcomeDigest: compactHeadTail(action.outcomeDigest, fieldLimit)
+    inputDigest: action.inputDigest ? compactUtf8HeadTail(action.inputDigest, textBytes) : undefined,
+    outcomeDigest: compactUtf8HeadTail(action.outcomeDigest, textBytes)
   }));
   return {
     ...observation,
     ref,
-    intent: observation.intent ? compactHeadTail(observation.intent, fieldLimit) : undefined,
-    interpretation: observation.interpretation ? compactHeadTail(observation.interpretation, fieldLimit) : undefined,
-    inputDigest: observation.inputDigest ? compactHeadTail(observation.inputDigest, fieldLimit) : undefined,
-    outcomeDigest: compactHeadTail(observation.outcomeDigest, actions ? Math.max(80, fieldLimit) : Math.max(120, fieldLimit * 2)),
+    intent: observation.intent ? compactUtf8HeadTail(observation.intent, textBytes) : undefined,
+    interpretation: observation.interpretation ? compactUtf8HeadTail(observation.interpretation, textBytes) : undefined,
+    inputDigest: observation.inputDigest ? compactUtf8HeadTail(observation.inputDigest, textBytes) : undefined,
+    outcomeDigest: compactUtf8HeadTail(observation.outcomeDigest, textBytes),
     actions,
-    artifactRefs: observation.artifactRefs.slice(0, 4),
-    anchors: observation.anchors.slice(0, 8)
+    artifactRefs: [...observation.artifactRefs],
+    capabilityRefs: [...(observation.capabilityRefs ?? [])],
+    anchors: [...observation.anchors],
+    sourceEventIds: [...observation.sourceEventIds]
   };
 }
 
+function projectionObservationBytes(observations: ProjectionObservation[]): number {
+  return Buffer.byteLength(renderProjectionObservations(observations), "utf8");
+}
+
 export function renderProjectionGraphContext(context: ProjectionGraphContext): string {
+  const omittedNodeCount = Math.max(0, context.sourceNodeCount - context.nodes.length);
+  const omittedEdgeCount = Math.max(0, context.sourceEdgeCount - context.edges.length);
+  const sourceSummary = omittedNodeCount > 0 || omittedEdgeCount > 0
+    ? `GraphStore closure: nodes=${context.sourceNodeCount} edges=${context.sourceEdgeCount}; byte view omitted nodes=${omittedNodeCount} edges=${omittedEdgeCount}. Use graph_search/query/trace for omitted semantics.`
+    : undefined;
   if (context.nodes.length === 0) {
-    return "无已有相关图节点。";
+    return ["无已有相关图节点。", sourceSummary].filter((line): line is string => Boolean(line)).join("\n");
   }
   const nodeLines = context.nodes.map((node) => (
     `${node.ref} ${node.graphKind}/${node.type} ${node.label}${Object.keys(node.properties).length > 0 ? ` ${JSON.stringify(node.properties)}` : ""}`
@@ -517,8 +1150,9 @@ export function renderProjectionGraphContext(context: ProjectionGraphContext): s
     "相关图节点：",
     ...(nodeLines.length > 0 ? nodeLines : ["无"]),
     "可见拓扑：",
-    ...(edgeLines.length > 0 ? edgeLines : ["无"])
-  ].join("\n");
+    ...(edgeLines.length > 0 ? edgeLines : ["无"]),
+    sourceSummary
+  ].filter((line): line is string => Boolean(line)).join("\n");
 }
 
 function stableOperationNodeId(node: Record<string, unknown>): string | undefined {
@@ -680,6 +1314,24 @@ function compactTaskOutcome(event: ExecutionEvent): string {
   );
 }
 
+function connectivityAnchors(payload: Record<string, unknown>): string[] {
+  const scalarKeys = [
+    "routeRef",
+    "connectionRef",
+    "sessionRef",
+    "pivotHostRef",
+    "hostRef",
+    "dialAddress"
+  ];
+  return dedupeStrings([
+    ...scalarKeys.flatMap((key) => {
+      const value = textProperty(payload[key]);
+      return value ? [value] : [];
+    }),
+    ...stringArray(payload.targetCidrs)
+  ]);
+}
+
 function compactValue(value: unknown, maxChars: number): string | undefined {
   if (value === undefined || value === null) {
     return undefined;
@@ -738,7 +1390,7 @@ function coalesceProjectionObservations(observations: ProjectionObservation[]): 
       interpretation: observation.interpretation ?? previous.interpretation,
       inputDigest: mergeObservationInputs(previous.inputDigest, observation.inputDigest, repeatCount),
       artifactRefs: dedupeStrings([...previous.artifactRefs, ...observation.artifactRefs]),
-      anchors: dedupeStrings([...previous.anchors, ...observation.anchors]).slice(0, 4),
+      anchors: dedupeStrings([...previous.anchors, ...observation.anchors]),
       sourceEventIds: dedupeStrings([...previous.sourceEventIds, ...observation.sourceEventIds]),
       repeatCount
     };
@@ -750,7 +1402,8 @@ function canCoalesceObservations(left: ProjectionObservation, right: ProjectionO
   if (left.kind !== "action" || right.kind !== "action" || left.actions || right.actions) {
     return false;
   }
-  return left.action === right.action
+  return (left.repeatCount ?? 1) < MAX_REPEATED_ACTIONS_PER_OBSERVATION
+    && left.action === right.action
     && left.status === right.status
     && semanticFingerprint(left.outcomeDigest) === semanticFingerprint(right.outcomeDigest)
     && semanticFingerprint(left.anchors.join("|")) === semanticFingerprint(right.anchors.join("|"));
@@ -807,6 +1460,62 @@ function compactHeadTail(value: string, maxChars: number): string {
   const headLength = Math.ceil(available * 0.55);
   const tailLength = Math.max(0, available - headLength);
   return `${normalized.slice(0, headLength)}${marker}${normalized.slice(-tailLength)}`;
+}
+
+export function compactUtf8HeadTail(value: string, maxBytes: number): string {
+  const normalized = normalizeWhitespace(value);
+  if (Buffer.byteLength(normalized, "utf8") <= maxBytes) {
+    return normalized;
+  }
+  if (maxBytes <= 0) {
+    return "";
+  }
+  const omittedBytes = Buffer.byteLength(normalized, "utf8") - maxBytes;
+  const marker = `...[${Math.max(1, omittedBytes)} bytes omitted]...`;
+  const markerBytes = Buffer.byteLength(marker, "utf8");
+  if (markerBytes >= maxBytes) {
+    return utf8Prefix(marker, maxBytes);
+  }
+  const availableBytes = maxBytes - markerBytes;
+  const headBytes = Math.ceil(availableBytes * 0.55);
+  const tailBytes = Math.max(0, availableBytes - headBytes);
+  return `${utf8Prefix(normalized, headBytes)}${marker}${utf8Suffix(normalized, tailBytes)}`;
+}
+
+function utf8Prefix(value: string, maxBytes: number): string {
+  if (maxBytes <= 0) {
+    return "";
+  }
+  let result = "";
+  let usedBytes = 0;
+  for (const character of value) {
+    const characterBytes = Buffer.byteLength(character, "utf8");
+    if (usedBytes + characterBytes > maxBytes) {
+      break;
+    }
+    result += character;
+    usedBytes += characterBytes;
+  }
+  return result;
+}
+
+function utf8Suffix(value: string, maxBytes: number): string {
+  if (maxBytes <= 0) {
+    return "";
+  }
+  const characters = Array.from(value);
+  let result = "";
+  let usedBytes = 0;
+  for (let index = characters.length - 1; index >= 0; index -= 1) {
+    const character = characters[index]!;
+    const characterBytes = Buffer.byteLength(character, "utf8");
+    if (usedBytes + characterBytes > maxBytes) {
+      break;
+    }
+    result = character + result;
+    usedBytes += characterBytes;
+  }
+  return result;
 }
 
 function compactNodeProperties(properties: Record<string, unknown>): Record<string, unknown> {
@@ -901,7 +1610,7 @@ function extractAnchors(value: string): string[] {
       anchors.push(path);
     }
   }
-  return dedupeStrings(anchors).slice(0, 4);
+  return dedupeStrings(anchors);
 }
 
 function isRuntimeContextAction(action: string, inputDigest?: string, outcomeDigest?: string): boolean {
