@@ -63,6 +63,9 @@ LuaN1aoAgent v2 将职责拆分为三类角色：
 
 ## <a id="showcase"></a>🖥️ 项目展示
 
+https://github.com/user-attachments/assets/85febe15-0644-496a-888d-905fbf5f4d5f
+<p align="center"><strong>演示视频</strong></p>
+
 <p align="center">
   <img src="docs/assets/workbench-live-trace.png" alt="LuaN1aoAgent v2 实时 Agent 轨迹，展示思考、动作、Artifact 和运行状态检查" width="100%" />
 </p>
