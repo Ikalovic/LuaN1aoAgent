@@ -61,10 +61,12 @@ test("projector terminal tool bounds the wire schema and enforces draft semantic
       nodes: {
         maxItems?: number;
         items?: {
-          properties?: {
-            id?: { pattern?: string };
-            graphKind?: { minLength?: number; maxLength?: number };
-          };
+          anyOf?: Array<{
+            properties?: {
+              id?: { pattern?: string };
+            };
+            additionalProperties?: boolean;
+          }>;
         };
       };
       edges: {
@@ -81,12 +83,13 @@ test("projector terminal tool bounds the wire schema and enforces draft semantic
     additionalProperties?: boolean;
   };
 
-  // The wire schema only checks field shapes and bounds; vocabulary and
-  // connectivity are enforced by validateProjectionDraftIntegrity so model
-  // mistakes get actionable feedback instead of opaque schema rejections.
+  // The wire schema constrains aliases, graph vocabulary and unexpected keys;
+  // cross-record identity and connectivity remain deterministic runtime checks.
   assert.equal(schema.properties.nodes.maxItems, 24);
   assert.equal(schema.properties.edges.maxItems, 40);
-  assert.equal(schema.properties.nodes.items?.properties?.id?.pattern, "^(existing|new):[1-9][0-9]*$");
+  assert.equal(schema.properties.nodes.items?.anyOf?.[0]?.properties?.id?.pattern, "^(existing|new):[1-9][0-9]*$");
+  assert.equal(schema.properties.nodes.items?.anyOf?.[0]?.additionalProperties, false);
+  assert.equal(schema.properties.nodes.items?.anyOf?.[1]?.additionalProperties, false);
   assert.equal(schema.properties.edges.items?.properties?.from?.pattern, "^(existing|new):[1-9][0-9]*$");
   assert.equal(schema.properties.edges.items?.properties?.to?.pattern, "^(existing|new):[1-9][0-9]*$");
   assert.equal(schema.properties.sourceEventIds, undefined);
@@ -122,13 +125,28 @@ test("projector terminal tool bounds the wire schema and enforces draft semantic
     edges: []
   }), false);
 
-  // Shape-valid but semantically invalid drafts pass the wire schema and are
-  // rejected by execute with messages naming the offending node or edge.
+  // Invalid graph vocabulary and misplaced metadata are rejected at the wire
+  // boundary before the terminating tool can accept them.
   const vocabularyDraft = {
     nodes: [{ id: "new:1", graphKind: "bogus", type: "Nope", label: "Wrong vocabulary" }],
     edges: []
   };
-  assert.equal(Check(tool.parameters, vocabularyDraft), true);
+  assert.equal(Check(tool.parameters, vocabularyDraft), false);
+  assert.equal(Check(tool.parameters, {
+    nodes: [{ id: "new:1", graphKind: "reasoning", type: "Evidence", label: "Extra keys", status: "confirmed" }],
+    edges: []
+  }), false);
+  assert.equal(Check(tool.parameters, {
+    nodes: [],
+    edges: [{ from: "existing:1", to: "existing:2", type: "depends_on" }]
+  }), false);
+  assert.equal(Check(tool.parameters, {
+    nodes: [{ id: "new:1", graphKind: "reasoning", label: "Missing type" }],
+    edges: []
+  }), false);
+
+  // Direct execute calls still retain actionable deterministic validation for
+  // providers or legacy paths that do not enforce the advertised schema.
   await assert.rejects(
     () => tool.execute(
       "call:projector:vocabulary",
@@ -273,7 +291,7 @@ test("projector terminal tool validates existing aliases against only its curren
       () => undefined,
       {} as never
     ),
-    /cannot mutate task graph aliases existing:3\(Goal\); no part of the delta was accepted/
+    /cannot mutate task graph aliases existing:3\(Goal\); no part of the delta was accepted/i
   );
 
   await assert.rejects(
@@ -284,7 +302,7 @@ test("projector terminal tool validates existing aliases against only its curren
       () => undefined,
       {} as never
     ),
-    /cannot mutate task graph aliases existing:3\(Goal\); no part of the delta was accepted/
+    /cannot mutate task graph aliases existing:3\(Goal\); no part of the delta was accepted/i
   );
 });
 
@@ -427,6 +445,14 @@ test("projector graph tools share one stable alias namespace through submission"
     properties: { ip: "10.0.0.8" },
     evidenceRefs: ["event:discovered"]
   };
+  const hiddenTaskNode = {
+    id: "task:hidden-from-projector",
+    graphKind: "task" as const,
+    type: "Task",
+    label: "Hidden task",
+    properties: { status: "open" },
+    evidenceRefs: ["event:task"]
+  };
   const graphContext = aliasProjectionGraphContext({ nodes: [seedNode], edges: [] });
   const references = new ProjectorGraphRefRegistry(graphContext);
   let queryFocusNodeIds: string[] | undefined;
@@ -437,7 +463,7 @@ test("projector graph tools share one stable alias namespace through submission"
       queryFocusNodeIds = focusNodeIds;
       return {
         view: "planner",
-        nodes: [seedNode, discoveredNode],
+        nodes: [seedNode, discoveredNode, hiddenTaskNode],
         edges: [{
           id: "edge:internal",
           from: seedNode.id,
@@ -445,6 +471,13 @@ test("projector graph tools share one stable alias namespace through submission"
           type: "observed_on",
           properties: {},
           evidenceRefs: ["event:discovered"]
+        }, {
+          id: "edge:task",
+          from: hiddenTaskNode.id,
+          to: discoveredNode.id,
+          type: "requires_evidence",
+          properties: {},
+          evidenceRefs: ["event:task"]
         }],
         summary: { focusNodeIds: [seedNode.id] }
       } satisfies GraphSnapshot;
@@ -473,9 +506,12 @@ test("projector graph tools share one stable alias namespace through submission"
   const searchTool = createGraphSearchTool(graphStore, references);
   const submitTool = createGraphDeltaSubmitTool({ existingAliases: references.aliasContext() });
 
+  assert.equal(Check(queryTool.parameters, { view: "operation", focusNodeIds: ["existing:1"] }), true);
+  assert.equal(Check(queryTool.parameters, { view: "planner", focusNodeIds: ["existing:1"] }), false);
+  assert.equal(Check(queryTool.parameters, { view: "task", focusNodeIds: ["existing:1"] }), false);
   const queryResult = await queryTool.execute(
     "call:projector-query",
-    { view: "planner", focusNodeIds: ["existing:1"], limit: 20 },
+    { view: "operation", focusNodeIds: ["existing:1"], limit: 20 },
     new AbortController().signal,
     () => undefined,
     {} as never
@@ -500,7 +536,7 @@ test("projector graph tools share one stable alias namespace through submission"
   }]);
   assert.deepEqual(queryPage.summary.focusNodeIds, ["existing:1"]);
   assert.deepEqual(queryPage.page.missingFocusNodeIds, []);
-  assert.doesNotMatch(queryText, /projected:(seed|discovered)-node|edge:internal/);
+  assert.doesNotMatch(queryText, /projected:(seed|discovered)-node|edge:internal|task:hidden-from-projector|Hidden task/);
 
   const traceResult = await traceTool.execute(
     "call:projector-trace",

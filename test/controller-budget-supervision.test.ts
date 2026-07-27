@@ -1482,6 +1482,9 @@ test("projector input uses compact artifact index and graph context", async () =
   assert.match(prompt, /middle-breakthrough-marker/);
   assert.match(prompt, /taskOutcome=.*"status":"partial"/);
   assert.ok(prompt.includes(artifactRefs.at(-1)!));
+  const projectorGraphContext = prompt.match(/<graph_context>\n([\s\S]*?)\n<\/graph_context>/)?.[1] ?? "";
+  assert.doesNotMatch(projectorGraphContext, /existing:\d+ task\/(?:Task|Scope|Goal|Milestone|Blocker)/);
+  assert.doesNotMatch(projectorGraphContext, /task:|scope:|goal:/);
   assert.doesNotMatch(prompt, /  head:|  tail:/);
   assert.doesNotMatch(prompt, /ARTIFACT_MANIFEST:|CURRENT_GRAPH_SLICE:/);
   assert.doesNotMatch(prompt, /artifact:graph-noise/);

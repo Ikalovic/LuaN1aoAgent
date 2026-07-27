@@ -6,8 +6,11 @@ import { chmod, copyFile, lstat, mkdir, realpath, rename, unlink } from "node:fs
 import { basename, extname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { compactExecutionEvents } from "../log-summary.js";
 import {
+  PROJECTION_EDGE_TYPES,
   PROJECTOR_MAX_DELTA_EDGES,
   PROJECTOR_MAX_DELTA_NODES,
+  PROJECTION_OPERATION_NODE_TYPES,
+  PROJECTION_REASONING_NODE_TYPES,
   validateProjectionDraftIntegrity,
   type ProjectionDraftValidationOptions,
   type ProjectorGraphRefRegistry
@@ -26,26 +29,44 @@ const GraphNodeCommonProperties = {
 };
 
 const ProjectorGraphNodeCommonProperties = {
-  ...GraphNodeCommonProperties,
-  id: Type.String({ pattern: "^(existing|new):[1-9][0-9]*$", maxLength: 32 })
+  id: Type.String({ pattern: "^(existing|new):[1-9][0-9]*$", maxLength: 32 }),
+  label: Type.String({ minLength: 1 }),
+  properties: Type.Optional(Type.Record(Type.String(), Type.Unknown(), {
+    description: "Node metadata including status, target, description, severity, artifactRef and artifactRefs."
+  })),
+  evidenceRefs: Type.Optional(Type.Array(Type.String()))
 };
 
-// graphKind/type vocabulary and unexpected keys are rejected by
-// validateProjectionDraftIntegrity with actionable messages; the wire schema
-// only checks field shapes so model mistakes get precise feedback.
-const ProjectorGraphNodeSchema = Type.Object({
-  ...ProjectorGraphNodeCommonProperties,
-  graphKind: Type.String({ minLength: 1, maxLength: 32 }),
-  type: Type.String({ minLength: 1, maxLength: 64 })
-});
+const ProjectorOperationNodeTypeSchema = Type.Union(
+  PROJECTION_OPERATION_NODE_TYPES.map((type) => Type.Literal(type))
+);
+const ProjectorReasoningNodeTypeSchema = Type.Union(
+  PROJECTION_REASONING_NODE_TYPES.map((type) => Type.Literal(type))
+);
+const ProjectorEdgeTypeSchema = Type.Union(
+  PROJECTION_EDGE_TYPES.map((type) => Type.Literal(type))
+);
+
+const ProjectorGraphNodeSchema = Type.Union([
+  Type.Object({
+    ...ProjectorGraphNodeCommonProperties,
+    graphKind: Type.Literal("operation"),
+    type: ProjectorOperationNodeTypeSchema
+  }, { additionalProperties: false }),
+  Type.Object({
+    ...ProjectorGraphNodeCommonProperties,
+    graphKind: Type.Literal("reasoning"),
+    type: ProjectorReasoningNodeTypeSchema
+  }, { additionalProperties: false })
+]);
 
 const ProjectorGraphEdgeSchema = Type.Object({
   from: Type.String({ pattern: "^(existing|new):[1-9][0-9]*$", maxLength: 32 }),
   to: Type.String({ pattern: "^(existing|new):[1-9][0-9]*$", maxLength: 32 }),
-  type: Type.String({ minLength: 1, maxLength: 64 }),
+  type: ProjectorEdgeTypeSchema,
   properties: Type.Optional(Type.Record(Type.String(), Type.Unknown())),
   evidenceRefs: Type.Optional(Type.Array(Type.String()))
-});
+}, { additionalProperties: false });
 
 const PlannerTaskIdSchema = Type.String({ pattern: "^task:.+", minLength: 6, maxLength: 256 });
 const PlannerNodeIdSchema = Type.String({ minLength: 1, maxLength: 256 });
@@ -229,18 +250,25 @@ export function createGraphQueryTool(
   cache?: Map<string, string>,
   materials?: GraphToolMaterialsResolver
 ) {
+  const viewSchema = references
+    ? Type.Union([
+      Type.Literal("reasoning"),
+      Type.Literal("operation"),
+      Type.Literal("sessions")
+    ])
+    : Type.Union([
+      Type.Literal("planner"),
+      Type.Literal("reasoning"),
+      Type.Literal("operation"),
+      Type.Literal("task"),
+      Type.Literal("sessions")
+    ]);
   return defineTool({
     name: "graph_query",
     label: "Graph Query",
     description: "Read a byte-bounded closed tri-graph page when the initial view is insufficient. Returned edges always include both endpoint nodes; use nextCursor with unchanged arguments for continuation.",
     parameters: Type.Object({
-      view: Type.Union([
-        Type.Literal("planner"),
-        Type.Literal("reasoning"),
-        Type.Literal("operation"),
-        Type.Literal("task"),
-        Type.Literal("sessions")
-      ]),
+      view: viewSchema,
       focusNodeIds: Type.Optional(Type.Array(Type.String({ minLength: 1, maxLength: 256 }), { maxItems: 32 })),
       limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 200 })),
       cursor: Type.Optional(Type.String({ minLength: 1, maxLength: 256 }))

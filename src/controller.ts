@@ -53,6 +53,7 @@ import {
   compactProjectionBatchForInput,
   compactUtf8HeadTail,
   expandProjectionDraft,
+  filterProjectorSemanticGraph,
   observationDigest,
   partitionProjectionBatchForInput,
   PROJECTOR_MAX_DELTA_NODES,
@@ -3221,7 +3222,7 @@ export class SecurityAgentController {
       nodeLimit: 64,
       edgeLimit: 96
     });
-    const fullGraphContext = aliasProjectionGraphContext(closure);
+    const fullGraphContext = aliasProjectionGraphContext(filterProjectorSemanticGraph(closure));
     const artifactIndex = await this.loadProjectorArtifactIndex({
       taskEnvelope: input.input.taskEnvelope,
       taskResult: input.input.taskResult,

@@ -20,16 +20,23 @@ export const PROJECTOR_MAX_DELTA_BYTES = 128 * 1024;
 
 const PROJECTION_NODE_KEYS = new Set(["id", "graphKind", "type", "label", "properties", "evidenceRefs"]);
 const PROJECTION_EDGE_KEYS = new Set(["from", "to", "type", "properties", "evidenceRefs"]);
+export const PROJECTION_OPERATION_NODE_TYPES = [
+  "Host", "Port", "Service", "WebEndpoint", "Parameter", "Credential",
+  "AgentSession", "ShellSession", "Session", "File", "Process"
+] as const;
+export const PROJECTION_REASONING_NODE_TYPES = [
+  "Evidence", "Hypothesis", "Vulnerability", "Exploit"
+] as const;
 const PROJECTION_NODE_TYPES: Record<string, readonly string[]> = {
-  operation: ["Host", "Port", "Service", "WebEndpoint", "Parameter", "Credential", "AgentSession", "ShellSession", "Session", "File", "Process"],
-  reasoning: ["Evidence", "Hypothesis", "Vulnerability", "Exploit"]
+  operation: PROJECTION_OPERATION_NODE_TYPES,
+  reasoning: PROJECTION_REASONING_NODE_TYPES
 };
-const PROJECTION_EDGE_TYPES: readonly string[] = [
+export const PROJECTION_EDGE_TYPES = [
   "supports", "contradicts", "confirms", "promoted_to", "exploited_by", "produces_evidence",
   "observed_on", "affects", "has_port", "runs_service", "exposes_endpoint", "has_parameter",
   "authenticates_to", "creates_session", "session_on", "tunnels_to", "proxy_route",
   "contains_file", "spawns_process"
-];
+] as const;
 
 export type ProjectionObservation = {
   ref: string;
@@ -127,7 +134,7 @@ export class ProjectorGraphRefRegistry {
   private nextAliasIndex = 1;
 
   constructor(context: ProjectionGraphContext) {
-    for (const node of context.nodes) {
+    for (const node of context.nodes.filter(isProjectorSemanticNode)) {
       this.register(node.ref, {
         id: node.id,
         graphKind: node.graphKind,
@@ -174,17 +181,18 @@ export class ProjectorGraphRefRegistry {
   }
 
   aliasSnapshot(snapshot: GraphSnapshot): GraphSnapshot {
-    for (const node of snapshot.nodes) {
+    const visible = filterProjectorSemanticGraph(snapshot);
+    for (const node of visible.nodes) {
       this.intern(node);
     }
-    const nodes = snapshot.nodes.map((node) => ({
+    const nodes = visible.nodes.map((node) => ({
       ...node,
       id: this.intern(node),
       label: this.aliasValue(node.label) as string,
       properties: this.aliasValue(node.properties) as Record<string, unknown>,
       evidenceRefs: this.aliasValue(node.evidenceRefs) as string[] | undefined
     }));
-    const edges = snapshot.edges.map((edge) => ({
+    const edges = visible.edges.map((edge) => ({
       from: this.aliasesByNodeId.get(edge.from) ?? edge.from,
       to: this.aliasesByNodeId.get(edge.to) ?? edge.to,
       type: edge.type,
@@ -508,6 +516,22 @@ export function aliasProjectionGraphContext(input: {
   };
 }
 
+export function filterProjectorSemanticGraph<T extends {
+  nodes: GraphNode[];
+  edges: GraphEdge[];
+}>(input: T): T {
+  const nodes = input.nodes.filter(isProjectorSemanticNode);
+  const visibleNodeIds = new Set(nodes.map((node) => node.id));
+  const edges = input.edges.filter((edge) => (
+    visibleNodeIds.has(edge.from) && visibleNodeIds.has(edge.to)
+  ));
+  return {
+    ...input,
+    nodes,
+    edges
+  };
+}
+
 export function compactProjectionGraphContextForInput(
   context: ProjectionGraphContext,
   maxBytes: number
@@ -723,47 +747,56 @@ export function validateProjectionDraftIntegrity(
     throw new ProjectionDeltaLimitError("edges", draft.edges.length, PROJECTOR_MAX_DELTA_EDGES);
   }
 
+  const errors: string[] = [];
   const declaredAliases = new Set<string>();
+  const declaredNodes = new Map<string, Record<string, unknown>>();
+  const aliasTypes = new Map<string, { graphKind: GraphNode["graphKind"]; type: string }>(
+    options.existingAliases ? [...options.existingAliases.entries()] : []
+  );
   const unknownExistingAliases = new Set<string>();
   const taskGraphAliases = new Map<string, string>();
   const conflictingExistingAliases = new Set<string>();
   for (const [index, valueNode] of draft.nodes.entries()) {
     if (!isRecord(valueNode)) {
-      throw new ProjectionDraftIntegrityError(
-        `Projection node at index ${index} is not an object; no part of the delta was accepted`
-      );
+      errors.push(`Projection node at index ${index} is not an object`);
+      continue;
     }
     const unexpectedNodeKeys = Object.keys(valueNode).filter((key) => !PROJECTION_NODE_KEYS.has(key));
     if (unexpectedNodeKeys.length > 0) {
-      throw new ProjectionDraftIntegrityError(
-        `Projection node at index ${index} has unexpected top-level keys [${unexpectedNodeKeys.join(", ")}]; nodes only allow id, graphKind, type, label, properties, evidenceRefs — move metadata such as status/target/description into properties. No part of the delta was accepted`
+      errors.push(
+        `Projection node at index ${index} has unexpected top-level keys [${unexpectedNodeKeys.join(", ")}]; nodes only allow id, graphKind, type, label, properties, evidenceRefs — move metadata such as status/target/description into properties`
       );
     }
     const nodeGraphKind = String(valueNode.graphKind ?? "");
     const allowedNodeTypes = PROJECTION_NODE_TYPES[nodeGraphKind];
     if (!allowedNodeTypes) {
-      throw new ProjectionDraftIntegrityError(
-        `Projection node at index ${index} has graphKind ${JSON.stringify(valueNode.graphKind ?? null)}; expected "operation" or "reasoning". No part of the delta was accepted`
+      errors.push(
+        `Projection node at index ${index} has graphKind ${JSON.stringify(valueNode.graphKind ?? null)}; expected "operation" or "reasoning"`
       );
     }
     const nodeType = String(valueNode.type ?? "");
-    if (!allowedNodeTypes.includes(nodeType)) {
-      throw new ProjectionDraftIntegrityError(
-        `Projection node at index ${index} (${nodeGraphKind}) has type ${JSON.stringify(valueNode.type ?? null)}; valid ${nodeGraphKind} types: ${allowedNodeTypes.join(", ")}. No part of the delta was accepted`
+    if (allowedNodeTypes && !allowedNodeTypes.includes(nodeType)) {
+      errors.push(
+        `Projection node at index ${index} (${nodeGraphKind}) has type ${JSON.stringify(valueNode.type ?? null)}; valid ${nodeGraphKind} types: ${allowedNodeTypes.join(", ")}`
       );
     }
     const alias = String(valueNode.id ?? "").trim();
     if (!/^(existing|new):[1-9][0-9]*$/.test(alias)) {
-      throw new ProjectionDraftIntegrityError(
-        `Projection node at index ${index} has invalid alias ${alias || "<empty>"}; no part of the delta was accepted`
-      );
+      errors.push(`Projection node at index ${index} has invalid alias ${alias || "<empty>"}`);
+      continue;
     }
     if (declaredAliases.has(alias)) {
-      throw new ProjectionDraftIntegrityError(
-        `Projection node alias ${alias} is declared more than once; no part of the delta was accepted`
-      );
+      errors.push(`Projection node alias ${alias} is declared more than once`);
+      continue;
     }
     declaredAliases.add(alias);
+    declaredNodes.set(alias, valueNode);
+    if (allowedNodeTypes?.includes(nodeType)) {
+      aliasTypes.set(alias, {
+        graphKind: nodeGraphKind as GraphNode["graphKind"],
+        type: nodeType
+      });
+    }
     if (alias.startsWith("existing:") && options.existingAliases) {
       const existing = options.existingAliases.get(alias);
       if (!existing) {
@@ -782,28 +815,31 @@ export function validateProjectionDraftIntegrity(
   const referencedNewAliases = new Set<string>();
   for (const [index, valueEdge] of draft.edges.entries()) {
     if (!isRecord(valueEdge)) {
-      throw new ProjectionDraftIntegrityError(
-        `Projection edge at index ${index} is not an object; no part of the delta was accepted`
-      );
+      errors.push(`Projection edge at index ${index} is not an object`);
+      continue;
     }
     const unexpectedEdgeKeys = Object.keys(valueEdge).filter((key) => !PROJECTION_EDGE_KEYS.has(key));
     if (unexpectedEdgeKeys.length > 0) {
-      throw new ProjectionDraftIntegrityError(
-        `Projection edge at index ${index} has unexpected top-level keys [${unexpectedEdgeKeys.join(", ")}]; edges only allow from, to, type, properties, evidenceRefs. No part of the delta was accepted`
+      errors.push(
+        `Projection edge at index ${index} has unexpected top-level keys [${unexpectedEdgeKeys.join(", ")}]; edges only allow from, to, type, properties, evidenceRefs`
       );
     }
     const edgeType = String(valueEdge.type ?? "");
-    if (!PROJECTION_EDGE_TYPES.includes(edgeType)) {
-      throw new ProjectionDraftIntegrityError(
-        `Projection edge at index ${index} has type ${JSON.stringify(valueEdge.type ?? null)}; valid edge types: ${PROJECTION_EDGE_TYPES.join(", ")}. No part of the delta was accepted`
+    if (!(PROJECTION_EDGE_TYPES as readonly string[]).includes(edgeType)) {
+      const suggestion = suggestProjectionEdgeType(valueEdge, aliasTypes);
+      errors.push(
+        `Projection edge at index ${index} has type ${JSON.stringify(valueEdge.type ?? null)}; ${
+          suggestion
+            ? suggestion
+            : `valid edge types: ${PROJECTION_EDGE_TYPES.join(", ")}`
+        }`
       );
     }
     for (const endpoint of [valueEdge.from, valueEdge.to]) {
       const alias = String(endpoint ?? "").trim();
       if (!/^(existing|new):[1-9][0-9]*$/.test(alias)) {
-        throw new ProjectionDraftIntegrityError(
-          `Projection edge at index ${index} has invalid endpoint alias ${alias || "<empty>"}; no part of the delta was accepted`
-        );
+        errors.push(`Projection edge at index ${index} has invalid endpoint alias ${alias || "<empty>"}`);
+        continue;
       }
       if (alias.startsWith("new:") && !declaredAliases.has(alias)) {
         missingNewAliases.add(alias);
@@ -822,39 +858,92 @@ export function validateProjectionDraftIntegrity(
     }
   }
   if (missingNewAliases.size > 0) {
-    throw new ProjectionDraftIntegrityError(
-      `Projection delta is incomplete: edges reference undeclared new aliases ${[...missingNewAliases].join(", ")}; re-submit the complete nodes and edges together. No part of the delta was accepted`
+    errors.push(
+      `Projection delta is incomplete: edges reference undeclared new aliases ${[...missingNewAliases].join(", ")}; re-submit the complete nodes and edges together`
     );
   }
   if (unknownExistingAliases.size > 0) {
-    throw new ProjectionDraftIntegrityError(
-      `Projection delta references unknown existing aliases ${[...unknownExistingAliases].join(", ")}; use only existing aliases from this graph context. No part of the delta was accepted`
+    errors.push(
+      `Projection delta references unknown existing aliases ${[...unknownExistingAliases].join(", ")}; use only existing aliases from this graph context`
     );
   }
   if (taskGraphAliases.size > 0) {
-    throw new ProjectionDraftIntegrityError(
-      `Projection delta cannot mutate task graph aliases ${[...taskGraphAliases].map(([alias, type]) => `${alias}(${type})`).join(", ")}; no part of the delta was accepted`
+    errors.push(
+      `Projection delta cannot mutate task graph aliases ${[...taskGraphAliases].map(([alias, type]) => `${alias}(${type})`).join(", ")}`
     );
   }
   if (conflictingExistingAliases.size > 0) {
-    throw new ProjectionDraftIntegrityError(
-      `Projection delta conflicts with existing node identity: ${[...conflictingExistingAliases].join(", ")}; no part of the delta was accepted`
+    errors.push(
+      `Projection delta conflicts with existing node identity: ${[...conflictingExistingAliases].join(", ")}`
     );
   }
   const unconnectedSemanticAliases = [...declaredAliases].filter((alias) => {
-    const node = (draft.nodes as unknown[]).find((candidate: unknown) => (
-      isRecord(candidate) && candidate.id === alias
-    ));
+    const node = declaredNodes.get(alias);
     return alias.startsWith("new:")
       && isRecord(node)
       && node.graphKind === "reasoning"
       && !referencedNewAliases.has(alias);
   });
   if (unconnectedSemanticAliases.length > 0) {
-    throw new ProjectionDraftIntegrityError(
-      `Projection delta contains unconnected semantic nodes ${unconnectedSemanticAliases.join(", ")}; connect each node with evidence-backed edges or omit it, then re-submit the complete delta. No part of the delta was accepted`
+    errors.push(
+      `Projection delta contains unconnected semantic nodes ${unconnectedSemanticAliases.join(", ")}; connect each node with evidence-backed edges or omit it, then re-submit the complete delta`
     );
   }
+  if (errors.length > 0) {
+    throw new ProjectionDraftIntegrityError(
+      `Projection delta has ${errors.length} validation error${errors.length === 1 ? "" : "s"}: ${
+        errors.map((error, index) => `[${index + 1}] ${error}`).join("; ")
+      }; No part of the delta was accepted`
+    );
+  }
+}
+
+function suggestProjectionEdgeType(
+  edge: Record<string, unknown>,
+  aliasTypes: ReadonlyMap<string, { graphKind: GraphNode["graphKind"]; type: string }>
+): string | undefined {
+  const fromAlias = String(edge.from ?? "").trim();
+  const toAlias = String(edge.to ?? "").trim();
+  const from = aliasTypes.get(fromAlias);
+  const to = aliasTypes.get(toAlias);
+  if (!from || !to) {
+    return undefined;
+  }
+  const relation = projectionEdgeTypeForEndpoints(from, to);
+  if (relation) {
+    return `for ${from.type} -> ${to.type}, use ${JSON.stringify(relation)}`;
+  }
+  if (from.type === "Exploit" && to.type === "Vulnerability") {
+    return `reverse the endpoints and use "exploited_by" for Vulnerability -> Exploit`;
+  }
+  return undefined;
+}
+
+function projectionEdgeTypeForEndpoints(
+  from: { graphKind: GraphNode["graphKind"]; type: string },
+  to: { graphKind: GraphNode["graphKind"]; type: string }
+): string | undefined {
+  if (from.type === "Host" && to.type === "Port") return "has_port";
+  if (from.type === "Port" && to.type === "Service") return "runs_service";
+  if (from.type === "Service" && to.type === "WebEndpoint") return "exposes_endpoint";
+  if (from.type === "WebEndpoint" && to.type === "Parameter") return "has_parameter";
+  if (from.type === "Credential" && ["Service", "WebEndpoint"].includes(to.type)) return "authenticates_to";
+  if (from.type === "Credential" && isProjectionSessionType(to.type)) return "creates_session";
+  if (isProjectionSessionType(from.type) && to.type === "Host") return "session_on";
+  if (from.type === "Host" && to.type === "File") return "contains_file";
+  if ((from.type === "Host" || isProjectionSessionType(from.type)) && to.type === "Process") return "spawns_process";
+  if (from.type === "Evidence" && to.graphKind === "operation") return "observed_on";
+  if (from.type === "Evidence" && to.type === "Hypothesis") return "supports";
+  if (from.type === "Evidence" && to.type === "Vulnerability") return "confirms";
+  if (from.type === "Hypothesis" && to.type === "Vulnerability") return "promoted_to";
+  if (from.type === "Vulnerability" && to.type === "Exploit") return "exploited_by";
+  if (["Vulnerability", "Exploit"].includes(from.type) && to.graphKind === "operation") return "affects";
+  if (["Evidence", "Exploit"].includes(from.type) && to.type === "Evidence") return "produces_evidence";
+  return undefined;
+}
+
+function isProjectionSessionType(type: string): boolean {
+  return ["AgentSession", "ShellSession", "Session"].includes(type);
 }
 
 export function projectionExistingAliasContext(
@@ -1178,6 +1267,10 @@ function stableOperationalEdgeId(type: string, properties: Record<string, unknow
 function stableIdentity(prefix: string, value: unknown): string | undefined {
   const identity = typeof value === "string" ? value.trim() : "";
   return identity ? `${prefix}:${encodeURIComponent(identity)}` : undefined;
+}
+
+function isProjectorSemanticNode(node: Pick<GraphNode, "graphKind">): boolean {
+  return node.graphKind === "operation" || node.graphKind === "reasoning";
 }
 
 export function observationDigest(observations: ProjectionObservation[], maxChars = 900, limit = 6): string {

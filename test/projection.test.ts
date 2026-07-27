@@ -8,6 +8,7 @@ import {
   compactProjectionBatchForInput,
   compactProjectionGraphContextForInput,
   expandProjectionDraft,
+  filterProjectorSemanticGraph,
   observationDigest,
   partitionProjectionBatchForInput,
   renderProjectionGraphContext,
@@ -317,6 +318,58 @@ test("expands graph aliases and observation evidence refs into stable GraphDelta
   assert.match(renderProjectionGraphContext(graphContext), /existing:1 operation\/WebEndpoint/);
 });
 
+test("filters task and scope nodes before building Projector-visible graph context", () => {
+  const filtered = filterProjectorSemanticGraph({
+    nodes: [{
+      id: "task:read-flag",
+      graphKind: "task",
+      type: "Task",
+      label: "Read flag",
+      properties: {}
+    }, {
+      id: "scope:root",
+      graphKind: "task",
+      type: "Scope",
+      label: "Authorized scope",
+      properties: {}
+    }, {
+      id: "endpoint:flag",
+      graphKind: "operation",
+      type: "WebEndpoint",
+      label: "GET /flag",
+      properties: { path: "/flag" }
+    }, {
+      id: "evidence:flag",
+      graphKind: "reasoning",
+      type: "Evidence",
+      label: "Flag response",
+      properties: {}
+    }],
+    edges: [{
+      from: "task:read-flag",
+      to: "endpoint:flag",
+      type: "requires_evidence"
+    }, {
+      from: "task:read-flag",
+      to: "scope:root",
+      type: "within_scope"
+    }, {
+      from: "evidence:flag",
+      to: "endpoint:flag",
+      type: "observed_on"
+    }]
+  });
+
+  assert.deepEqual(filtered.nodes.map((node) => node.id), ["endpoint:flag", "evidence:flag"]);
+  assert.deepEqual(filtered.edges, [{
+    from: "evidence:flag",
+    to: "endpoint:flag",
+    type: "observed_on"
+  }]);
+  const graphContext = aliasProjectionGraphContext(filtered);
+  assert.doesNotMatch(renderProjectionGraphContext(graphContext), /task\/|Task|Scope|task:|scope:/);
+});
+
 test("projector rejects task graph mutations atomically", () => {
   const graphContext = aliasProjectionGraphContext({
     nodes: [{
@@ -392,7 +445,7 @@ test("projector rejects task graph mutations atomically", () => {
       }],
       edges: [{ from: "existing:1", to: "new:1", type: "observed_on", evidenceRefs: ["o1"] }]
     }
-  }), /cannot mutate task graph aliases existing:1\(Task\); no part of the delta was accepted/);
+  }), /cannot mutate task graph aliases existing:1\(Task\); no part of the delta was accepted/i);
 });
 
 test("rejects unknown edge aliases instead of silently dropping relationships", () => {
@@ -490,6 +543,67 @@ test("rejects malformed projection drafts with actionable per-node and per-edge 
       edges: [{ from: "new:1", to: "new:1", type: "tunnel_to", evidenceRefs: ["o1"] }]
     }
   }), /edge at index 0 has type "tunnel_to"; valid edge types:/);
+});
+
+test("reports all projection draft errors together with endpoint-aware edge suggestions", () => {
+  const graphContext = aliasProjectionGraphContext({ nodes: [], edges: [] });
+  const batch = {
+    observations: [{
+      ref: "o1",
+      kind: "action" as const,
+      seqStart: 1,
+      seqEnd: 1,
+      action: "bash",
+      outcomeDigest: "Observed service and endpoint",
+      status: "ok" as const,
+      artifactRefs: [],
+      anchors: [],
+      sourceEventIds: ["event:1"]
+    }],
+    toSeq: 1,
+    sourceEventIds: ["event:1"]
+  };
+
+  assert.throws(() => expandProjectionDraft({
+    batch,
+    graphContext,
+    value: {
+      nodes: [{
+        id: "new:1",
+        graphKind: "operation",
+        type: "Service",
+        label: "HTTP service",
+        properties: {}
+      }, {
+        id: "new:2",
+        graphKind: "operation",
+        type: "WebEndpoint",
+        label: "GET /",
+        properties: {},
+        artifactRefs: ["artifact:test"]
+      }, {
+        id: "new:3",
+        graphKind: "reasoning",
+        type: "Evidence",
+        label: "Unconnected evidence",
+        properties: {},
+        evidenceRefs: ["o1"]
+      }],
+      edges: [{
+        from: "new:1",
+        to: "new:2",
+        type: "serves_endpoint",
+        evidenceRefs: ["o1"]
+      }]
+    }
+  }), (error: unknown) => {
+    assert.ok(error instanceof Error);
+    assert.match(error.message, /has 3 validation errors/);
+    assert.match(error.message, /unexpected top-level keys \[artifactRefs\]/);
+    assert.match(error.message, /for Service -> WebEndpoint, use "exposes_endpoint"/);
+    assert.match(error.message, /unconnected semantic nodes new:3/);
+    return true;
+  });
 });
 
 test("rejects one Projector submission above the 24/40 delta contract instead of slicing it", () => {
@@ -626,7 +740,7 @@ test("projector rejects explicit global ids outside the alias boundary atomicall
       }],
       edges: []
     }
-  }), /invalid alias evidence:model-chosen-global-id; no part of the delta was accepted/);
+  }), /invalid alias evidence:model-chosen-global-id; no part of the delta was accepted/i);
 });
 
 test("planner observation digest preserves task outcomes and diverse earlier findings", () => {

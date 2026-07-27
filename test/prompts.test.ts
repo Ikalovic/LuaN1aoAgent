@@ -194,6 +194,11 @@ test("projector prompt requests semantic changes instead of one node per observa
   assert.match(OBSERVER_PROJECTOR_SYSTEM_PROMPT, /只允许 id、graphKind、type、label、properties、evidenceRefs 六个顶层键/);
   assert.match(OBSERVER_PROJECTOR_SYSTEM_PROMPT, /operation 节点 type 只能是 Host、Port、Service、WebEndpoint、Parameter、Credential、AgentSession、ShellSession、Session、File、Process/);
   assert.match(OBSERVER_PROJECTOR_SYSTEM_PROMPT, /只修正错误信息点名的节点或边，其余内容原样重交/);
+  assert.match(OBSERVER_PROJECTOR_SYSTEM_PROMPT, /禁止创造 hosted_on、serves_endpoint、targets、exploits、suggests、refines、refutes、extends、uses_parameter/);
+  assert.match(OBSERVER_PROJECTOR_SYSTEM_PROMPT, /Service -exposes_endpoint-> WebEndpoint/);
+  assert.match(OBSERVER_PROJECTOR_SYSTEM_PROMPT, /Vulnerability -exploited_by-> Exploit/);
+  assert.match(OBSERVER_PROJECTOR_SYSTEM_PROMPT, /Task、Milestone、Blocker、Goal、Scope 不会作为可用 existing 别名提供/);
+  assert.match(OBSERVER_PROJECTOR_SYSTEM_PROMPT, /没有匹配关系时省略该边.*提交空 delta/);
   assert.match(OBSERVER_PROJECTOR_SYSTEM_PROMPT, /<example name="semantic-merge">/);
   assert.match(OBSERVER_SUPERVISOR_SYSTEM_PROMPT, /检查近期实验是否真正减少不确定性/);
   assert.match(OBSERVER_SUPERVISOR_SYSTEM_PROMPT, /同时改变多个独立条件后统一失败/);
