@@ -114,6 +114,17 @@ type ControllerHarness = {
     taskEnvelope: TaskEnvelope,
     state?: TestActiveState
   ) => Promise<TaskResult>;
+  collectBudgetCheckpointTaskResult: (input: {
+    taskEnvelope: TaskEnvelope;
+    state: TestActiveState;
+    executorSession: {
+      session: ReturnType<typeof createCheckpointSubmissionSession>;
+      dynamicExecutor: boolean;
+      resumed: boolean;
+      resumeCount: number;
+    };
+    logging?: { drain: () => Promise<void> };
+  }) => Promise<TaskResult | undefined>;
   disposeTaskExecutorResources: (taskId: string) => Promise<void>;
 };
 
@@ -123,6 +134,7 @@ type TestActiveState = {
   lifecycleState: "created" | "running" | "closing" | "closed";
   executorSession?: { abort: () => Promise<void>; clearQueue?: () => unknown; steer?: (text: string) => Promise<void> };
   executorStopRequested: boolean;
+  checkpointFinalizationActive: boolean;
   controlSignal?: ControlSignal;
   terminationPromise?: Promise<void>;
   terminationFailure?: string;
@@ -856,61 +868,152 @@ test("checkpoint without steer support remains advisory and does not terminate",
   await harness.controller.close({ drainProjectionJobs: false });
 });
 
-test("runtime budget abort records only an EpochOutcome even when observations contain a breakthrough", async () => {
+test("budget checkpoint finalization accepts completed and restores the Executor tool set", async () => {
   const harness = createControllerHarness();
   const taskEnvelope = makeTaskEnvelope();
   const state = harness.controllerHarness.beginTaskExecution(taskEnvelope);
   state.executorStopRequested = true;
-  const checkpointSignal: ControlSignal = {
-    decision: "handoff",
-    reason: "budget reached",
-    evidenceRefs: ["event:budget"],
-    confidence: "high"
-  };
+  const checkpointSignal: ControlSignal = { decision: "handoff", reason: "budget reached", evidenceRefs: [] };
   state.abortContext = {
     kind: "budget_abort",
     reason: checkpointSignal.reason,
     controlSignal: checkpointSignal
   };
-  const artifact = await harness.controller.artifactStore.write({
+  const finalizerSession = createCheckpointSubmissionSession({
     taskId: taskEnvelope.taskId,
-    kind: "http_body",
-    mediaType: "application/json",
-    data: '{"flag":"flag{checkpoint_result_preserved}"}'
+    status: "completed",
+    summary: "The Executor verified every task success criterion before the budget boundary.",
+    evidenceRefs: [],
+    artifactRefs: []
   });
-  await harness.controller.executionLog.append({
-    epochId: state.epochId,
-    taskId: taskEnvelope.taskId,
-    role: "executor",
-    eventType: "tool_started",
-    summary: "tool_started:bash",
-    payload: { toolCallId: "call:flag", toolName: "bash", args: { command: "read flag" } }
-  });
-  const finished = await harness.controller.executionLog.append({
-    epochId: state.epochId,
-    taskId: taskEnvelope.taskId,
-    role: "executor",
-    eventType: "tool_finished",
-    summary: "tool_finished:bash:ok",
-    payload: {
-      toolCallId: "call:flag",
-      toolName: "bash",
-      result: { content: [{ type: "text", text: '{"flag":"flag{checkpoint_result_preserved}"}' }] }
-    },
-    artifactRefs: [artifact.artifactRef]
+  const semanticResult = await harness.controllerHarness.collectBudgetCheckpointTaskResult({
+    taskEnvelope,
+    state,
+    executorSession: {
+      session: finalizerSession,
+      dynamicExecutor: true,
+      resumed: false,
+      resumeCount: 0
+    }
   });
 
+  assert.equal(semanticResult?.status, "completed");
+  assert.equal(semanticResult?.retryable, undefined);
+  assert.equal(semanticResult?.checkpointReason, undefined);
+  assert.deepEqual(finalizerSession.getActiveToolNames(), ["bash", "read", "artifact_write", "task_result_submit"]);
+  assert.deepEqual(finalizerSession.activeToolHistory(), [
+    ["artifact_write", "task_result_submit"],
+    ["bash", "read", "artifact_write", "task_result_submit"]
+  ]);
+  assert.match(finalizerSession.prompts()[0] ?? "", /artifact_write/);
+  assert.match(finalizerSession.prompts()[0] ?? "", /不得调用 bash/);
+  assert.ok((await harness.controller.executionLog.readAll()).some((event) =>
+    event.eventType === "executor_checkpoint_submitted"
+      && event.payload.taskResultStatus === "completed"
+  ));
+  harness.controllerHarness.finishTaskExecution(taskEnvelope.taskId, "budget_exhausted");
+  await harness.controller.close({ drainProjectionJobs: false });
+});
+
+test("partial checkpoint gets runtime metadata while only its finalization turn is excluded", async () => {
+  const harness = createControllerHarness();
+  const taskEnvelope = makeTaskEnvelope({ budget: { maxTurns: 10 } });
+  const state = harness.controllerHarness.beginTaskExecution(taskEnvelope);
+  state.executorStopRequested = true;
+  state.abortContext = {
+    kind: "budget_abort",
+    reason: "Task budget reached: maxTurns=10",
+    controlSignal: { decision: "handoff", reason: "Task budget reached: maxTurns=10", evidenceRefs: [] }
+  };
+  await harness.controllerHarness.handleExecutorEventPersisted(makeExecutionEvent(
+    taskEnvelope.taskId,
+    "turn_usage",
+    { responseId: "response:late-exploration", stopReason: "stop", usage: { input: 1, output: 1 } },
+    "event:late-exploration"
+  ));
+  const finalizerSession = createCheckpointSubmissionSession({
+    taskId: taskEnvelope.taskId,
+    status: "partial",
+    summary: "A verified intermediate capability remains reusable.",
+    evidenceRefs: [],
+    artifactRefs: [],
+    checkpointReason: "model supplied reason must not become the runtime boundary",
+    retryable: false
+  }, async () => {
+    await harness.controllerHarness.handleExecutorEventPersisted(makeExecutionEvent(
+      taskEnvelope.taskId,
+      "turn_usage",
+      { responseId: "response:finalization", stopReason: "toolUse", usage: { input: 1, output: 1 } },
+      "event:finalization"
+    ));
+  });
+
+  const semanticResult = await harness.controllerHarness.collectBudgetCheckpointTaskResult({
+    taskEnvelope,
+    state,
+    executorSession: {
+      session: finalizerSession,
+      dynamicExecutor: true,
+      resumed: false,
+      resumeCount: 0
+    }
+  });
+
+  assert.equal(semanticResult?.status, "partial");
+  assert.equal(semanticResult?.retryable, true);
+  assert.equal(semanticResult?.checkpointReason, "Task budget reached: maxTurns=10");
+  assert.equal(harness.controller.runtimeStore.getTaskConsumedTurns(taskEnvelope.taskId), 1);
+  assert.equal(state.checkpointFinalizationActive, false);
+  assert.deepEqual(finalizerSession.getActiveToolNames(), ["bash", "read", "artifact_write", "task_result_submit"]);
+  harness.controllerHarness.finishTaskExecution(taskEnvelope.taskId, "budget_exhausted");
+  await harness.controller.close({ drainProjectionJobs: false });
+});
+
+test("checkpoint finalization provider failure leaves only the mechanical EpochOutcome", async () => {
+  const harness = createControllerHarness();
+  const taskEnvelope = makeTaskEnvelope();
+  const state = harness.controllerHarness.beginTaskExecution(taskEnvelope);
+  state.executorStopRequested = true;
+  state.abortContext = {
+    kind: "budget_abort",
+    reason: "Task budget reached: maxTurns=12",
+    controlSignal: { decision: "handoff", reason: "Task budget reached: maxTurns=12", evidenceRefs: [] }
+  };
+  const finalizerSession = createCheckpointSubmissionSession({
+    taskId: taskEnvelope.taskId,
+    status: "partial",
+    summary: "This result is never submitted because the provider fails first.",
+    evidenceRefs: [],
+    artifactRefs: []
+  }, () => {
+    throw new Error("provider unavailable during checkpoint finalization");
+  });
+
+  const semanticResult = await harness.controllerHarness.collectBudgetCheckpointTaskResult({
+    taskEnvelope,
+    state,
+    executorSession: {
+      session: finalizerSession,
+      dynamicExecutor: true,
+      resumed: false,
+      resumeCount: 0
+    }
+  });
   const { outcome } = await harness.controllerHarness.persistEpochOutcome(state, {
     status: "checkpointed",
-    reason: checkpointSignal.reason,
+    reason: state.abortContext.reason,
     retryable: true,
     taskOutcomeRef: undefined
   });
 
+  assert.equal(semanticResult, undefined);
   assert.equal(outcome.status, "checkpointed");
-  assert.equal(outcome.reason, "budget reached");
   assert.equal(harness.controller.runtimeStore.getTaskOutcome(taskEnvelope.taskId), undefined);
-  assert.deepEqual(finished.artifactRefs, [artifact.artifactRef]);
+  assert.deepEqual(finalizerSession.getActiveToolNames(), ["bash", "read", "artifact_write", "task_result_submit"]);
+  assert.ok((await harness.controller.executionLog.readAll()).some((event) =>
+    event.eventType === "executor_checkpoint_finalization_failed"
+      && String(event.summary).includes("provider unavailable")
+  ));
   harness.controllerHarness.finishTaskExecution(taskEnvelope.taskId, "budget_exhausted");
   await harness.controller.close({ drainProjectionJobs: false });
 });
@@ -5746,17 +5849,19 @@ test("identified product resumes into vulnerability research before broader prob
   await controller.close({ drainProjectionJobs: false, projectionCancelGraceMs: 100 });
 });
 
-test("runtime-aborted epoch remains resumable on the same Executor session", async () => {
+test("maxTurns abort gives the same Executor one unmetered structured finalization turn", async () => {
   const runtimeDir = mkdtempSync(join(tmpdir(), "luanniao-controller-"));
   const controller = createControllerWithTestLlmEnv(runtimeDir);
   const controllerHarness = controller as unknown as ControllerHarness;
   const listeners: Array<(event: unknown) => void> = [];
   const prompts: string[] = [];
+  const activeToolHistory: string[][] = [];
   let promptCount = 0;
   let abortCount = 0;
   let disposeCount = 0;
   let executorFactoryCount = 0;
   let currentTaskEnvelope: TaskEnvelope | undefined;
+  let activeToolNames = ["bash", "read", "artifact_write", "task_result_submit"];
   const executorSession = {
     isStreaming: false,
     async prompt(text: string): Promise<void> {
@@ -5764,33 +5869,51 @@ test("runtime-aborted epoch remains resumable on the same Executor session", asy
       promptCount += 1;
       if (promptCount === 1) {
         assert.ok(currentTaskEnvelope);
-        const epochId = controllerHarness.activeEpochIdByTask?.get(currentTaskEnvelope.taskId);
-        const state = epochId
-          ? controllerHarness.activeEpochs?.get(epochId) as TestActiveState | undefined
-          : undefined;
-        void controllerHarness.requestEpochStop(currentTaskEnvelope, {
-          decision: "checkpoint",
-          reason: "Epoch time slice reached: test checkpoint",
-          evidenceRefs: [],
-          confidence: "high"
-        }, state!, "executor_checkpoint_requested");
+        for (let turn = 1; turn <= MIN_TASK_BUDGET.maxTurns; turn += 1) {
+          for (const listener of [...listeners]) {
+            listener({
+              type: "turn_end",
+              message: {
+                role: "assistant",
+                stopReason: "toolUse",
+                responseId: `response:exploration:${turn}`,
+                usage: { input: 10, output: 10 }
+              }
+            });
+          }
+        }
+        await waitFor(() => abortCount === 1);
         throw new Error("Request was aborted");
       }
+      assert.equal(promptCount, 2);
       for (const listener of [...listeners]) {
+        const details = {
+          taskId: "task:primary",
+          status: "partial",
+          summary: "Checkpoint preserves the latest verified capability and its current limitation.",
+          evidenceRefs: [],
+          artifactRefs: []
+        };
         listener({
-          type: "message_end",
+          type: "tool_execution_start",
+          toolCallId: "call:checkpoint-finalization",
+          toolName: "task_result_submit",
+          args: details
+        });
+        listener({
+          type: "tool_execution_end",
+          toolCallId: "call:checkpoint-finalization",
+          toolName: "task_result_submit",
+          result: { details },
+          isError: false
+        });
+        listener({
+          type: "turn_end",
           message: {
             role: "assistant",
-            content: [{
-              type: "text",
-              text: JSON.stringify({
-                taskId: "task:primary",
-                status: "completed",
-                summary: "Recovered the target artifact after resuming the interrupted operation.",
-                evidenceRefs: [],
-                artifactRefs: []
-              })
-            }]
+            stopReason: "toolUse",
+            responseId: "response:checkpoint-finalization",
+            usage: { input: 10, output: 10 }
           }
         });
       }
@@ -5807,43 +5930,54 @@ test("runtime-aborted epoch remains resumable on the same Executor session", asy
     },
     dispose(): void {
       disposeCount += 1;
+    },
+    getActiveToolNames(): string[] {
+      return [...activeToolNames];
+    },
+    setActiveToolsByName(toolNames: string[]): void {
+      activeToolNames = [...toolNames];
+      activeToolHistory.push([...toolNames]);
+    },
+    getSessionStats() {
+      return {
+        sessionId: "session:checkpoint-integration",
+        userMessages: promptCount,
+        assistantMessages: promptCount,
+        toolCalls: promptCount === 0 ? 0 : promptCount - 1,
+        toolResults: promptCount === 0 ? 0 : promptCount - 1,
+        totalMessages: promptCount * 2,
+        tokens: {
+          input: promptCount * 10,
+          output: promptCount * 10,
+          cacheRead: 0,
+          cacheWrite: 0,
+          total: promptCount * 20
+        },
+        cost: promptCount * 0.001
+      };
     }
   };
   controllerHarness.agents = {
-    planner: createMockTextSessionSequence([
-      JSON.stringify({
-        decision: "apply_commands",
-        commands: [{
-          kind: "create_tasks",
-          tasks: [{
-            id: "task:primary",
-            goal: "Recover the target artifact",
-            targetRefs: ["goal:root"],
-            scopeRef: "scope:root",
-            constraints: ["authorized target only"],
-            successCriteria: ["recover the target artifact"],
-            budget: { maxTurns: 10 },
-            priority: 1
-          }],
-          reason: "Create the primary task",
-          basedOnRefs: ["goal:root"]
+    planner: createMockTextSession(JSON.stringify({
+      decision: "apply_commands",
+      commands: [{
+        kind: "create_tasks",
+        tasks: [{
+          id: "task:primary",
+          goal: "Recover the target artifact",
+          targetRefs: ["goal:root"],
+          scopeRef: "scope:root",
+          constraints: ["authorized target only"],
+          successCriteria: ["recover the target artifact"],
+          budget: { maxTurns: MIN_TASK_BUDGET.maxTurns },
+          priority: 1
         }],
-        reason: "Start the primary task",
+        reason: "Create the primary task",
         basedOnRefs: ["goal:root"]
-      }),
-      JSON.stringify({
-        decision: "apply_commands",
-        commands: [{
-          kind: "set_task_status",
-          taskId: "task:primary",
-          status: "open",
-          reason: "Resume the same task after its runtime time slice checkpoint.",
-          basedOnRefs: ["task:primary"]
-        }],
-        reason: "Resume the interrupted task",
-        basedOnRefs: ["task:primary"]
-      })
-    ]),
+      }],
+      reason: "Start the primary task",
+      basedOnRefs: ["goal:root"]
+    })),
     executor: createAbortableMockTextSession("{}"),
     observer: createMockTextSession(observerProjectionJson())
   };
@@ -5853,26 +5987,47 @@ test("runtime-aborted epoch remains resumable on the same Executor session", asy
     return {
       session: executorSession as never,
       dynamicExecutor: true,
-      resumed: executorFactoryCount > 1,
-      resumeCount: executorFactoryCount > 1 ? 1 : 0
+      resumed: false,
+      resumeCount: 0
     };
   };
 
   const result = await controller.runUntilDone({
     userGoal: "Recover the target artifact",
     scopeSummary: "Authorized target only",
-    maxPlannerCycles: 2,
+    maxPlannerCycles: 1,
     maxParallelTasks: 1
   });
   const events = await controller.executionLog.readAll();
 
-  assert.equal(result.cycles.length, 2);
-  assert.equal(executorFactoryCount, 2);
+  assert.equal(result.cycles.length, 1);
+  assert.equal(executorFactoryCount, 1);
   assert.equal(promptCount, 2);
-  assert.match(prompts[1] ?? "", /继续执行同一个 Task/);
+  assert.match(prompts[1] ?? "", /RUNTIME_BUDGET_CHECKPOINT_FINALIZATION/);
+  assert.match(prompts[1] ?? "", /artifact_write/);
+  const checkpointTaskEvent = events.find((event) => event.eventType === "task_partial"
+    && event.summary === "Checkpoint preserves the latest verified capability and its current limitation.");
+  assert.ok(checkpointTaskEvent);
+  assert.ok(controller.runtimeStore.listTaskEpochOutcomes("task:primary").some((outcome) =>
+    outcome.status === "submitted"
+      && outcome.taskOutcomeRef === "task:primary"
+      && outcome.terminalSeq >= (checkpointTaskEvent.seq ?? 0)
+  ));
+  assert.ok(events.some((event) => event.eventType === "projection_job_queued"
+    && event.payload.reason === "task_end"));
+  assert.equal(controller.runtimeStore.getTaskConsumedTurns("task:primary"), MIN_TASK_BUDGET.maxTurns);
+  assert.deepEqual(activeToolHistory, [
+    ["artifact_write", "task_result_submit"],
+    ["bash", "read", "artifact_write", "task_result_submit"]
+  ]);
+  const executorMetrics = events.filter((event) => event.eventType === "invocation_metrics"
+    && event.payload.invocationKind === "executor");
+  assert.equal(executorMetrics.length, 2);
+  assert.equal(executorMetrics[0]?.payload.phase, undefined);
+  assert.equal(executorMetrics[1]?.payload.phase, "checkpoint_finalization");
   assert.ok(!events.some((event) => event.eventType === "executor_provider_retry_scheduled"));
   assert.equal(abortCount, 1);
-  assert.equal(disposeCount, 2);
+  assert.equal(disposeCount, 1);
   await controller.close({ drainProjectionJobs: false, projectionCancelGraceMs: 100 });
 });
 
@@ -6874,6 +7029,60 @@ function createMockTextSession(output: string): {
   steers: () => string[];
 } {
   return createMockTextSessionSequence([output]);
+}
+
+function createCheckpointSubmissionSession(
+  details: TaskResult,
+  onPrompt?: () => void | Promise<void>
+): ReturnType<typeof createMockTextSession> & {
+  abort: () => Promise<void>;
+  getActiveToolNames: () => string[];
+  setActiveToolsByName: (toolNames: string[]) => void;
+  activeToolHistory: () => string[][];
+} {
+  const listeners: Array<(event: unknown) => void> = [];
+  const prompts: string[] = [];
+  const toolHistory: string[][] = [];
+  let activeToolNames = ["bash", "read", "artifact_write", "task_result_submit"];
+  return {
+    async prompt(text: string): Promise<void> {
+      prompts.push(text);
+      await onPrompt?.();
+      for (const listener of [...listeners]) {
+        listener({
+          type: "tool_execution_start",
+          toolCallId: "call:checkpoint-finalization",
+          toolName: "task_result_submit",
+          args: details
+        });
+        listener({
+          type: "tool_execution_end",
+          toolCallId: "call:checkpoint-finalization",
+          toolName: "task_result_submit",
+          result: { details },
+          isError: false
+        });
+      }
+    },
+    async steer(): Promise<void> {},
+    subscribe(listener: (event: unknown) => void): () => void {
+      listeners.push(listener);
+      return () => {
+        const index = listeners.indexOf(listener);
+        if (index >= 0) listeners.splice(index, 1);
+      };
+    },
+    promptCount: () => prompts.length,
+    prompts: () => [...prompts],
+    steers: () => [],
+    async abort(): Promise<void> {},
+    getActiveToolNames: () => [...activeToolNames],
+    setActiveToolsByName(toolNames: string[]): void {
+      activeToolNames = [...toolNames];
+      toolHistory.push([...toolNames]);
+    },
+    activeToolHistory: () => toolHistory.map((toolNames) => [...toolNames])
+  };
 }
 
 function createAbortableMockTextSession(output: string): ReturnType<typeof createMockTextSession> & { abort: () => Promise<void> } {

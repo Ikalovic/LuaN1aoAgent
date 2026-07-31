@@ -230,6 +230,7 @@ const PROJECTOR_OBSERVATION_EVENT_TYPES = [
 ];
 const EXECUTOR_PROVIDER_RETRY_ATTEMPTS = 2;
 const EXECUTOR_PROVIDER_RETRY_BACKOFF_MS = 250;
+const EXECUTOR_CHECKPOINT_FINALIZATION_TIMEOUT_MS = 60_000;
 const EXECUTOR_SESSION_DIR = "executor-sessions";
 
 type ObserverProjectionRequest = {
@@ -281,6 +282,7 @@ type ActiveTaskState = {
   epochTurnCount: number;
   taskTurnCount: number;
   executorStopRequested: boolean;
+  checkpointFinalizationActive: boolean;
   controlSignal?: ControlSignal;
   abortContext?: RuntimeAbortContext;
   terminationFailure?: string;
@@ -1907,6 +1909,16 @@ export class SecurityAgentController {
       }
 
       if (!taskResult) {
+        taskResult = await this.collectBudgetCheckpointTaskResult({
+          taskEnvelope,
+          state,
+          executorSession,
+          logging: executorLogging
+        });
+        await executorLogging?.drain();
+      }
+
+      if (!taskResult) {
         const reason = providerFailure?.message
           ?? state.abortContext?.reason
           ?? errorMessageFromUnknown(executorError)
@@ -2757,6 +2769,7 @@ export class SecurityAgentController {
       epochTurnCount: 0,
       taskTurnCount: this.runtimeStore.getTaskConsumedTurns(taskEnvelope.taskId),
       executorStopRequested: false,
+      checkpointFinalizationActive: false,
       dynamicExecutor: false,
       attempt,
       budgetStatusSteerKeys: new Set(),
@@ -2947,14 +2960,14 @@ export class SecurityAgentController {
       await this.resumeExecutorEpochBudget(state, event.eventType);
     }
     if (isCountableExecutorTurn(event)) {
+      if (state.checkpointFinalizationActive) {
+        return;
+      }
       state.epochTurnCount += 1;
       state.taskTurnCount = this.runtimeStore.recordTaskTurn({
         taskId: event.taskId,
         eventId: taskTurnIdentity(event)
       });
-      if (state.executorStopRequested) {
-        return;
-      }
       this.publishExecutorBudgetStatusUpdate({
         taskEnvelope,
         state,
@@ -4301,6 +4314,121 @@ export class SecurityAgentController {
       evidenceRefs: [event.id]
     };
     void this.requestEpochStop(taskEnvelope, budgetSignal, state, "executor_checkpoint_requested");
+  }
+
+  private async collectBudgetCheckpointTaskResult(input: {
+    taskEnvelope: TaskEnvelope;
+    state: ActiveTaskState;
+    executorSession: ExecutorSessionLease;
+    logging?: { drain: () => Promise<void> };
+  }): Promise<TaskResult | undefined> {
+    if (
+      input.state.abortContext?.kind !== "budget_abort"
+      || this.stopRequestedReason
+      || this.invocationAbortController.signal.aborted
+    ) {
+      return undefined;
+    }
+    const timeoutMs = this.remainingRunTimeLimit(EXECUTOR_CHECKPOINT_FINALIZATION_TIMEOUT_MS);
+    if (timeoutMs <= 0) {
+      return undefined;
+    }
+    const prompt = [
+      "RUNTIME_BUDGET_CHECKPOINT_FINALIZATION",
+      input.state.abortContext.reason,
+      "探索预算已经耗尽。不得调用 bash、read、搜索、图查询或继续探索。",
+      "若本次已生成且明确知道路径的可复用材料尚未归档，可先用现有的 artifact_write 原样归档；不得创建、修改、检查或搜索文件。",
+      "随后只调用一次现有的 task_result_submit，并根据任务成功条件如实选择 completed、partial、blocked 或 failed。",
+      "summary 写明本次已经验证的能力、最新失效条件和仍未解决的问题；",
+      "evidenceRefs 和 artifactRefs 只填写本会话中真实存在的引用；",
+      "不要继续探索，也不要输出自由文本 JSON。"
+    ].join("\n");
+    const session = input.executorSession.session;
+    const invocationId = `executor:${input.state.epochId}:checkpoint-finalization`;
+    const startedAt = Date.now();
+    const statsBefore = readPiSessionStats(session);
+    const inputBytes = Buffer.byteLength(prompt);
+    let invocationStatus = "failed";
+    let originalToolNames: string[] | undefined;
+    try {
+      originalToolNames = session.getActiveToolNames();
+      const finalizationToolNames = ["artifact_write", "task_result_submit"]
+        .filter((toolName) => originalToolNames?.includes(toolName));
+      session.setActiveToolsByName(finalizationToolNames);
+      const activeFinalizationToolNames = session.getActiveToolNames();
+      if (
+        !activeFinalizationToolNames.includes("task_result_submit")
+        || activeFinalizationToolNames.some((toolName) => toolName !== "artifact_write" && toolName !== "task_result_submit")
+      ) {
+        throw new Error("Executor checkpoint finalization must expose task_result_submit and may expose artifact_write only");
+      }
+      input.state.checkpointFinalizationActive = true;
+      const taskResult = await invokeStructured(session, prompt, {
+        toolName: "task_result_submit",
+        idleTimeoutMs: timeoutMs,
+        hardTimeoutMs: timeoutMs,
+        maxTruncationSteers: 0,
+        validate: (value) => {
+          const normalized = normalizeTaskResult(value as Partial<TaskResult>, input.taskEnvelope);
+          return normalized.status === "partial"
+            ? {
+                ...normalized,
+                checkpointReason: input.state.abortContext?.reason,
+                retryable: true
+              }
+            : normalized;
+        },
+        admission: this.providerAdmission("executor")
+      });
+      await input.logging?.drain();
+      invocationStatus = "submitted";
+      await this.executionLog.append({
+        epochId: input.state.epochId,
+        taskId: input.taskEnvelope.taskId,
+        role: "runtime",
+        eventType: "executor_checkpoint_submitted",
+        summary: taskResult.summary,
+        payload: {
+          invocationId,
+          controlSignal: input.state.controlSignal,
+          taskResultStatus: taskResult.status
+        }
+      });
+      return taskResult;
+    } catch (error) {
+      await this.executionLog.append({
+        epochId: input.state.epochId,
+        taskId: input.taskEnvelope.taskId,
+        role: "runtime",
+        eventType: "executor_checkpoint_finalization_failed",
+        summary: errorMessageFromUnknown(error) ?? "Executor checkpoint finalization failed",
+        payload: {
+          error: errorMessageFromUnknown(error) ?? String(error)
+        }
+      });
+      return undefined;
+    } finally {
+      input.state.checkpointFinalizationActive = false;
+      if (originalToolNames) {
+        session.setActiveToolsByName(originalToolNames);
+      }
+      await this.appendInvocationMetrics({
+        session,
+        before: statsBefore,
+        invocationId,
+        invocationKind: "executor",
+        agentRole: "executor",
+        status: invocationStatus,
+        startedAt,
+        taskId: input.taskEnvelope.taskId,
+        epochId: input.state.epochId,
+        inputBytes,
+        details: {
+          phase: "checkpoint_finalization",
+          taskResultTurnExcludedFromBudget: true
+        }
+      });
+    }
   }
 
   private publishExecutorBudgetStatusUpdate(input: {
