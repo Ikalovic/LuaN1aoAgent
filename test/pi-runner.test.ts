@@ -669,6 +669,47 @@ test("uses Pi native retry delay as provider cooldown without retrying prompts i
   secondLease.release();
 });
 
+test("admits one request at a time after rate limiting until one provider response succeeds", async () => {
+  const clock = createManualClock();
+  const gate = new ProviderAdmissionGate({
+    defaultMaxConcurrent: 3,
+    now: clock.now,
+    sleep: clock.sleep
+  });
+  const active = await Promise.all([
+    gate.acquire({ key: "provider:a" }),
+    gate.acquire({ key: "provider:a" }),
+    gate.acquire({ key: "provider:a" })
+  ]);
+  gate.observe("provider:a", {
+    type: "auto_retry_start",
+    delayMs: 2_000,
+    errorMessage: "HTTP 429 TPM limit exceeded"
+  });
+  const admitted: string[] = [];
+  const queued = ["first", "second", "third"].map((name) => gate.acquire({ key: "provider:a" }).then((lease) => {
+    admitted.push(name);
+    return lease;
+  }));
+  active.forEach((lease) => lease.release());
+
+  clock.advance(2_000);
+  await flushMicrotasks();
+  assert.deepEqual(admitted, ["first"]);
+  const first = await queued[0];
+  first.release();
+  await flushMicrotasks();
+  assert.deepEqual(admitted, ["first", "second"]);
+
+  gate.observe("provider:a", { type: "after_provider_response", status: 200 });
+  await flushMicrotasks();
+  assert.deepEqual(admitted, ["first", "second", "third"]);
+  const second = await queued[1];
+  const third = await queued[2];
+  second.release();
+  third.release();
+});
+
 test("lets the same Pi session repair a terminal submit validation error", async () => {
   const listeners: Array<(event: unknown) => void> = [];
   let promptCount = 0;
@@ -721,6 +762,168 @@ test("lets the same Pi session repair a terminal submit validation error", async
     basedOnRefs: ["goal:root"]
   });
   assert.equal(promptCount, 1);
+});
+
+test("terminates a projector invocation on the first rejected graph draft", async () => {
+  const listeners: Array<(event: unknown) => void> = [];
+  let aborted = false;
+  let staleRepairSubmitted = false;
+  const session = {
+    async prompt(): Promise<void> {
+      emitToListeners(listeners, {
+        type: "tool_execution_end",
+        toolName: "graph_delta_submit",
+        isError: true,
+        result: { content: [{ type: "text", text: "Projection delta is invalid" }] }
+      });
+      await delay(5);
+      if (!aborted) {
+        staleRepairSubmitted = true;
+      }
+    },
+    subscribe(listener: (event: unknown) => void): () => void {
+      listeners.push(listener);
+      return () => undefined;
+    },
+    async abort(): Promise<void> {
+      aborted = true;
+    },
+    clearQueue(): void {
+      aborted = true;
+    }
+  };
+
+  await assert.rejects(
+    () => invokeStructured(session, "test", {
+      toolName: "graph_delta_submit",
+      terminateOnToolError: true
+    }),
+    (error) => error instanceof StructuredInvocationError
+      && error.code === "invalid_submit"
+      && error.message === "Projection delta is invalid"
+  );
+  assert.equal(aborted, true);
+  assert.equal(staleRepairSubmitted, false);
+});
+
+test("lets Projector repair one rejected graph draft in the same session", async () => {
+  const listeners: Array<(event: unknown) => void> = [];
+  const session = {
+    async prompt(): Promise<void> {
+      emitToListeners(listeners, {
+        type: "tool_execution_end",
+        toolName: "graph_delta_submit",
+        isError: true,
+        result: { content: [{ type: "text", text: "Unknown alias new:9" }] }
+      });
+      await delay(5);
+      emitToListeners(listeners, {
+        type: "tool_execution_end",
+        toolName: "graph_delta_submit",
+        isError: false,
+        result: { details: { nodes: [], edges: [] } }
+      });
+    },
+    subscribe(listener: (event: unknown) => void): () => void {
+      listeners.push(listener);
+      return () => undefined;
+    },
+    async abort(): Promise<void> {}
+  };
+
+  assert.deepEqual(await invokeStructured(session, "test", {
+    toolName: "graph_delta_submit",
+    maxRepeatedToolErrors: 2,
+    idleTimeoutMs: 1_000,
+    hardTimeoutMs: 2_000
+  }), { nodes: [], edges: [] });
+});
+
+test("stops Projector after the same rejected graph draft is submitted twice", async () => {
+  const listeners: Array<(event: unknown) => void> = [];
+  let aborted = false;
+  const session = {
+    async prompt(): Promise<void> {
+      for (let attempt = 0; attempt < 2; attempt += 1) {
+        emitToListeners(listeners, {
+          type: "tool_execution_start",
+          toolName: "graph_delta_submit",
+          toolCallId: `call:${attempt}`,
+          args: { nodes: [{ id: "new:9" }], edges: [] }
+        });
+        emitToListeners(listeners, {
+          type: "tool_execution_end",
+          toolName: "graph_delta_submit",
+          toolCallId: `call:${attempt}`,
+          isError: true,
+          result: { content: [{ type: "text", text: "Unknown alias new:9" }] }
+        });
+        await delay(1);
+      }
+    },
+    subscribe(listener: (event: unknown) => void): () => void {
+      listeners.push(listener);
+      return () => undefined;
+    },
+    async abort(): Promise<void> {
+      aborted = true;
+    },
+    clearQueue(): void {
+      aborted = true;
+    }
+  };
+
+  await assert.rejects(() => invokeStructured(session, "test", {
+    toolName: "graph_delta_submit",
+    maxRepeatedToolErrors: 2,
+    idleTimeoutMs: 1_000,
+    hardTimeoutMs: 2_000
+  }), (error) => error instanceof StructuredInvocationError
+    && error.code === "invalid_submit"
+    && error.message === "Unknown alias new:9");
+  assert.equal(aborted, true);
+});
+
+test("does not treat a changed Projector draft as the same rejected submission", async () => {
+  const listeners: Array<(event: unknown) => void> = [];
+  const session = {
+    async prompt(): Promise<void> {
+      for (const [attempt, label] of ["first", "second"].entries()) {
+        emitToListeners(listeners, {
+          type: "tool_execution_start",
+          toolName: "graph_delta_submit",
+          toolCallId: `call:${attempt}`,
+          args: { nodes: [{ id: "new:9", label }], edges: [] }
+        });
+        emitToListeners(listeners, {
+          type: "tool_execution_end",
+          toolName: "graph_delta_submit",
+          toolCallId: `call:${attempt}`,
+          isError: true,
+          result: { content: [{ type: "text", text: "Unknown alias new:9" }] }
+        });
+        await delay(1);
+      }
+      emitToListeners(listeners, {
+        type: "tool_execution_end",
+        toolName: "graph_delta_submit",
+        isError: false,
+        result: { details: { nodes: [], edges: [] } }
+      });
+    },
+    subscribe(listener: (event: unknown) => void): () => void {
+      listeners.push(listener);
+      return () => undefined;
+    },
+    async abort(): Promise<void> {}
+  };
+
+  assert.deepEqual(await invokeStructured(session, "test", {
+    toolName: "graph_delta_submit",
+    maxRepeatedToolErrors: 2,
+    idleTimeoutMs: 1_000,
+    hardTimeoutMs: 2_000
+  }), { nodes: [], edges: [] });
 });
 
 test("preserves terminal validation details when the session does not repair the submit", async () => {
@@ -847,6 +1050,65 @@ test("keeps small tool output inline in execution log", async () => {
   const [event] = await executionLog.readAll();
   assert.equal(((event.payload.result as { content: Array<{ text: string }> }).content[0]).text, "small output");
   assert.deepEqual(await artifactStore.list({ taskId: "task:small" }), []);
+});
+
+test("records graph tool acceptance as a draft pending GraphStore commit", async () => {
+  const runtimeDir = mkdtempSync(join(tmpdir(), "luanniao-runner-"));
+  const session = createMockSession();
+  const executionLog = new ExecutionLog(join(runtimeDir, "execution.jsonl"));
+  attachExecutionLogging({
+    session,
+    executionLog,
+    role: "observer",
+    getTaskId: () => "task:projection-draft"
+  });
+
+  session.emit({
+    type: "tool_execution_end",
+    toolName: "graph_delta_submit",
+    isError: false,
+    result: { details: { nodes: [], edges: [] } }
+  });
+
+  await waitFor(async () => (await executionLog.readAll()).length === 1);
+  const [event] = await executionLog.readAll();
+  assert.equal(event.eventType, "projection_draft_received");
+  assert.equal(event.summary, "projection_draft_received:accepted_pending_commit");
+  assert.notEqual(event.eventType, "projection_job_succeeded");
+});
+
+test("SDK compaction events are not persisted as tool events or observations", async () => {
+  // Auto-compaction only rewrites the session's internal context; the raw
+  // observation stream (what the Projector consumes) must stay untouched and
+  // these session-lifecycle events must not be mistaken for tool activity.
+  const runtimeDir = mkdtempSync(join(tmpdir(), "luanniao-runner-"));
+  const session = createMockSession();
+  const executionLog = new ExecutionLog(join(runtimeDir, "execution.jsonl"));
+  attachExecutionLogging({
+    session,
+    executionLog,
+    role: "executor",
+    getTaskId: () => "task:ctxmgr",
+    getEpochId: () => "epoch:ctxmgr-1"
+  });
+
+  session.emit({ type: "compaction_start", reason: "threshold" });
+  session.emit({ type: "compaction_end", reason: "threshold", result: { ok: true }, aborted: false, willRetry: false });
+  // A known persisted event afterwards proves the subscription kept working.
+  session.emit({
+    type: "tool_execution_end",
+    toolName: "bash",
+    toolCallId: "call:after-ctx-reset",
+    result: {
+      content: [{ type: "text", text: "still logging" }]
+    }
+  });
+
+  await waitFor(async () => (await executionLog.readAll()).length === 1);
+  const events = await executionLog.readAll();
+  assert.equal(events.length, 1);
+  assert.equal(events[0].eventType, "tool_finished");
+  assert.ok(!JSON.stringify(events).includes("compaction"));
 });
 
 test("spills large tool output to artifact and leaves pointer in execution log", async () => {

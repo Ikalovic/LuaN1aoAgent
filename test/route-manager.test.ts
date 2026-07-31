@@ -53,7 +53,7 @@ async function openManagedRoutePair(manager: RouteManager) {
   return { ssh, chisel };
 }
 
-test("Chisel startup failures retain a degraded route for later recovery", async () => {
+test("Chisel startup failures create no route or active snapshot", async () => {
   const published: Array<Array<{ routeRef: string; connectionRef?: string }>> = [];
   const network = {
     connectorAddress: "192.168.1.2",
@@ -69,28 +69,25 @@ test("Chisel startup failures retain a degraded route for later recovery", async
     { append: async () => ({}) } as unknown as ExecutionLog
   );
 
-  const route = await manager.open({
+  await assert.rejects(() => manager.open({
     connector: "chisel",
     pivotHostRef: "host:dmz",
     targetCidrs: ["172.31.0.0/24"],
     bootstrapConnectionRef: "connection:webshell"
-  }, "task:pivot");
+  }, "task:pivot"), /requires a live RouteManager SSH connection/);
 
-  assert.equal(route.desiredState, "running");
-  assert.equal(route.status, "degraded");
-  assert.match(route.error ?? "", /requires a live RouteManager SSH connection/);
-  assert.equal(published.at(-1)?.[0]?.routeRef, route.routeRef);
-  assert.equal((await manager.status(route.routeRef))[0]?.routeRef, route.routeRef);
+  assert.deepEqual(await manager.status(), []);
+  assert.equal(published.length, 0);
 });
 
 test("route publication failure atomically restores the previous route table", async () => {
   const root = await mkdtemp("/tmp/luanniao-route-publish-failure-");
   const published: Array<Array<{ routeRef: string }>> = [];
-  let connectorCalls = 0;
+  const connectorCommands: string[] = [];
   const network = {
     connectorAddress: "192.168.1.2",
-    connectorExec: async () => {
-      connectorCalls += 1;
+    connectorExec: async (command: string) => {
+      connectorCommands.push(command);
       return { code: 0, stdout: "", stderr: "" };
     },
     replaceRoutes: async (routes: Array<{ routeRef: string }>) => {
@@ -120,12 +117,121 @@ test("route publication failure atomically restores the previous route table", a
 
   assert.equal(published[0]?.length, 1);
   assert.deepEqual(published[1], []);
-  assert.equal(connectorCalls, 0);
+  assert.ok(connectorCommands.some((command) => command.startsWith("setsid sh -c")));
+  assert.ok(connectorCommands.some((command) => command.includes('kill -TERM -"$pid"')));
   assert.deepEqual(await manager.status(), []);
   assert.equal(store.listDefinitions("route").length, 0);
   assert.equal(store.listDefinitions("session").length, 0);
   store.close();
   await rm(root, { recursive: true, force: true });
+});
+
+test("invalid SSH input creates no route and a corrected same-CIDR retry succeeds", async () => {
+  const published: Array<Array<{ cidr: string }>> = [];
+  const network = {
+    connectorAddress: "192.168.1.2",
+    connectorExec: async () => ({ code: 0, stdout: "", stderr: "" }),
+    replaceRoutes: async (routes: Array<{ cidr: string }>) => {
+      assert.equal(new Set(routes.map((route) => route.cidr)).size, routes.length);
+      published.push(routes);
+    }
+  } as unknown as NetworkSandboxManager;
+  const manager = new RouteManager(
+    network,
+    {
+      get: async () => ({ taskId: "task:credential" }),
+      read: async () => "route-password"
+    } as unknown as ArtifactStore,
+    { append: async () => ({}) } as unknown as ExecutionLog
+  );
+  const base = {
+    connector: "ssh" as const,
+    pivotHostRef: "host:dmz",
+    dialAddress: "192.0.2.10",
+    targetCidrs: ["172.31.0.0/24"],
+    options: { port: 22, user: "ops" }
+  };
+
+  await assert.rejects(() => manager.open(base, "task:pivot"),
+    /requires dialAddress, options\.user, and credentialRef/);
+  assert.deepEqual(await manager.status(), []);
+  assert.equal(published.length, 0);
+
+  const route = await manager.open({ ...base, credentialRef: "artifact:key" }, "task:pivot");
+  assert.equal(route.status, "live");
+  assert.deepEqual(published.map((routes) => routes.map((candidate) => candidate.cidr)), [["172.31.0.0/24"]]);
+});
+
+test("authenticated SOCKS5 routes keep credentials in the Connector and publish an internal transparent egress", async () => {
+  const commands: Array<{ command: string; stdin?: string }> = [];
+  const published: Array<Array<{ socksHost: string; socksPort: number; cidr: string }>> = [];
+  const network = {
+    connectorAddress: "192.168.1.2",
+    connectorExec: async (command: string, stdin?: string) => {
+      commands.push({ command, stdin });
+      return { code: 0, stdout: "", stderr: "" };
+    },
+    replaceRoutes: async (routes: Array<{ socksHost: string; socksPort: number; cidr: string }>) => {
+      published.push(routes);
+    }
+  } as unknown as NetworkSandboxManager;
+  const manager = new RouteManager(
+    network,
+    {
+      get: async () => ({ taskId: "task:proxy" }),
+      read: async () => "proxy-secret"
+    } as unknown as ArtifactStore,
+    { append: async () => ({}) } as unknown as ExecutionLog
+  );
+
+  const route = await manager.open({
+    connector: "socks5",
+    pivotHostRef: "host:upstream-proxy",
+    dialAddress: "198.51.100.8",
+    targetCidrs: ["203.0.113.0/24"],
+    credentialRef: "artifact:proxy-password",
+    options: { port: 10800, user: "admin" }
+  }, "task:proxy");
+
+  assert.equal(route.connector, "socks5");
+  assert.equal(route.status, "live");
+  assert.equal(route.connectionRef, undefined);
+  assert.deepEqual(published.at(-1)?.map((candidate) => ({
+    socksHost: candidate.socksHost,
+    cidr: candidate.cidr
+  })), [{ socksHost: "192.168.1.2", cidr: "203.0.113.0/24" }]);
+  const start = commands.find((entry) => entry.command.startsWith("setsid sh -c"));
+  assert.match(start?.command ?? "", /socks-connector/);
+  assert.match(start?.command ?? "", /198\.51\.100\.8:10800/);
+  assert.match(start?.command ?? "", /admin/);
+  assert.doesNotMatch(start?.command ?? "", /proxy-secret/);
+  const staged = commands.find((entry) => entry.stdin === "proxy-secret");
+  assert.match(staged?.command ?? "", /\/run\/luanniao\/credentials\//);
+});
+
+test("SOCKS5 route validation fails before connector startup when credentials are incomplete", async () => {
+  let connectorCalls = 0;
+  const manager = new RouteManager(
+    {
+      connectorAddress: "192.168.1.2",
+      connectorExec: async () => {
+        connectorCalls += 1;
+        return { code: 0, stdout: "", stderr: "" };
+      },
+      replaceRoutes: async () => undefined
+    } as unknown as NetworkSandboxManager,
+    {} as ArtifactStore,
+    { append: async () => ({}) } as unknown as ExecutionLog
+  );
+
+  await assert.rejects(() => manager.open({
+    connector: "socks5",
+    pivotHostRef: "host:upstream-proxy",
+    dialAddress: "198.51.100.8",
+    targetCidrs: ["203.0.113.0/24"],
+    options: { port: 10800, user: "admin" }
+  }, "task:proxy"), /SOCKS5 route requires dialAddress, options\.user, and credentialRef/);
+  assert.equal(connectorCalls, 0);
 });
 
 test("Chisel reuses a RouteManager-owned SSH command connection", async () => {
@@ -251,7 +357,7 @@ test("RouteManager emits typed connectivity facts for Projector without a graph 
   assert.deepEqual(events[1]?.payload?.targetCidrs, ["172.31.0.0/24"]);
 });
 
-test("SSH routes accept matching user:password artifacts", async () => {
+test("SSH routes stage a plain password artifact unchanged", async () => {
   const root = await mkdtemp("/tmp/luanniao-route-store-");
   const staged: string[] = [];
   const commands: string[] = [];
@@ -268,7 +374,7 @@ test("SSH routes accept matching user:password artifacts", async () => {
   } as unknown as NetworkSandboxManager;
   const artifacts = {
     get: async () => ({ taskId: "task:test" }),
-    read: async () => "ops:Lan1ao-Ops!23\n"
+    read: async () => "Lan1ao-Ops!23\n"
   } as unknown as ArtifactStore;
   const log = { append: async () => ({}) } as unknown as ExecutionLog;
   const store = new ConnectivityStore(`${root}/state.sqlite`);
@@ -313,7 +419,7 @@ test("SSH routes accept credential artifacts produced by predecessor tasks", asy
   } as unknown as NetworkSandboxManager;
   const artifacts = {
     get: async () => ({ taskId: "task:predecessor" }),
-    read: async () => "ops:shared-password\n"
+    read: async () => "shared-password\n"
   } as unknown as ArtifactStore;
   const log = { append: async () => ({}) } as unknown as ExecutionLog;
   const manager = new RouteManager(network, artifacts, log);
@@ -331,7 +437,41 @@ test("SSH routes accept credential artifacts produced by predecessor tasks", asy
   assert.deepEqual(staged, ["shared-password"]);
 });
 
-test("SSH routes extract passwords from structured credential artifacts", async () => {
+test("SSH routes may dial a Docker host alias without using it as the pivot identity", async () => {
+  const commands: string[] = [];
+  const network = {
+    connectorAddress: "192.168.1.2",
+    connectorExec: async (command: string) => {
+      commands.push(command);
+      return { code: 0, stdout: "", stderr: "" };
+    },
+    replaceRoutes: async () => undefined
+  } as unknown as NetworkSandboxManager;
+  const manager = new RouteManager(
+    network,
+    {
+      get: async () => ({ taskId: "task:predecessor" }),
+      read: async () => "host-password"
+    } as unknown as ArtifactStore,
+    { append: async () => ({}) } as unknown as ExecutionLog
+  );
+
+  const route = await manager.open({
+    connector: "ssh",
+    pivotHostRef: "dmz-web",
+    dialAddress: "host.docker.internal",
+    targetCidrs: ["172.31.0.0/24"],
+    credentialRef: "artifact:predecessor",
+    options: { port: 18023, user: "ops" }
+  }, "task:successor");
+
+  assert.equal(route.status, "live");
+  assert.equal(route.pivotHostRef, "dmz-web");
+  assert.equal(route.dialAddress, "host.docker.internal");
+  assert.ok(commands.some((command) => command.includes("ops@host.docker.internal")));
+});
+
+test("SSH credential artifacts are staged as opaque bytes", async () => {
   const staged: string[] = [];
   const network = {
     connectorAddress: "192.168.1.2",
@@ -359,10 +499,10 @@ test("SSH routes extract passwords from structured credential artifacts", async 
   }, "task:successor");
 
   assert.equal(route.status, "live");
-  assert.deepEqual(staged, ["json-password"]);
+  assert.deepEqual(staged, [JSON.stringify({ username: "ops", password: "json-password", host: "dmz-web" })]);
 });
 
-test("SSH route failures surface connector authentication logs", async () => {
+test("SSH authentication failures reject without persisting or publishing a route", async () => {
   const root = await mkdtemp("/tmp/luanniao-route-failure-");
   const publishedRoutes: Array<Array<{ routeRef: string; cidr: string }>> = [];
   const network = {
@@ -385,25 +525,18 @@ test("SSH route failures surface connector authentication logs", async () => {
   const store = new ConnectivityStore(`${root}/state.sqlite`);
   const manager = new RouteManager(network, artifacts, log, store);
 
-  const route = await manager.open({
+  await assert.rejects(() => manager.open({
     connector: "ssh",
     pivotHostRef: "dmz-web",
     dialAddress: "192.0.2.23",
     targetCidrs: ["172.31.0.0/24"],
     credentialRef: "artifact:test",
     options: { port: 18023, user: "ops" }
-  }, "task:test");
-  assert.equal(route.desiredState, "running");
-  assert.equal(route.status, "degraded");
-  assert.match(route.error ?? "", /SSH connector failed: Permission denied/);
-  assert.equal(publishedRoutes[0]?.[0]?.cidr, "172.31.0.0/24");
-  assert.equal(publishedRoutes.at(-1)?.[0]?.routeRef, route.routeRef);
-  const persisted = store.listDefinitions("route")[0];
-  assert.equal(persisted?.externalId, route.routeRef);
-  assert.equal(persisted?.desiredState, "running");
-  assert.equal(persisted?.status, "degraded");
-  assert.match(String(persisted?.definition.lastFailureReason), /Permission denied/);
-  assert.equal((await manager.status(route.routeRef))[0]?.routeRef, route.routeRef);
+  }, "task:test"), /SSH connector failed: Permission denied/);
+  assert.equal(publishedRoutes.length, 0);
+  assert.deepEqual(await manager.status(), []);
+  assert.equal(store.listDefinitions("route").length, 0);
+  assert.equal(store.listDefinitions("session").length, 0);
   store.close();
   await rm(root, { recursive: true, force: true });
 });
@@ -455,8 +588,7 @@ test("stopped routes restore and reconnect with the same route identity", async 
   const manager = new RouteManager(network, artifacts, log, store);
 
   await manager.restore();
-  assert.equal(published.at(-1)?.[0]?.routeRef, "route:recoverable");
-  assert.equal(published.at(-1)?.[0]?.cidr, "172.31.0.0/24");
+  assert.deepEqual(published.at(-1), []);
   events.length = 0;
   const route = await manager.reconnect("route:recoverable");
 
@@ -469,13 +601,67 @@ test("stopped routes restore and reconnect with the same route identity", async 
   const failClosedPublish = events.findIndex((event) => event === "publish:172.31.0.0/24");
   const connectorStart = events.findIndex((event) => event.startsWith("connector:setsid "));
   assert.ok(failClosedPublish >= 0 && connectorStart > failClosedPublish);
-  assert.equal(published[1]?.[0]?.cidr, "172.31.0.0/24");
   assert.equal(published.at(-1)?.[0]?.routeRef, "route:recoverable");
   const persisted = store.listDefinitions("route")[0];
   assert.equal(persisted?.desiredState, "running");
   assert.equal(persisted?.status, "live");
   assert.equal(persisted?.definition.connectionRef, "connection:dmz");
   assert.equal(persisted?.definition.sessionRef, undefined);
+  store.close();
+  await rm(root, { recursive: true, force: true });
+});
+
+test("persisted SOCKS5 routes restore and reconnect through the same transparent route identity", async () => {
+  const root = await mkdtemp("/tmp/luanniao-socks-route-reconnect-");
+  const commands: Array<{ command: string; stdin?: string }> = [];
+  const network = {
+    connectorAddress: "192.168.1.2",
+    connectorExec: async (command: string, stdin?: string) => {
+      commands.push({ command, stdin });
+      return { code: 0, stdout: "", stderr: "" };
+    },
+    replaceRoutes: async () => undefined
+  } as unknown as NetworkSandboxManager;
+  const artifacts = {
+    get: async () => ({ taskId: "task:proxy" }),
+    read: async () => "proxy-secret"
+  } as unknown as ArtifactStore;
+  const store = new ConnectivityStore(`${root}/state.sqlite`);
+  store.upsertDefinition({
+    kind: "route",
+    externalId: "route:socks-recoverable",
+    desiredState: "stopped",
+    status: "stale",
+    hostRef: "host:proxy",
+    processRef: "connector:socks-recoverable",
+    credentialRef: "artifact:proxy-password",
+    definition: {
+      transport: "socks5",
+      pivotHostRef: "host:proxy",
+      targetCidrs: ["203.0.113.0/24"],
+      connectorRef: "connector:socks-recoverable",
+      dialAddress: "198.51.100.8",
+      dialPort: 10800,
+      dialUser: "admin",
+      ownerTaskId: "task:proxy",
+      lastFailureReason: ""
+    }
+  });
+  const manager = new RouteManager(
+    network,
+    artifacts,
+    { append: async () => ({}) } as unknown as ExecutionLog,
+    store
+  );
+
+  await manager.restore();
+  const route = await manager.reconnect("route:socks-recoverable");
+
+  assert.equal(route.routeRef, "route:socks-recoverable");
+  assert.equal(route.connector, "socks5");
+  assert.equal(route.status, "live");
+  assert.ok(commands.some((entry) => entry.command.includes("socks-connector")));
+  assert.ok(commands.some((entry) => entry.stdin === "proxy-secret"));
   store.close();
   await rm(root, { recursive: true, force: true });
 });
@@ -774,7 +960,7 @@ test("stopAll preserves routes for a later reconnect", async () => {
   assert.equal(stopped?.externalId, opened.routeRef);
   assert.equal(stopped?.desiredState, "stopped");
   assert.equal(stopped?.status, "stale");
-  assert.equal(published.at(-1)?.[0]?.routeRef, opened.routeRef);
+  assert.deepEqual(published.at(-1), []);
   const credentialPath = `/run/luanniao/credentials/${opened.connectorRef.replace(/[^A-Za-z0-9._-]+/g, "-")}`;
   assert.ok(commands.some((command) => command.includes('kill -TERM -"$pid"') && command.includes(credentialPath)));
   assert.equal(commands.filter((command) => command.startsWith("umask 077; cat >") && command.includes(credentialPath)).length, 1);
@@ -895,7 +1081,7 @@ test("route stop persists stopped intent when connector cleanup fails and retrie
   assert.equal(persisted?.desiredState, "stopped");
   assert.equal(persisted?.status, "stale");
   assert.match(String(persisted?.definition.lastFailureReason), /connector unavailable/);
-  assert.equal(published.at(-1)?.[0]?.routeRef, opened.routeRef);
+  assert.deepEqual(published.at(-1), []);
 
   const stopped = await manager.stop(opened.routeRef);
   persisted = store.listDefinitions("route")[0];
@@ -940,25 +1126,24 @@ test("suspendAll preserves running desire while releasing live connectors", asyn
   await rm(root, { recursive: true, force: true });
 });
 
-test("open preserves startup and cleanup failures on the same recoverable route", async () => {
+test("open reports startup and cleanup failures without committing a route", async () => {
   const root = await mkdtemp("/tmp/luanniao-route-open-compensation-");
   const events: Array<{ payload?: Record<string, unknown> }> = [];
   const commands: string[] = [];
-  let failStart = true;
-  let failCleanup = true;
+  const published: Array<Array<{ routeRef: string }>> = [];
   const network = {
     connectorAddress: "192.168.1.2",
     connectorExec: async (command: string) => {
       commands.push(command);
-      if (command.startsWith("setsid sh -c") && failStart) {
+      if (command.startsWith("setsid sh -c")) {
         return { code: 1, stdout: "", stderr: "startup unavailable" };
       }
-      if (command.includes('kill -TERM -"$pid"') && failCleanup) {
+      if (command.includes('kill -TERM -"$pid"')) {
         return { code: 1, stdout: "", stderr: "cleanup unavailable" };
       }
       return { code: 0, stdout: "", stderr: "" };
     },
-    replaceRoutes: async () => undefined
+    replaceRoutes: async (routes: Array<{ routeRef: string }>) => { published.push(routes); }
   } as unknown as NetworkSandboxManager;
   const store = new ConnectivityStore(`${root}/state.sqlite`);
   const manager = new RouteManager(
@@ -976,38 +1161,27 @@ test("open preserves startup and cleanup failures on the same recoverable route"
     store
   );
 
-  const opened = await manager.open({
+  await assert.rejects(() => manager.open({
     connector: "ssh",
     pivotHostRef: "host:dmz",
     dialAddress: "192.0.2.10",
     targetCidrs: ["172.31.0.0/24"],
     credentialRef: "artifact:key",
     options: { port: 22, user: "ops" }
-  }, "task:pivot");
+  }, "task:pivot"), (error: unknown) => {
+    assert.ok(error instanceof AggregateError);
+    assert.match(error.message, /startup unavailable/);
+    assert.match(error.message, /cleanup unavailable/);
+    return true;
+  });
 
-  assert.equal(opened.status, "degraded");
-  assert.match(opened.error ?? "", /startup unavailable/);
-  assert.match(opened.error ?? "", /cleanup unavailable/);
-  const persisted = store.getDefinition(stableConnectivityId("route", opened.routeRef));
-  assert.equal(persisted?.desiredState, "running");
-  assert.equal(persisted?.definition.connectorCleanupPending, true);
-  assert.match(String(persisted?.definition.lastFailureReason), /startup unavailable/);
-  assert.match(String(persisted?.definition.lastFailureReason), /cleanup unavailable/);
-  assert.ok(events.some((event) => event.payload?.transition === "open_failed"
-    && String(event.payload?.failureReason).includes("cleanup unavailable")));
-
-  const commandsBeforeStatus = commands.length;
-  const [stillDegraded] = await manager.status(opened.routeRef);
-  assert.equal(stillDegraded?.status, "degraded");
-  assert.equal(commands.length, commandsBeforeStatus);
-
-  failStart = false;
-  failCleanup = false;
-  const recovered = await manager.reconnect(opened.routeRef);
-  assert.equal(recovered.routeRef, opened.routeRef);
-  assert.equal(recovered.connectorRef, opened.connectorRef);
-  assert.equal(recovered.status, "live");
-  assert.equal(store.getDefinition(stableConnectivityId("route", opened.routeRef))?.definition.connectorCleanupPending, false);
+  assert.deepEqual(await manager.status(), []);
+  assert.equal(store.listDefinitions("route").length, 0);
+  assert.equal(store.listDefinitions("session").length, 0);
+  assert.equal(published.length, 0);
+  assert.ok(commands.some((command) => command.startsWith("setsid sh -c")));
+  assert.ok(commands.some((command) => command.includes('kill -TERM -"$pid"')));
+  assert.deepEqual(events, []);
   store.close();
   await rm(root, { recursive: true, force: true });
 });

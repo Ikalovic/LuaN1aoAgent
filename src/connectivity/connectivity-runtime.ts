@@ -100,7 +100,8 @@ export class ConnectivityRuntime {
     this.replayGatewayFactory = input.replayGatewayFactory ?? (() => new ReplayGatewayRuntime({
       runtimeDir: this.network.runtimeDir,
       networkName: this.network.networkName,
-      image: this.network.image
+      image: this.network.image,
+      hostEgress: () => this.network.hostEgress()
     }));
   }
 
@@ -109,6 +110,11 @@ export class ConnectivityRuntime {
     if (this.closing) throw new Error("Connectivity runtime is closing");
     this.startPromise ??= this.startOwnedResources();
     return this.startPromise;
+  }
+
+  configureAuthorizedScope(cidrs: string): Promise<void> {
+    if (this.closing) throw new Error("Connectivity runtime is closing");
+    return this.network.configureAuthorizedScope(cidrs);
   }
 
   beginTaskEpoch(input: { taskId: string; epochId: string }): Promise<TaskGateway> {
@@ -159,6 +165,15 @@ export class ConnectivityRuntime {
     });
   }
 
+  replaceTransparentProxy(input: RouteOpenInput): Promise<RouteStatus> {
+    return this.withRoutes(async () => {
+      await this.ensureRoutesInitialized();
+      const route = await this.routes.replaceTransparentProxy(input);
+      this.routeRetries.delete(route.routeRef);
+      return route;
+    });
+  }
+
   routeStatus(routeRef?: string): Promise<RouteStatus[]> {
     return this.withRoutes(async () => {
       await this.ensureRoutesInitialized();
@@ -167,6 +182,41 @@ export class ConnectivityRuntime {
         if (route.status === "live") this.routeRetries.delete(route.routeRef);
       }
       return routes;
+    });
+  }
+
+  executorRouteStatus(routeRef?: string): Promise<RouteStatus[]> {
+    return this.routeStatus(routeRef).then((routes) => routes.filter(
+      (route) => !this.routes.isTransparentProxyRoute(route.routeRef)
+    ));
+  }
+
+  executorStopRoute(routeRef: string): Promise<RouteStatus> {
+    return this.withRoutes(async () => {
+      await this.ensureRoutesInitialized();
+      if (this.routes.isTransparentProxyRoute(routeRef)) {
+        throw new Error("The process-wide transparent proxy is operator-managed");
+      }
+      const route = await this.routes.stop(routeRef);
+      this.routeRetries.delete(routeRef);
+      return route;
+    });
+  }
+
+  executorReconnectRoute(routeRef: string): Promise<RouteStatus> {
+    return this.withRoutes(async () => {
+      await this.ensureRoutesInitialized();
+      if (this.routes.isTransparentProxyRoute(routeRef)) {
+        throw new Error("The process-wide transparent proxy is operator-managed");
+      }
+      try {
+        const route = await this.routes.reconnect(routeRef);
+        this.routeRetries.delete(routeRef);
+        return route;
+      } catch (error) {
+        this.recordRouteRetryFailure(routeRef);
+        throw error;
+      }
     });
   }
 
@@ -244,6 +294,28 @@ export class ConnectivityRuntime {
       await this.ownerLease.acquire();
       acquired = true;
       await this.network.start({ connector: !this.lazyRoutes });
+      for (const pending of this.network.pendingEpochs?.() ?? []) {
+        try {
+          const drain = await this.network.endEpoch(pending.taskId, pending.epochId);
+          await this.executionLog.append({
+            epochId: pending.epochId,
+            taskId: pending.taskId,
+            role: "runtime",
+            eventType: "network_capture_finalized",
+            summary: `${pending.epochId} network evidence finalized during recovery`,
+            payload: { ...drain, recovered: true }
+          });
+        } catch (error) {
+          await this.executionLog.append({
+            epochId: pending.epochId,
+            taskId: pending.taskId,
+            role: "runtime",
+            eventType: "network_capture_degraded",
+            summary: error instanceof Error ? error.message : String(error),
+            payload: { epochId: pending.epochId, recovered: true }
+          });
+        }
+      }
       if (!this.lazyRoutes) await this.ensureRoutesInitialized(true);
     } catch (error) {
       this.startPromise = undefined;

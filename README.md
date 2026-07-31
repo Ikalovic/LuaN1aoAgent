@@ -188,7 +188,7 @@ Executors use Pi coding tools inside the configured sandbox boundary:
 - `vulnerability_search` for CVE/advisory research through NVD and public web references, preserving weak negative semantics when no public hit is found.
 - `browser_render` for post-JavaScript DOM inspection inside the Executor network boundary; Docker mode runs Chromium through the same transparent Gateway as other target traffic.
 - `artifact_read` and `artifact_write` for durable cross-task material; complete workspace files can be imported without passing their contents through the model context.
-- `route_open`, `route_status`, `route_stop`, and `route_reconnect` for Docker-mode Runtime-managed SSH/Chisel reachability.
+- `route_open`, `route_status`, `route_stop`, and `route_reconnect` for Docker-mode Runtime-managed SSH and Chisel reachability. The operator-owned process-wide SOCKS5 proxy is configured before Agent execution and is not exposed through `route_open`.
 - `task_result_submit` for structured task completion or checkpoint handoff.
 
 Public research results are treated as hypotheses or intelligence leads until the Executor validates them against the authorized target with sandboxed tools. Optional `NVD_API_KEY` increases NVD rate limits but is not required.
@@ -225,9 +225,9 @@ Skills installed by `./install.sh` live in the project-local `.agents/skills/` (
 
 ### Sandbox Isolation
 
-- `auto` prefers a per-Task Docker Executor sharing its Gateway network namespace; explicit `docker` fails closed when Docker or a required image is unavailable.
+- `auto` prefers a per-Task Docker Executor on a private internal network; explicit `docker` fails closed when Docker or a required image is unavailable. The Executor and its Gateway use separate network namespaces, and the Gateway is the task network's only exit.
 - Docker Executors run as UID 1000 with no capabilities, a read-only root filesystem, executable size-limited `/tmp`, and a host-visible persistent `/workspace`.
-- Gateway containers add only `NET_ADMIN`, `SETUID`, and `SETGID` after dropping all capabilities: PID 1 configures TUN/policy routing and launches mitmproxy/connect gates as dedicated UIDs; the gate processes then clear their capability bounding sets.
+- Gateway containers add only `NET_ADMIN`, `SETUID`, and `SETGID` after dropping all capabilities: PID 1 configures TUN/policy routing and launches the protocol-aware Go Gateway as a dedicated UID; that process then clears its capability bounding set. HTTP/HTTPS is detected and transparently captured on any TCP port, while other TCP is relayed unchanged.
 - Without Docker, macOS Seatbelt and Linux Bubblewrap remain available; `workspace` is the explicit development fallback.
 - Executor workspaces and runtime roots are resolved explicitly, and one Task retains its workspace across checkpoint/resume epochs.
 - Host paths outside allowed roots fail closed under forced sandbox modes.
@@ -300,14 +300,29 @@ v2 reads `.env` locally. The file is ignored by Git and must never be committed.
 
 ```bash
 npm start -- \
-  --goal "在授权范围内评估 http://<authorized-routable-host>:8080" \
-  --scope "仅限 http://<authorized-routable-host>:8080" \
+  --goal "评估授权目标 10.0.0.10" \
+  --scope "10.0.0.0/24,11.0.0.0/24" \
+  --proxy "socks5://user:password@proxy.example:1080" \
   --max-cycles 8 \
   --max-parallel-tasks 2
 ```
 
 When stdin and stdout are attached to a TTY, the interactive Agent timeline starts automatically.
 Starting without `--resume` always creates a fresh session and never reads an older task graph.
+
+`--scope` is the network authorization root and accepts comma-separated IPv4 addresses, CIDRs, exact
+domains, or leading-wildcard domains. Bare IP addresses are normalized to `/32`. When `--scope` is
+omitted, the Planner model extracts only IPv4 addresses and CIDRs explicitly present in `--goal`;
+deterministic validation rejects invented or widened ranges. Domain scope must be supplied explicitly.
+If the Goal contains no explicit IPv4 target, startup fails and asks for `--scope`.
+
+`--proxy` is a Docker-mode, run-level transparent SOCKS5 egress. Runtime authenticates and installs
+the proxy Route before Planner or Executor work begins; each task Gateway still enforces the normalized
+CIDR and domain root Scope before traffic reaches that Route. Agents
+continue to use real target addresses and receive no proxy variables or SOCKS endpoint. The password
+is stored as a non-searchable `0600` credential Artifact and is omitted from events and route snapshots.
+Because SOCKS5 carries TCP, scoped TCP tools such as `curl`, `nmap -sT`, and TCP clients use the proxy;
+route-matched UDP and ICMP fail closed.
 
 Resume one specific unfinished session without repeating or replacing its Goal or authorized Scope:
 
@@ -321,7 +336,8 @@ npm start -- --resume 20260720-080000Z-a1b2c3d4
 
 ```text
 --goal <text>                Agent goal
---scope <text>               Authorized scope summary
+--scope <entries>            Authorized IPv4/CIDRs/domains (for example baidu.com,*.baidu.com)
+--proxy <socks5-url>         Transparently route all scoped Agent TCP through SOCKS5
 --runtime-dir <path>         Empty directory for a new runtime
 --resume <session>           Resume one runtime; restores Goal and Scope
 --max-cycles <number>        Maximum Planner cycles
@@ -332,6 +348,13 @@ npm start -- --resume 20260720-080000Z-a1b2c3d4
 --no-tui                     Disable the interactive TUI
 --help                       Show CLI help
 ```
+
+Domain scope entries are normalized case-insensitively. A bare name such as `baidu.com`
+authorizes that exact DNS name; `*.baidu.com` authorizes subdomains but not the apex name.
+The task Gateway filters DNS queries against those rules and adds returned IPv4 addresses
+to a task-local, expiring kernel set before releasing the DNS response. CIDR entries continue
+to be enforced directly. Domain-derived UDP/ICMP access is limited to addresses learned by
+that task Gateway's controlled DNS path; direct out-of-scope IP access remains rejected.
 
 ### Interactive controls
 
@@ -348,8 +371,8 @@ Use JSON Lines when another process needs the complete durable event stream:
 
 ```bash
 npm start -- \
-  --goal "Inspect the authorized target" \
-  --scope "localhost only" \
+  --goal "Inspect the authorized target 127.0.0.1" \
+  --scope "127.0.0.1/32" \
   --jsonl
 ```
 
@@ -386,7 +409,9 @@ The Web workbench is primarily an observability surface: it reads persisted grap
 
 All `/api/*` traffic and connectivity endpoints require a valid session. Analysts may read runtime metadata, sensitive proxy history, and connection status, but connectivity lifecycle mutations require the administrator-only `connectivity:manage` capability. No delete/export traffic endpoint is exposed. GET requests are CSRF-exempt, while mutations require the same-origin double-submit token. Runtime paths are canonicalized beneath the configured `--runtime-dir` root, including symlink checks, so the API is not an arbitrary filesystem browser.
 
-Docker Executors share a per-Task Gateway network namespace. The Executor receives no proxy variables, SOCKS endpoints, or Docker-internal aliases: ordinary `curl`, language sockets, and raw TCP clients keep the real destination address. IPv4 TCP is policy-routed through a TUN connect gate, captured by mitmproxy, and then dialed directly or through a managed SSH/Chisel route. The gate completes the Executor-side TCP handshake only after the real target connection succeeds, so a transparent proxy cannot turn a refused port into a false positive. UDP and ICMP remain direct and are attributed from conntrack telemetry.
+Each Docker Executor uses a private internal network and a separate per-Task Gateway network namespace. The Executor receives no proxy variables or SOCKS endpoint: ordinary `curl`, language sockets, and TCP clients keep the real destination address. All IPv4 TCP is policy-routed through one Go protocol Gateway. Plain HTTP and TLS that explicitly negotiates HTTP/1.1 or HTTP/2 are captured on any port; unknown TLS and other TCP protocols are relayed unchanged. Direct connections use an authenticated host-side dial broker, which waits for the host kernel's real target result before the Gateway completes the Executor-side handshake; route-matched connections instead use a Runtime-managed SSH, Chisel, or authenticated upstream SOCKS5 Connector and never fall back to direct. UDP and ICMP are attributed from conntrack telemetry, and route-matched UDP/ICMP fails closed.
+
+The normalized root Scope is compiled into each task Gateway. CIDRs are enforced directly; domain rules are enforced by controlled DNS plus task-local expiring address sets. Direct TCP, UDP, and ICMP destinations outside those rules are rejected. A live managed Route may authorize TCP to its own CIDR without widening the root Scope; route-matched UDP and ICMP remain rejected.
 
 Each epoch persists segmented `.mitm` capture files plus `.net.jsonl` connection telemetry under `<runtime>/traffic/flows/<task>/`. HTTP request/response bodies are truncated only in the persisted copy; live forwarding is unchanged. A read-only Index container rebuilds its view from those files after restart, so a dead localhost index process is not a second source of truth. The sidebar's **Web Traffic** view uses opaque `flowRef` identifiers and distinguishes HTTP from raw TCP; bodies are loaded on demand, rendered as escaped text, and expose truncation or eviction states explicitly.
 
@@ -398,7 +423,7 @@ Replay accepts only complete captured HTTP requests and preserves method, URL, h
 
 Connections and routes are persisted independently of graph projection. A Connection is a command channel; a Route is network reachability and may be backed by a Connection. `route_stop` preserves the definition, while `route_reconnect` restores the original reference. The Projector consumes typed connectivity observations to create semantic `ShellSession`, `session_on`, and discovered-host `proxy_route` facts; Runtime containers and Docker aliases never become graph hosts.
 
-The sidebar's **Connections** view lists Connection and Route desired/observed state, backing references, heartbeat, target CIDRs, failures, and operation-graph links. Lifecycle mutations are administrator-only and accept credential references rather than inline secrets. Agent-managed SSH and Chisel routes can be stopped and reconnected; channels created autonomously in Bash remain audited as unmanaged traffic and are not given a fabricated recoverable reference.
+The sidebar's **Connections** view lists Connection and Route desired/observed state, backing references, heartbeat, target CIDRs, failures, and operation-graph links. Lifecycle mutations are administrator-only and accept credential references rather than inline secrets. Agent-managed SSH, Chisel, and upstream SOCKS5 routes can be stopped and reconnected; channels created autonomously in Bash remain audited as unmanaged traffic and are not given a fabricated recoverable reference.
 
 ---
 

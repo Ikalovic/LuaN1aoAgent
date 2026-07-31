@@ -110,6 +110,7 @@ export class ExecutionLog {
     limit: number;
     eventTypes?: string[];
     roles?: Array<AgentRole | "runtime">;
+    direction?: "forward" | "backward";
   }): Promise<{ events: ExecutionEvent[]; nextCursor?: string }> {
     const where: string[] = [];
     const parameters: Array<string | number> = [];
@@ -138,11 +139,11 @@ export class ExecutionLog {
       }
     }
     const whereSql = where.length > 0 ? `WHERE ${where.join(" AND ")}` : "";
-    const order = input.cursor ? "ASC" : "DESC";
+    const order = input.direction === "forward" || input.cursor ? "ASC" : "DESC";
     const rows = this.database.prepare(`
       SELECT * FROM execution_events ${whereSql} ORDER BY seq ${order} LIMIT ?
     `).all(...parameters, Math.max(0, input.limit)) as ExecutionEventRow[];
-    const events = (input.cursor ? rows : rows.reverse()).map(rowToEvent);
+    const events = (order === "DESC" ? rows.reverse() : rows).map(rowToEvent);
     return {
       events,
       nextCursor: events.at(-1)?.id
@@ -183,6 +184,12 @@ export class ExecutionLog {
     const row = this.database.prepare("SELECT seq FROM execution_events WHERE id = ?")
       .get(eventId) as { seq: number } | undefined;
     return row ? Number(row.seq) : undefined;
+  }
+
+  eventById(eventId: string): ExecutionEvent | undefined {
+    const row = this.database.prepare("SELECT * FROM execution_events WHERE id = ?")
+      .get(eventId) as ExecutionEventRow | undefined;
+    return row ? rowToEvent(row) : undefined;
   }
 
   artifactRefsForEvents(eventIds: string[]): Map<string, string[]> {
@@ -318,7 +325,7 @@ export class ExecutionLog {
         projector.failed += 1;
         accumulateNumber(projector.durationMs, event.payload.durationMs);
       }
-      if (event.eventType === "projection_job_discarded") {
+      if (event.eventType === "projection_job_discarded" || event.eventType === "projection_request_discarded") {
         projector.discarded += 1;
       }
       if (event.eventType === "supervisor_check_started") supervisor.started += 1;

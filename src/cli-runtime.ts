@@ -7,7 +7,7 @@ import type { CliOptions } from "./cli-options.js";
 export type CliRunContext = {
   runtimeDir: string;
   userGoal: string;
-  scopeSummary: string;
+  scopeSummary?: string;
   resumed: boolean;
 };
 

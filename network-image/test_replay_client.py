@@ -43,18 +43,12 @@ class FakeClient:
 
 
 class ReplayClientTest(unittest.TestCase):
-    def test_request_uses_ephemeral_context_and_internal_header(self) -> None:
+    def test_request_uses_out_of_band_context_without_internal_header(self) -> None:
         FakeClient.requests.clear()
         with tempfile.TemporaryDirectory() as directory:
             actual_path = Path(directory) / "context.json"
-
-            def mapped_path(value):
-                self.assertEqual(value, "/run/luanniao-replay-" + "a" * 64 + ".json")
-                return actual_path
-
             with (
-                patch("replay_client.secrets.token_hex", return_value="a" * 64),
-                patch("replay_client.Path", side_effect=mapped_path),
+                patch.object(replay_client, "CONTEXT_PATH", actual_path),
                 patch("replay_client.httpx.Client", FakeClient),
                 patch("replay_client.socket.getaddrinfo", return_value=[(None, None, None, None, ("172.31.0.20", 0))]),
             ):
@@ -75,8 +69,8 @@ class ReplayClientTest(unittest.TestCase):
         self.assertFalse(actual_path.exists())
         request = FakeClient.requests[-1]
         self.assertEqual(request["content"], b"test")
-        self.assertIn((replay_client.CONTEXT_HEADER, "a" * 64), request["headers"])
         self.assertEqual(request["headers"][0], ("X-Test", ""))
+        self.assertFalse(any(name.lower() == "x-luanniao-replay-context" for name, _ in request["headers"]))
 
     def test_routed_replay_rejects_a_target_outside_original_cidrs(self) -> None:
         with patch("replay_client.socket.getaddrinfo", return_value=[(None, None, None, None, ("192.0.2.10", 0))]):
@@ -92,9 +86,11 @@ class ReplayClientTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "outside the original route"):
                 replay_client.validate_route_target("http://example.test/", ["172.31.0.0/24"])
 
-    def test_reserved_context_header_cannot_be_supplied(self) -> None:
-        with self.assertRaisesRegex(ValueError, "header name"):
-            replay_client.validate_headers([{"name": replay_client.CONTEXT_HEADER, "value": "forged"}])
+    def test_old_context_header_is_not_control_metadata(self) -> None:
+        self.assertEqual(
+            replay_client.validate_headers([{"name": "X-Luanniao-Replay-Context", "value": "application-value"}]),
+            [("X-Luanniao-Replay-Context", "application-value")],
+        )
 
 
 if __name__ == "__main__":

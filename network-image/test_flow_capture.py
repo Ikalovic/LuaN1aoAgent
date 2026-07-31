@@ -49,48 +49,6 @@ class FlowCaptureTest(unittest.TestCase):
 
         self.assertEqual(route["routeRef"], "route:specific")
 
-    def test_replay_context_is_consumed_before_forwarding_and_tags_the_flow(self) -> None:
-        writer = CaptureWriter()
-        token = "a" * 64
-        headers = {"x-luanniao-replay-context": token}
-        flow = SimpleNamespace(request=SimpleNamespace(headers=headers), metadata={})
-
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / f"context-{token}.json"
-            path.write_text(json.dumps({
-                "replayOf": "task:source:flow",
-                "taskRef": "task:source",
-                "routeRef": "route:source",
-                "connectionRef": "connection:source",
-                "attribution": "web-user:test",
-            }))
-            details = path.stat()
-            with (
-                patch("flow_capture.REPLAY_CONTEXT_PREFIX", str(Path(directory) / "context-")),
-                patch.object(Path, "stat", return_value=SimpleNamespace(
-                    st_mode=details.st_mode,
-                    st_uid=1000,
-                    st_size=details.st_size,
-                )),
-            ):
-                writer._consume_replay_context(flow)
-
-        self.assertNotIn("x-luanniao-replay-context", headers)
-        self.assertEqual(flow.metadata["replayOf"], "task:source:flow")
-        self.assertEqual(flow.metadata["taskRef"], "task:source")
-        self.assertEqual(flow.metadata["routeRef"], "route:source")
-        self.assertEqual(flow.metadata["connectionRef"], "connection:source")
-
-    def test_invalid_replay_context_header_is_removed_without_metadata(self) -> None:
-        writer = CaptureWriter()
-        headers = {"x-luanniao-replay-context": "not-a-token"}
-        flow = SimpleNamespace(request=SimpleNamespace(headers=headers), metadata={})
-
-        writer._consume_replay_context(flow)
-
-        self.assertNotIn("x-luanniao-replay-context", headers)
-        self.assertEqual(flow.metadata, {})
-
     def test_tcp_error_persists_failed_flow(self) -> None:
         writer = CaptureWriter()
         flow = object()

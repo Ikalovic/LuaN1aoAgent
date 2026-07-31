@@ -16,7 +16,7 @@ export function AuthScreen(props: AuthScreenProps) {
     <div className="auth-shell">
       <section className="auth-product">
         <div className="auth-brand">
-          <div className="brand-mark">鸾</div>
+          <div className="brand-mark"><img src="/brand/luanniao-mark.svg" alt="" /></div>
           <div><strong>{t("auth.brand")}</strong><span>Agent Operations Workbench</span></div>
           <Tooltip title={locale === "zh-CN" ? t("language.switchToEnglish") : t("language.switchToChinese")}>
             <Button type="text" icon={<Languages size={18} />} onClick={toggleLocale}>{locale === "zh-CN" ? "English" : "中文"}</Button>

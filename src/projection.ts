@@ -3,12 +3,24 @@ import { stableSessionNodeId } from "./operation-identity.js";
 import type { ExecutionEvent, GraphDelta, GraphEdge, GraphNode, GraphSnapshot } from "./types.js";
 
 export type ProjectionObservationKind = "action" | "task_outcome" | "connectivity" | "runtime_error";
+export type ProjectionMaterialIntegrity = "complete" | "truncated" | "unavailable";
+
+export type ProjectionMaterialIntegrityPair = {
+  input: ProjectionMaterialIntegrity;
+  outcome: ProjectionMaterialIntegrity;
+};
 
 const TASK_OUTCOME_EVENT_TYPES = new Set([
   "task_completed",
   "task_partial",
   "task_blocked",
   "task_failed"
+]);
+const EPOCH_OUTCOME_EVENT_TYPES = new Set([
+  "epoch_checkpointed",
+  "epoch_provider_error",
+  "epoch_failed",
+  "epoch_aborted"
 ]);
 
 const LEGACY_RAW_RESULT_INTERPRETATION = "No recorded Executor interpretation; use only the raw result as evidence.";
@@ -48,6 +60,7 @@ export type ProjectionObservation = {
   action?: string;
   inputDigest?: string;
   outcomeDigest: string;
+  materialIntegrity?: ProjectionMaterialIntegrityPair;
   status: "ok" | "error" | "incomplete";
   artifactRefs: string[];
   capabilityRefs?: string[];
@@ -58,6 +71,7 @@ export type ProjectionObservation = {
     action: string;
     inputDigest?: string;
     outcomeDigest: string;
+    materialIntegrity?: ProjectionMaterialIntegrityPair;
     status: "ok" | "error" | "incomplete";
     seqStart?: number;
     seqEnd?: number;
@@ -125,6 +139,7 @@ export type ProjectionExistingAliasContext = ReadonlyMap<string, {
 
 export type ProjectionDraftValidationOptions = {
   existingAliases?: ProjectionExistingAliasContext;
+  availableEvidenceRefs?: ReadonlySet<string>;
 };
 
 export class ProjectorGraphRefRegistry {
@@ -251,6 +266,7 @@ type PendingAction = {
   intent?: string;
   action: string;
   inputDigest?: string;
+  inputIntegrity: ProjectionMaterialIntegrity;
   sourceEventIds: string[];
   artifactRefs: string[];
 };
@@ -303,6 +319,7 @@ export function buildProjectionObservations(events: ExecutionEvent[]): Projectio
         action: observation.action ?? "unknown",
         inputDigest: observation.inputDigest,
         outcomeDigest: observation.outcomeDigest,
+        materialIntegrity: observation.materialIntegrity,
         status: observation.status,
         seqStart: observation.seqStart,
         seqEnd: observation.seqEnd,
@@ -335,7 +352,8 @@ export function buildProjectionObservations(events: ExecutionEvent[]): Projectio
     if (event.eventType === "tool_started") {
       const toolCallId = textProperty(event.payload.toolCallId) ?? event.id;
       const action = textProperty(event.payload.toolName) ?? "unknown";
-      const inputDigest = compactInputValue(event.payload.args);
+      const inputMaterial = projectionInputMaterial(event.payload.args);
+      const inputDigest = inputMaterial.text;
       if (!isRuntimeContextAction(action, inputDigest, "")) {
         closeOpenActions(MISSING_RESULT_INTERPRETATION, event.id);
       }
@@ -344,6 +362,7 @@ export function buildProjectionObservations(events: ExecutionEvent[]): Projectio
         intent: pendingIntent?.text,
         action,
         inputDigest,
+        inputIntegrity: inputMaterial.integrity,
         sourceEventIds: dedupeStrings([
           ...(pendingIntent ? [pendingIntent.eventId] : []),
           event.id
@@ -360,7 +379,8 @@ export function buildProjectionObservations(events: ExecutionEvent[]): Projectio
       const pending = pendingActions.get(toolCallId);
       pendingActions.delete(toolCallId);
       const inputDigest = pending?.inputDigest;
-      const outcomeDigest = compactToolOutcome(event);
+      const outcomeMaterial = projectionToolOutcomeMaterial(event);
+      const outcomeDigest = outcomeMaterial.text;
       const artifactRefs = dedupeStrings([
         ...(pending?.artifactRefs ?? []),
         ...eventArtifactRefs(event)
@@ -377,6 +397,10 @@ export function buildProjectionObservations(events: ExecutionEvent[]): Projectio
         action,
         inputDigest,
         outcomeDigest,
+        materialIntegrity: {
+          input: pending?.inputIntegrity ?? "unavailable",
+          outcome: outcomeMaterial.integrity
+        },
         interpretation: pending
           ? undefined
           : LEGACY_RAW_RESULT_INTERPRETATION,
@@ -424,7 +448,7 @@ export function buildProjectionObservations(events: ExecutionEvent[]): Projectio
       continue;
     }
 
-    if (event.eventType === "provider_error") {
+    if (event.eventType === "provider_error" || EPOCH_OUTCOME_EVENT_TYPES.has(event.eventType)) {
       closeOpenActions(event.summary ?? "Provider error interrupted result interpretation.", event.id);
       observations.push({
         ref: "",
@@ -582,6 +606,10 @@ export function expandProjectionDraft(input: {
 }): GraphDelta {
   validateProjectionDraftIntegrity(input.value, {
     existingAliases: input.references?.aliasContext() ?? projectionExistingAliasContext(input.graphContext),
+    availableEvidenceRefs: new Set([
+      ...input.batch.observations.map((observation) => observation.ref),
+      ...input.batch.sourceEventIds
+    ]),
     ...input.validationOptions
   });
   const record = isRecord(input.value) ? input.value : {};
@@ -688,9 +716,7 @@ export function expandProjectionDraft(input: {
           `Projection edge references unknown existing alias: ${submittedFrom || "<empty>"} -> ${submittedTo || "<empty>"}; no part of the delta was accepted`
         );
       }
-      const id = stableOperationalEdgeId(type, properties);
       return {
-        ...(id ? { id } : {}),
         from,
         to,
         type,
@@ -767,19 +793,6 @@ export function validateProjectionDraftIntegrity(
         `Projection node at index ${index} has unexpected top-level keys [${unexpectedNodeKeys.join(", ")}]; nodes only allow id, graphKind, type, label, properties, evidenceRefs — move metadata such as status/target/description into properties`
       );
     }
-    const nodeGraphKind = String(valueNode.graphKind ?? "");
-    const allowedNodeTypes = PROJECTION_NODE_TYPES[nodeGraphKind];
-    if (!allowedNodeTypes) {
-      errors.push(
-        `Projection node at index ${index} has graphKind ${JSON.stringify(valueNode.graphKind ?? null)}; expected "operation" or "reasoning"`
-      );
-    }
-    const nodeType = String(valueNode.type ?? "");
-    if (allowedNodeTypes && !allowedNodeTypes.includes(nodeType)) {
-      errors.push(
-        `Projection node at index ${index} (${nodeGraphKind}) has type ${JSON.stringify(valueNode.type ?? null)}; valid ${nodeGraphKind} types: ${allowedNodeTypes.join(", ")}`
-      );
-    }
     const alias = String(valueNode.id ?? "").trim();
     if (!/^(existing|new):[1-9][0-9]*$/.test(alias)) {
       errors.push(`Projection node at index ${index} has invalid alias ${alias || "<empty>"}`);
@@ -791,6 +804,36 @@ export function validateProjectionDraftIntegrity(
     }
     declaredAliases.add(alias);
     declaredNodes.set(alias, valueNode);
+    const existingIdentity = alias.startsWith("existing:") ? options.existingAliases?.get(alias) : undefined;
+    const nodeGraphKind = String(valueNode.graphKind ?? existingIdentity?.graphKind ?? "");
+    const allowedNodeTypes = PROJECTION_NODE_TYPES[nodeGraphKind];
+    if (!allowedNodeTypes) {
+      errors.push(
+        `Projection node at index ${index} has graphKind ${JSON.stringify(valueNode.graphKind ?? null)}; expected "operation" or "reasoning"`
+      );
+    }
+    const nodeType = String(valueNode.type ?? existingIdentity?.type ?? "");
+    if (allowedNodeTypes && !allowedNodeTypes.includes(nodeType)) {
+      errors.push(
+        `Projection node at index ${index} (${nodeGraphKind}) has type ${JSON.stringify(valueNode.type ?? null)}; valid ${nodeGraphKind} types: ${allowedNodeTypes.join(", ")}`
+      );
+    }
+    const submittedEvidenceRefs = stringArray(valueNode.evidenceRefs);
+    const availableEvidenceRefs = options.availableEvidenceRefs;
+    const hasResolvableEvidence = submittedEvidenceRefs.some((ref) => (
+      !availableEvidenceRefs || availableEvidenceRefs.has(ref)
+    ));
+    const nodeProperties = isRecord(valueNode.properties) ? valueNode.properties : {};
+    if (nodeType === "Vulnerability" && !hasResolvableEvidence) {
+      errors.push(
+        `Projection node at index ${index} (Vulnerability) must include at least one evidenceRef from the current observations`
+      );
+    }
+    if (nodeType === "Exploit" && nodeProperties.status === "succeeded" && !hasResolvableEvidence) {
+      errors.push(
+        `Projection node at index ${index} (succeeded Exploit) must include at least one evidenceRef from the current observations`
+      );
+    }
     if (allowedNodeTypes?.includes(nodeType)) {
       aliasTypes.set(alias, {
         graphKind: nodeGraphKind as GraphNode["graphKind"],
@@ -803,7 +846,10 @@ export function validateProjectionDraftIntegrity(
         unknownExistingAliases.add(alias);
       } else if (existing.graphKind === "task") {
         taskGraphAliases.set(alias, existing.type);
-      } else if (valueNode.graphKind !== existing.graphKind || valueNode.type !== existing.type) {
+      } else if (
+        (valueNode.graphKind !== undefined && valueNode.graphKind !== existing.graphKind)
+        || (valueNode.type !== undefined && valueNode.type !== existing.type)
+      ) {
         conflictingExistingAliases.add(
           `${alias} expected ${existing.graphKind}/${existing.type}, received ${String(valueNode.graphKind)}/${String(valueNode.type)}`
         );
@@ -968,13 +1014,21 @@ export function renderProjectionObservations(observations: ProjectionObservation
     observation.action ? `  action: ${observation.action}` : undefined,
     ...(observation.actions ?? []).flatMap((action, index) => [
       `  tool[${index + 1}]: ${action.action} status=${action.status}`,
-      action.inputDigest ? `    input: ${action.inputDigest}` : undefined,
-      action.outcomeDigest ? `    outcome: ${action.outcomeDigest}` : undefined
+      action.materialIntegrity
+        ? `    material_integrity: input=${action.materialIntegrity.input} outcome=${action.materialIntegrity.outcome}`
+        : undefined,
+      action.inputDigest ? `    input: ${JSON.stringify(action.inputDigest)}` : undefined,
+      action.outcomeDigest ? `    outcome: ${JSON.stringify(action.outcomeDigest)}` : undefined
     ]),
     (observation.repeatCount ?? 1) > 1 ? `  repeated: ${observation.repeatCount}` : undefined,
-    !observation.actions && observation.inputDigest ? `  input: ${observation.inputDigest}` : undefined,
-    !observation.actions && observation.outcomeDigest ? `  outcome: ${observation.outcomeDigest}` : undefined,
-    observation.interpretation ? `  executor_interpretation: ${observation.interpretation}` : undefined,
+    !observation.actions && observation.materialIntegrity
+      ? `  material_integrity: input=${observation.materialIntegrity.input} outcome=${observation.materialIntegrity.outcome}`
+      : undefined,
+    !observation.actions && observation.inputDigest ? `  input: ${JSON.stringify(observation.inputDigest)}` : undefined,
+    !observation.actions && observation.outcomeDigest ? `  outcome: ${JSON.stringify(observation.outcomeDigest)}` : undefined,
+    observation.interpretation
+      ? `  executor_interpretation_non_evidence: ${JSON.stringify(observation.interpretation)}`
+      : undefined,
     observation.artifactRefs.length > 0 ? `  artifacts: ${observation.artifactRefs.join(", ")}` : undefined,
     (observation.capabilityRefs ?? []).length > 0
       ? `  capabilities: ${(observation.capabilityRefs ?? []).join(", ")}`
@@ -1196,18 +1250,42 @@ function compactProjectionObservation(
   textBytes: number,
   ref: string
 ): ProjectionObservation {
-  const actions = observation.actions?.map((action) => ({
-    ...action,
-    inputDigest: action.inputDigest ? compactUtf8HeadTail(action.inputDigest, textBytes) : undefined,
-    outcomeDigest: compactUtf8HeadTail(action.outcomeDigest, textBytes)
-  }));
+  const actions = observation.actions?.map((action) => {
+    const inputDigest = action.inputDigest
+      ? compactUtf8HeadTailExact(action.inputDigest, textBytes)
+      : undefined;
+    const outcomeDigest = compactUtf8HeadTailExact(action.outcomeDigest, textBytes);
+    return {
+      ...action,
+      inputDigest,
+      outcomeDigest,
+      materialIntegrity: compactedMaterialIntegrity(
+        action.materialIntegrity,
+        action.inputDigest,
+        inputDigest,
+        action.outcomeDigest,
+        outcomeDigest
+      )
+    };
+  });
+  const inputDigest = observation.inputDigest
+    ? compactUtf8HeadTailExact(observation.inputDigest, textBytes)
+    : undefined;
+  const outcomeDigest = compactUtf8HeadTailExact(observation.outcomeDigest, textBytes);
   return {
     ...observation,
     ref,
     intent: observation.intent ? compactUtf8HeadTail(observation.intent, textBytes) : undefined,
     interpretation: observation.interpretation ? compactUtf8HeadTail(observation.interpretation, textBytes) : undefined,
-    inputDigest: observation.inputDigest ? compactUtf8HeadTail(observation.inputDigest, textBytes) : undefined,
-    outcomeDigest: compactUtf8HeadTail(observation.outcomeDigest, textBytes),
+    inputDigest,
+    outcomeDigest,
+    materialIntegrity: compactedMaterialIntegrity(
+      observation.materialIntegrity,
+      observation.inputDigest,
+      inputDigest,
+      observation.outcomeDigest,
+      outcomeDigest
+    ),
     actions,
     artifactRefs: [...observation.artifactRefs],
     capabilityRefs: [...(observation.capabilityRefs ?? [])],
@@ -1252,16 +1330,6 @@ function stableOperationNodeId(node: Record<string, unknown>): string | undefine
     type: String(node.type ?? ""),
     properties: isRecord(node.properties) ? node.properties : {}
   });
-}
-
-function stableOperationalEdgeId(type: string, properties: Record<string, unknown>): string | undefined {
-  if (type === "tunnels_to") {
-    return stableIdentity("tunnel", properties.tunnelId);
-  }
-  if (type === "proxy_route") {
-    return stableIdentity("proxy-route", properties.routeId);
-  }
-  return undefined;
 }
 
 function stableIdentity(prefix: string, value: unknown): string | undefined {
@@ -1377,23 +1445,61 @@ function decisionObservationScore(
   return kindScore + structuralScore + recencyScore;
 }
 
-function compactToolOutcome(event: ExecutionEvent): string {
+function projectionToolOutcomeMaterial(event: ExecutionEvent): {
+  text: string;
+  integrity: ProjectionMaterialIntegrity;
+} {
   const result = event.payload.result;
-  return compactHeadTail(toolResultText(result) ?? event.summary ?? "Tool completed", 700);
+  const text = toolResultText(result);
+  if (text === undefined) {
+    return {
+      text: event.summary ?? "Tool completed without persisted result material",
+      integrity: "unavailable"
+    };
+  }
+  return {
+    text,
+    integrity: containsExplicitTruncation(result) ? "truncated" : "complete"
+  };
 }
 
-function compactInputValue(value: unknown): string | undefined {
+function projectionInputMaterial(value: unknown): {
+  text?: string;
+  integrity: ProjectionMaterialIntegrity;
+} {
   if (value === undefined || value === null) {
-    return undefined;
+    return { integrity: "unavailable" };
   }
   if (typeof value === "string") {
-    return compactHeadTail(value, 320);
+    return { text: value, integrity: "complete" };
   }
   try {
-    return compactHeadTail(JSON.stringify(value), 320);
+    const serialized = JSON.stringify(value);
+    return serialized === undefined
+      ? { integrity: "unavailable" }
+      : { text: serialized, integrity: "complete" };
   } catch {
-    return compactHeadTail(String(value), 320);
+    return { integrity: "unavailable" };
   }
+}
+
+function containsExplicitTruncation(value: unknown, depth = 0): boolean {
+  if (depth > 8 || value === undefined || value === null) {
+    return false;
+  }
+  if (Array.isArray(value)) {
+    return value.some((entry) => containsExplicitTruncation(entry, depth + 1));
+  }
+  if (!isRecord(value)) {
+    return false;
+  }
+  if (value.truncated === true || value.matchLimitReached !== undefined) {
+    return true;
+  }
+  if (isRecord(value.truncation)) {
+    return true;
+  }
+  return Object.values(value).some((entry) => containsExplicitTruncation(entry, depth + 1));
 }
 
 function compactTaskOutcome(event: ExecutionEvent): string {
@@ -1441,29 +1547,29 @@ function compactValue(value: unknown, maxChars: number): string | undefined {
 
 function toolResultText(value: unknown): string | undefined {
   if (typeof value === "string") {
-    return normalizeWhitespace(value);
+    return value;
   }
   if (Array.isArray(value)) {
     const parts = value.map(toolResultText).filter((part): part is string => Boolean(part));
-    return parts.length > 0 ? parts.join(" ") : undefined;
+    return parts.length > 0 ? parts.join("\n") : undefined;
   }
   if (!isRecord(value)) {
     return value === undefined || value === null ? undefined : String(value);
   }
   if (typeof value.text === "string") {
-    return normalizeWhitespace(value.text);
+    return value.text;
   }
   const preferredKeys = ["content", "stdout", "stderr", "output", "body", "message"];
   const preferredParts = preferredKeys
     .map((key) => toolResultText(value[key]))
     .filter((part): part is string => Boolean(part));
   if (preferredParts.length > 0) {
-    return preferredParts.join(" ");
+    return preferredParts.join("\n");
   }
   try {
-    return normalizeWhitespace(JSON.stringify(value));
+    return JSON.stringify(value);
   } catch {
-    return normalizeWhitespace(String(value));
+    return undefined;
   }
 }
 
@@ -1476,12 +1582,14 @@ function coalesceProjectionObservations(observations: ProjectionObservation[]): 
       continue;
     }
     const repeatCount = (previous.repeatCount ?? 1) + (observation.repeatCount ?? 1);
+    const mergedInput = mergeObservationInputs(previous.inputDigest, observation.inputDigest, repeatCount);
     coalesced[coalesced.length - 1] = {
       ...previous,
       seqEnd: observation.seqEnd,
       intent: observation.intent ?? previous.intent,
       interpretation: observation.interpretation ?? previous.interpretation,
-      inputDigest: mergeObservationInputs(previous.inputDigest, observation.inputDigest, repeatCount),
+      inputDigest: mergedInput,
+      materialIntegrity: mergeRepeatedMaterialIntegrity(previous, observation, mergedInput),
       artifactRefs: dedupeStrings([...previous.artifactRefs, ...observation.artifactRefs]),
       anchors: dedupeStrings([...previous.anchors, ...observation.anchors]),
       sourceEventIds: dedupeStrings([...previous.sourceEventIds, ...observation.sourceEventIds]),
@@ -1498,8 +1606,35 @@ function canCoalesceObservations(left: ProjectionObservation, right: ProjectionO
   return (left.repeatCount ?? 1) < MAX_REPEATED_ACTIONS_PER_OBSERVATION
     && left.action === right.action
     && left.status === right.status
-    && semanticFingerprint(left.outcomeDigest) === semanticFingerprint(right.outcomeDigest)
+    && left.outcomeDigest === right.outcomeDigest
     && semanticFingerprint(left.anchors.join("|")) === semanticFingerprint(right.anchors.join("|"));
+}
+
+function mergeRepeatedMaterialIntegrity(
+  left: ProjectionObservation,
+  right: ProjectionObservation,
+  mergedInput: string | undefined
+): ProjectionMaterialIntegrityPair | undefined {
+  if (!left.materialIntegrity || !right.materialIntegrity) {
+    return left.materialIntegrity ?? right.materialIntegrity;
+  }
+  const inputsRemainExact = left.inputDigest === right.inputDigest && mergedInput === left.inputDigest;
+  return {
+    input: inputsRemainExact
+      ? mergeMaterialIntegrity(left.materialIntegrity.input, right.materialIntegrity.input)
+      : "truncated",
+    outcome: mergeMaterialIntegrity(left.materialIntegrity.outcome, right.materialIntegrity.outcome)
+  };
+}
+
+function mergeMaterialIntegrity(
+  left: ProjectionMaterialIntegrity,
+  right: ProjectionMaterialIntegrity
+): ProjectionMaterialIntegrity {
+  if (left === "unavailable" || right === "unavailable") {
+    return "unavailable";
+  }
+  return left === "truncated" || right === "truncated" ? "truncated" : "complete";
 }
 
 function isClosedObservation(observation: ProjectionObservation): boolean {
@@ -1518,7 +1653,9 @@ function pendingExecutorIntentSeq(events: ExecutionEvent[]): number | undefined 
       pendingSeq = undefined;
       continue;
     }
-    if (TASK_OUTCOME_EVENT_TYPES.has(event.eventType) || event.eventType === "provider_error") {
+    if (TASK_OUTCOME_EVENT_TYPES.has(event.eventType)
+      || EPOCH_OUTCOME_EVENT_TYPES.has(event.eventType)
+      || event.eventType === "provider_error") {
       pendingSeq = undefined;
     }
   }
@@ -1557,13 +1694,17 @@ function compactHeadTail(value: string, maxChars: number): string {
 
 export function compactUtf8HeadTail(value: string, maxBytes: number): string {
   const normalized = normalizeWhitespace(value);
-  if (Buffer.byteLength(normalized, "utf8") <= maxBytes) {
-    return normalized;
+  return compactUtf8HeadTailExact(normalized, maxBytes);
+}
+
+function compactUtf8HeadTailExact(value: string, maxBytes: number): string {
+  if (Buffer.byteLength(value, "utf8") <= maxBytes) {
+    return value;
   }
   if (maxBytes <= 0) {
     return "";
   }
-  const omittedBytes = Buffer.byteLength(normalized, "utf8") - maxBytes;
+  const omittedBytes = Buffer.byteLength(value, "utf8") - maxBytes;
   const marker = `...[${Math.max(1, omittedBytes)} bytes omitted]...`;
   const markerBytes = Buffer.byteLength(marker, "utf8");
   if (markerBytes >= maxBytes) {
@@ -1572,7 +1713,23 @@ export function compactUtf8HeadTail(value: string, maxBytes: number): string {
   const availableBytes = maxBytes - markerBytes;
   const headBytes = Math.ceil(availableBytes * 0.55);
   const tailBytes = Math.max(0, availableBytes - headBytes);
-  return `${utf8Prefix(normalized, headBytes)}${marker}${utf8Suffix(normalized, tailBytes)}`;
+  return `${utf8Prefix(value, headBytes)}${marker}${utf8Suffix(value, tailBytes)}`;
+}
+
+function compactedMaterialIntegrity(
+  integrity: ProjectionMaterialIntegrityPair | undefined,
+  originalInput: string | undefined,
+  compactedInput: string | undefined,
+  originalOutcome: string,
+  compactedOutcome: string
+): ProjectionMaterialIntegrityPair | undefined {
+  if (!integrity) {
+    return undefined;
+  }
+  return {
+    input: integrity.input === "complete" && originalInput !== compactedInput ? "truncated" : integrity.input,
+    outcome: integrity.outcome === "complete" && originalOutcome !== compactedOutcome ? "truncated" : integrity.outcome
+  };
 }
 
 function utf8Prefix(value: string, maxBytes: number): string {

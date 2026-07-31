@@ -21,6 +21,36 @@ test("writes artifacts and reads them by artifact ref", async () => {
   assert.equal((await artifactStore.get(record.artifactRef))?.path, record.path);
 });
 
+test("stores runtime credentials without searchable or serialized secret material", async () => {
+  const runtimeDir = mkdtempSync(join(tmpdir(), "luanniao-credential-"));
+  const artifactStore = new ArtifactStore(join(runtimeDir, "artifacts"));
+  const secret = "proxy-password-value";
+  const record = await artifactStore.writeCredential({ data: secret });
+
+  assert.equal(record.kind, "credential");
+  assert.equal(record.preview, "[sensitive credential]");
+  assert.equal(await artifactStore.read(record.artifactRef), secret);
+  assert.equal(statSync(record.path).mode & 0o777, 0o600);
+  assert.equal(readFileSync(join(runtimeDir, "artifacts", "index.jsonl"), "utf8").includes(secret), false);
+  assert.deepEqual(await artifactStore.searchWithin({
+    artifactRefs: [record.artifactRef],
+    query: "proxy password value"
+  }), []);
+  const readTool = createArtifactReadTool(artifactStore);
+  await assert.rejects(() => readTool.execute(
+    "call:credential-read",
+    { ref: record.artifactRef },
+    new AbortController().signal,
+    () => undefined,
+    {} as never
+  ), /Artifact not found/);
+  await assert.rejects(() => artifactStore.write({
+    kind: "credential",
+    mediaType: "text/plain",
+    data: secret
+  }), /writeCredential/);
+});
+
 test("lists artifacts by task id", async () => {
   const runtimeDir = mkdtempSync(join(tmpdir(), "luanniao-artifact-"));
   const artifactStore = new ArtifactStore(join(runtimeDir, "artifacts"));
@@ -137,7 +167,7 @@ test("artifact_read explicitly materializes complete binary artifacts into the E
 
   const result = await tool.execute(
     "call:materialize",
-    { path: record.artifactRef, materialize: true },
+    { ref: record.artifactRef, materialize: true },
     new AbortController().signal,
     () => undefined,
     {} as never
@@ -156,13 +186,27 @@ test("artifact_read explicitly materializes complete binary artifacts into the E
   await assert.rejects(
     () => tool.execute(
       "call:host-path",
-      { path: record.path },
+      { ref: record.path },
       new AbortController().signal,
       () => undefined,
       {} as never
     ),
     /requires a real artifactRef/
   );
+  artifactStore.close();
+});
+
+test("artifact_read only exposes materialize when an Executor workspace is available", () => {
+  const runtimeDir = mkdtempSync(join(tmpdir(), "luanniao-artifact-schema-"));
+  const artifactStore = new ArtifactStore(join(runtimeDir, "artifacts"));
+  const plannerTool = createArtifactReadTool(artifactStore, { maxReadBytes: 64_000 });
+  const executorTool = createArtifactReadTool(artifactStore, {
+    workspace: { hostDir: join(runtimeDir, "workspace"), visibleRoot: "/workspace" }
+  });
+
+  assert.equal(Check(plannerTool.parameters, { ref: "artifact:example" }), true);
+  assert.equal(Check(plannerTool.parameters, { ref: "artifact:example", materialize: true }), false);
+  assert.equal(Check(executorTool.parameters, { ref: "artifact:example", materialize: true }), true);
   artifactStore.close();
 });
 
@@ -186,7 +230,7 @@ test("artifact materialization rejects a workspace artifact-directory symlink", 
   await assert.rejects(
     () => tool.execute(
       "call:materialize",
-      { path: record.artifactRef, materialize: true },
+      { ref: record.artifactRef, materialize: true },
       new AbortController().signal,
       () => undefined,
       {} as never
@@ -211,7 +255,7 @@ test("artifact_write imports a complete workspace file without exposing its host
   const result = await tool.execute(
     "call:import",
     {
-      source: { type: "file", path: "/workspace/bundle.js" },
+      path: "/workspace/bundle.js",
       kind: "text",
       mediaType: "application/javascript"
     },
@@ -229,38 +273,55 @@ test("artifact_write imports a complete workspace file without exposing its host
   artifactStore.close();
 });
 
-test("artifact_write schema infers the source type and tolerates omitted discriminators", async () => {
+test("artifact tools expose one strict canonical schema without argument shims", async () => {
   const runtimeDir = mkdtempSync(join(tmpdir(), "luanniao-artifact-schema-"));
+  const workspaceDir = join(runtimeDir, "workspace");
+  mkdirSync(workspaceDir);
+  writeFileSync(join(workspaceDir, "evidence.txt"), "canonical file payload");
   const artifactStore = new ArtifactStore(join(runtimeDir, "artifacts"));
-  const schema = createArtifactWriteTool(artifactStore).parameters;
-  const common = { kind: "text", mediaType: "text/plain" };
+  const readRecord = await artifactStore.write({
+    kind: "text",
+    mediaType: "text/plain",
+    data: "read payload"
+  });
+  const readTool = createArtifactReadTool(artifactStore);
+  const readSchema = readTool.parameters;
+  assert.equal(Check(readSchema, { ref: readRecord.artifactRef }), true);
+  assert.equal(Check(readSchema, {}), false);
+  assert.equal(Check(readSchema, { path: readRecord.artifactRef }), false);
+  assert.equal(Check(readSchema, { ref: readRecord.artifactRef, extra: true }), false);
 
-  assert.equal(Check(schema, { ...common, source: { type: "inline", data: "evidence" } }), true);
-  assert.equal(Check(schema, { ...common, source: { type: "file", path: "/workspace/evidence.txt" } }), true);
-  assert.equal(Check(schema, { ...common, source: { data: "evidence" } }), true);
-  assert.equal(Check(schema, { ...common, source: { path: "/workspace/evidence.txt" } }), true);
-  assert.equal(Check(schema, { ...common, source: { type: "unknown", data: "evidence" } }), false);
-  assert.equal(Check(schema, { ...common, data: "legacy", path: "/workspace/evidence.txt" }), false);
-
-  const tool = createArtifactWriteTool(artifactStore);
-  const execute = (source: Record<string, unknown>) => tool.execute(
-    "call:infer",
-    { ...common, source },
+  const readResult = await readTool.execute(
+    "call:canonical-read",
+    { ref: readRecord.artifactRef },
     new AbortController().signal,
     () => undefined,
     {} as never
   );
-  const inferredInline = await execute({ data: "inferred inline payload" });
-  const inlineText = inferredInline.content[0]?.type === "text" ? inferredInline.content[0].text : "{}";
-  assert.equal((JSON.parse(inlineText) as { byteLength: number }).byteLength, Buffer.byteLength("inferred inline payload"));
-  await assert.rejects(
-    execute({ type: "file", path: "/workspace/evidence.txt", data: "ambiguous" }),
-    /file source requires exactly path \(no data\)/
+  assert.equal(readResult.content[0]?.type === "text" ? readResult.content[0].text : "", "read payload");
+
+  const writeTool = createArtifactWriteTool(artifactStore, {
+    workspace: { hostDir: workspaceDir, visibleRoot: "/workspace" }
+  });
+  const schema = writeTool.parameters;
+  const common = { kind: "text", mediaType: "text/plain" };
+
+  assert.equal(Check(schema, { ...common, path: "/workspace/evidence.txt" }), true);
+  assert.equal(Check(schema, common), false);
+  assert.equal(Check(schema, { ...common, source: {} }), false);
+  assert.equal(Check(schema, { ...common, source: { data: "inline payload" } }), false);
+  assert.equal(Check(schema, { ...common, path: "/workspace/evidence.txt", extra: true }), false);
+
+  const writeResult = await writeTool.execute(
+    "call:canonical-write",
+    { ...common, path: "/workspace/evidence.txt" },
+    new AbortController().signal,
+    () => undefined,
+    {} as never
   );
-  await assert.rejects(
-    execute({ type: "inline", path: "/workspace/evidence.txt", data: "ambiguous" }),
-    /inline source requires exactly data \(no path\)/
-  );
+  const writeText = writeResult.content[0]?.type === "text" ? writeResult.content[0].text : "{}";
+  const writeRecord = JSON.parse(writeText) as { artifactRef: string };
+  assert.equal(await artifactStore.read(writeRecord.artifactRef), "canonical file payload");
   artifactStore.close();
 });
 
@@ -301,7 +362,7 @@ test("artifact_write imports sandbox files through the sandbox-owned reader", as
   });
   const execute = (path: string) => tool.execute(
     `call:sandbox:${path}`,
-    { source: { type: "file", path }, kind: "text", mediaType: "text/plain" },
+    { path, kind: "text", mediaType: "text/plain" },
     new AbortController().signal,
     () => undefined,
     {} as never
@@ -339,7 +400,7 @@ test("artifact_write rejects files outside or symlinked from the Executor worksp
   });
   const execute = (path: string) => tool.execute(
     `call:reject:${path}`,
-    { source: { type: "file", path }, kind: "text", mediaType: "text/plain" },
+    { path, kind: "text", mediaType: "text/plain" },
     new AbortController().signal,
     () => undefined,
     {} as never

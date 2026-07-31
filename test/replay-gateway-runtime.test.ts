@@ -7,6 +7,27 @@ import { ReplayGatewayRuntime } from "../src/connectivity/replay-gateway-runtime
 import type { MitmFlowClient } from "../src/connectivity/mitm-flow-client.js";
 import type { TrafficExchange } from "../src/connectivity/traffic-proxy-client.js";
 
+const hostEgress = async () => ({
+  host: "host.docker.internal" as const,
+  port: 32123,
+  token: "00".repeat(32)
+});
+
+function replayNetworkCommand(args: string[]): { code: number; stdout: string; stderr: string } | undefined {
+  if (args[0] !== "network") return undefined;
+  if (args[1] === "inspect") {
+    const subnet = args.at(-1)?.includes("replay-task") ? "172.31.0.0/24" : "172.30.0.0/24";
+    return {
+      code: 0,
+      stdout: args[3]?.includes("luanniao.managed")
+        ? `true|replay-task-network|${subnet}|true\n`
+        : `${subnet}\n`,
+      stderr: ""
+    };
+  }
+  return { code: 0, stdout: "", stderr: "" };
+}
+
 test("replay gateway sends HTTP through uid 1000 and captures replay metadata in one epoch", async () => {
   const runtimeDir = await mkdtemp(join(tmpdir(), "luanniao-replay-gateway-"));
   const routeSnapshot = [{
@@ -27,6 +48,8 @@ test("replay gateway sends HTTP through uid 1000 and captures replay metadata in
   let epochRef = "";
   const runner = async (args: string[], stdin?: string) => {
     commands.push({ args, stdin });
+    const network = replayNetworkCommand(args);
+    if (network) return network;
     if (args[0] === "inspect") return { code: 1, stdout: "", stderr: "missing" };
     if (args[0] === "exec" && args.includes("gatewayctl")) {
       if (args.includes("epoch.begin")) epochRef = JSON.parse(args.at(-1) ?? "{}").epochRef;
@@ -43,7 +66,8 @@ test("replay gateway sends HTTP through uid 1000 and captures replay metadata in
   const runtime = new ReplayGatewayRuntime({
     runtimeDir,
     networkName: "luanniao-net-0123456789abcdef",
-    runner
+    runner,
+    hostEgress
   });
 
   const result = await runtime.replay(client, {
@@ -82,7 +106,7 @@ test("replay gateway sends HTTP through uid 1000 and captures replay metadata in
   assert.match(epochPayload.flowFile, /\.mitm$/);
   assert.match(epochPayload.netFile, /\.net\.jsonl$/);
   assert.ok(commands.some((entry) => entry.args.includes("epoch.end")));
-  const gatewayRun = commands.find((entry) => entry.args[0] === "run")?.args ?? [];
+  const gatewayRun = commands.find((entry) => entry.args[0] === "run" && entry.args.includes("--name"))?.args ?? [];
   assert.ok(gatewayRun.includes("/dev/net/tun:/dev/net/tun"));
   assert.ok(gatewayRun.includes("net.netfilter.nf_conntrack_acct=1"));
   for (const capability of ["NET_ADMIN", "SETUID", "SETGID", "CHOWN", "FOWNER", "SETPCAP"]) {
@@ -93,7 +117,7 @@ test("replay gateway sends HTTP through uid 1000 and captures replay metadata in
   assert.ok(gatewayRun.includes(`type=bind,src=${join(runtimeDir, "traffic", "flows", "web-replay")},dst=/traffic/flows/web-replay`));
   assert.ok(gatewayRun.includes(`type=bind,src=${join(runtimeDir, "traffic", "ca")},dst=/traffic/ca`));
   assert.equal(gatewayRun.includes(`type=bind,src=${join(runtimeDir, "traffic")},dst=/traffic`), false);
-  assert.equal(commands.some((entry) => entry.args[0] === "network"), false);
+  assert.ok(commands.some((entry) => entry.args.slice(0, 2).join(" ") === "network connect"));
 });
 
 test("routed replay fails closed before Docker when its route is absent from the owner snapshot", async () => {
@@ -102,6 +126,7 @@ test("routed replay fails closed before Docker when its route is absent from the
   const runtime = new ReplayGatewayRuntime({
     runtimeDir,
     networkName: "luanniao-net-0123456789abcdef",
+    hostEgress,
     runner: async (args) => {
       commands.push(args);
       return { code: 1, stdout: "", stderr: "unexpected" };
@@ -135,6 +160,8 @@ test("direct replay applies an empty route snapshot and never inherits managed r
   let epochRef = "";
   const runner = async (args: string[], stdin?: string) => {
     commands.push({ args, stdin });
+    const network = replayNetworkCommand(args);
+    if (network) return network;
     if (args[0] === "inspect") return { code: 1, stdout: "", stderr: "missing" };
     if (args[0] === "exec" && args.includes("gatewayctl")) {
       if (args.includes("epoch.begin")) epochRef = JSON.parse(args.at(-1) ?? "{}").epochRef;
@@ -148,7 +175,8 @@ test("direct replay applies an empty route snapshot and never inherits managed r
   const runtime = new ReplayGatewayRuntime({
     runtimeDir,
     networkName: "luanniao-net-0123456789abcdef",
-    runner
+    runner,
+    hostEgress
   });
 
   await runtime.replay({
@@ -177,7 +205,7 @@ test("direct replay applies an empty route snapshot and never inherits managed r
   const routeCommand = commands.find((entry) => entry.args.includes("routes.replace"));
   assert(routeCommand);
   assert.deepEqual(JSON.parse(routeCommand.args.at(-1) ?? "{}").routes, []);
-  assert.equal(commands.some((entry) => entry.args[0] === "network"), false);
+  assert.ok(commands.some((entry) => entry.args.slice(0, 2).join(" ") === "network connect"));
 });
 
 test("replay gateway replaces an owned container created from a stale image ID", async () => {
@@ -188,8 +216,11 @@ test("replay gateway replaces an owned container created from a stale image ID",
   const first = new ReplayGatewayRuntime({
     runtimeDir,
     networkName: "luanniao-net-0123456789abcdef",
+    hostEgress,
     runner: async (args) => {
       firstCommands.push(args);
+      const network = replayNetworkCommand(args);
+      if (network) return network;
       if (args[0] === "inspect") return { code: 1, stdout: "", stderr: "missing" };
       if (args[0] === "run") {
         configDigest = args.find((value) => value.startsWith("luanniao.config="))?.split("=", 2)[1] ?? "";
@@ -228,8 +259,11 @@ test("replay gateway replaces an owned container created from a stale image ID",
   const second = new ReplayGatewayRuntime({
     runtimeDir,
     networkName: "luanniao-net-0123456789abcdef",
+    hostEgress,
     runner: async (args) => {
       secondCommands.push(args);
+      const network = replayNetworkCommand(args);
+      if (network) return network;
       if (args[0] === "image") return { code: 0, stdout: "sha256:current\n", stderr: "" };
       if (args[0] === "inspect" && args[2]?.includes(".State.Running")) {
         return { code: 0, stdout: `true|true|replay-gateway|${configDigest}|sha256:stale\n`, stderr: "" };

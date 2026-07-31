@@ -88,7 +88,7 @@ test("closes a long tool result with the next Executor interpretation without co
   assert.equal(observations.length, 1);
   assert.match(observations[0]?.interpretation ?? "", /\/keys 可穿越事实/);
   assert.doesNotMatch(observations[0]?.sourceEventIds.join(" ") ?? "", /event:interpretation/);
-  assert.match(renderProjectionObservations(observations), /executor_interpretation: 利用 \/keys 可穿越事实/);
+  assert.match(renderProjectionObservations(observations), /executor_interpretation_non_evidence: "利用 \/keys 可穿越事实/);
   assert.match(causalObservationDigest(observations), /\/keys 可穿越事实/);
   assert.equal(batch.observations.length, 1);
   assert.equal(batch.toSeq, 3);
@@ -128,7 +128,7 @@ test("groups parallel tool results under one Executor interpretation", () => {
   assert.match(observations[0]?.interpretation ?? "", /同时开放 HTTP 和 SSH/);
   const rendered = renderProjectionObservations(observations);
   assert.match(rendered, /tool\[1\]: bash/);
-  assert.equal(rendered.match(/executor_interpretation:/g)?.length, 1);
+  assert.equal(rendered.match(/executor_interpretation_non_evidence:/g)?.length, 1);
 });
 
 test("does not advance projection watermark past an unclosed action", () => {
@@ -228,6 +228,81 @@ test("preserves the final conclusion of long tool results", () => {
   assert.match(observations[0]?.outcomeDigest ?? "", /^candidate-output/);
   assert.match(observations[0]?.outcomeDigest ?? "", /No match found$/);
   assert.match(observations[0]?.inputDigest ?? "", /exact-final-expression/);
+});
+
+test("keeps complete persisted tool material authoritative over Executor interpretation", () => {
+  const exactMechanism = "posix_mknod($path, 06000 | 0666, $device)";
+  const command = `${"setup;".repeat(100)}${exactMechanism}\n${";cleanup".repeat(100)}`;
+  const observations = buildProjectionObservations([
+    event(1, "event:start", "tool_started", {
+      toolCallId: "call:mechanism",
+      toolName: "bash",
+      args: { command }
+    }),
+    event(2, "event:end", "tool_finished", {
+      toolCallId: "call:mechanism",
+      toolName: "bash",
+      result: { content: [{ type: "text", text: "stat_mode=106644\nstat_mode_after=106600" }] }
+    }),
+    event(3, "event:interpretation", "assistant_intent", {
+      text: "块设备节点已成功创建，重新打开此前被反驳的机制。"
+    })
+  ]);
+
+  assert.equal(observations[0]?.materialIntegrity?.input, "complete");
+  assert.equal(observations[0]?.materialIntegrity?.outcome, "complete");
+  assert.equal(observations[0]?.inputDigest, JSON.stringify({ command }));
+  assert.equal(observations[0]?.outcomeDigest, "stat_mode=106644\nstat_mode_after=106600");
+  const rendered = renderProjectionObservations(observations);
+  assert.match(rendered, /material_integrity: input=complete outcome=complete/);
+  assert.match(rendered, /executor_interpretation_non_evidence:/);
+});
+
+test("marks material truncated only when the unified Projector byte budget compacts it", () => {
+  const observations = buildProjectionObservations([
+    event(1, "event:start", "tool_started", {
+      toolCallId: "call:large",
+      toolName: "bash",
+      args: { command: `head-${"input-material-".repeat(300)}-tail` }
+    }),
+    event(2, "event:end", "tool_finished", {
+      toolCallId: "call:large",
+      toolName: "bash",
+      result: { content: [{ type: "text", text: `head-${"output-material-".repeat(300)}-tail` }] }
+    }),
+    event(3, "event:interpretation", "assistant_intent", { text: "机制已确认。" })
+  ]);
+  const compacted = compactProjectionBatchForInput({
+    observations,
+    toSeq: 3,
+    sourceEventIds: observations[0]!.sourceEventIds
+  }, { maxObservations: 1, maxBytes: 900 });
+
+  assert.equal(compacted.observations[0]?.materialIntegrity?.input, "truncated");
+  assert.equal(compacted.observations[0]?.materialIntegrity?.outcome, "truncated");
+  assert.match(renderProjectionObservations(compacted.observations), /material_integrity: input=truncated outcome=truncated/);
+});
+
+test("propagates tool-native truncation metadata into Projector material integrity", () => {
+  const observations = buildProjectionObservations([
+    event(1, "event:start", "tool_started", {
+      toolCallId: "call:truncated",
+      toolName: "bash",
+      args: { command: "produce bounded output" }
+    }),
+    event(2, "event:end", "tool_finished", {
+      toolCallId: "call:truncated",
+      toolName: "bash",
+      result: {
+        content: [{ type: "text", text: "visible prefix and suffix" }],
+        details: { truncation: { truncated: true, originalBytes: 100_000 } }
+      }
+    }),
+    event(3, "event:interpretation", "assistant_intent", { text: "输出证明机制成立。" })
+  ]);
+
+  assert.equal(observations[0]?.materialIntegrity?.input, "complete");
+  assert.equal(observations[0]?.materialIntegrity?.outcome, "truncated");
 });
 
 test("coalesces consecutive repeated observations without losing event provenance", () => {
@@ -604,6 +679,88 @@ test("reports all projection draft errors together with endpoint-aware edge sugg
     assert.match(error.message, /unconnected semantic nodes new:3/);
     return true;
   });
+});
+
+test("rejects Vulnerability and succeeded Exploit drafts without resolvable evidence", () => {
+  const graphContext = aliasProjectionGraphContext({ nodes: [], edges: [] });
+  const batch = {
+    observations: [{
+      ref: "o1",
+      kind: "action" as const,
+      seqStart: 1,
+      seqEnd: 1,
+      action: "bash",
+      outcomeDigest: "Observed exploit evidence",
+      status: "ok" as const,
+      artifactRefs: [],
+      anchors: [],
+      sourceEventIds: ["event:1"]
+    }],
+    toSeq: 1,
+    sourceEventIds: ["event:1"]
+  };
+
+  assert.throws(() => expandProjectionDraft({
+    batch,
+    graphContext,
+    value: {
+      nodes: [{
+        id: "new:1",
+        graphKind: "reasoning",
+        type: "Vulnerability",
+        label: "Confirmed issue",
+        properties: { status: "confirmed" },
+        evidenceRefs: ["o-missing"]
+      }, {
+        id: "new:2",
+        graphKind: "reasoning",
+        type: "Exploit",
+        label: "Successful exploit",
+        properties: { status: "succeeded" },
+        evidenceRefs: []
+      }],
+      edges: [{
+        from: "new:1",
+        to: "new:2",
+        type: "exploited_by",
+        evidenceRefs: ["o1"]
+      }]
+    }
+  }), (error: unknown) => {
+    assert.ok(error instanceof Error);
+    assert.match(error.message, /has 2 validation errors/);
+    assert.match(error.message, /Vulnerability.*must include at least one evidenceRef/);
+    assert.match(error.message, /succeeded Exploit.*must include at least one evidenceRef/);
+    return true;
+  });
+
+  assert.doesNotThrow(() => expandProjectionDraft({
+    batch,
+    graphContext,
+    value: {
+      nodes: [{
+        id: "new:1",
+        graphKind: "reasoning",
+        type: "Vulnerability",
+        label: "Confirmed issue",
+        properties: { status: "confirmed" },
+        evidenceRefs: ["o1"]
+      }, {
+        id: "new:2",
+        graphKind: "reasoning",
+        type: "Exploit",
+        label: "Successful exploit",
+        properties: { status: "succeeded" },
+        evidenceRefs: ["event:1"]
+      }],
+      edges: [{
+        from: "new:1",
+        to: "new:2",
+        type: "exploited_by",
+        evidenceRefs: ["o1"]
+      }]
+    }
+  }));
 });
 
 test("rejects one Projector submission above the 24/40 delta contract instead of slicing it", () => {
@@ -1113,11 +1270,12 @@ test("projection graph context compaction keeps complete records and aligned ali
   assert.match(rendered, /byte view omitted nodes=/);
 });
 
-test("projector derives stable tunnel and proxy route edge identities", () => {
+test("projector leaves operational edge identity to GraphStore after alias resolution", () => {
   const graphContext = aliasProjectionGraphContext({
     nodes: [
       { id: "host:a", graphKind: "operation", type: "Host", label: "A", properties: { host: "a.test" } },
-      { id: "host:b", graphKind: "operation", type: "Host", label: "B", properties: { host: "b.test" } }
+      { id: "host:b", graphKind: "operation", type: "Host", label: "B", properties: { host: "b.test" } },
+      { id: "host:c", graphKind: "operation", type: "Host", label: "C", properties: { host: "c.test" } }
     ],
     edges: []
   });
@@ -1128,12 +1286,18 @@ test("projector derives stable tunnel and proxy route edge identities", () => {
       nodes: [],
       edges: [
         { from: "existing:1", to: "existing:2", type: "tunnels_to", properties: { tunnelId: "ssh / primary", transport: "ssh" } },
-        { from: "existing:1", to: "existing:2", type: "proxy_route", properties: { routeId: "route #1", via: "127.0.0.1:8080" } }
+        { from: "existing:1", to: "existing:2", type: "proxy_route", properties: { routeId: "route #1", via: "127.0.0.1:8080" } },
+        { from: "existing:1", to: "existing:3", type: "proxy_route", properties: { routeId: "route #1", via: "127.0.0.1:8080" } }
       ]
     }
   });
 
-  assert.deepEqual(delta.edges.map((edge) => edge.id), ["tunnel:ssh%20%2F%20primary", "proxy-route:route%20%231"]);
+  assert.deepEqual(delta.edges.map((edge) => edge.id), [undefined, undefined, undefined]);
+  assert.deepEqual(delta.edges.map((edge) => [edge.from, edge.to]), [
+    ["host:a", "host:b"],
+    ["host:a", "host:b"],
+    ["host:a", "host:c"]
+  ]);
   assert.equal(delta.edges[0]?.properties?.transport, "ssh");
   assert.equal(delta.edges[1]?.properties?.via, "127.0.0.1:8080");
 });

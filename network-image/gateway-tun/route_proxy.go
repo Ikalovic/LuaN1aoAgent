@@ -97,11 +97,18 @@ type directDialFunc func(context.Context, string, string) (net.Conn, error)
 type socksDialFunc func(context.Context, string, string, time.Duration) (net.Conn, error)
 
 type routeDialer struct {
-	routes         routeStore
-	connectTimeout time.Duration
-	directDial     directDialFunc
-	socksDial      socksDialFunc
-	selfTargets    []string
+	routes              routeStore
+	connectTimeout      time.Duration
+	directDial          directDialFunc
+	socksDial           socksDialFunc
+	selfTargets         []string
+	brokerAddress       string
+	brokerToken         string
+	localDirect         map[netip.Addr]struct{}
+	localDenyPorts      map[uint16]struct{}
+	denyPrefixes        []netip.Prefix
+	allowPrefixes       []netip.Prefix
+	allowDomainResolved bool
 }
 
 func newRouteDialer(routesFile string, connectTimeout time.Duration, selfTargets ...string) *routeDialer {
@@ -115,26 +122,107 @@ func newRouteDialer(routesFile string, connectTimeout time.Duration, selfTargets
 }
 
 func (dialer *routeDialer) dial(ctx context.Context, destination string) (net.Conn, error) {
+	connection, _, err := dialer.dialWithRoute(ctx, destination)
+	return connection, err
+}
+
+func (dialer *routeDialer) dialWithRoute(ctx context.Context, destination string) (net.Conn, *networkRoute, error) {
 	for _, target := range dialer.selfTargets {
 		if sameInfrastructureEndpoint(destination, target) {
-			return nil, fmt.Errorf("refusing recursive gateway dial to %s", destination)
+			return nil, nil, fmt.Errorf("refusing recursive gateway dial to %s", destination)
 		}
+	}
+	if dialer.denied(destination) {
+		return nil, nil, fmt.Errorf("destination %s is protected gateway infrastructure", destination)
 	}
 	route, err := dialer.routes.match(destination)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	if route == nil {
+		if !dialer.directAllowed(destination) {
+			return nil, nil, fmt.Errorf("destination %s is outside authorized scope", destination)
+		}
+		if dialer.isLocalDirect(destination) {
+			_, rawPort, _ := net.SplitHostPort(destination)
+			port, _ := strconv.Atoi(rawPort)
+			if _, denied := dialer.localDenyPorts[uint16(port)]; denied {
+				return nil, nil, fmt.Errorf("destination %s is a protected host service", destination)
+			}
+			connectContext, cancel := context.WithTimeout(ctx, dialer.connectTimeout)
+			defer cancel()
+			connection, err := dialer.directDial(connectContext, "tcp", destination)
+			return connection, nil, err
+		}
+		if dialer.brokerAddress != "" {
+			connection, err := dialHostBroker(ctx, dialer.brokerAddress, dialer.brokerToken, destination, dialer.connectTimeout)
+			return connection, nil, err
+		}
 		connectContext, cancel := context.WithTimeout(ctx, dialer.connectTimeout)
 		defer cancel()
-		return dialer.directDial(connectContext, "tcp", destination)
+		connection, err := dialer.directDial(connectContext, "tcp", destination)
+		return connection, nil, err
 	}
 	proxyAddress := net.JoinHostPort(route.SocksHost, strconv.Itoa(route.SocksPort))
 	connection, err := dialer.socksDial(ctx, proxyAddress, destination, dialer.connectTimeout)
 	if err != nil {
-		return nil, fmt.Errorf("route %s failed: %w", route.RouteRef, err)
+		return nil, route, fmt.Errorf("route %s failed: %w", route.RouteRef, err)
 	}
-	return connection, nil
+	return connection, route, nil
+}
+
+func (dialer *routeDialer) directAllowed(destination string) bool {
+	// Domain-derived addresses have already passed the task namespace's
+	// fail-closed ipset guard before policy routing delivers TCP to this TUN.
+	if dialer.allowDomainResolved {
+		return true
+	}
+	host, _, err := net.SplitHostPort(destination)
+	if err != nil {
+		return false
+	}
+	address, err := netip.ParseAddr(host)
+	if err != nil {
+		return false
+	}
+	address = address.Unmap()
+	for _, prefix := range dialer.allowPrefixes {
+		if prefix.Contains(address) {
+			return true
+		}
+	}
+	return false
+}
+
+func (dialer *routeDialer) denied(destination string) bool {
+	host, _, err := net.SplitHostPort(destination)
+	if err != nil {
+		return true
+	}
+	address, err := netip.ParseAddr(host)
+	if err != nil {
+		return false
+	}
+	address = address.Unmap()
+	for _, prefix := range dialer.denyPrefixes {
+		if prefix.Contains(address) {
+			return true
+		}
+	}
+	return false
+}
+
+func (dialer *routeDialer) isLocalDirect(destination string) bool {
+	host, _, err := net.SplitHostPort(destination)
+	if err != nil {
+		return false
+	}
+	address, err := netip.ParseAddr(host)
+	if err != nil {
+		return false
+	}
+	_, ok := dialer.localDirect[address.Unmap()]
+	return ok
 }
 
 func sameInfrastructureEndpoint(destination string, target string) bool {

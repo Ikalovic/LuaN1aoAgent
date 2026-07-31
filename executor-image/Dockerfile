@@ -10,6 +10,8 @@ RUN apt-get update \
       curl \
       wget \
       dnsutils \
+      iproute2 \
+      iptables \
       iputils-ping \
       netcat-openbsd \
       nmap \
@@ -31,6 +33,8 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/* \
     && install -m 0755 /usr/bin/ping /usr/local/bin/ping \
     && useradd --uid 1000 --create-home --shell /bin/bash agent
+
+LABEL io.luanniao.executor.facts='{"version":1,"uid":1000,"rawSockets":false,"platform":"linux-container","tools":["bash","chromium","curl","dig","git","imagemagick","ip","iptables","jq","nc","nmap","node","openssl","python3","tesseract","wget"]}'
 
 USER 1000:1000
 WORKDIR /workspace

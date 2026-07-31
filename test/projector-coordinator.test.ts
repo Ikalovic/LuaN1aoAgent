@@ -266,9 +266,35 @@ test("owns retry timing after a failed projector callback", async () => {
   await coordinator.close();
 });
 
+test("terminal work can advance an empty observation range without a parked state", async () => {
+  const store = new FakeProjectionStore();
+  let attempts = 0;
+  const coordinator = new ProjectorCoordinator({
+    store,
+    countObservations: () => 0,
+    run: (work) => {
+      attempts += 1;
+      store.commit(work.taskId, work.targetSeq);
+    },
+    retryDelayMs: 10
+  });
+
+  await coordinator.request({
+    taskId: "task:waiting-interpretation",
+    desiredSeq: 1,
+    terminal: true
+  });
+  await coordinator.waitForCommitted("task:waiting-interpretation", 1, { timeoutMs: 1_000 });
+  assert.equal(attempts, 1);
+  assert.equal(store.getState("task:waiting-interpretation").committedSeq, 1);
+  await coordinator.close();
+});
+
 test("backs off repeated retries exponentially up to a cap and resets after progress", async () => {
   const store = new FakeProjectionStore();
   const attemptTimes: number[] = [];
+  const batchSizes: number[] = [];
+  const retryAttempts: number[] = [];
   let attempts = 0;
   const coordinator = new ProjectorCoordinator({
     store,
@@ -276,6 +302,8 @@ test("backs off repeated retries exponentially up to a cap and resets after prog
     run: (work) => {
       attempts += 1;
       attemptTimes.push(Date.now());
+      batchSizes.push(work.maxObservations);
+      retryAttempts.push(work.retryAttempt);
       if (attempts <= 4 || attempts === 6) {
         throw new Error(`failure ${attempts}`);
       }
@@ -289,6 +317,8 @@ test("backs off repeated retries exponentially up to a cap and resets after prog
   await coordinator.request({ taskId: "task:backoff", desiredSeq: 1 });
   await coordinator.waitForCommitted("task:backoff", 1, { timeoutMs: 2_000 });
   assert.equal(attempts, 5);
+  assert.deepEqual(batchSizes, [16, 8, 4, 2, 1]);
+  assert.deepEqual(retryAttempts, [0, 1, 2, 3, 4]);
 
   const gap = (index: number) => attemptTimes[index]! - attemptTimes[index - 1]!;
   assert.ok(gap(1) >= 20, `first retry gap ${gap(1)}ms, expected ~25ms base delay`);
@@ -299,11 +329,41 @@ test("backs off repeated retries exponentially up to a cap and resets after prog
   await coordinator.request({ taskId: "task:backoff", desiredSeq: 2 });
   await coordinator.waitForCommitted("task:backoff", 2, { timeoutMs: 2_000 });
   assert.equal(attempts, 7);
+  assert.deepEqual(batchSizes.slice(5), [16, 8]);
+  assert.deepEqual(retryAttempts.slice(5), [0, 1]);
   assert.ok(
     gap(6) >= 20 && gap(6) < 45,
     `retry after progress ${gap(6)}ms should reset to the ~25ms base delay`
   );
   await coordinator.close();
+});
+
+test("stops replaying an unchanged failing target until new observations arrive", async () => {
+  const store = new FakeProjectionStore();
+  const runs: ProjectorWorkItem[] = [];
+  const coordinator = new ProjectorCoordinator({
+    store,
+    countObservations: ({ toSeq, afterSeq }) => toSeq - afterSeq,
+    run: (work) => {
+      runs.push(work);
+      throw new Error("deterministic projection failure");
+    },
+    liveObservationThreshold: 1,
+    retryDelayMs: 1,
+    maxRetryDelayMs: 1,
+    maxConsecutiveFailures: 3
+  });
+
+  await coordinator.request({ taskId: "task:fixed-failure", desiredSeq: 1 });
+  await waitFor(() => runs.length === 3);
+  await delay(20);
+  assert.equal(runs.length, 3);
+  assert.deepEqual(runs.map((work) => work.maxObservations), [16, 8, 4]);
+
+  await coordinator.request({ taskId: "task:fixed-failure", desiredSeq: 2 });
+  await waitFor(() => runs.length === 6);
+  assert.deepEqual(runs.slice(3).map((work) => work.retryAttempt), [0, 1, 2]);
+  await coordinator.close({ drain: false });
 });
 
 test("keeps the process alive while a persisted retry is awaited", () => {

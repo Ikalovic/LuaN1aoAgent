@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { SecurityAgentController } from "../src/controller.js";
-import type { TaskEnvelope, TaskResult } from "../src/types.js";
+import type { EpochOutcome, TaskEnvelope } from "../src/types.js";
 
 type ControllerHarness = {
   agents: {
@@ -37,12 +37,10 @@ type ControllerHarness = {
     resumed: boolean;
     resumeCount: number;
   }>;
-  createSyntheticTaskResult: (input: {
-    taskEnvelope: TaskEnvelope;
-    signal?: { decision: string; reason: string; evidenceRefs: string[] };
-    reason: string;
-    executorOutputPreview: string;
-  }) => Promise<TaskResult>;
+  persistEpochOutcome: (
+    state: ReturnType<ControllerHarness["beginTaskExecution"]>,
+    input: Pick<EpochOutcome, "status" | "reason" | "retryable" | "taskOutcomeRef">
+  ) => Promise<{ outcome: EpochOutcome; eventId: string }>;
   renderResumeExecutorInput: (input: {
     rootGoal: string;
     taskEnvelope: TaskEnvelope;
@@ -50,9 +48,28 @@ type ControllerHarness = {
     plannerHint?: string;
     runtimeBudgetStatus: string;
   }) => Promise<string>;
-  beginTaskExecution: (taskEnvelope: TaskEnvelope) => { epochId: string; abortContext?: { kind: string; reason: string } };
+  beginTaskExecution: (taskEnvelope: TaskEnvelope) => {
+    epochId: string;
+    executorStopRequested: boolean;
+    controlSignal?: { decision: string; reason: string; evidenceRefs: string[] };
+    abortContext?: {
+      kind: string;
+      reason: string;
+      controlSignal?: { decision: string; reason: string; evidenceRefs: string[] };
+    };
+  };
   finishTaskExecution: (taskId: string, reason?: string) => void;
   ensureRootGraph: (input: { userGoal: string; scopeSummary: string }) => Promise<void>;
+  createTaskRuntimeTools: (taskEnvelope: TaskEnvelope) => Array<{
+    name: string;
+    execute: (
+      toolCallId: string,
+      params: never,
+      signal: AbortSignal,
+      onUpdate: () => void,
+      context: never
+    ) => Promise<{ content: Array<{ type: string; text?: unknown }> }>;
+  }>;
 };
 
 function createControllerWithTestLlmEnv(runtimeDir: string): SecurityAgentController {
@@ -65,7 +82,7 @@ function createControllerWithTestLlmEnv(runtimeDir: string): SecurityAgentContro
   process.env.LLM_API_KEY = previousEnv.LLM_API_KEY ?? "test-key";
   process.env.LLM_DEFAULT_MODEL = previousEnv.LLM_DEFAULT_MODEL ?? "test-model";
   try {
-    return new SecurityAgentController({ cwd: process.cwd(), runtimeDir });
+    return new SecurityAgentController({ cwd: process.cwd(), runtimeDir, executorSandboxMode: "workspace" });
   } finally {
     restoreEnv("LLM_API_BASE_URL", previousEnv.LLM_API_BASE_URL);
     restoreEnv("LLM_API_KEY", previousEnv.LLM_API_KEY);
@@ -113,6 +130,33 @@ function createHarness(runtimeDir: string): { controller: SecurityAgentControlle
   });
   return { controller, harness };
 }
+
+test("Executor evidence_list can follow graph notifications across sibling tasks in the same runtime", async () => {
+  const runtimeDir = mkdtempSync(join(tmpdir(), "luanniao-session-boundary-"));
+  const { controller, harness } = createHarness(runtimeDir);
+  await controller.executionLog.append({
+    taskId: "task:sibling",
+    role: "executor",
+    eventType: "tool_finished",
+    summary: "Sibling task evidence",
+    payload: { toolName: "bash" }
+  });
+  const evidenceList = harness.createTaskRuntimeTools(makeTaskEnvelope({ taskId: "task:consumer" }))
+    .find((tool) => tool.name === "evidence_list");
+  assert.ok(evidenceList);
+  const result = await evidenceList.execute(
+    "call:evidence",
+    { taskRef: "task:sibling" } as never,
+    new AbortController().signal,
+    () => undefined,
+    {} as never
+  );
+  const payload = JSON.parse(String(result.content[0]?.text ?? "{}")) as {
+    events: Array<{ eventType: string }>;
+  };
+  assert.equal(payload.events[0]?.eventType, "tool_finished");
+  await controller.close({ drainProjectionJobs: false });
+});
 
 test("runtime store persists executor session file per task", async () => {
   const runtimeDir = mkdtempSync(join(tmpdir(), "luanniao-session-boundary-"));
@@ -215,66 +259,80 @@ test("resume input re-injects task, graph, dependency outcomes and planner hint"
   await controller.close({ drainProjectionJobs: false });
 });
 
-test("provider retryable error synthesizes failed retryable result, not partial", async () => {
+test("provider errors persist an EpochOutcome without fabricating a TaskOutcome", async () => {
   const runtimeDir = mkdtempSync(join(tmpdir(), "luanniao-session-boundary-"));
   const { controller, harness } = createHarness(runtimeDir);
   await controller.initialize();
   const taskEnvelope = makeTaskEnvelope();
 
-  const taskResult = await harness.createSyntheticTaskResult({
-    taskEnvelope,
+  const state = harness.beginTaskExecution(taskEnvelope);
+  const { outcome } = await harness.persistEpochOutcome(state, {
+    status: "provider_error",
     reason: "429 Too Many Requests: rate limit exceeded",
-    executorOutputPreview: ""
+    retryable: true,
+    taskOutcomeRef: undefined
   });
 
-  assert.equal(taskResult.status, "failed");
-  assert.equal(taskResult.retryable, true);
-  assert.match(taskResult.summary, /rate limit exceeded/);
+  assert.equal(outcome.status, "provider_error");
+  assert.equal(outcome.retryable, true);
+  assert.match(outcome.reason, /rate limit exceeded/);
+  assert.equal(harness.runtimeStore.getTaskOutcome(taskEnvelope.taskId), undefined);
+  const persisted = harness.runtimeStore.getEpochOutcome(state.epochId);
+  assert.equal(persisted?.epochRef, outcome.epochRef);
+  assert.equal(persisted?.status, outcome.status);
+  assert.equal(persisted?.reason, outcome.reason);
 
+  harness.finishTaskExecution(taskEnvelope.taskId, "provider_error");
   await controller.close({ drainProjectionJobs: false });
 });
 
-test("budget abort synthesizes failed retryable result, not partial", async () => {
+test("budget abort persists a resumable EpochOutcome without fabricating task semantics", async () => {
   const runtimeDir = mkdtempSync(join(tmpdir(), "luanniao-session-boundary-"));
   const { controller, harness } = createHarness(runtimeDir);
   await controller.initialize();
   const taskEnvelope = makeTaskEnvelope();
   const state = harness.beginTaskExecution(taskEnvelope);
-  state.abortContext = { kind: "budget_abort", reason: "Task budget reached: maxTurns=12" };
+  const budgetSignal = {
+    decision: "handoff",
+    reason: "Task budget reached: maxTurns=12",
+    evidenceRefs: ["event:budget"]
+  };
+  state.executorStopRequested = true;
+  state.controlSignal = budgetSignal;
+  state.abortContext = { kind: "budget_abort", reason: budgetSignal.reason, controlSignal: budgetSignal };
 
-  const taskResult = await harness.createSyntheticTaskResult({
-    taskEnvelope,
-    reason: "checkpoint",
-    executorOutputPreview: ""
+  const { outcome } = await harness.persistEpochOutcome(state, {
+    status: "checkpointed",
+    reason: budgetSignal.reason,
+    retryable: true,
+    taskOutcomeRef: undefined
   });
 
-  assert.equal(taskResult.status, "failed");
-  assert.equal(taskResult.retryable, true);
+  assert.equal(outcome.status, "checkpointed");
+  assert.equal(outcome.retryable, true);
+  assert.equal(outcome.reason, budgetSignal.reason);
+  assert.equal(harness.runtimeStore.getTaskOutcome(taskEnvelope.taskId), undefined);
 
   harness.finishTaskExecution(taskEnvelope.taskId, "budget_exhausted");
   await controller.close({ drainProjectionJobs: false });
 });
 
-test("observer checkpoint still synthesizes partial result", async () => {
+test("unforced Supervisor handoff advice creates neither task nor epoch outcome", async () => {
   const runtimeDir = mkdtempSync(join(tmpdir(), "luanniao-session-boundary-"));
   const { controller, harness } = createHarness(runtimeDir);
   await controller.initialize();
   const taskEnvelope = makeTaskEnvelope();
 
-  const taskResult = await harness.createSyntheticTaskResult({
-    taskEnvelope,
-    signal: {
-      decision: "checkpoint",
-      reason: "handoff to planner",
-      evidenceRefs: ["event:checkpoint"]
-    },
-    reason: "checkpoint",
-    executorOutputPreview: ""
-  });
+  const state = harness.beginTaskExecution(taskEnvelope);
+  state.controlSignal = {
+    decision: "handoff",
+    reason: "handoff to planner",
+    evidenceRefs: ["event:handoff"]
+  };
 
-  assert.equal(taskResult.status, "partial");
-  assert.equal(taskResult.retryable, true);
-  assert.equal(taskResult.checkpointReason, "handoff to planner");
+  assert.equal(harness.runtimeStore.getTaskOutcome(taskEnvelope.taskId), undefined);
+  assert.equal(harness.runtimeStore.getEpochOutcome(state.epochId), undefined);
 
+  harness.finishTaskExecution(taskEnvelope.taskId, "supervisor_handoff");
   await controller.close({ drainProjectionJobs: false });
 });

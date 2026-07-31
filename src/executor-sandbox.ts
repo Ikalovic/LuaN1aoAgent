@@ -332,10 +332,12 @@ export function executorSandboxModeFromEnv(): ExecutorSandboxRequestedMode {
   if (value === "bwrap" || value === "linux-bubblewrap") {
     return "bubblewrap";
   }
-  if (value === "docker" || value === "seatbelt" || value === "bubblewrap" || value === "workspace") {
+  if (value === "auto" || value === "docker" || value === "seatbelt" || value === "bubblewrap" || value === "workspace") {
     return value;
   }
-  return "auto";
+  // Default is the fail-closed Docker backend: without a daemon the bootstrap
+  // refuses to start rather than silently running unsandboxed on the host.
+  return "docker";
 }
 
 async function prepareSandboxEnvironment(input: NodeJS.ProcessEnv | undefined, root: string): Promise<NodeJS.ProcessEnv | undefined> {

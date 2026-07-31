@@ -23,17 +23,14 @@ from mitmproxy import http, io, tcp
 from mitmproxy.exceptions import FlowReadException
 from conntrack_telemetry import AGENT_INTENT_MARK, ConntrackEpochTracker, stream_conntrack_epochs
 from segmented_capture import capture_quota_state
+from scope_dns import ScopeDnsProxy
 
 REPLAY_BODY_LIMIT = int(os.environ.get("LUANNIAO_CAPTURE_BYTES", str(1 << 20)))
 CONTROL_REQUEST_LIMIT = 1 << 20
 ROUTES_PATH = Path(os.environ.get("LUANNIAO_ROUTES_FILE", "/run/luanniao/routes.json"))
-CAPTURE_TUN_NAME = "luanniao0"
-ROUTE_TUN_NAME = "luanniao1"
-CAPTURE_ROUTE_TABLE = "4242"
-ROUTE_ROUTE_TABLE = "4243"
-CAPTURE_GATE_READY = Path("/run/luanniao/capture-gate.ready")
-ROUTE_GATE_READY = Path("/run/luanniao/route-gate.ready")
-MITM_ROUTE_MARK = int(os.environ.get("LUANNIAO_MITM_ROUTE_MARK", "0x4c4e4102"), 0)
+GATEWAY_TUN_NAME = "luanniao0"
+GATEWAY_ROUTE_TABLE = "4242"
+GATEWAY_READY = Path("/run/luanniao/gateway-tun.ready")
 CONNTRACK_ACCT_PATH = Path("/proc/sys/net/netfilter/nf_conntrack_acct")
 CAPTURE_STATUS_PATH = Path(os.environ.get(
     "LUANNIAO_CAPTURE_STATUS", "/run/luanniao/capture/status.json"
@@ -42,6 +39,10 @@ CONNTRACK_STATUS_PATH = Path(os.environ.get(
     "LUANNIAO_CONNTRACK_STATUS", "/run/luanniao/conntrack-status.json"
 ))
 GATEWAY_DRAIN_TIMEOUT_SECONDS = float(os.environ.get("LUANNIAO_GATEWAY_DRAIN_TIMEOUT_S", "15"))
+ROUTE_GUARD_CHAIN = "LUANNIAO_ROUTE_GUARD"
+SCOPE_GUARD_CHAIN = "LUANNIAO_SCOPE_GUARD"
+SCOPE_NFT_TABLE = "luanniao_scope"
+SCOPE_NFT_SET = "allowed4"
 
 
 def json_line(path: Path, value: dict) -> None:
@@ -123,6 +124,23 @@ def flow_record(path: Path, flow, quota: dict | None = None) -> dict:
     return base
 
 
+def native_flow_record(path: Path, value: dict, quota: dict | None = None) -> dict:
+    if value.get("format") != "luanniao-flow-v1" or not value.get("id"):
+        return {}
+    record = dict(value)
+    try:
+        record["request_body"] = base64.b64decode(record.pop("request_body_base64", ""), validate=True)
+        record["response_body"] = base64.b64decode(record.pop("response_body_base64", ""), validate=True)
+    except (ValueError, TypeError) as error:
+        raise ValueError("invalid native flow body encoding") from error
+    record.pop("format", None)
+    record["runtime_ref"] = record.get("run_ref", "")
+    record["source_file"] = str(path)
+    record["quota_pressure"] = bool((quota or {}).get("quota_pressure", False))
+    record["evicted_exchanges"] = int((quota or {}).get("evicted_records", 0))
+    return record
+
+
 @dataclass
 class IndexedFlowFile:
     identity: tuple[int, int]
@@ -185,6 +203,26 @@ class FlowIndex:
     def _read_appended_records(indexed: IndexedFlowFile, quota: dict) -> None:
         try:
             with indexed.path.open("rb") as source:
+                first_byte = source.read(1)
+                source.seek(indexed.committed_offset)
+                if first_byte == b"{":
+                    while True:
+                        start = source.tell()
+                        line = source.readline()
+                        if not line:
+                            break
+                        if not line.endswith(b"\n"):
+                            source.seek(start)
+                            break
+                        try:
+                            value = json.loads(line)
+                            record = native_flow_record(indexed.path, value, quota)
+                        except (json.JSONDecodeError, UnicodeDecodeError, ValueError):
+                            break
+                        indexed.committed_offset = source.tell()
+                        if record:
+                            indexed.records.append(record)
+                    return
                 source.seek(indexed.committed_offset)
                 try:
                     for flow in io.FlowReader(source).stream():
@@ -304,39 +342,44 @@ def body_record(record: dict, flow_ref: str, body_side: str, byte_limit: int) ->
     }
 
 
-def mitm_command() -> list[str]:
-    return [
-        "setpriv", "--reuid=101", "--regid=101", "--clear-groups", "--pdeathsig", "TERM", "mitmdump",
-        "--mode", "socks5@1080", "--set", "rawtcp=true", "--set", "connection_strategy=eager",
-        "--set", "ssl_insecure=true",
-        "--set", "block_global=false", "--set", "block_private=false",
-        "--set", "confdir=/traffic/ca", "-s", "/opt/luanniao/flow_capture.py", "--quiet"
-    ]
-
-
 def _unprivileged_gate_command() -> list[str]:
     return [
-        "setpriv", "--reuid=102", "--regid=102", "--clear-groups",
+        "setpriv", "--reuid=101", "--regid=101", "--clear-groups",
         "--pdeathsig", "TERM",
         "--bounding-set=-all", "--inh-caps=-all", "--ambient-caps=-all", "--no-new-privs",
         "gateway-tun",
     ]
 
 
-def capture_gate_command() -> list[str]:
-    return [
+def gateway_tun_command() -> list[str]:
+    command = [
         *_unprivileged_gate_command(),
-        "--mode", "capture", "--tun", CAPTURE_TUN_NAME,
-        "--proxy", "127.0.0.1:1080", "--ready-file", str(CAPTURE_GATE_READY),
+        "--mode", "unified", "--tun", GATEWAY_TUN_NAME,
+        "--routes-file", str(ROUTES_PATH),
+        "--direct-broker", os.environ["LUANNIAO_DIRECT_BROKER"],
+        "--direct-broker-token", os.environ["LUANNIAO_DIRECT_BROKER_TOKEN"],
+        "--local-direct-host", "host.docker.internal",
+        "--deny-cidrs", f"{os.environ['LUANNIAO_TASK_NETWORK_CIDR']},{os.environ['LUANNIAO_CONTROL_NETWORK_CIDR']}",
+        "--allow-cidrs", os.environ["LUANNIAO_AUTHORIZED_CIDRS"],
+        "--local-direct-deny-ports", os.environ.get("LUANNIAO_LOCAL_DIRECT_DENY_PORTS", ""),
+        "--epoch-file", "/run/luanniao/epoch.json",
+        "--capture-status", str(CAPTURE_STATUS_PATH),
+        "--ca-cert", "/traffic/ca/mitmproxy-ca-cert.pem",
+        "--ca-key", "/traffic/ca/luanniao-ca-key.pem",
+        "--run-ref", os.environ.get("LUANNIAO_RUN_REF", ""),
+        "--task-ref", os.environ.get("LUANNIAO_TASK_REF", ""),
+        "--ready-file", str(GATEWAY_READY),
+        "--max-inflight", "8192",
     ]
+    if _authorized_domains():
+        command.append("--allow-domain-resolved")
+    return command
 
 
-def route_gate_command() -> list[str]:
+def _authorized_domains() -> list[str]:
     return [
-        *_unprivileged_gate_command(),
-        "--mode", "route", "--tun", ROUTE_TUN_NAME,
-        "--proxy", "127.0.0.1:1080", "--routes-file", str(ROUTES_PATH),
-        "--ready-file", str(ROUTE_GATE_READY),
+        value.strip() for value in os.environ.get("LUANNIAO_AUTHORIZED_DOMAINS", "").split(",")
+        if value.strip()
     ]
 
 
@@ -353,6 +396,7 @@ class GatewayControl:
         active_connection_drain: Callable[[], int] | None = None,
         drain_timeout_seconds: float = GATEWAY_DRAIN_TIMEOUT_SECONDS,
         network_epoch_drain: Callable[[str], None] | None = None,
+        route_guard_replace: Callable[[list[dict]], None] | None = None,
     ) -> None:
         self.socket_path = socket_path
         self.ready = ready
@@ -364,6 +408,7 @@ class GatewayControl:
         self.active_connection_drain = active_connection_drain or drain_executor_connections
         self.network_epoch_drain = network_epoch_drain
         self.drain_timeout_seconds = max(0.1, drain_timeout_seconds)
+        self.route_guard_replace = route_guard_replace
 
     def serve(self) -> None:
         Path(self.socket_path).parent.mkdir(parents=True, exist_ok=True)
@@ -438,6 +483,8 @@ class GatewayControl:
                 normalized["connectionRef"] = self._route_string(connection_ref, "connectionRef", 512)
             ordered.append(normalized)
         ordered.sort(key=lambda item: (-item["prefixLength"], item["cidr"], item["routeRef"]))
+        if self.route_guard_replace:
+            self.route_guard_replace(ordered)
         self._write_routes({"routes": ordered})
 
     @staticmethod
@@ -544,10 +591,15 @@ class GatewayControl:
                     int(final_network.get("persistedSequence", 0)),
                 )
             if snapshot[:4] == (0, 0, 0, 0):
-                if snapshot == stable_snapshot:
+                # Stability is anchored on the flow persistence sequence only.
+                # The conntrack/network sequence keeps moving on destroy
+                # bookkeeping (e.g. after full-port scans) and must not block
+                # the stability window once nothing is active.
+                drain_signature = snapshot[:5]
+                if drain_signature == stable_snapshot:
                     stable_observations += 1
                 else:
-                    stable_snapshot = snapshot
+                    stable_snapshot = drain_signature
                     stable_observations = 1
                 if stable_observations >= 3:
                     break
@@ -558,7 +610,8 @@ class GatewayControl:
                 raise RuntimeError(
                     "gateway epoch drain timed out "
                     f"(active_flows={snapshot[0]}, active_tcp={snapshot[1]}, "
-                    f"active_network={snapshot[2]}, kernel_connections={snapshot[3]})"
+                    f"active_network={snapshot[2]}, kernel_connections={snapshot[3]}, "
+                    f"flow_seq={snapshot[4]}, net_seq={snapshot[5]})"
                 )
             time.sleep(0.05)
 
@@ -685,59 +738,169 @@ def drain_executor_connections() -> int:
             active += 1
     return active
 
-def configure_gateway_firewall() -> None:
-    if MITM_ROUTE_MARK == AGENT_INTENT_MARK:
-        raise RuntimeError("Executor and mitm route marks must be distinct")
-    for tun_name, route_table in (
-        (CAPTURE_TUN_NAME, CAPTURE_ROUTE_TABLE),
-        (ROUTE_TUN_NAME, ROUTE_ROUTE_TABLE),
-    ):
-        subprocess.run(["ip", "tuntap", "add", "dev", tun_name, "mode", "tun", "user", "102", "group", "102"], check=True)
-        subprocess.run(["ip", "link", "set", "dev", tun_name, "up"], check=True)
-        subprocess.run(["ip", "route", "add", "default", "dev", tun_name, "table", route_table], check=True)
+def _gateway_networks() -> tuple[ipaddress.IPv4Network, ipaddress.IPv4Network]:
+    task_network = ipaddress.ip_network(os.environ["LUANNIAO_TASK_NETWORK_CIDR"], strict=False)
+    control_network = ipaddress.ip_network(os.environ["LUANNIAO_CONTROL_NETWORK_CIDR"], strict=False)
+    if task_network.version != 4 or control_network.version != 4 or task_network.overlaps(control_network):
+        raise RuntimeError("gateway task and control networks must be distinct IPv4 CIDRs")
+    return task_network, control_network
+
+
+def wait_for_gateway_networks() -> str:
+    task_network, control_network = _gateway_networks()
+    for _ in range(100):
+        addresses = json.loads(subprocess.run(
+            ["ip", "-j", "-4", "address", "show"], check=True,
+            stdout=subprocess.PIPE, text=True,
+        ).stdout)
+        task_address = ""
+        has_control = False
+        for interface in addresses:
+            for address in interface.get("addr_info", []):
+                candidate = ipaddress.ip_address(address.get("local", "0.0.0.0"))
+                if candidate in task_network:
+                    task_address = str(candidate)
+                if candidate in control_network:
+                    has_control = True
+        if task_address and has_control:
+            return task_address
+        time.sleep(0.1)
+    raise RuntimeError("gateway did not receive both task and control network interfaces")
+
+
+def replace_route_guard(routes: list[dict]) -> None:
+    subprocess.run(["iptables", "-F", ROUTE_GUARD_CHAIN], check=True)
+    for route in routes:
+        for protocol in ("udp", "icmp"):
+            subprocess.run([
+                "iptables", "-A", ROUTE_GUARD_CHAIN,
+                "-d", route["cidr"], "-p", protocol,
+                "-j", "REJECT",
+            ], check=True)
+
+
+def configure_gateway_firewall(task_address: str) -> None:
+    task_network, control_network = _gateway_networks()
+    authorized_networks = [
+        ipaddress.ip_network(value.strip(), strict=False)
+        for value in os.environ["LUANNIAO_AUTHORIZED_CIDRS"].split(",")
+        if value.strip()
+    ]
+    authorized_domains = _authorized_domains()
+    if (not authorized_networks and not authorized_domains) or any(network.version != 4 for network in authorized_networks):
+        raise RuntimeError("gateway authorized scope must contain IPv4 CIDRs or domains")
+    subprocess.run(["ip", "tuntap", "add", "dev", GATEWAY_TUN_NAME, "mode", "tun", "user", "101", "group", "101"], check=True)
+    subprocess.run(["ip", "link", "set", "dev", GATEWAY_TUN_NAME, "up"], check=True)
+    subprocess.run(["ip", "route", "add", "default", "dev", GATEWAY_TUN_NAME, "table", GATEWAY_ROUTE_TABLE], check=True)
     subprocess.run([
         "ip", "rule", "add", "priority", "100", "fwmark",
-        f"{AGENT_INTENT_MARK:#x}/0xffffffff", "lookup", CAPTURE_ROUTE_TABLE
-    ], check=True)
-    subprocess.run([
-        "ip", "rule", "add", "priority", "110", "fwmark",
-        f"{MITM_ROUTE_MARK:#x}/0xffffffff", "lookup", ROUTE_ROUTE_TABLE
+        f"{AGENT_INTENT_MARK:#x}/0xffffffff", "lookup", GATEWAY_ROUTE_TABLE
     ], check=True)
     subprocess.run(["ip", "rule", "add", "priority", "200", "lookup", "local"], check=True)
     subprocess.run(["ip", "rule", "del", "priority", "0", "lookup", "local"], check=True)
+    subprocess.run(["iptables", "-N", ROUTE_GUARD_CHAIN], check=True)
+    if authorized_domains:
+        subprocess.run(["nft", "add", "table", "ip", SCOPE_NFT_TABLE], check=True)
+        subprocess.run([
+            "nft", "add", "set", "ip", SCOPE_NFT_TABLE, SCOPE_NFT_SET,
+            "{", "type", "ipv4_addr", ";", "flags", "timeout", ";", "timeout", "5m", ";", "}"
+        ], check=True)
+        subprocess.run([
+            "nft", "add", "chain", "ip", SCOPE_NFT_TABLE, "forward",
+            "{", "type", "filter", "hook", "forward", "priority", "-1", ";", "policy", "accept", ";", "}"
+        ], check=True)
+        subprocess.run([
+            "nft", "add", "rule", "ip", SCOPE_NFT_TABLE, "forward",
+            "ip", "saddr", str(task_network), "ip", "daddr", f"@{SCOPE_NFT_SET}", "accept"
+        ], check=True)
+        for network in authorized_networks:
+            subprocess.run([
+                "nft", "add", "rule", "ip", SCOPE_NFT_TABLE, "forward",
+                "ip", "saddr", str(task_network), "ip", "daddr", str(network), "accept"
+            ], check=True)
+        subprocess.run([
+            "nft", "add", "rule", "ip", SCOPE_NFT_TABLE, "forward",
+            "ip", "saddr", str(task_network), "reject"
+        ], check=True)
+    else:
+        subprocess.run(["iptables", "-N", SCOPE_GUARD_CHAIN], check=True)
+        for network in authorized_networks:
+            subprocess.run([
+                "iptables", "-A", SCOPE_GUARD_CHAIN, "-d", str(network), "-j", "RETURN"
+            ], check=True)
+        subprocess.run(["iptables", "-A", SCOPE_GUARD_CHAIN, "-j", "REJECT"], check=True)
     subprocess.run([
-        "iptables", "-t", "mangle", "-A", "OUTPUT",
-        "-m", "owner", "--uid-owner", "1000",
-        "-m", "conntrack", "--ctstate", "NEW",
+        "iptables", "-t", "mangle", "-A", "PREROUTING",
+        "-s", str(task_network), "-m", "conntrack", "--ctstate", "NEW",
         "-j", "CONNMARK", "--set-mark", f"{AGENT_INTENT_MARK:#x}/0xffffffff"
     ], check=True)
+    if os.environ.get("LUANNIAO_TRUSTED_REPLAY") == "1":
+        subprocess.run([
+            "iptables", "-t", "mangle", "-A", "OUTPUT",
+            "-m", "owner", "--uid-owner", "1000", "-p", "tcp",
+            "-m", "conntrack", "--ctstate", "NEW",
+            "-j", "CONNMARK", "--set-mark", f"{AGENT_INTENT_MARK:#x}/0xffffffff"
+        ], check=True)
+        subprocess.run([
+            "iptables", "-t", "mangle", "-A", "OUTPUT",
+            "-m", "owner", "--uid-owner", "1000", "-p", "tcp",
+            "-j", "MARK", "--set-mark", f"{AGENT_INTENT_MARK:#x}/0xffffffff"
+        ], check=True)
     subprocess.run([
-        "iptables", "-t", "mangle", "-A", "OUTPUT",
-        "-m", "owner", "--uid-owner", "1000", "-p", "tcp",
-        "-j", "CONNMARK", "--restore-mark"
+        "iptables", "-t", "mangle", "-A", "PREROUTING",
+        "-s", str(task_network), "-p", "tcp",
+        "-j", "MARK", "--set-mark", f"{AGENT_INTENT_MARK:#x}/0xffffffff"
+    ], check=True)
+    for protocol in ("udp", "tcp"):
+        subprocess.run([
+            "iptables", "-A", "INPUT", "-s", str(task_network),
+            "-d", f"{task_address}/32", "-p", protocol, "--dport", "53", "-j", "ACCEPT"
+        ], check=True)
+    subprocess.run([
+        "iptables", "-A", "INPUT", "-s", str(task_network), "-j", "REJECT"
     ], check=True)
     subprocess.run([
-        "iptables", "-t", "mangle", "-A", "OUTPUT",
-        "-m", "owner", "--uid-owner", "101", "-p", "tcp",
-        "-m", "conntrack", "--ctstate", "NEW",
-        "-j", "CONNMARK", "--set-mark", f"{MITM_ROUTE_MARK:#x}/0xffffffff"
+        "iptables", "-A", "FORWARD", "-m", "conntrack", "--ctstate", "ESTABLISHED,RELATED", "-j", "ACCEPT"
     ], check=True)
     subprocess.run([
-        "iptables", "-t", "mangle", "-A", "OUTPUT",
-        "-m", "owner", "--uid-owner", "101", "-p", "tcp",
-        "-j", "CONNMARK", "--restore-mark"
+        "iptables", "-A", "FORWARD", "-s", str(task_network), "-d", str(control_network), "-j", "REJECT"
     ], check=True)
+    if not authorized_domains:
+        subprocess.run([
+            "iptables", "-A", "FORWARD", "-s", str(task_network), "-j", SCOPE_GUARD_CHAIN
+        ], check=True)
+    subprocess.run([
+        "iptables", "-A", "FORWARD", "-s", str(task_network), "-j", ROUTE_GUARD_CHAIN
+    ], check=True)
+    subprocess.run([
+        "iptables", "-A", "FORWARD", "-s", str(task_network), "-j", "ACCEPT"
+    ], check=True)
+    subprocess.run([
+        "iptables", "-A", "FORWARD", "-d", str(task_network), "-j", "REJECT"
+    ], check=True)
+    subprocess.run([
+        "iptables", "-t", "nat", "-A", "POSTROUTING", "-s", str(task_network), "-j", "MASQUERADE"
+    ], check=True)
+
+
+def authorize_domain_address(address: str, ttl: int) -> None:
+    try:
+        subprocess.run([
+            "nft", "add", "element", "ip", SCOPE_NFT_TABLE, SCOPE_NFT_SET,
+            "{", address, "timeout", f"{ttl}s", "}"
+        ], check=True)
+    except subprocess.CalledProcessError as error:
+        raise OSError(f"failed to authorize DNS address {address}") from error
 
 
 def publish_gateway_ready(
     ready: threading.Event,
     *,
-    mitm_listener_ready: bool,
     ca_ready: bool,
-    capture_gate_ready: bool,
-    route_gate_ready: bool,
+    gate_ready: bool,
+    capture_ready: bool,
 ) -> bool:
-    if not (mitm_listener_ready and ca_ready and capture_gate_ready and route_gate_ready):
+    if not (ca_ready and gate_ready and capture_ready):
         return False
     ready.set()
     return True
@@ -763,7 +926,7 @@ def prepare_tun_gate_ready_file(path: Path) -> None:
     os.chmod(path.parent, 0o733)
     try:
         subprocess.run([
-            "setpriv", "--reuid=102", "--regid=102", "--clear-groups",
+            "setpriv", "--reuid=101", "--regid=101", "--clear-groups",
             "install", "-m", "0600", "/dev/null", str(path),
         ], check=True)
     finally:
@@ -794,6 +957,7 @@ def gateway() -> None:
     CONNTRACK_STATUS_PATH.write_text('{"epochs":{}}', encoding="utf-8")
     os.chmod(CONNTRACK_STATUS_PATH, 0o660)
     ready = threading.Event()
+    task_address = wait_for_gateway_networks()
     conntrack_tracker = ConntrackEpochTracker(CONNTRACK_STATUS_PATH)
     control = GatewayControl(
         "/run/luanniao/gateway.sock",
@@ -804,9 +968,10 @@ def gateway() -> None:
         CAPTURE_STATUS_PATH,
         CONNTRACK_STATUS_PATH,
         network_epoch_drain=conntrack_tracker.close_epoch,
+        route_guard_replace=replace_route_guard,
     )
+    configure_gateway_firewall(task_address)
     control.replace_routes([])
-    configure_gateway_firewall()
     threading.Thread(target=control.serve, daemon=True).start()
     ensure_conntrack_accounting()
     telemetry = subprocess.Popen(
@@ -825,70 +990,40 @@ def gateway() -> None:
         daemon=True,
     )
     telemetry_thread.start()
-    mitm = subprocess.Popen(mitm_command())
+    dns = ScopeDnsProxy(
+        task_address,
+        _authorized_domains(),
+        authorize_domain_address,
+        allow_unmatched=bool(os.environ.get("LUANNIAO_AUTHORIZED_CIDRS", "").strip()),
+    )
+    dns.start()
     ca_cert = ca_path / "mitmproxy-ca-cert.pem"
-    listener_ready = False
-    for _ in range(100):
-        if telemetry.poll() is not None:
-            raise RuntimeError("conntrack telemetry exited during gateway startup")
-        if mitm.poll() is not None:
-            raise RuntimeError("mitmproxy exited during gateway startup")
-        listener_ready = False
-        try:
-            with socket.create_connection(("127.0.0.1", 1080), timeout=0.1):
-                listener_ready = True
-        except OSError:
-            pass
-        if listener_ready and file_is_nonempty(ca_cert) and capture_writer_is_ready():
-            break
-        time.sleep(0.1)
-    else:
-        raise RuntimeError(
-            "gateway mitm readiness timed out "
-            f"(listener_ready={listener_ready}, ca_ready={file_is_nonempty(ca_cert)}, "
-            f"capture_ready={capture_writer_is_ready()})"
-        )
-
-    prepare_tun_gate_ready_file(CAPTURE_GATE_READY)
-    prepare_tun_gate_ready_file(ROUTE_GATE_READY)
-    capture_gate = subprocess.Popen(capture_gate_command())
-    route_gate = subprocess.Popen(route_gate_command())
+    prepare_tun_gate_ready_file(GATEWAY_READY)
+    gate = subprocess.Popen(gateway_tun_command())
     for _ in range(100):
         if telemetry.poll() is not None or not telemetry_thread.is_alive():
             raise RuntimeError("conntrack telemetry exited during TUN gate startup")
-        if mitm.poll() is not None:
-            raise RuntimeError("mitmproxy exited during TUN gate startup")
-        if capture_gate.poll() is not None:
-            raise RuntimeError("capture gate exited during gateway startup")
-        if route_gate.poll() is not None:
-            raise RuntimeError("route gate exited during gateway startup")
-        mitm_listener_ready = False
-        try:
-            with socket.create_connection(("127.0.0.1", 1080), timeout=0.1):
-                mitm_listener_ready = True
-        except OSError:
-            pass
+        if not dns.is_alive():
+            raise RuntimeError("gateway DNS forwarder exited during gateway startup")
+        if gate.poll() is not None:
+            raise RuntimeError("protocol gateway exited during gateway startup")
         if publish_gateway_ready(
             ready,
-            mitm_listener_ready=mitm_listener_ready and capture_writer_is_ready(),
             ca_ready=file_is_nonempty(ca_cert),
-            capture_gate_ready=file_is_nonempty(CAPTURE_GATE_READY),
-            route_gate_ready=file_is_nonempty(ROUTE_GATE_READY),
+            gate_ready=file_is_nonempty(GATEWAY_READY),
+            capture_ready=capture_writer_is_ready(),
         ):
             break
         time.sleep(0.1)
     else:
-        raise RuntimeError("TUN gate readiness timed out")
+        raise RuntimeError("protocol gateway readiness timed out")
     print(json.dumps({"ready": True, "task": os.environ["LUANNIAO_TASK_REF"]}), flush=True)
-    while mitm.poll() is None and capture_gate.poll() is None and route_gate.poll() is None:
+    while dns.is_alive() and gate.poll() is None:
         if telemetry.poll() is not None or not telemetry_thread.is_alive():
             raise RuntimeError("conntrack telemetry stopped while gateway was running")
         time.sleep(0.2)
-    code = next(
-        process.poll()
-        for process in (mitm, capture_gate, route_gate)
-        if process.poll() is not None
-    )
+    code = gate.poll()
+    dns.close()
     telemetry.terminate()
     telemetry_thread.join(timeout=2)
     raise SystemExit(code or 1)

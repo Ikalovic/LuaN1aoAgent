@@ -8,12 +8,15 @@ case "$role" in
   gateway)
     : "${LUANNIAO_TASK_FLOW_ROOT:?LUANNIAO_TASK_FLOW_ROOT is required}"
     mkdir -p /run/luanniao/capture /traffic/ca "$LUANNIAO_TASK_FLOW_ROOT"
-    chgrp -R 101 /run/luanniao/capture /traffic/ca "$LUANNIAO_TASK_FLOW_ROOT"
-    find /traffic/ca "$LUANNIAO_TASK_FLOW_ROOT" -type d -exec chmod 2770 {} +
-    find /traffic/ca "$LUANNIAO_TASK_FLOW_ROOT" -type f -exec chmod g+rw {} +
+    chgrp 101 /run/luanniao/capture
     chmod 2770 /run/luanniao/capture
-    exec setpriv --groups=101 --bounding-set=-chown,-fowner,-setpcap \
+    exec setpriv --groups=101 \
       python3 /opt/luanniao/index_server.py gateway "$@"
+    ;;
+  storage-init)
+    [ "$#" -gt 0 ] || { echo "storage-init requires at least one path" >&2; exit 64; }
+    chown -R 101:101 "$@"
+    find "$@" -type d -exec chmod 2770 {} +
     ;;
   index)
     exec python3 /opt/luanniao/index_server.py index "$@"
@@ -24,7 +27,7 @@ case "$role" in
     exec sleep infinity
     ;;
   *)
-    echo "usage: entrypoint.sh gateway|index|connector" >&2
+    echo "usage: entrypoint.sh gateway|index|connector|storage-init" >&2
     exit 64
     ;;
 esac

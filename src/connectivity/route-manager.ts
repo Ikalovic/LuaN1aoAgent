@@ -6,12 +6,13 @@ import type { ExecutionLog } from "../stores/execution-log.js";
 import { stableConnectivityId, type ConnectivityDefinition, type ConnectivityDesiredState, type ConnectivityStore } from "../stores/connectivity-store.js";
 
 const CHISEL_VERSION = "1.10.1";
+const TRANSPARENT_PROXY_OWNER = "runtime:transparent-proxy";
 const CHISEL_ASSETS = {
   amd64: "0525aa3c5d457f2a4075e66221d5125d434bedf15006d3271c213f5cd6ff2230",
   arm64: "f55beb68fb99b69903df1adcff4197fbfdb82cb0ee596848c0f055dc219da983"
 } as const;
 
-export type RouteConnector = "ssh" | "chisel";
+export type RouteConnector = "ssh" | "chisel" | "socks5";
 
 export type RouteOpenInput = {
   connector: RouteConnector;
@@ -53,6 +54,7 @@ export type RouteStatus = Pick<ManagedRoute,
 
 export class RouteManager {
   private readonly routes = new Map<string, ManagedRoute>();
+  private readonly pendingConnectorCleanups = new Map<string, ManagedRoute>();
 
   constructor(
     private readonly network: NetworkSandboxManager,
@@ -72,6 +74,15 @@ export class RouteManager {
 
   async open(input: RouteOpenInput, ownerTaskId: string): Promise<RouteStatus> {
     validateRouteInput(input);
+    const connectorCredential = input.connector === "ssh" || input.connector === "socks5"
+      ? await this.readConnectorCredential(input.credentialRef, input.connector)
+      : undefined;
+    if (input.connector === "chisel") {
+      this.requireOwnedSshConnection(input.bootstrapConnectionRef!);
+      if (!this.network.chiselEndpoint || !this.network.chiselAuth || !this.network.chiselFingerprint) {
+        throw new Error("Chisel routes require LUANNIAO_CHISEL_PUBLIC_HOST to be reachable from the pivot");
+      }
+    }
     const routeRef = `route:${randomUUID()}`;
     const connectorRef = `connector:${randomUUID()}`;
     const socksPort = connectorPort(connectorRef);
@@ -87,7 +98,7 @@ export class RouteManager {
       ...(dialAddress ? { dialAddress } : {}),
       targetCidrs: [...new Set(input.targetCidrs)].sort(),
       desiredState: "running",
-      status: "degraded",
+      status: "stale",
       lastHeartbeat: new Date().toISOString(),
       connectorCleanupPending: false,
       socksPort,
@@ -97,62 +108,87 @@ export class RouteManager {
       credentialRef: input.credentialRef,
       options: { port: input.options?.port, user: input.options?.user }
     };
-    this.routes.set(routeRef, route);
-    try {
-      await this.publishRoutes();
-    } catch (publishError) {
-      this.routes.delete(routeRef);
-      try {
-        await this.publishRoutes();
-      } catch (rollbackError) {
-        throw new AggregateError(
-          [publishError, rollbackError],
-          `Failed to publish route ${routeRef} and restore the previous route table`
-        );
-      }
-      throw publishError;
-    }
     try {
       if (input.connector === "ssh") {
-        await this.startSsh(route, input);
+        await this.startSsh(route, input, connectorCredential);
+      } else if (input.connector === "socks5") {
+        await this.startSocks5(route, input, connectorCredential);
       } else {
         await this.startChisel(route, input);
       }
     } catch (startError) {
       let failure: unknown = startError;
-      let connectorCleanupPending = false;
       try {
         await this.stopRouteConnector(route);
       } catch (cleanupError) {
-        connectorCleanupPending = true;
         failure = combineFailures(
           startError,
           cleanupError,
           `Route ${routeRef} startup failed and connector cleanup was not confirmed`
         );
+        const cleanupPending: ManagedRoute = {
+          ...route,
+          desiredState: "stopped",
+          status: "stale",
+          error: failureMessage(failure),
+          connectorCleanupPending: true,
+          lastHeartbeat: new Date().toISOString()
+        };
+        this.pendingConnectorCleanups.set(routeRef, cleanupPending);
       }
-      route = {
-        ...route,
-        desiredState: "running",
-        status: "degraded",
-        error: failureMessage(failure),
-        connectorCleanupPending,
-        lastHeartbeat: new Date().toISOString()
-      };
-      this.routes.set(routeRef, route);
-      this.persistRoute(route, "running");
-      this.persistOwnedSession(route, "running");
-      await this.recordOwnedSession("open_failed", route);
-      await this.record("open_failed", route);
-      return publicRoute(route);
+      throw failure;
     }
     route = { ...route, status: "live", connectorCleanupPending: false, lastHeartbeat: new Date().toISOString() };
     this.routes.set(routeRef, route);
+    try {
+      await this.publishRoutes();
+    } catch (publishError) {
+      this.routes.delete(routeRef);
+      let failure: unknown = publishError;
+      try {
+        await this.publishRoutes();
+      } catch (rollbackError) {
+        failure = combineFailures(
+          failure,
+          rollbackError,
+          `Route ${routeRef} publication failed and the previous route table could not be restored`
+        );
+      }
+      try {
+        await this.stopRouteConnector(route);
+      } catch (cleanupError) {
+        failure = combineFailures(
+          failure,
+          cleanupError,
+          `Route ${routeRef} publication failed and connector cleanup was not confirmed`
+        );
+        const cleanupPending = {
+          ...route,
+          desiredState: "stopped" as const,
+          status: "stale" as const,
+          error: failureMessage(failure),
+          connectorCleanupPending: true,
+          lastHeartbeat: new Date().toISOString()
+        };
+        this.pendingConnectorCleanups.set(routeRef, cleanupPending);
+      }
+      throw failure;
+    }
     this.persistRoute(route, "running");
     this.persistOwnedSession(route, "running");
     await this.recordOwnedSession("opened", route);
     await this.record("opened", route);
     return publicRoute(route);
+  }
+
+  async replaceTransparentProxy(input: RouteOpenInput): Promise<RouteStatus> {
+    if (input.connector !== "socks5") throw new Error("Transparent proxy requires a SOCKS5 connector");
+    for (const route of [...this.routes.values()]) {
+      if (route.ownerTaskId === TRANSPARENT_PROXY_OWNER && route.status !== "closed") {
+        await this.forget(route.routeRef);
+      }
+    }
+    return this.open(input, TRANSPARENT_PROXY_OWNER);
   }
 
   async status(routeRef?: string): Promise<RouteStatus[]> {
@@ -194,6 +230,10 @@ export class RouteManager {
       if (route.connectionRef) refs.add(route.connectionRef);
     }
     return [...refs];
+  }
+
+  isTransparentProxyRoute(routeRef: string): boolean {
+    return this.routes.get(routeRef)?.ownerTaskId === TRANSPARENT_PROXY_OWNER;
   }
 
   async forget(routeRef: string): Promise<RouteStatus> {
@@ -253,6 +293,7 @@ export class RouteManager {
     try {
       const input = routeInput(route);
       if (route.connector === "ssh") await this.startSsh(route, input);
+      else if (route.connector === "socks5") await this.startSocks5(route, input);
       else await this.startChisel(route, input);
       route = {
         ...route,
@@ -304,6 +345,7 @@ export class RouteManager {
     this.routes.set(routeRef, stopped);
     this.persistOwnedSession(stopped, "stopped");
     this.persistRoute(stopped, "stopped");
+    await this.publishRoutes();
     try {
       await this.stopRouteConnector(stopped);
     } catch (error) {
@@ -337,6 +379,14 @@ export class RouteManager {
     for (const route of routes) {
       try {
         await this.stop(route.routeRef);
+      } catch (error) {
+        failures.push(error);
+      }
+    }
+    for (const route of this.pendingConnectorCleanups.values()) {
+      try {
+        await this.stopRouteConnector(route);
+        this.pendingConnectorCleanups.delete(route.routeRef);
       } catch (error) {
         failures.push(error);
       }
@@ -377,6 +427,14 @@ export class RouteManager {
       this.persistOwnedSession(suspended, suspended.desiredState);
       this.persistRoute(suspended, suspended.desiredState);
     }
+    for (const route of this.pendingConnectorCleanups.values()) {
+      try {
+        await this.stopRouteConnector(route);
+        this.pendingConnectorCleanups.delete(route.routeRef);
+      } catch (error) {
+        failures.push(error);
+      }
+    }
     await this.publishRoutes();
     if (failures.length > 0) throw new AggregateError(failures, "One or more route connectors could not be suspended");
   }
@@ -416,18 +474,15 @@ export class RouteManager {
       }));
   }
 
-  private async startSsh(route: ManagedRoute, input: RouteOpenInput): Promise<void> {
+  private async startSsh(route: ManagedRoute, input: RouteOpenInput, credential?: string): Promise<void> {
     const dialAddress = routeDialAddress(input);
     if (!dialAddress || !input.options?.user || !input.credentialRef) {
       throw new Error("SSH route requires dialAddress, options.user, and credentialRef");
     }
-    const credential = await this.readCredential(input.credentialRef);
+    credential ??= await this.readConnectorCredential(input.credentialRef, "ssh");
     const credentialPath = `/run/luanniao/credentials/${safeRef(route.connectorRef)}`;
     const mode = credential.includes("PRIVATE KEY") ? "identity" : "password";
-    const stagedCredential = mode === "identity"
-      ? credential
-      : normalizePasswordCredential(credential, input.options.user);
-    const stored = await this.network.connectorExec(`umask 077; cat > ${quote(credentialPath)}`, stagedCredential);
+    const stored = await this.network.connectorExec(`umask 077; cat > ${quote(credentialPath)}`, credential);
     if (stored.code !== 0) throw new Error(`Failed to stage SSH credential: ${stored.stderr}`);
     const pidFile = `/run/luanniao/connectors/${safeRef(route.connectorRef)}.pid`;
     const controlPath = `/run/luanniao/connectors/${safeRef(route.connectorRef)}.sock`;
@@ -441,6 +496,35 @@ export class RouteManager {
     await this.waitForSocks(route.socksPort, pidFile, `/run/luanniao/connectors/${safeRef(route.connectorRef)}.log`);
     const verified = await this.network.connectorExec(`ssh -T -S ${quote(controlPath)} -o BatchMode=yes -p ${input.options.port ?? 22} ${quote(target)} -- true`);
     if (verified.code !== 0) throw new Error(`SSH command channel verification failed: ${verified.stderr || verified.stdout}`);
+  }
+
+  private async startSocks5(route: ManagedRoute, input: RouteOpenInput, credential?: string): Promise<void> {
+    const dialAddress = routeDialAddress(input);
+    if (!dialAddress || !input.options?.user || !input.credentialRef) {
+      throw new Error("SOCKS5 route requires dialAddress, options.user, and credentialRef");
+    }
+    credential ??= await this.readConnectorCredential(input.credentialRef, "socks5");
+    if (Buffer.byteLength(input.options.user) > 255 || Buffer.byteLength(credential) > 255) {
+      throw new Error("SOCKS5 username and password must contain at most 255 bytes");
+    }
+    const credentialPath = `/run/luanniao/credentials/${safeRef(route.connectorRef)}`;
+    const stored = await this.network.connectorExec(`umask 077; cat > ${quote(credentialPath)}`, credential);
+    if (stored.code !== 0) throw new Error(`Failed to stage SOCKS5 credential: ${stored.stderr}`);
+    const pidFile = `/run/luanniao/connectors/${safeRef(route.connectorRef)}.pid`;
+    const logFile = `/run/luanniao/connectors/${safeRef(route.connectorRef)}.log`;
+    const upstream = `${dialAddress}:${input.options.port ?? 1080}`;
+    const command = [
+      "socks-connector",
+      "--listen", `0.0.0.0:${route.socksPort}`,
+      "--upstream", upstream,
+      "--username", input.options.user,
+      "--password-file", credentialPath
+    ].map(quote).join(" ");
+    const started = await this.network.connectorExec(
+      `setsid sh -c ${quote(command)} >${quote(logFile)} 2>&1 & echo $! > ${quote(pidFile)}`
+    );
+    if (started.code !== 0) throw new Error(`Failed to start SOCKS5 connector: ${started.stderr}`);
+    await this.waitForSocks(route.socksPort, pidFile, logFile, "SOCKS5");
   }
 
   private async startChisel(route: ManagedRoute, input: RouteOpenInput): Promise<void> {
@@ -551,7 +635,7 @@ export class RouteManager {
     };
   }
 
-  private async waitForSocks(port: number, pidFile?: string, logFile?: string): Promise<void> {
+  private async waitForSocks(port: number, pidFile?: string, logFile?: string, connectorLabel = "SSH"): Promise<void> {
     let lastError = "SOCKS readiness timed out";
     for (let attempt = 0; attempt < 50; attempt += 1) {
       const probe = await this.network.connectorExec(`nc -z 127.0.0.1 ${port}`);
@@ -566,7 +650,7 @@ export class RouteManager {
     if (logFile) {
       const log = await this.network.connectorExec(`tail -c 4096 ${quote(logFile)} 2>/dev/null || true`);
       const detail = (log.stdout || log.stderr).trim();
-      if (detail) throw new Error(`SSH connector failed: ${detail}`);
+      if (detail) throw new Error(`${connectorLabel} connector failed: ${detail}`);
     }
     throw new Error(lastError);
   }
@@ -606,6 +690,14 @@ export class RouteManager {
     const value = await this.artifactStore.read(credentialRef);
     if (!value || value.length > 1 << 20) throw new Error("Credential artifact is empty or too large");
     return value.trimEnd();
+  }
+
+  private async readConnectorCredential(
+    credentialRef: string | undefined,
+    connector: "ssh" | "socks5"
+  ): Promise<string> {
+    if (!credentialRef) throw new Error(`${connector === "ssh" ? "SSH" : "SOCKS5"} route requires credentialRef`);
+    return this.readCredential(credentialRef);
   }
 
   private async stopConnector(route: ManagedRoute): Promise<void> {
@@ -676,7 +768,7 @@ export class RouteManager {
     if (!socksHost) throw new Error("Connector address is unavailable");
     const routes: NetworkRoute[] = [];
     for (const route of this.routes.values()) {
-      if (route.status === "closed") continue;
+      if (route.desiredState !== "running" || route.status === "closed") continue;
       for (const cidr of route.targetCidrs) {
         routes.push({
           routeRef: route.routeRef,
@@ -832,7 +924,7 @@ function managedRouteFromDefinition(definition: ConnectivityDefinition): Managed
     ?? (connector === "chisel"
       ? definition.definition.pivotSessionRef ?? definition.definition.sessionRef
       : undefined);
-  if ((connector !== "ssh" && connector !== "chisel")
+  if ((connector !== "ssh" && connector !== "chisel" && connector !== "socks5")
     || typeof pivotHostRef !== "string" || !pivotHostRef
     || !Array.isArray(targetCidrs) || !targetCidrs.every((value) => typeof value === "string")
     || typeof connectorRef !== "string" || !connectorRef
@@ -912,23 +1004,31 @@ function combineFailures(primary: unknown, secondary: unknown, message: string):
 }
 
 function validateRouteInput(input: RouteOpenInput): void {
-  if (input.connector !== "ssh" && input.connector !== "chisel") throw new Error("Unsupported route connector");
+  if (input.connector !== "ssh" && input.connector !== "chisel" && input.connector !== "socks5") throw new Error("Unsupported route connector");
   if (!input.pivotHostRef.trim()) throw new Error("pivotHostRef is required");
   if (isDockerInfrastructureAlias(input.pivotHostRef)) throw new Error("pivotHostRef must identify the real pivot host");
   const dialAddress = routeDialAddress(input);
   if (dialAddress !== undefined && (!dialAddress || dialAddress.length > 255 || /[\s\0]/.test(dialAddress))) {
     throw new Error("Invalid dialAddress");
   }
-  if (dialAddress && isDockerInfrastructureAlias(dialAddress)) {
-    throw new Error("dialAddress must be the real routable target, not a Docker infrastructure alias");
-  }
-  if (!input.targetCidrs.length || input.targetCidrs.length > 32) throw new Error("targetCidrs must contain 1-32 CIDRs");
+  if (!input.targetCidrs.length || input.targetCidrs.length > 1024) throw new Error("targetCidrs must contain 1-1024 CIDRs");
   for (const cidr of input.targetCidrs) {
     const [host, prefixText] = cidr.split("/");
     const prefix = Number(prefixText);
     if (isIP(host) !== 4 || !Number.isInteger(prefix) || prefix < 0 || prefix > 32) throw new Error(`Invalid IPv4 CIDR: ${cidr}`);
   }
   if (input.options?.port !== undefined && (!Number.isInteger(input.options.port) || input.options.port < 1 || input.options.port > 65_535)) throw new Error("Invalid connector port");
+  if (input.connector === "ssh") {
+    if (!dialAddress || !input.options?.user?.trim() || !input.credentialRef?.trim()) {
+      throw new Error("SSH route requires dialAddress, options.user, and credentialRef");
+    }
+  } else if (input.connector === "socks5") {
+    if (!dialAddress || !input.options?.user?.trim() || !input.credentialRef?.trim()) {
+      throw new Error("SOCKS5 route requires dialAddress, options.user, and credentialRef");
+    }
+  } else if (!input.bootstrapConnectionRef?.trim()) {
+    throw new Error("Chisel route requires bootstrapConnectionRef");
+  }
 }
 
 function routeDialAddress(input: RouteOpenInput): string | undefined {
@@ -980,28 +1080,6 @@ function chiselProcessStopCommand(connectorRef: string): string {
     "fi",
     `rm -f ${quote(pidPath)}`
   ].join("\n");
-}
-
-function normalizePasswordCredential(credential: string, user: string): string {
-  if (credential.startsWith("{")) {
-    let parsed: unknown;
-    try {
-      parsed = JSON.parse(credential);
-    } catch {
-      throw new Error("Credential artifact contains invalid JSON");
-    }
-    if (!parsed || typeof parsed !== "object") throw new Error("Credential artifact JSON must be an object");
-    const record = parsed as Record<string, unknown>;
-    if (typeof record.username === "string" && record.username !== user) {
-      throw new Error(`Credential artifact username does not match SSH user: ${user}`);
-    }
-    if (typeof record.password !== "string" || !record.password) {
-      throw new Error("Credential artifact JSON must contain a non-empty password");
-    }
-    return record.password;
-  }
-  const prefix = `${user}:`;
-  return credential.startsWith(prefix) ? credential.slice(prefix.length) : credential;
 }
 
 function safeRef(value: string): string {

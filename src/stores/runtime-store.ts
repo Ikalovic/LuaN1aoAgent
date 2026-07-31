@@ -6,10 +6,12 @@ import type {
   ExecutionEpochRecord,
   ExecutionEpochState,
   ExecutionEpochTerminationReason,
+  EpochOutcome,
   ProjectionClaim,
   ProjectionState,
   TaskOutcome
 } from "../types.js";
+import type { EpochBudgetClockSnapshot } from "../epoch-budget-clock.js";
 
 export type ExecutorSessionRecord = {
   taskId: string;
@@ -67,6 +69,23 @@ type TaskOutcomeRow = {
   terminal_seq: number;
   outcome_json: string;
   created_at: string;
+};
+
+type EpochOutcomeRow = {
+  epoch_id: string;
+  task_id: string;
+  terminal_seq: number;
+  outcome_json: string;
+  created_at: string;
+};
+
+type EpochBudgetRow = {
+  epoch_id: string;
+  time_limit_ms: number;
+  deadline_at: number;
+  paused_at: number | null;
+  accumulated_pause_ms: number;
+  updated_at: string;
 };
 
 export class RuntimeStore {
@@ -156,6 +175,40 @@ export class RuntimeStore {
       SELECT COUNT(*) AS count FROM execution_epochs WHERE task_id = ?
     `).get(taskId) as { count: number };
     return Number(row.count);
+  }
+
+  upsertEpochBudget(snapshot: EpochBudgetClockSnapshot): void {
+    this.database.prepare(`
+      INSERT INTO epoch_budgets (
+        epoch_id, time_limit_ms, deadline_at, paused_at, accumulated_pause_ms, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?)
+      ON CONFLICT(epoch_id) DO UPDATE SET
+        time_limit_ms = excluded.time_limit_ms,
+        deadline_at = excluded.deadline_at,
+        paused_at = excluded.paused_at,
+        accumulated_pause_ms = excluded.accumulated_pause_ms,
+        updated_at = excluded.updated_at
+    `).run(
+      snapshot.epochId,
+      snapshot.timeLimitMs,
+      snapshot.deadlineAt,
+      snapshot.pausedAt ?? null,
+      snapshot.accumulatedPauseMs,
+      new Date().toISOString()
+    );
+  }
+
+  getEpochBudget(epochId: string): EpochBudgetClockSnapshot | undefined {
+    const row = this.database.prepare(`
+      SELECT * FROM epoch_budgets WHERE epoch_id = ?
+    `).get(epochId) as EpochBudgetRow | undefined;
+    return row ? {
+      epochId: row.epoch_id,
+      timeLimitMs: Number(row.time_limit_ms),
+      deadlineAt: Number(row.deadline_at),
+      pausedAt: row.paused_at ?? undefined,
+      accumulatedPauseMs: Number(row.accumulated_pause_ms)
+    } : undefined;
   }
 
   stats(): Record<string, unknown> {
@@ -376,6 +429,61 @@ export class RuntimeStore {
     return rows.map(taskOutcomeRowToRecord);
   }
 
+  upsertEpochOutcome(outcome: EpochOutcome): EpochOutcome {
+    this.database.prepare(`
+      INSERT INTO epoch_outcomes (epoch_id, task_id, terminal_seq, outcome_json, created_at)
+      VALUES (?, ?, ?, ?, ?)
+      ON CONFLICT(epoch_id) DO UPDATE SET
+        task_id = excluded.task_id,
+        terminal_seq = excluded.terminal_seq,
+        outcome_json = excluded.outcome_json,
+        created_at = excluded.created_at
+    `).run(
+      outcome.epochRef,
+      outcome.taskRef,
+      outcome.terminalSeq,
+      JSON.stringify(outcome),
+      outcome.createdAt
+    );
+    return outcome;
+  }
+
+  getEpochOutcome(epochId: string): EpochOutcome | undefined {
+    const row = this.database.prepare(`
+      SELECT * FROM epoch_outcomes WHERE epoch_id = ?
+    `).get(epochId) as EpochOutcomeRow | undefined;
+    return row ? epochOutcomeRowToRecord(row) : undefined;
+  }
+
+  listEpochOutcomes(limit = 32): EpochOutcome[] {
+    const rows = this.database.prepare(`
+      SELECT * FROM epoch_outcomes ORDER BY terminal_seq DESC LIMIT ?
+    `).all(Math.max(1, Math.floor(limit))) as EpochOutcomeRow[];
+    return rows.map(epochOutcomeRowToRecord);
+  }
+
+  listTaskEpochOutcomes(taskId: string, limit = 32): EpochOutcome[] {
+    const rows = this.database.prepare(`
+      SELECT * FROM epoch_outcomes WHERE task_id = ? ORDER BY terminal_seq DESC LIMIT ?
+    `).all(taskId, Math.max(1, Math.floor(limit))) as EpochOutcomeRow[];
+    return rows.map(epochOutcomeRowToRecord);
+  }
+
+  recordTaskTurn(input: { taskId: string; eventId: string }): number {
+    this.database.prepare(`
+      INSERT OR IGNORE INTO task_turn_events (event_id, task_id, created_at)
+      VALUES (?, ?, ?)
+    `).run(input.eventId, input.taskId, new Date().toISOString());
+    return this.getTaskConsumedTurns(input.taskId);
+  }
+
+  getTaskConsumedTurns(taskId: string): number {
+    const row = this.database.prepare(`
+      SELECT COUNT(*) AS count FROM task_turn_events WHERE task_id = ?
+    `).get(taskId) as { count: number };
+    return Number(row.count);
+  }
+
   private initialize(): void {
     this.database.exec(`
       CREATE TABLE IF NOT EXISTS execution_epochs (
@@ -419,6 +527,30 @@ export class RuntimeStore {
       );
       CREATE INDEX IF NOT EXISTS idx_task_outcomes_terminal_seq
         ON task_outcomes(terminal_seq DESC);
+      CREATE TABLE IF NOT EXISTS epoch_outcomes (
+        epoch_id TEXT PRIMARY KEY,
+        task_id TEXT NOT NULL,
+        terminal_seq INTEGER NOT NULL,
+        outcome_json TEXT NOT NULL,
+        created_at TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_epoch_outcomes_task_terminal_seq
+        ON epoch_outcomes(task_id, terminal_seq DESC);
+      CREATE TABLE IF NOT EXISTS task_turn_events (
+        event_id TEXT PRIMARY KEY,
+        task_id TEXT NOT NULL,
+        created_at TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_task_turn_events_task
+        ON task_turn_events(task_id);
+      CREATE TABLE IF NOT EXISTS epoch_budgets (
+        epoch_id TEXT PRIMARY KEY REFERENCES execution_epochs(epoch_id) ON DELETE CASCADE,
+        time_limit_ms INTEGER NOT NULL,
+        deadline_at INTEGER NOT NULL,
+        paused_at INTEGER,
+        accumulated_pause_ms INTEGER NOT NULL DEFAULT 0,
+        updated_at TEXT NOT NULL
+      );
       CREATE TABLE IF NOT EXISTS runtime_metadata (
         key TEXT PRIMARY KEY,
         value TEXT NOT NULL
@@ -529,6 +661,17 @@ function taskOutcomeRowToRecord(row: TaskOutcomeRow): TaskOutcome {
     ...parsed,
     taskRef: row.task_id,
     epochRef: row.epoch_id,
+    terminalSeq: Number(row.terminal_seq),
+    createdAt: row.created_at
+  };
+}
+
+function epochOutcomeRowToRecord(row: EpochOutcomeRow): EpochOutcome {
+  const parsed = JSON.parse(row.outcome_json) as EpochOutcome;
+  return {
+    ...parsed,
+    epochRef: row.epoch_id,
+    taskRef: row.task_id,
     terminalSeq: Number(row.terminal_seq),
     createdAt: row.created_at
   };

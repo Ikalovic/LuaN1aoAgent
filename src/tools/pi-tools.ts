@@ -4,7 +4,6 @@ import { createHash, randomUUID } from "node:crypto";
 import { constants } from "node:fs";
 import { chmod, copyFile, lstat, mkdir, realpath, rename, unlink } from "node:fs/promises";
 import { basename, extname, isAbsolute, join, relative, resolve, sep } from "node:path";
-import { compactExecutionEvents } from "../log-summary.js";
 import {
   PROJECTION_EDGE_TYPES,
   PROJECTOR_MAX_DELTA_EDGES,
@@ -21,6 +20,7 @@ import type { SQLiteGraphStore } from "../stores/graph-store.js";
 import type { ArtifactRecord, GraphEdge, GraphNode, GraphSnapshot, GraphView } from "../types.js";
 
 export const GRAPH_TOOL_MAX_OUTPUT_BYTES = 10_000;
+export const EVIDENCE_TOOL_DEFAULT_READ_BYTES = 12_000;
 const GraphNodeCommonProperties = {
   id: Type.String({ minLength: 1, maxLength: 256 }),
   label: Type.String({ minLength: 1 }),
@@ -29,7 +29,7 @@ const GraphNodeCommonProperties = {
 };
 
 const ProjectorGraphNodeCommonProperties = {
-  id: Type.String({ pattern: "^(existing|new):[1-9][0-9]*$", maxLength: 32 }),
+  id: Type.String({ pattern: "^new:[1-9][0-9]*$", maxLength: 32 }),
   label: Type.String({ minLength: 1 }),
   properties: Type.Optional(Type.Record(Type.String(), Type.Unknown(), {
     description: "Node metadata including status, target, description, severity, artifactRef and artifactRefs."
@@ -48,6 +48,11 @@ const ProjectorEdgeTypeSchema = Type.Union(
 );
 
 const ProjectorGraphNodeSchema = Type.Union([
+  Type.Object({
+    id: Type.String({ pattern: "^existing:[1-9][0-9]*$", maxLength: 32 }),
+    properties: Type.Optional(Type.Record(Type.String(), Type.Unknown())),
+    evidenceRefs: Type.Optional(Type.Array(Type.String()))
+  }, { additionalProperties: false }),
   Type.Object({
     ...ProjectorGraphNodeCommonProperties,
     graphKind: Type.Literal("operation"),
@@ -72,19 +77,28 @@ const PlannerTaskIdSchema = Type.String({ pattern: "^task:.+", minLength: 6, max
 const PlannerNodeIdSchema = Type.String({ minLength: 1, maxLength: 256 });
 const PlannerRefArraySchema = Type.Array(Type.String({ minLength: 1, maxLength: 256 }), { maxItems: 32 });
 const PlannerCommandBasisProperties = {
-  basedOnRefs: Type.Optional(PlannerRefArraySchema),
-  reason: Type.Optional(Type.String({ minLength: 1, maxLength: 2_000 }))
+  basedOnRefs: Type.Optional(Type.Array(Type.String({ minLength: 1, maxLength: 256 }), {
+    maxItems: 32,
+    description: "Persisted references supporting this specific graph command."
+  }))
 };
 const PlannerTaskBudgetSchema = Type.Object({
   maxTurns: Type.Optional(Type.Integer({ minimum: 1, maximum: 40 }))
 }, { additionalProperties: false });
 const PlannerTaskSpecSchema = Type.Object({
   id: PlannerTaskIdSchema,
-  goal: Type.String({ minLength: 1, maxLength: 2_000 }),
+  goal: Type.String({
+    minLength: 1,
+    maxLength: 2_000,
+    description: "A decidable question or result for this Task. It may be technically specific without prescribing the Executor's only method."
+  }),
   targetRefs: PlannerRefArraySchema,
   scopeRef: Type.String({ pattern: "^scope:.+", minLength: 7, maxLength: 256 }),
-  constraints: Type.Array(Type.String({ maxLength: 1_000 }), { maxItems: 32 }),
-  successCriteria: Type.Array(Type.String({ minLength: 1, maxLength: 1_000 }), { minItems: 1, maxItems: 32 }),
+  successCriteria: Type.Array(Type.String({ minLength: 1, maxLength: 1_000 }), {
+    minItems: 1,
+    maxItems: 32,
+    description: "Observable signals that establish the Task result, not a mandatory sequence of actions."
+  }),
   budget: Type.Optional(PlannerTaskBudgetSchema),
   priority: Type.Number({ minimum: 1 }),
   parentTaskId: Type.Optional(Type.String({ pattern: "^(goal|task):.+", maxLength: 256 })),
@@ -92,16 +106,12 @@ const PlannerTaskSpecSchema = Type.Object({
   parallelGroup: Type.Optional(Type.String({ minLength: 1, maxLength: 256 }))
 }, { additionalProperties: false });
 const PlannerTaskPatchSchema = Type.Object({
-  goal: Type.Optional(Type.String({ minLength: 1, maxLength: 2_000 })),
-  constraints: Type.Optional(Type.Array(Type.String({ maxLength: 1_000 }), { maxItems: 32 })),
-  successCriteria: Type.Optional(Type.Array(Type.String({ minLength: 1, maxLength: 1_000 }), { maxItems: 32 })),
   budget: Type.Optional(PlannerTaskBudgetSchema),
   priority: Type.Optional(Type.Number({ minimum: 1 })),
   parallelGroup: Type.Optional(Type.String({ maxLength: 256 }))
 }, { additionalProperties: false });
 const PlannerTaskStatusSchema = Type.Union([
   Type.Literal("open"),
-  Type.Literal("partial"),
   Type.Literal("completed"),
   Type.Literal("blocked"),
   Type.Literal("failed"),
@@ -147,10 +157,8 @@ export function createPlannerSubmitTool(input: {
     label: "Submit Planner Decision",
     description: "Submit the final Planner decision using commands discriminated by the required kind field, then terminate this Planner invocation.",
     parameters: Type.Object({
-      decision: Type.Union([Type.Literal("apply_commands")]),
       commands: Type.Optional(Type.Array(PlannerCommandSchema, { maxItems: 32 })),
-      reason: Type.String({ minLength: 1, maxLength: 4_000 }),
-      basedOnRefs: PlannerRefArraySchema
+      reason: Type.String({ minLength: 1, maxLength: 4_000 })
     }, { additionalProperties: false }),
     execute: async (_toolCallId, params) => {
       // validate may return a normalized replacement (e.g. abbreviated
@@ -165,6 +173,22 @@ export function createPlannerSubmitTool(input: {
   });
 }
 
+export function createScopeSubmitTool() {
+  return defineTool({
+    name: "scope_submit",
+    label: "Submit Authorized Scope",
+    description: "Submit only the explicit IPv4 addresses and CIDRs found in the user's Goal, then terminate scope extraction.",
+    parameters: Type.Object({
+      cidrs: Type.Array(Type.String({ minLength: 3, maxLength: 18 }), { minItems: 1, maxItems: 64 })
+    }, { additionalProperties: false }),
+    execute: async (_toolCallId, params) => ({
+      content: [{ type: "text", text: "Authorized scope submitted" }],
+      details: params,
+      terminate: true
+    })
+  });
+}
+
 export function createTaskResultSubmitTool() {
   return defineTool({
     name: "task_result_submit",
@@ -175,6 +199,7 @@ export function createTaskResultSubmitTool() {
       status: Type.Union([
         Type.Literal("completed"),
         Type.Literal("partial"),
+        Type.Literal("blocked"),
         Type.Literal("failed")
       ]),
       summary: Type.String(),
@@ -185,7 +210,7 @@ export function createTaskResultSubmitTool() {
       suggestedNextGoal: Type.Optional(Type.String()),
       checkpointReason: Type.Optional(Type.String()),
       retryable: Type.Optional(Type.Boolean())
-    }),
+    }, { additionalProperties: false }),
     execute: async (_toolCallId, params) => ({
       content: [{ type: "text", text: "Task result submitted" }],
       details: params,
@@ -203,19 +228,13 @@ export function createControlSubmitTool() {
       decision: Type.Union([
         Type.Literal("continue"),
         Type.Literal("redirect"),
-        Type.Literal("checkpoint"),
-        Type.Literal("stop_executor"),
-        Type.Literal("need_planner")
+        Type.Literal("handoff"),
+        Type.Literal("stop_executor")
       ]),
       reason: Type.String(),
       evidenceRefs: Type.Array(Type.String()),
-      confidence: Type.Optional(Type.Union([
-        Type.Literal("low"),
-        Type.Literal("medium"),
-        Type.Literal("high")
-      ])),
       guidance: Type.Optional(Type.String())
-    }),
+    }, { additionalProperties: false }),
     execute: async (_toolCallId, params) => ({
       content: [{ type: "text", text: "Control signal submitted" }],
       details: params,
@@ -236,7 +255,7 @@ export function createGraphDeltaSubmitTool(options: ProjectionDraftValidationOpt
     execute: async (_toolCallId, params) => {
       validateProjectionDraftIntegrity(params, options);
       return {
-        content: [{ type: "text", text: "Graph delta submitted atomically" }],
+        content: [{ type: "text", text: "Graph delta draft accepted; graph transaction commit is pending" }],
         details: params,
         terminate: true
       };
@@ -819,46 +838,145 @@ function compactUtf8Prefix(value: string, maxBytes: number): string {
   return `${prefix}${suffix}`;
 }
 
-export function createLogWindowTool(
+type EvidenceToolOptions = {
+  allowedTaskIds?: ReadonlySet<string>;
+  maxListLimit?: number;
+  maxReadBytes?: number;
+};
+
+export function createEvidenceListTool(
   executionLog: ExecutionLog,
-  options: { maxLimit?: number; allowFull?: boolean } = {}
+  options: EvidenceToolOptions = {}
 ) {
+  const allowedTaskIds = options.allowedTaskIds;
   return defineTool({
-    name: "log_window",
-    label: "Log Window",
-    description: "Read a bounded execution log window for Observer projection.",
+    name: "evidence_list",
+    label: "Evidence List",
+    description: "List an authorized Task's persisted observations as a mechanical index without semantic ranking.",
     parameters: Type.Object({
-      taskId: Type.Optional(Type.String()),
-      cursor: Type.Optional(Type.String()),
-      limit: Type.Number(),
-      eventTypes: Type.Optional(Type.Array(Type.String())),
-      roles: Type.Optional(Type.Array(Type.String())),
-      mode: Type.Optional(Type.Union([Type.Literal("summary"), Type.Literal("full")]))
-    }),
+      taskRef: Type.String({ minLength: 1, maxLength: 256 }),
+      cursor: Type.Optional(Type.String({ minLength: 1, maxLength: 256 })),
+      limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 100 })),
+      eventTypes: Type.Optional(Type.Array(Type.String({ minLength: 1, maxLength: 128 }), { maxItems: 32 }))
+    }, { additionalProperties: false }),
     execute: async (_toolCallId, params) => {
-      const limit = Math.min(params.limit, options.maxLimit ?? params.limit);
+      if (allowedTaskIds !== undefined && !allowedTaskIds.has(params.taskRef)) {
+        throw new Error(`evidence_list cannot list observations outside the Task boundary: ${params.taskRef}`);
+      }
+      const limit = Math.min(params.limit ?? 32, options.maxListLimit ?? 100);
       const window = await executionLog.window({
-        ...params,
+        taskId: params.taskRef,
+        cursor: params.cursor,
         limit,
-        roles: (params.roles as Array<"planner" | "executor" | "observer" | "runtime"> | undefined) ?? ["executor", "runtime"]
+        eventTypes: params.eventTypes,
+        direction: "forward"
       });
-      const mode = options.allowFull === false ? "summary" : params.mode ?? "summary";
+      const events = window.events.map((event) => evidenceIndexRecord(event));
       return {
         content: [{
           type: "text",
           text: JSON.stringify({
-            ...window,
-            mode,
-            requestedMode: params.mode ?? "summary",
-            requestedLimit: params.limit,
-            effectiveLimit: limit,
-            events: mode === "full" ? window.events : compactExecutionEvents(window.events)
+            taskRef: params.taskRef,
+            events,
+            nextCursor: window.nextCursor
           }, null, 2)
         }],
         details: {}
       };
     }
   });
+}
+
+export function createEvidenceReadTool(
+  executionLog: ExecutionLog,
+  options: EvidenceToolOptions = {}
+) {
+  return defineTool({
+    name: "evidence_read",
+    label: "Evidence Read",
+    description: "Read one real event Ref as byte-paged canonical JSON.",
+    parameters: Type.Object({
+      ref: Type.String({ pattern: "^event:.+", minLength: 7, maxLength: 256 }),
+      offset: Type.Optional(Type.Integer({ minimum: 0 })),
+      length: Type.Optional(Type.Integer({ minimum: 1, maximum: 64_000 }))
+    }, { additionalProperties: false }),
+    execute: async (_toolCallId, params) => {
+      const event = executionLog.eventById(params.ref);
+      if (!event) {
+        throw new Error(`evidence_read cannot resolve event Ref: ${params.ref}`);
+      }
+      const canonical = JSON.stringify(event, null, 2);
+      const totalBytes = Buffer.byteLength(canonical, "utf8");
+      const offset = params.offset ?? 0;
+      const length = Math.min(params.length ?? EVIDENCE_TOOL_DEFAULT_READ_BYTES, options.maxReadBytes ?? 64_000);
+      const page = utf8BytePage(canonical, offset, length);
+      const nextOffset = page.endOffset < totalBytes ? page.endOffset : undefined;
+      return {
+        content: [{
+          type: "text",
+          text: JSON.stringify({
+            ref: event.id,
+            offset: page.startOffset,
+            totalBytes,
+            nextOffset,
+            content: page.content
+          }, null, 2)
+        }],
+        details: {}
+      };
+    }
+  });
+}
+
+function evidenceIndexRecord(event: import("../types.js").ExecutionEvent): Record<string, unknown> {
+  const toolName = typeof event.payload.toolName === "string" ? event.payload.toolName : undefined;
+  const toolCallId = typeof event.payload.toolCallId === "string" ? event.payload.toolCallId : undefined;
+  const args = event.eventType === "tool_started" ? event.payload.args : undefined;
+  return {
+    ref: event.id,
+    seq: event.seq,
+    eventType: event.eventType,
+    timestamp: event.timestamp,
+    toolName,
+    toolCallId,
+    actionFingerprint: toolName && args !== undefined
+      ? createHash("sha256").update(`${toolName}\n${stableCanonicalJson(args)}`).digest("hex")
+      : undefined,
+    isError: event.payload.isError === true ? true : undefined,
+    artifactRefs: event.artifactRefs ?? []
+  };
+}
+
+function stableCanonicalJson(value: unknown): string {
+  if (Array.isArray(value)) {
+    return `[${value.map(stableCanonicalJson).join(",")}]`;
+  }
+  if (value && typeof value === "object") {
+    return `{${Object.entries(value as Record<string, unknown>)
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([key, nested]) => `${JSON.stringify(key)}:${stableCanonicalJson(nested)}`)
+      .join(",")}}`;
+  }
+  return JSON.stringify(value) ?? "null";
+}
+
+function utf8BytePage(value: string, offset: number, length: number): {
+  content: string;
+  startOffset: number;
+  endOffset: number;
+} {
+  const bytes = Buffer.from(value, "utf8");
+  let startOffset = Math.min(offset, bytes.length);
+  while (startOffset < bytes.length && (bytes[startOffset]! & 0xc0) === 0x80) startOffset += 1;
+  let endOffset = Math.min(bytes.length, startOffset + length);
+  while (endOffset < bytes.length && endOffset > startOffset && (bytes[endOffset]! & 0xc0) === 0x80) {
+    endOffset -= 1;
+  }
+  return {
+    content: bytes.subarray(startOffset, endOffset).toString("utf8"),
+    startOffset,
+    endOffset
+  };
 }
 
 export function createArtifactReadTool(
@@ -868,23 +986,34 @@ export function createArtifactReadTool(
     workspace?: { hostDir: string; visibleRoot: string; sharedWithContainer?: boolean };
   } = {}
 ) {
+  const readProperties = {
+    ref: Type.String(),
+    offset: Type.Optional(Type.Number()),
+    length: Type.Optional(Type.Number())
+  };
+  const parameters = options.workspace
+    ? Type.Object({ ...readProperties, materialize: Type.Optional(Type.Boolean()) }, { additionalProperties: false })
+    : Type.Object(readProperties, { additionalProperties: false });
   return defineTool({
     name: "artifact_read",
     label: "Artifact Read",
-    description: "Read a bounded artifact range by artifact ref, or explicitly materialize the complete artifact into the persistent workspace.",
-    parameters: Type.Object({
-      path: Type.String(),
-      offset: Type.Optional(Type.Number()),
-      length: Type.Optional(Type.Number()),
-      materialize: Type.Optional(Type.Boolean())
-    }),
-    execute: async (_toolCallId, params) => {
-      if (!params.path.startsWith("artifact:")) {
+    description: options.workspace
+      ? "Read a bounded artifact range by artifact ref, or explicitly materialize the complete artifact into the persistent Executor workspace."
+      : "Read a bounded artifact range by artifact ref.",
+    parameters,
+    execute: async (_toolCallId, rawParams) => {
+      const params = rawParams as {
+        ref: string;
+        offset?: number;
+        length?: number;
+        materialize?: boolean;
+      };
+      if (!params.ref.startsWith("artifact:")) {
         throw new Error("artifact_read requires a real artifactRef");
       }
       // Models habitually truncate Refs (like git short hashes); accept an
       // unambiguous prefix and resolve it to the canonical full Ref.
-      const artifactRef = await resolveArtifactRef(artifactStore, params.path);
+      const artifactRef = await resolveArtifactRef(artifactStore, params.ref);
       if (params.materialize) {
         if (!options.workspace) {
           throw new Error("Artifact materialization requires an Executor workspace");
@@ -918,8 +1047,9 @@ export function createArtifactReadTool(
 
 async function resolveArtifactRef(artifactStore: ArtifactStore, artifactRef: string): Promise<string> {
   const exact = await artifactStore.get(artifactRef);
-  if (exact) return exact.artifactRef;
+  if (exact && exact.kind !== "credential") return exact.artifactRef;
   const matches = (await artifactStore.list())
+    .filter((record) => record.kind !== "credential")
     .map((record) => record.artifactRef)
     .filter((candidate) => candidate.startsWith(artifactRef));
   if (matches.length === 1) return matches[0];
@@ -994,69 +1124,43 @@ export function createArtifactWriteTool(
     readExecutorFile?: (visiblePath: string) => Promise<Buffer>;
   } = {}
 ) {
+  const parameters = Type.Object({
+    taskId: Type.Optional(Type.String()),
+    kind: Type.Union([
+      Type.Literal("http_body"),
+      Type.Literal("screenshot"),
+      Type.Literal("stdout"),
+      Type.Literal("stderr"),
+      Type.Literal("poc"),
+      Type.Literal("json"),
+      Type.Literal("text"),
+      Type.Literal("other")
+    ]),
+    mediaType: Type.String(),
+    path: Type.String(),
+    extension: Type.Optional(Type.String())
+  }, { additionalProperties: false });
   return defineTool({
     name: "artifact_write",
     label: "Artifact Write",
-    description: "Persist inline data or import a complete file from the Executor sandbox (for example /workspace or /tmp). Pass exactly one payload: source={data:\"...\"} for inline text or source={path\":\"/workspace/file\"} for a sandbox file; the optional source.type (\"inline\"|\"file\") is inferred from data/path when omitted.",
-    parameters: Type.Object({
-      taskId: Type.Optional(Type.String()),
-      kind: Type.Union([
-        Type.Literal("http_body"),
-        Type.Literal("screenshot"),
-        Type.Literal("stdout"),
-        Type.Literal("stderr"),
-        Type.Literal("poc"),
-        Type.Literal("json"),
-        Type.Literal("text"),
-        Type.Literal("other")
-      ]),
-      mediaType: Type.String(),
-      source: Type.Object({
-        type: Type.Optional(Type.Union([
-          Type.Literal("inline"),
-          Type.Literal("file")
-        ])),
-        data: Type.Optional(Type.String()),
-        path: Type.Optional(Type.String())
-      }, { additionalProperties: false }),
-      extension: Type.Optional(Type.String())
-    }, { additionalProperties: false }),
+    description: "Import a complete existing file from the Executor sandbox (for example /workspace/evidence.json or /tmp/response.bin) into persistent Artifact storage.",
+    parameters,
     execute: async (_toolCallId, params) => {
-      const data = params.source.data;
-      const path = params.source.path;
-      const sourceType = params.source.type ?? (data !== undefined ? "inline" : "file");
-      let record: ArtifactRecord;
-      if (sourceType === "file") {
-        if (path === undefined || data !== undefined) {
-          throw new Error("artifact_write file source requires exactly path (no data); use source={path:\"/workspace/file\"} or source={type:\"file\",path:\"...\"}");
-        }
-        record = options.readExecutorFile
-          ? await artifactStore.write({
-              taskId: params.taskId,
-              kind: params.kind as ArtifactRecord["kind"],
-              mediaType: params.mediaType,
-              data: await options.readExecutorFile(path),
-              extension: params.extension ?? extensionFromPath(path)
-            })
-          : await artifactStore.importFile({
-              taskId: params.taskId,
-              kind: params.kind as ArtifactRecord["kind"],
-              mediaType: params.mediaType,
-              sourcePath: await resolveExecutorWorkspaceFile(path, options.workspace),
-              extension: params.extension
-            });
-      } else {
-        if (data === undefined || path !== undefined) {
-          throw new Error("artifact_write inline source requires exactly data (no path); use source={data:\"...\"} or source={type:\"inline\",data:\"...\"}");
-        }
-        record = await artifactStore.write({
-          taskId: params.taskId,
-          kind: params.kind as ArtifactRecord["kind"],
-          mediaType: params.mediaType,
-          data,
-          extension: params.extension
-        });
-      }
+      const record: ArtifactRecord = options.readExecutorFile
+        ? await artifactStore.write({
+            taskId: params.taskId,
+            kind: params.kind as ArtifactRecord["kind"],
+            mediaType: params.mediaType,
+            data: await options.readExecutorFile(params.path),
+            extension: params.extension ?? extensionFromPath(params.path)
+          })
+        : await artifactStore.importFile({
+            taskId: params.taskId,
+            kind: params.kind as ArtifactRecord["kind"],
+            mediaType: params.mediaType,
+            sourcePath: await resolveExecutorWorkspaceFile(params.path, options.workspace),
+            extension: params.extension
+          });
       const publicRecord = publicArtifactRecord(record);
       return {
         content: [{ type: "text", text: JSON.stringify(publicRecord, null, 2) }],

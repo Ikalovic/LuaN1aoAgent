@@ -115,14 +115,17 @@ export type GraphDelta = {
   edges: GraphEdge[];
 };
 
-export type TaskEnvelope = {
+export type TaskDefinition = {
   taskId: string;
   goal: string;
   targetRefs: string[];
+  basisRefs?: string[];
   scopeRef: string;
   constraints: string[];
   successCriteria: string[];
-  availableSessionRefs?: string[];
+};
+
+export type TaskSchedulingPolicy = {
   dependsOnTaskRefs?: string[];
   parentTaskId?: string;
   parallelGroup?: string;
@@ -131,7 +134,14 @@ export type TaskEnvelope = {
   };
 };
 
-export type TaskBudget = NonNullable<TaskEnvelope["budget"]>;
+export type TaskRuntimeContext = {
+  availableSessionRefs?: string[];
+};
+
+/** Executor wire view assembled from separately owned definition, scheduling and runtime state. */
+export type TaskEnvelope = TaskDefinition & TaskSchedulingPolicy & TaskRuntimeContext;
+
+export type TaskBudget = NonNullable<TaskSchedulingPolicy["budget"]>;
 
 export type TaskResultStatus = "completed" | "partial" | "blocked" | "failed";
 
@@ -151,15 +161,15 @@ export type TaskResult = {
   lastEventId?: string;
 };
 
-export type TaskGraphStatus = "open" | "partial" | "completed" | "blocked" | "failed" | "archived";
-
-export type PlannerDecisionType = "apply_commands";
+export type TaskGraphStatus = "open" | "completed" | "blocked" | "failed" | "archived";
 
 export type PlannerDecision = {
-  decision: PlannerDecisionType;
+  /** Historical persisted decisions may still carry this constant. */
+  decision?: "apply_commands";
   commands?: PlannerCommand[];
   reason: string;
-  basedOnRefs: string[];
+  /** Historical persisted decisions may still carry transaction-wide provenance. */
+  basedOnRefs?: string[];
 };
 
 export type PlannerTaskSpec = {
@@ -167,7 +177,6 @@ export type PlannerTaskSpec = {
   goal: string;
   targetRefs: string[];
   scopeRef: string;
-  constraints: string[];
   successCriteria: string[];
   budget?: TaskBudget;
   priority: number;
@@ -177,9 +186,6 @@ export type PlannerTaskSpec = {
 };
 
 export type PlannerTaskPatch = {
-  goal?: string;
-  constraints?: string[];
-  successCriteria?: string[];
   budget?: TaskBudget;
   priority?: number;
   parallelGroup?: string;
@@ -187,6 +193,7 @@ export type PlannerTaskPatch = {
 
 type PlannerCommandBasis = {
   basedOnRefs?: string[];
+  /** Historical persisted commands may still carry a duplicated reason. */
   reason?: string;
 };
 
@@ -219,14 +226,17 @@ export type PlannerCommand =
 export type ControlSignalDecision =
   | "continue"
   | "redirect"
-  | "checkpoint"
+  | "handoff"
   | "stop_executor"
+  /** Historical persisted signals only. */
+  | "checkpoint"
   | "need_planner";
 
 export type ControlSignal = {
   decision: ControlSignalDecision;
   reason: string;
   evidenceRefs: string[];
+  /** Historical persisted signals may still carry this display-only field. */
   confidence?: "low" | "medium" | "high";
   guidance?: string;
 };
@@ -244,12 +254,31 @@ export type TaskOutcome = {
   evidenceRefs: string[];
   artifactRefs: string[];
   capabilityRefs: string[];
+  suggestedNextGoal?: string;
   checkpoint?: {
     reason?: string;
     retryable?: boolean;
     resumeCursor?: string;
   };
   terminalSeq: number;
+  createdAt: string;
+};
+
+export type EpochOutcomeStatus =
+  | "submitted"
+  | "checkpointed"
+  | "provider_error"
+  | "failed"
+  | "aborted";
+
+export type EpochOutcome = {
+  epochRef: string;
+  taskRef: string;
+  status: EpochOutcomeStatus;
+  reason: string;
+  terminalSeq: number;
+  taskOutcomeRef?: string;
+  retryable: boolean;
   createdAt: string;
 };
 
@@ -329,7 +358,7 @@ export type ProjectionClaim = {
 export type ArtifactRecord = {
   artifactRef: string;
   taskId?: string;
-  kind: "http_body" | "screenshot" | "stdout" | "stderr" | "poc" | "json" | "text" | "other";
+  kind: "http_body" | "screenshot" | "stdout" | "stderr" | "poc" | "json" | "text" | "credential" | "other";
   mediaType: string;
   path: string;
   byteLength: number;
@@ -351,18 +380,12 @@ export type PlannerTaskLedgerItem = {
   taskId: string;
   status: string;
   goal: string;
-  resultSummary?: string;
-  checkpointReason?: string;
-  resumeCursor?: string;
-  blockerReason?: string;
-  suggestedNextGoal?: string;
-  retryable?: boolean;
-  attempt?: number;
+  executionState?: "running" | "awaiting_planner" | "queued" | "blocked";
+  ready?: boolean;
+  blockedByTaskRefs?: string[];
+  dependencyStatuses?: Record<string, string>;
   priority?: number;
   dependsOnTaskRefs?: string[];
-  evidenceRefs?: string[];
-  artifactRefs?: string[];
-  capabilityRefs?: string[];
   projection?: {
     committedSeq: number;
     desiredSeq: number;
@@ -390,6 +413,7 @@ export type PlannerDecisionView = {
   };
   taskLedger: PlannerTaskLedgerItem[];
   taskOutcomes?: TaskOutcome[];
+  epochOutcomes?: EpochOutcome[];
   projectionDegradations?: Array<{
     taskRef: string;
     status: "degraded";
@@ -397,20 +421,13 @@ export type PlannerDecisionView = {
     committedSeq: number;
     desiredSeq: number;
     terminalTargetSeq?: number;
-    taskOutcome: TaskOutcome;
   }>;
   reasoningDigest: PlannerDigestItem[];
   operationDigest: PlannerDigestItem[];
   blockers: PlannerDigestItem[];
   graphSummary: JsonObject;
-  runtimeTail?: Array<{
-    taskId: string;
-    committedSeq: number;
-    desiredSeq: number;
-    digest: string;
-  }>;
   retrievalHints: {
-    tools: Array<"graph_query" | "graph_trace">;
+    tools: Array<"graph_query" | "graph_trace" | "evidence_list" | "evidence_read" | "artifact_read">;
     note: string;
   };
 };

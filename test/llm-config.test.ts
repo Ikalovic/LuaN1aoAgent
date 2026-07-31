@@ -1,5 +1,12 @@
 import assert from "node:assert/strict";
+import { createServer } from "node:http";
+import type { AddressInfo } from "node:net";
 import test from "node:test";
+import {
+  createAgentSession,
+  SessionManager,
+  SettingsManager
+} from "@earendil-works/pi-coding-agent";
 import {
   createLlmRuntime,
   loadLlmRuntimeConfig,
@@ -62,7 +69,7 @@ test("defaults to Chat Completions when LLM_API_TYPE is omitted", () => {
   assert.equal(config.apiType, "openai-completions");
 });
 
-test("defaults all roles to the shared model with a 32k completion budget", () => {
+test("uses bounded role completion defaults when no global budget override is configured", () => {
   const config = loadLlmRuntimeConfig({
     LLM_API_BASE_URL: "https://example.test/api/openai",
     LLM_API_KEY: "test-key",
@@ -70,16 +77,18 @@ test("defaults all roles to the shared model with a 32k completion budget", () =
   });
   assert.equal(config.defaultMaxTokens, 32_768);
   assert.equal(config.thinkingFormat, "zai");
+  const expected = { planner: 16_384, executor: 16_384, supervisor: 4_096, projector: 16_384 };
   for (const role of ["planner", "executor", "supervisor", "projector"] as const) {
     assert.equal(config.roles[role].modelId, "glm-5.2");
-    assert.equal(config.roles[role].maxTokens, 32_768);
+    assert.equal(config.roles[role].maxTokens, expected[role]);
     assert.equal(config.roles[role].thinkingLevel, "off");
   }
   const runtime = createLlmRuntime(config);
   for (const role of ["planner", "executor", "supervisor", "projector"] as const) {
     assert.equal(runtime.models[role].provider, "baizhi-openai");
     assert.equal(runtime.models[role].id, "glm-5.2");
-    assert.equal(runtime.models[role].maxTokens, 32_768);
+    assert.equal(runtime.metadata.models[role].modelId, "glm-5.2");
+    assert.equal(runtime.models[role].maxTokens, expected[role]);
   }
   assert.equal(runtime.model, runtime.models.planner);
 });
@@ -140,8 +149,58 @@ test("keeps per-role budgets distinct when roles share a model id", () => {
   });
   const runtime = createLlmRuntime(config);
   assert.equal(runtime.models.planner.maxTokens, 65_536);
-  assert.equal(runtime.models.executor.maxTokens, 32_768);
-  assert.notEqual(runtime.models.planner.id, runtime.models.executor.id);
+  assert.equal(runtime.models.executor.maxTokens, 16_384);
+  assert.equal(runtime.models.planner.id, "glm-5.2");
+  assert.equal(runtime.models.executor.id, "glm-5.2");
+  assert.notEqual(runtime.models.planner, runtime.models.executor);
+});
+
+test("sends the real model id and the supervisor-local completion cap on the wire", async () => {
+  let resolveRequest: (payload: Record<string, unknown>) => void = () => undefined;
+  const requestPayload = new Promise<Record<string, unknown>>((resolve) => {
+    resolveRequest = resolve;
+  });
+  const server = createServer((request, response) => {
+    const chunks: Buffer[] = [];
+    request.on("data", (chunk: Buffer) => chunks.push(chunk));
+    request.on("end", () => {
+      resolveRequest(JSON.parse(Buffer.concat(chunks).toString("utf8")) as Record<string, unknown>);
+      response.writeHead(200, { "content-type": "text/event-stream" });
+      response.write("data: {\"id\":\"chatcmpl-test\",\"object\":\"chat.completion.chunk\",\"created\":0,\"model\":\"glm-5.2\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"ok\"},\"finish_reason\":null}]}\n\n");
+      response.write("data: {\"id\":\"chatcmpl-test\",\"object\":\"chat.completion.chunk\",\"created\":0,\"model\":\"glm-5.2\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2}}\n\n");
+      response.end("data: [DONE]\n\n");
+    });
+  });
+  await new Promise<void>((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", () => resolve());
+  });
+  const address = server.address() as AddressInfo;
+  const config = loadLlmRuntimeConfig({
+    LLM_API_BASE_URL: `http://127.0.0.1:${address.port}/v1`,
+    LLM_API_KEY: "test-key",
+    LLM_DEFAULT_MODEL: "glm-5.2"
+  });
+  const runtime = createLlmRuntime(config);
+  const { session } = await createAgentSession({
+    cwd: process.cwd(),
+    noTools: "all",
+    authStorage: runtime.authStorage,
+    modelRegistry: runtime.modelRegistry,
+    model: runtime.models.supervisor,
+    thinkingLevel: runtime.roleConfig.supervisor.thinkingLevel,
+    settingsManager: SettingsManager.inMemory(),
+    sessionManager: SessionManager.inMemory(process.cwd())
+  });
+  try {
+    await session.prompt("reply ok");
+    const payload = await requestPayload;
+    assert.equal(payload.model, "glm-5.2");
+    assert.equal(payload.max_completion_tokens, 4_096);
+  } finally {
+    session.dispose();
+    await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+  }
 });
 
 test("rejects unsupported thinking level and format values", () => {

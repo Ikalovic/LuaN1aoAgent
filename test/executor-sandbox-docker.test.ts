@@ -14,10 +14,22 @@ import {
 } from "../src/executor-sandbox-docker.js";
 import { createBrowserRenderTool } from "../src/tools/browser-tools.js";
 
+const TEST_NETWORK = {
+  networkName: "task-network",
+  gatewayAddress: "172.30.0.2",
+  dnsAddress: "172.30.0.2"
+};
+
 function fakeRunner(handler: (args: string[]) => { code?: number | null; stdout?: string | Buffer; stderr?: string }): { runner: DockerRunner; calls: string[][] } {
   const calls: string[][] = [];
   const runner: DockerRunner = async (args) => {
     calls.push(args);
+    if (args[0] === "network" && args[1] === "inspect") {
+      return { code: 0, stdout: Buffer.from("sha256:task-network"), stderr: Buffer.alloc(0) };
+    }
+    if (args[0] === "run" && args.includes("--privileged") && args.includes("nsenter")) {
+      return { code: 0, stdout: Buffer.alloc(0), stderr: Buffer.alloc(0) };
+    }
     const result = handler(args);
     return {
       code: result.code ?? 0,
@@ -36,7 +48,7 @@ test("docker run args enforce the hardened baseline and never the forbidden flag
     environment: { PATH: "/usr/bin" },
     caCertHostPath: "/host/ca.crt",
     skillsRoots: ["/Users/x/.agents/skills"],
-    networkContainer: "gateway",
+    network: TEST_NETWORK,
     runRef: "run:test",
     taskRef: "task:one"
   });
@@ -62,10 +74,12 @@ test("docker run args enforce the hardened baseline and never the forbidden flag
   ]) {
     assert.ok(rendered.includes(required), `missing: ${required}`);
   }
-  assert.ok(rendered.includes("--network container:gateway"));
-  for (const forbidden of ["--privileged", "--network host", "--pid host", "docker.sock", "--cap-add", "type=volume", "dst=/tmp", "host.docker.internal"]) {
+  assert.ok(rendered.includes("--network task-network"));
+  assert.ok(rendered.includes("--dns 172.30.0.2"));
+  for (const forbidden of ["--privileged", "--network host", "--pid host", "docker.sock", "type=volume", "dst=/tmp", "host.docker.internal"]) {
     assert.equal(rendered.includes(forbidden), false, `forbidden: ${forbidden}`);
   }
+  assert.equal(rendered.includes("--cap-add"), false);
 });
 
 test("container and workspace names are deterministic per runtimeDir + taskId", () => {
@@ -95,7 +109,7 @@ test("container environment drops proxy and host secrets while mapping the Gatew
   assert.equal(environment.HOME, "/workspace/home");
 });
 
-test("transparent gateway mode removes explicit proxy state and shares the gateway namespace", () => {
+test("transparent gateway mode removes explicit proxy state and uses the isolated task network", () => {
   const { environment, caCertHostPath } = buildContainerEnvironment({
     HTTP_PROXY: "http://127.0.0.1:8080",
     HTTPS_PROXY: "http://127.0.0.1:8080",
@@ -113,9 +127,9 @@ test("transparent gateway mode removes explicit proxy state and shares the gatew
     environment,
     caCertHostPath,
     skillsRoots: [],
-    networkContainer: "gateway"
+    network: TEST_NETWORK
   });
-  assert.ok(args.join(" ").includes("--network container:gateway"));
+  assert.ok(args.join(" ").includes("--network task-network"));
   assert.equal(args.includes("--add-host"), false);
 });
 
@@ -153,7 +167,7 @@ test("host sandbox modes do not probe the Docker daemon", async () => {
 
 test("sandbox start reconciles containers by config and tool operations map to docker exec", async () => {
   const runtimeDir = mkdtempSync(join(tmpdir(), "lnw-docker-sandbox-"));
-  const { workspaceDir } = dockerSandboxNames(runtimeDir, "task:one");
+  const { workspaceDir, hostDir } = dockerSandboxNames(runtimeDir, "task:one");
   const additionalSkillsRoot = join(runtimeDir, "skills");
   mkdirSync(additionalSkillsRoot, { recursive: true });
   mkdirSync(join(workspaceDir, "home"), { recursive: true });
@@ -209,6 +223,12 @@ test("sandbox start reconciles containers by config and tool operations map to d
           Destination: "/etc/luanniao/traffic-proxy-ca.crt",
           RW: false
         },
+        {
+          Type: "bind",
+          Source: join(hostDir, "resolv.conf"),
+          Destination: "/etc/resolv.conf",
+          RW: false
+        },
         ...allowedReadRoots.slice(1).map((root) => ({ Type: "bind", Source: root, Destination: root, RW: false })),
         ...(state.extraMount ? [{ Type: "bind", Source: "/Users/host/project", Destination: "/host-project", RW: true }] : [])
       ].filter((mount) => mount.Destination !== state.omittedMountDestination);
@@ -234,13 +254,14 @@ test("sandbox start reconciles containers by config and tool operations map to d
           ReadonlyRootfs: true,
           Privileged: false,
           CapDrop: ["ALL"],
-          CapAdd: null,
+          CapAdd: [],
           SecurityOpt: ["no-new-privileges:true"],
           Tmpfs: { "/tmp": "rw,exec,nosuid,nodev,size=536870912,uid=1000,gid=1000,mode=1777" },
           PidsLimit: 512,
           Memory: 4294967296,
           NanoCpus: 2000000000,
-          NetworkMode: "container:gateway-container-id"
+          NetworkMode: "task-network",
+          Dns: ["172.30.0.2"]
         },
         Mounts: mounts
       }) };
@@ -265,7 +286,7 @@ test("sandbox start reconciles containers by config and tool operations map to d
     runtimeDir,
     runRef: "run:test",
     taskId: "task:one",
-    networkContainer: "gateway",
+    network: TEST_NETWORK,
     transparentCaPath: "/runtime/traffic/ca/mitmproxy-ca-cert.pem",
     additionalReadRoots: [additionalSkillsRoot],
     runner
@@ -274,7 +295,18 @@ test("sandbox start reconciles containers by config and tool operations map to d
   assert.equal(statSync(workspaceDir).mode & 0o777, 0o777);
   assert.equal(statSync(join(workspaceDir, "home")).mode & 0o777, 0o777);
   await sandbox.start();
-  assert.equal(calls.some((call) => call[0] === "run"), false, "running container with matching config must be reused");
+  assert.equal(
+    calls.some((call) => call[0] === "run" && !call.includes("--rm")),
+    false,
+    "running container with matching config must be reused"
+  );
+  assert.ok(calls.some((call) => call[0] === "run" && call.includes("--rm") && call.includes("--privileged") && call.includes("nsenter")));
+  const networkInit = calls.find((call) => call[0] === "run" && call.includes("nsenter"));
+  assert.ok(networkInit?.some((argument) => argument.includes("set -eu")));
+  assert.equal(
+    await import("node:fs/promises").then(({ readFile }) => readFile(join(hostDir, "resolv.conf"), "utf8")),
+    `nameserver ${TEST_NETWORK.dnsAddress}\noptions ndots:0\n`
+  );
 
   const tools = sandbox.createTools();
   const byName = Object.fromEntries(tools.map((tool) => [tool.name, tool])) as unknown as Record<string, {
@@ -429,7 +461,7 @@ test("docker sandbox refuses to replace or dispose an unmanaged deterministic co
     runtimeDir,
     runRef: "run:test",
     taskId: "task:unmanaged",
-    networkContainer: "gateway",
+    network: TEST_NETWORK,
     transparentCaPath: "/runtime/traffic/ca/mitmproxy-ca-cert.pem",
     runner
   });
@@ -471,7 +503,7 @@ test("docker sandbox refuses a labeled deterministic container owned by another 
     runtimeDir,
     runRef: "run:current",
     taskId,
-    networkContainer: "gateway",
+    network: TEST_NETWORK,
     transparentCaPath: "/runtime/traffic/ca/mitmproxy-ca-cert.pem",
     runner
   });
@@ -521,7 +553,7 @@ test("docker sandbox fails closed when an owned container image ID cannot be res
     runtimeDir,
     runRef: "run:test",
     taskId,
-    networkContainer: "gateway",
+    network: TEST_NETWORK,
     transparentCaPath: "/runtime/traffic/ca/mitmproxy-ca-cert.pem",
     runner
   });
@@ -542,6 +574,12 @@ test("docker bash uses the shared default timeout and honors overrides", async (
   const runtimeDir = mkdtempSync(join(tmpdir(), "lnw-docker-sandbox-timeout-"));
   const bashTimeouts: number[] = [];
   const runner: DockerRunner = async (args, options) => {
+    if (args[0] === "network" && args[1] === "inspect") {
+      return { code: 0, stdout: Buffer.from("sha256:task-network"), stderr: Buffer.alloc(0) };
+    }
+    if (args[0] === "run" && args.includes("--privileged") && args.includes("nsenter")) {
+      return { code: 0, stdout: Buffer.alloc(0), stderr: Buffer.alloc(0) };
+    }
     if (args[0] === "inspect" && args.at(-1) === "gateway") {
       return { code: 0, stdout: Buffer.from("gateway-container-id"), stderr: Buffer.alloc(0) };
     }
@@ -560,7 +598,7 @@ test("docker bash uses the shared default timeout and honors overrides", async (
       runtimeDir,
       runRef: "run:test",
       taskId: "task:timeout",
-      networkContainer: "gateway",
+      network: TEST_NETWORK,
       transparentCaPath: "/runtime/traffic/ca/mitmproxy-ca-cert.pem",
       runner
     });
@@ -593,7 +631,7 @@ test("docker start failure surfaces the daemon stderr", async () => {
     runtimeDir,
     runRef: "run:test",
     taskId: "task:one",
-    networkContainer: "gateway",
+    network: TEST_NETWORK,
     transparentCaPath: "/runtime/traffic/ca/mitmproxy-ca-cert.pem",
     runner
   });

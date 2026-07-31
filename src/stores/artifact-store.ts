@@ -1,5 +1,5 @@
 import { createReadStream, createWriteStream, existsSync, mkdirSync, readFileSync } from "node:fs";
-import { appendFile, link, lstat, mkdir, readFile, stat, unlink, writeFile } from "node:fs/promises";
+import { appendFile, chmod, link, lstat, mkdir, readFile, stat, unlink, writeFile } from "node:fs/promises";
 import { dirname, extname, join } from "node:path";
 import { createHash, randomUUID } from "node:crypto";
 import { DatabaseSync } from "node:sqlite";
@@ -46,6 +46,7 @@ export class ArtifactStore {
     data: string | Buffer;
     extension?: string;
   }): Promise<ArtifactRecord> {
+    if (input.kind === "credential") throw new Error("Credential artifacts require writeCredential");
     const dataBuffer = Buffer.isBuffer(input.data) ? input.data : Buffer.from(input.data);
     const contentHash = createHash("sha256").update(dataBuffer).digest("hex");
     const existing = this.database.prepare(`
@@ -85,6 +86,36 @@ export class ArtifactStore {
       if (concurrent) {
         return rowToRecord(concurrent);
       }
+    }
+    await this.appendRecord(record);
+    return record;
+  }
+
+  async writeCredential(input: { data: string | Buffer }): Promise<ArtifactRecord> {
+    const dataBuffer = Buffer.isBuffer(input.data) ? input.data : Buffer.from(input.data);
+    if (dataBuffer.byteLength === 0 || dataBuffer.byteLength > 1 << 20) {
+      throw new Error("Credential is empty or too large");
+    }
+    const createdAt = new Date().toISOString();
+    const artifactRef = `artifact:${randomUUID()}`;
+    const randomName = `${randomUUID()}.secret`;
+    const absolutePath = join(this.rootDir, "credentials", randomName);
+    await mkdir(dirname(absolutePath), { recursive: true, mode: 0o700 });
+    await writeFile(absolutePath, dataBuffer, { flag: "wx", mode: 0o600 });
+    await chmod(absolutePath, 0o600);
+    const record: ArtifactRecord = {
+      artifactRef,
+      kind: "credential",
+      mediaType: "application/vnd.luanniao.credential",
+      path: absolutePath,
+      byteLength: dataBuffer.byteLength,
+      createdAt,
+      preview: "[sensitive credential]",
+      contentHash: `sensitive:${randomUUID()}`
+    };
+    if (!this.insertRecord(record, "")) {
+      await unlink(absolutePath).catch(() => undefined);
+      throw new Error("Failed to persist credential artifact");
     }
     await this.appendRecord(record);
     return record;

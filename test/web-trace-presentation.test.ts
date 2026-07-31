@@ -87,12 +87,12 @@ test("summarizes planner commands with readable task details", () => {
     },
     { kind: "set_task_status", taskId: "task:entry-recon", status: "completed" },
     { kind: "replace_dependencies", taskId: "task:flag-read", dependencyTaskIds: ["task:auth-explore"] },
-    { kind: "patch_task", taskId: "task:auth-explore", patch: { goal: "x", priority: 2 } }
+    { kind: "patch_task", taskId: "task:auth-explore", patch: { budget: { maxTurns: 12 }, priority: 2 } }
   ]), [
     "创建任务 task:auth-explore：利用已验证的测试凭证登录后台，探索可用功能并寻找读取 /challenge/flag.txt 的路径。（依赖：task:entry-recon）",
     "标记任务 task:entry-recon 为 completed",
     "调整依赖 task:flag-read → task:auth-explore",
-    "更新任务 task:auth-explore：修改 goal、priority"
+    "更新任务 task:auth-explore：修改 budget、priority"
   ]);
 });
 

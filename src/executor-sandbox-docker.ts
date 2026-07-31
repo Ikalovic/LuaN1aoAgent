@@ -1,7 +1,7 @@
 import { spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
-import { chmod, lstat, mkdir, readFile } from "node:fs/promises";
+import { chmod, lstat, mkdir, readFile, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join, matchesGlob, posix, resolve } from "node:path";
 import {
@@ -19,6 +19,7 @@ import type { BrowserProcessRuntime } from "./tools/browser-tools.js";
 export const DOCKER_SANDBOX_WORKDIR = "/workspace";
 export const DOCKER_SANDBOX_TMPDIR = "/tmp";
 export const DOCKER_CA_PATH = "/etc/luanniao/traffic-proxy-ca.crt";
+export const DOCKER_RESOLV_PATH = "/etc/resolv.conf";
 const MAX_EXEC_OUTPUT_BYTES = 16 * 1024 * 1024;
 const DOCKER_CONTROL_TIMEOUT_MS = 120_000;
 
@@ -44,6 +45,7 @@ type DockerContainerInspect = {
     Memory?: number;
     NanoCpus?: number;
     NetworkMode?: string;
+    Dns?: string[];
   };
   Mounts?: Array<{
     Type?: string;
@@ -59,8 +61,16 @@ type ExpectedContainerSpec = {
   environment: NodeJS.ProcessEnv;
   workspaceDir: string;
   caCertHostPath: string;
+  resolverHostPath: string;
   skillsRoots: string[];
   networkMode: string;
+  dnsAddress: string;
+};
+
+export type DockerTaskNetworkAttachment = {
+  networkName: string;
+  gatewayAddress: string;
+  dnsAddress: string;
 };
 
 export type DockerExecResult = { code: number | null; stdout: Buffer; stderr: Buffer };
@@ -76,7 +86,7 @@ export type DockerTaskSandboxInput = {
   taskId: string;
   image?: string;
   environment?: NodeJS.ProcessEnv;
-  networkContainer: string;
+  network: DockerTaskNetworkAttachment;
   transparentCaPath: string;
   additionalReadRoots?: string[];
   runner?: DockerRunner;
@@ -110,8 +120,9 @@ export function createDockerRunArgs(input: {
   image: string;
   environment: NodeJS.ProcessEnv;
   caCertHostPath: string;
+  resolverHostPath?: string;
   skillsRoots: string[];
-  networkContainer: string;
+  network: DockerTaskNetworkAttachment;
   runRef?: string;
   taskRef?: string;
 }): string[] {
@@ -132,7 +143,8 @@ export function createDockerRunArgs(input: {
     "--pids-limit", "512",
     "--memory", "4g",
     "--cpus", "2",
-    "--network", `container:${input.networkContainer}`,
+    "--network", input.network.networkName,
+    "--dns", input.network.dnsAddress,
     "--mount", `type=bind,src=${input.workspaceDir},dst=${DOCKER_SANDBOX_WORKDIR}`,
     "--workdir", DOCKER_SANDBOX_WORKDIR
   ];
@@ -141,6 +153,9 @@ export function createDockerRunArgs(input: {
   }
   if (input.caCertHostPath) {
     args.push("--mount", `type=bind,src=${input.caCertHostPath},dst=${DOCKER_CA_PATH},readonly`);
+  }
+  if (input.resolverHostPath) {
+    args.push("--mount", `type=bind,src=${input.resolverHostPath},dst=${DOCKER_RESOLV_PATH},readonly`);
   }
   // Skills are mounted at their real host paths (same layout the prompt and the
   // seatbelt backend use), which also keeps destinations unique per source.
@@ -215,6 +230,10 @@ export async function createDockerTaskSandbox(input: DockerTaskSandboxInput): Pr
   // Pi prompt loader and session headers — the container never sees it.
   const hostRoot = hostDir;
   await mkdir(hostRoot, { recursive: true });
+  const resolverHostPath = join(hostRoot, "resolv.conf");
+  await chmod(resolverHostPath, 0o600).catch(() => undefined);
+  await writeFile(resolverHostPath, `nameserver ${input.network.dnsAddress}\noptions ndots:0\n`, { mode: 0o600 });
+  await chmod(resolverHostPath, 0o444);
   await prepareContainerWritableDirectory(workspaceDir);
   await prepareContainerWritableDirectory(join(workspaceDir, "home"));
   const { environment, caCertHostPath } = buildContainerEnvironment(input.environment, {
@@ -232,8 +251,9 @@ export async function createDockerTaskSandbox(input: DockerTaskSandboxInput): Pr
     image,
     environment,
     caCertHostPath,
+    resolverHostPath,
     skillsRoots,
-    networkContainer: input.networkContainer,
+    network: input.network,
     runRef: input.runRef,
     taskRef: input.taskId
   });
@@ -400,12 +420,29 @@ export async function createDockerTaskSandbox(input: DockerTaskSandboxInput): Pr
     allowedReadRoots: [DOCKER_SANDBOX_WORKDIR, ...skillsRoots],
     async start() {
       const networkInspect = await exec([
-        "inspect", "--format", "{{.Id}}", input.networkContainer
+        "network", "inspect", "--format", "{{.Id}}", input.network.networkName
       ], { timeoutMs: 10_000 });
-      const networkContainerId = networkInspect.stdout.toString("utf8").trim();
-      if (networkInspect.code !== 0 || !networkContainerId) {
-        throw new Error(`Failed to inspect executor network container ${input.networkContainer}: ${networkInspect.stderr.toString("utf8").trim() || "container not found"}`);
+      if (networkInspect.code !== 0 || !networkInspect.stdout.toString("utf8").trim()) {
+        throw new Error(`Failed to inspect executor task network ${input.network.networkName}: ${networkInspect.stderr.toString("utf8").trim() || "network not found"}`);
       }
+      const initializeNetwork = async (): Promise<void> => {
+        const initialized = await exec([
+          "run", "--rm", "--network", "none",
+          "--pid", `container:${containerName}`,
+          "--user", "0", "--privileged", "--read-only",
+          "--pids-limit", "32", "--memory", "128m", "--cpus", "0.25",
+          image, "nsenter", "--target", "1", "--net", "sh", "-c",
+          `set -eu; ip route replace default via ${shellQuote(input.network.gatewayAddress)}; `
+          + "iptables -t raw -C OUTPUT -d 127.0.0.11 -p udp --dport 53 -j DROP 2>/dev/null "
+          + "|| iptables -t raw -I OUTPUT -d 127.0.0.11 -p udp --dport 53 -j DROP; "
+          + "iptables -t raw -C OUTPUT -d 127.0.0.11 -p tcp --dport 53 -j DROP 2>/dev/null "
+          + "|| iptables -t raw -I OUTPUT -d 127.0.0.11 -p tcp --dport 53 -j DROP; "
+          + `ip route get ${shellQuote(input.network.dnsAddress)} >/dev/null`
+        ], { timeoutMs: 30_000 });
+        if (initialized.code !== 0) {
+          throw new Error(`Failed to initialize executor network: ${initialized.stderr.toString("utf8").trim() || initialized.stdout.toString("utf8").trim()}`);
+        }
+      };
       const inspect = await exec([
         "inspect", "--format", "{{json .}}",
         containerName
@@ -426,15 +463,21 @@ export async function createDockerTaskSandbox(input: DockerTaskSandboxInput): Pr
           environment,
           workspaceDir,
           caCertHostPath,
+          resolverHostPath,
           skillsRoots,
-          networkMode: `container:${networkContainerId}`
+          networkMode: input.network.networkName,
+          dnsAddress: input.network.dnsAddress
         });
         if (configMatches && inspected.State?.Running === true) {
+          await initializeNetwork();
           return;
         }
         if (configMatches) {
           const restarted = await exec(["start", containerName], { timeoutMs: 15_000 });
-          if (restarted.code === 0) return;
+          if (restarted.code === 0) {
+            await initializeNetwork();
+            return;
+          }
         }
         await exec(["rm", "-f", containerName], { timeoutMs: 15_000 });
       }
@@ -442,6 +485,7 @@ export async function createDockerTaskSandbox(input: DockerTaskSandboxInput): Pr
       if (created.code !== 0) {
         throw new Error(`Failed to start executor container ${containerName}: ${created.stderr.toString("utf8").trim()}`);
       }
+      await initializeNetwork();
     },
     async quiesce() {
       const inspect = await exec([
@@ -653,6 +697,7 @@ function containerSpecMatches(actual: DockerContainerInspect, expected: Expected
   const expectedMounts = [
     mountIdentity("bind", expected.workspaceDir, DOCKER_SANDBOX_WORKDIR, true),
     ...(expected.caCertHostPath ? [mountIdentity("bind", expected.caCertHostPath, DOCKER_CA_PATH, false)] : []),
+    mountIdentity("bind", expected.resolverHostPath, DOCKER_RESOLV_PATH, false),
     ...expected.skillsRoots.map((root) => mountIdentity("bind", root, root, false))
   ];
   const actualMounts = Array.isArray(actual.Mounts)
@@ -684,6 +729,7 @@ function containerSpecMatches(actual: DockerContainerInspect, expected: Expected
     && actual.HostConfig.Memory === 4 * 1024 * 1024 * 1024
     && actual.HostConfig.NanoCpus === 2_000_000_000
     && actual.HostConfig.NetworkMode === expected.networkMode
+    && stringMultisetMatches(actual.HostConfig.Dns ?? [], [expected.dnsAddress])
     && stringMultisetMatches(actualMounts, expectedMounts);
 }
 

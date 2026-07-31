@@ -23,6 +23,7 @@ export type LlmAgentRole = "planner" | "executor" | "supervisor" | "projector";
 export type LlmRoleConfig = {
   modelId: string;
   maxTokens: number;
+  contextWindow: number;
   thinkingLevel: LlmThinkingLevel;
   baseUrl?: string;
   apiKey?: string;
@@ -62,7 +63,8 @@ export type LlmRuntime = {
       provider: string;
       modelId: string;
       baseUrl: string;
-      maxTokens: number;
+    maxTokens: number;
+      contextWindow: number;
       thinkingLevel: LlmThinkingLevel;
     }>;
   };
@@ -71,6 +73,12 @@ export type LlmRuntime = {
 const PROVIDER_NAME = "baizhi-openai";
 const AGENT_ROLES: LlmAgentRole[] = ["planner", "executor", "supervisor", "projector"];
 const DEFAULT_MAX_TOKENS = 32_768;
+const DEFAULT_ROLE_MAX_TOKENS: Record<LlmAgentRole, number> = {
+  planner: 16_384,
+  executor: 16_384,
+  supervisor: 4_096,
+  projector: 16_384
+};
 const DEFAULT_CONTEXT_WINDOW = 128_000;
 const DEFAULT_THINKING_FORMAT: LlmThinkingFormat = "zai";
 const DEFAULT_THINKING_LEVEL: LlmThinkingLevel = "off";
@@ -94,13 +102,19 @@ export function loadLlmRuntimeConfig(env: NodeJS.ProcessEnv = process.env): LlmR
     throw new Error("Missing LLM_DEFAULT_MODEL");
   }
   const defaultMaxTokens = positiveIntegerValue(env.LLM_MAX_TOKENS, DEFAULT_MAX_TOKENS);
+  const hasGlobalMaxTokens = typeof env.LLM_MAX_TOKENS === "string" && env.LLM_MAX_TOKENS.trim().length > 0;
+  const defaultContextWindow = positiveIntegerValue(env.LLM_CONTEXT_WINDOW, DEFAULT_CONTEXT_WINDOW);
   const defaultThinkingLevel = parseThinkingLevel(env.LLM_THINKING, DEFAULT_THINKING_LEVEL);
   const roles = {} as Record<LlmAgentRole, LlmRoleConfig>;
   for (const role of AGENT_ROLES) {
     const prefix = `LLM_${role.toUpperCase()}_`;
     roles[role] = {
       modelId: env[`${prefix}MODEL`] || modelId,
-      maxTokens: positiveIntegerValue(env[`${prefix}MAX_TOKENS`], defaultMaxTokens),
+      maxTokens: positiveIntegerValue(
+        env[`${prefix}MAX_TOKENS`],
+        hasGlobalMaxTokens ? defaultMaxTokens : DEFAULT_ROLE_MAX_TOKENS[role]
+      ),
+      contextWindow: positiveIntegerValue(env[`${prefix}CONTEXT_WINDOW`], defaultContextWindow),
       thinkingLevel: parseThinkingLevel(env[`${prefix}THINKING`], defaultThinkingLevel),
       baseUrl: env[`${prefix}BASE_URL`]
         ? normalizeOpenAIBaseUrl(env[`${prefix}BASE_URL`] as string, apiType)
@@ -157,23 +171,18 @@ export function createLlmRuntime(config = loadLlmRuntimeConfig()): LlmRuntime {
       providerGroups.set(provider, { baseUrl, apiKey, models: [] });
     }
     const group = providerGroups.get(provider)!;
-    const existing = group.models.find((model) => model.name === roleCfg.modelId
-      && model.maxTokens === roleCfg.maxTokens);
+    const existing = group.models.find((model) => model.id === roleCfg.modelId);
     if (existing) {
       roleAssignments.set(role, { provider, baseUrl, registeredId: existing.id as string });
       continue;
     }
-    let registeredId = roleCfg.modelId;
-    if (group.models.some((model) => model.id === registeredId)) {
-      registeredId = `${roleCfg.modelId}#${role}`;
-    }
     group.models.push({
-      id: registeredId,
+      id: roleCfg.modelId,
       name: roleCfg.modelId,
       api: config.apiType,
       reasoning: true,
       input: ["text"],
-      contextWindow: DEFAULT_CONTEXT_WINDOW,
+      contextWindow: roleCfg.contextWindow,
       maxTokens: roleCfg.maxTokens,
       cost: costPerMillionTokens,
       compat: {
@@ -182,7 +191,7 @@ export function createLlmRuntime(config = loadLlmRuntimeConfig()): LlmRuntime {
         thinkingFormat: config.thinkingFormat
       }
     });
-    roleAssignments.set(role, { provider, baseUrl, registeredId });
+    roleAssignments.set(role, { provider, baseUrl, registeredId: roleCfg.modelId });
   }
   for (const [provider, group] of providerGroups) {
     authStorage.setRuntimeApiKey(provider, group.apiKey);
@@ -200,10 +209,15 @@ export function createLlmRuntime(config = loadLlmRuntimeConfig()): LlmRuntime {
   const metadataModels = {} as LlmRuntime["metadata"]["models"];
   for (const role of AGENT_ROLES) {
     const assignment = roleAssignments.get(role)!;
-    const model = modelRegistry.find(assignment.provider, assignment.registeredId);
-    if (!model) {
+    const registeredModel = modelRegistry.find(assignment.provider, assignment.registeredId);
+    if (!registeredModel) {
       throw new Error(`Unable to register model ${assignment.provider}/${assignment.registeredId}`);
     }
+    const model = {
+      ...registeredModel,
+      contextWindow: config.roles[role].contextWindow,
+      maxTokens: config.roles[role].maxTokens
+    };
     models[role] = model;
     roleConfig[role] = {
       ...config.roles[role],
@@ -215,6 +229,7 @@ export function createLlmRuntime(config = loadLlmRuntimeConfig()): LlmRuntime {
       modelId: config.roles[role].modelId,
       baseUrl: assignment.baseUrl,
       maxTokens: config.roles[role].maxTokens,
+      contextWindow: config.roles[role].contextWindow,
       thinkingLevel: config.roles[role].thinkingLevel
     };
   }

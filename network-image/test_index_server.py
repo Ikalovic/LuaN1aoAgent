@@ -37,15 +37,13 @@ from index_server import (
     FlowIndex,
     GatewayControl,
     body_record,
-    capture_gate_command,
     configure_gateway_firewall,
     ensure_conntrack_accounting,
     file_is_nonempty,
     flow_record,
-    mitm_command,
+    gateway_tun_command,
     prepare_tun_gate_ready_file,
     publish_gateway_ready,
-    route_gate_command,
 )
 
 
@@ -189,6 +187,27 @@ class FlowIndexTest(unittest.TestCase):
             self.assertEqual(snapshots, [["flow-2", "flow-1"]] * 8)
             self.assertEqual(FramedFlowReader.starts, [0])
 
+    def test_reads_native_jsonl_and_retries_a_partial_tail(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "epoch.mitm"
+            first = json.dumps({
+                "format": "luanniao-flow-v1", "id": "flow-1", "started_at": "2026-01-01T00:00:00Z",
+                "request_body_base64": "cmVxdWVzdA==", "response_body_base64": "cmVzcG9uc2U=",
+            }).encode() + b"\n"
+            second = json.dumps({
+                "format": "luanniao-flow-v1", "id": "flow-2", "started_at": "2026-01-01T00:00:01Z",
+                "request_body_base64": "", "response_body_base64": "",
+            }).encode() + b"\n"
+            path.write_bytes(first + second[:-2])
+            index = FlowIndex(Path(directory))
+
+            records = index.records()
+            self.assertEqual([record["id"] for record in records], ["flow-1"])
+            self.assertEqual(records[0]["request_body"], b"request")
+            with path.open("ab") as output:
+                output.write(second[-2:])
+            self.assertEqual([record["id"] for record in index.records()], ["flow-2", "flow-1"])
+
 
 class RouteProxyTest(unittest.TestCase):
     def test_missing_readiness_file_is_not_ready(self) -> None:
@@ -212,23 +231,70 @@ class RouteProxyTest(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "unavailable"):
                 ensure_conntrack_accounting(status)
 
-    def test_transparent_capture_accepts_authorized_self_signed_https(self) -> None:
-        command = mitm_command()
-        self.assertIn("ssl_insecure=true", command)
+    def test_protocol_gateway_owns_transparent_capture_and_routing(self) -> None:
+        with patch.dict(os.environ, {
+            "LUANNIAO_RUN_REF": "run:test", "LUANNIAO_TASK_REF": "task:test",
+            "LUANNIAO_DIRECT_BROKER": "host.docker.internal:12345",
+            "LUANNIAO_DIRECT_BROKER_TOKEN": "00" * 32,
+            "LUANNIAO_TASK_NETWORK_CIDR": "172.31.0.0/24",
+            "LUANNIAO_CONTROL_NETWORK_CIDR": "172.30.0.0/24",
+            "LUANNIAO_AUTHORIZED_CIDRS": "198.51.100.0/24",
+        }):
+            command = gateway_tun_command()
         self.assertEqual(command[command.index("--pdeathsig") + 1], "TERM")
-        self.assertEqual(command[command.index("--mode") + 1], "socks5@1080")
-        self.assertIn("connection_strategy=eager", command)
-        self.assertFalse(any("transparent" in argument for argument in command))
+        self.assertEqual(command[command.index("--mode") + 1], "unified")
+        self.assertEqual(command[command.index("--tun") + 1], "luanniao0")
+        self.assertEqual(command[command.index("--task-ref") + 1], "task:test")
+        self.assertEqual(command[command.index("--allow-cidrs") + 1], "198.51.100.0/24")
+        self.assertNotIn("--proxy", command)
 
-    def test_gateway_marks_all_executor_protocols_and_routes_only_tcp_to_tun(self) -> None:
+    def test_domain_scope_configures_nft_guard_and_gateway_admission(self) -> None:
+        environment = {
+            "LUANNIAO_RUN_REF": "run:test", "LUANNIAO_TASK_REF": "task:test",
+            "LUANNIAO_DIRECT_BROKER": "host.docker.internal:12345",
+            "LUANNIAO_DIRECT_BROKER_TOKEN": "00" * 32,
+            "LUANNIAO_TASK_NETWORK_CIDR": "172.31.0.0/24",
+            "LUANNIAO_CONTROL_NETWORK_CIDR": "172.30.0.0/24",
+            "LUANNIAO_AUTHORIZED_CIDRS": "",
+            "LUANNIAO_AUTHORIZED_DOMAINS": "baidu.com,*.baidu.com",
+        }
+        with patch.dict(os.environ, environment, clear=False):
+            gate_command = gateway_tun_command()
+        self.assertIn("--allow-domain-resolved", gate_command)
+
+        commands: list[list[str]] = []
+        with patch.dict(os.environ, environment, clear=False), patch(
+            "index_server.subprocess.run",
+            side_effect=lambda command, **_kwargs: commands.append(command) or MagicMock(returncode=0),
+        ):
+            configure_gateway_firewall("172.31.0.2")
+        self.assertIn([
+            "nft", "add", "table", "ip", "luanniao_scope"
+        ], commands)
+        self.assertIn([
+            "nft", "add", "rule", "ip", "luanniao_scope", "forward",
+            "ip", "saddr", "172.31.0.0/24", "ip", "daddr", "@allowed4", "accept"
+        ], commands)
+        self.assertIn([
+            "nft", "add", "rule", "ip", "luanniao_scope", "forward",
+            "ip", "saddr", "172.31.0.0/24", "reject"
+        ], commands)
+        self.assertFalse(any("LUANNIAO_SCOPE_GUARD" in command for command in commands))
+
+    def test_gateway_routes_all_task_tcp_to_one_protocol_gateway(self) -> None:
         commands: list[list[str]] = []
 
         def run(command, **_kwargs):
             commands.append(command)
             return MagicMock(returncode=0)
 
-        with patch("index_server.subprocess.run", side_effect=run):
-            configure_gateway_firewall()
+        environment = {
+            "LUANNIAO_TASK_NETWORK_CIDR": "172.31.0.0/24",
+            "LUANNIAO_CONTROL_NETWORK_CIDR": "172.30.0.0/24",
+            "LUANNIAO_AUTHORIZED_CIDRS": "198.51.100.0/24,203.0.113.10/32",
+        }
+        with patch.dict(os.environ, environment), patch("index_server.subprocess.run", side_effect=run):
+            configure_gateway_firewall("172.31.0.2")
 
         set_marks = [command for command in commands if "--set-mark" in command]
         restore_marks = [command for command in commands if "--restore-mark" in command]
@@ -236,53 +302,74 @@ class RouteProxyTest(unittest.TestCase):
         later_local = next(command for command in commands if command == ["ip", "rule", "add", "priority", "200", "lookup", "local"])
         old_local = next(command for command in commands if command == ["ip", "rule", "del", "priority", "0", "lookup", "local"])
         self.assertEqual(len(set_marks), 2)
-        self.assertEqual(
-            {
-                (
-                    command[command.index("--uid-owner") + 1],
-                    command[command.index("--ctstate") + 1],
-                )
-                for command in set_marks
-            },
-            {("1000", "NEW"), ("101", "NEW")},
-        )
-        self.assertEqual(
-            {(command[command.index("--uid-owner") + 1], command[command.index("-p") + 1]) for command in restore_marks},
-            {("1000", "tcp"), ("101", "tcp")},
-        )
-        self.assertIn(["ip", "tuntap", "add", "dev", "luanniao0", "mode", "tun", "user", "102", "group", "102"], commands)
-        self.assertIn(["ip", "tuntap", "add", "dev", "luanniao1", "mode", "tun", "user", "102", "group", "102"], commands)
+        self.assertFalse(any("--uid-owner" in command and command[command.index("--uid-owner") + 1] in {"0", "1000"} for command in commands))
+        self.assertEqual(len([command for command in set_marks if "PREROUTING" in command]), 2)
+        self.assertEqual(len([command for command in set_marks if "OUTPUT" in command]), 0)
+        self.assertEqual(restore_marks, [])
+        self.assertIn(["ip", "tuntap", "add", "dev", "luanniao0", "mode", "tun", "user", "101", "group", "101"], commands)
         self.assertIn(["ip", "route", "add", "default", "dev", "luanniao0", "table", "4242"], commands)
-        self.assertIn(["ip", "route", "add", "default", "dev", "luanniao1", "table", "4243"], commands)
-        self.assertEqual([int(rule[rule.index("priority") + 1]) for rule in fwmark_rules], [100, 110])
+        self.assertEqual([int(rule[rule.index("priority") + 1]) for rule in fwmark_rules], [100])
         self.assertTrue(all(commands.index(rule) < commands.index(later_local) for rule in fwmark_rules))
         self.assertLess(commands.index(later_local), commands.index(old_local))
         self.assertFalse(any("REDIRECT" in command for command in commands))
-        self.assertFalse(any("nat" in command for command in commands))
+        for protocol in ("udp", "tcp"):
+            self.assertIn([
+                "iptables", "-A", "INPUT", "-s", "172.31.0.0/24",
+                "-d", "172.31.0.2/32", "-p", protocol, "--dport", "53", "-j", "ACCEPT"
+            ], commands)
+        self.assertIn([
+            "iptables", "-A", "INPUT", "-s", "172.31.0.0/24", "-j", "REJECT"
+        ], commands)
+        self.assertIn([
+            "iptables", "-A", "FORWARD", "-s", "172.31.0.0/24", "-d", "172.30.0.0/24", "-j", "REJECT"
+        ], commands)
+        self.assertIn([
+            "iptables", "-A", "LUANNIAO_SCOPE_GUARD", "-d", "198.51.100.0/24", "-j", "RETURN"
+        ], commands)
+        self.assertIn([
+            "iptables", "-A", "LUANNIAO_SCOPE_GUARD", "-j", "REJECT"
+        ], commands)
+        self.assertIn([
+            "iptables", "-t", "nat", "-A", "POSTROUTING", "-s", "172.31.0.0/24", "-j", "MASQUERADE"
+        ], commands)
+        self.assertFalse(any("--dports" in command for command in commands))
 
-    def test_tun_gates_run_unprivileged_with_separate_owners(self) -> None:
-        capture = capture_gate_command()
-        route = route_gate_command()
+    def test_protocol_gateway_runs_unprivileged_as_capture_storage_owner(self) -> None:
+        with patch.dict(os.environ, {
+            "LUANNIAO_DIRECT_BROKER": "host.docker.internal:12345",
+            "LUANNIAO_DIRECT_BROKER_TOKEN": "00" * 32,
+            "LUANNIAO_TASK_NETWORK_CIDR": "172.31.0.0/24",
+            "LUANNIAO_CONTROL_NETWORK_CIDR": "172.30.0.0/24",
+            "LUANNIAO_AUTHORIZED_CIDRS": "198.51.100.0/24",
+        }):
+            command = gateway_tun_command()
+        self.assertIn("--reuid=101", command)
+        self.assertIn("--no-new-privs", command)
+        self.assertEqual(command[command.index("--pdeathsig") + 1], "TERM")
 
-        for command in (capture, route):
-            self.assertIn("--reuid=102", command)
-            self.assertIn("--no-new-privs", command)
-            self.assertEqual(command[command.index("--pdeathsig") + 1], "TERM")
-        self.assertEqual(capture[capture.index("--mode") + 1], "capture")
-        self.assertEqual(capture[capture.index("--tun") + 1], "luanniao0")
-        self.assertEqual(capture[capture.index("--proxy") + 1], "127.0.0.1:1080")
-        self.assertNotIn("--routes-file", capture)
-        self.assertEqual(route[route.index("--mode") + 1], "route")
-        self.assertEqual(route[route.index("--tun") + 1], "luanniao1")
-        self.assertEqual(route[route.index("--routes-file") + 1], "/run/luanniao/routes.json")
+    def test_uid_routing_exists_only_for_the_trusted_replay_helper(self) -> None:
+        commands: list[list[str]] = []
+        environment = {
+            "LUANNIAO_TASK_NETWORK_CIDR": "172.31.0.0/24",
+            "LUANNIAO_CONTROL_NETWORK_CIDR": "172.30.0.0/24",
+            "LUANNIAO_AUTHORIZED_CIDRS": "198.51.100.0/24",
+            "LUANNIAO_TRUSTED_REPLAY": "1",
+        }
+        with patch.dict(os.environ, environment), patch(
+            "index_server.subprocess.run",
+            side_effect=lambda command, **_kwargs: commands.append(command) or MagicMock(returncode=0),
+        ):
+            configure_gateway_firewall("172.31.0.2")
+        owner_rules = [command for command in commands if "--uid-owner" in command]
+        self.assertEqual(len(owner_rules), 2)
+        self.assertTrue(all(command[command.index("--uid-owner") + 1] == "1000" for command in owner_rules))
 
     def test_gateway_readiness_requires_every_data_plane_component(self) -> None:
         ready = MagicMock()
         conditions = {
-            "mitm_listener_ready": True,
             "ca_ready": True,
-            "capture_gate_ready": True,
-            "route_gate_ready": True,
+            "gate_ready": True,
+            "capture_ready": True,
         }
         for missing in conditions:
             with self.subTest(missing=missing):
@@ -294,7 +381,7 @@ class RouteProxyTest(unittest.TestCase):
         self.assertTrue(publish_gateway_ready(ready, **conditions))
         ready.set.assert_called_once_with()
 
-    def test_tun_ready_file_is_created_by_relay_uid_without_chown_capability(self) -> None:
+    def test_tun_ready_file_is_created_by_gateway_uid_without_chown_capability(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "tun-gate.ready"
             with (
@@ -305,7 +392,7 @@ class RouteProxyTest(unittest.TestCase):
                 prepare_tun_gate_ready_file(path)
 
         run.assert_called_once_with([
-            "setpriv", "--reuid=102", "--regid=102", "--clear-groups",
+            "setpriv", "--reuid=101", "--regid=101", "--clear-groups",
             "install", "-m", "0600", "/dev/null", str(path),
         ], check=True)
         self.assertEqual(chmod.call_args_list[0].args, (path.parent, 0o733))
@@ -546,6 +633,59 @@ class RouteProxyTest(unittest.TestCase):
             self.assertEqual(ack["activeNetworkCount"], 0)
             self.assertEqual(ack["persistedNetworkSequence"], 12)
             self.assertTrue(ack["flushed"])
+
+    def test_gateway_epoch_end_tolerates_conntrack_destroy_storm(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            epoch_state = root / "epoch.json"
+            flow_file = root / "epoch.mitm"
+            net_file = root / "epoch.net.jsonl"
+            capture_status = root / "capture-status.json"
+            conntrack_status = root / "conntrack-status.json"
+            flow_file.write_bytes(b"flow-bytes")
+            net_file.write_bytes(b"net-bytes")
+            epoch_state.write_text(json.dumps({
+                "active": True,
+                "epochRef": "epoch:storm",
+                "flowFile": str(flow_file),
+                "netFile": str(net_file),
+            }))
+            capture_status.write_text(json.dumps({"epochs": {"epoch:storm": {
+                "activeFlowCount": 0,
+                "activeTcpCount": 0,
+                "persistedSequence": 9,
+                "error": "",
+            }}}))
+            storm = {"netSeq": 100}
+
+            def churn_conntrack() -> None:
+                # Full-port scan teardown: nothing active, but the conntrack
+                # persistence sequence never sits still for two polls in a row.
+                storm["netSeq"] += 7
+                conntrack_status.write_text(json.dumps({"epochs": {"epoch:storm": {
+                    "activeNetworkCount": 0,
+                    "persistedSequence": storm["netSeq"],
+                    "error": "",
+                }}}))
+
+            churn_conntrack()
+            control = GatewayControl(
+                str(root / "gateway.sock"),
+                MagicMock(),
+                epoch_state,
+                root,
+                root / "routes.json",
+                capture_status,
+                conntrack_status,
+                lambda: 0,
+                5,
+            )
+
+            with patch("index_server.time.sleep", side_effect=lambda _seconds: churn_conntrack()):
+                ack = control.end_epoch({"epochRef": "epoch:storm"})
+
+            self.assertTrue(ack["flushed"])
+            self.assertEqual(ack["persistedFlowSequence"], 9)
 
     def test_gateway_epoch_end_failure_keeps_epoch_active_for_retry(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

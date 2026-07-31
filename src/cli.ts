@@ -1,6 +1,8 @@
 import { bootstrapAgentRuntime } from "./agent-runtime-bootstrap.js";
 import { cliHelp, parseCliOptions, shouldUseTui } from "./cli-options.js";
 import { resolveCliRunContext } from "./cli-runtime.js";
+import { normalizeScope } from "./scope.js";
+import { parseTransparentProxy } from "./proxy-config.js";
 import { AgentCliApp } from "./tui/app.js";
 
 try {
@@ -16,6 +18,7 @@ try {
 }
 
 async function run(options: ReturnType<typeof parseCliOptions>): Promise<void> {
+  const transparentProxy = options.proxy ? parseTransparentProxy(options.proxy) : undefined;
   const cwd = process.cwd();
   const runContext = resolveCliRunContext(options, cwd);
   const agentRuntime = await bootstrapAgentRuntime({
@@ -69,13 +72,21 @@ async function run(options: ReturnType<typeof parseCliOptions>): Promise<void> {
   process.on("SIGTERM", handleSignal);
 
   try {
+    const scopeSummary = runContext.resumed
+      ? runContext.scopeSummary!
+      : runContext.scopeSummary
+        ? normalizeScope(runContext.scopeSummary)
+        : await controller.inferScopeFromGoal(runContext.userGoal);
+    if (transparentProxy) {
+      await controller.configureTransparentProxy(transparentProxy, scopeSummary);
+    }
     if (options.jsonl) {
       process.stdout.write(`${JSON.stringify({
         type: "run",
         runtimeDir: runContext.runtimeDir,
         resumed: runContext.resumed,
         userGoal: runContext.userGoal,
-        scopeSummary: runContext.scopeSummary
+        scopeSummary
       })}\n`);
       unsubscribeJsonl = controller.executionLog.subscribe((event) => {
         process.stdout.write(`${JSON.stringify({ type: "event", event })}\n`);
@@ -84,7 +95,7 @@ async function run(options: ReturnType<typeof parseCliOptions>): Promise<void> {
     await app?.start();
     const result = await controller.runUntilDone({
       userGoal: runContext.userGoal,
-      scopeSummary: runContext.scopeSummary,
+      scopeSummary,
       maxPlannerCycles: options.maxPlannerCycles,
       maxParallelTasks: options.maxParallelTasks,
       maxRunTimeMs: options.maxRunTimeMs

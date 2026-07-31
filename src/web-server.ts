@@ -34,6 +34,7 @@ import { ConnectivityStore, type ConnectivityDefinition } from "./stores/connect
 import { ExecutionLog } from "./stores/execution-log.js";
 import { discoverRuntimeSessionDirs } from "./runtime-session-discovery.js";
 import { RuntimePathPolicy, RuntimePathPolicyError } from "./runtime-path-policy.js";
+import { normalizeScope } from "./scope.js";
 import {
   clearCsrfCookie,
   createCsrfToken,
@@ -1081,9 +1082,6 @@ function prepareGatewayReplayHeaders(
   replayUrl: string,
   bodyOverridden: boolean
 ): TrafficHeaderEntry[] {
-  if (headers.some((header) => header.name.toLowerCase() === "x-luanniao-replay-context")) {
-    throw new HttpError(400, "traffic_replay_invalid", "Replay 请求包含保留 Header");
-  }
   const explicitHost = headersOverridden && headers.some((header) => header.name.toLowerCase() === "host");
   const connectionTokens = new Set(headers
     .filter((header) => header.name.toLowerCase() === "connection")
@@ -1416,13 +1414,22 @@ function integerValue(value: string, name: string, min: number, max: number): nu
 async function handleStartRun(request: IncomingMessage, response: ServerResponse): Promise<void> {
   const body = await readJsonBody(request);
   const goal = stringValue(body.goal, "").trim();
-  const scope = stringValue(body.scope, "").trim();
-  if (!goal || !scope) {
+  const rawScope = stringValue(body.scope, "").trim();
+  if (!goal || !rawScope) {
     await sendJson(response, { error: { code: "invalid_request", message: "goal 和 scope 不能为空" } }, 400);
     return;
   }
-  if (goal.length > 4000 || scope.length > 4000) {
+  if (goal.length > 4000 || rawScope.length > 4000) {
     await sendJson(response, { error: { code: "invalid_request", message: "goal/scope 长度不能超过 4000 字符" } }, 400);
+    return;
+  }
+  let scope: string;
+  try {
+    scope = normalizeScope(rawScope);
+  } catch (error) {
+    await sendJson(response, {
+      error: { code: "invalid_request", message: error instanceof Error ? error.message : String(error) }
+    }, 400);
     return;
   }
 

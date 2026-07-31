@@ -33,6 +33,7 @@ type ProviderAdmissionState = {
   active: number;
   cooldownUntil: number;
   maxConcurrent: number;
+  recovering: boolean;
   queue: ProviderAdmissionWaiter[];
   wakeGeneration: number;
   wakeScheduled: boolean;
@@ -113,10 +114,22 @@ export class ProviderAdmissionGate {
   }
 
   observe(key: string, event: unknown): void {
+    const normalizedKey = key.trim();
+    if (!normalizedKey) {
+      return;
+    }
+    const state = this.getOrCreateState(normalizedKey);
+    if (isProviderRateLimitEvent(event)) {
+      state.recovering = true;
+    } else if (isSuccessfulProviderEvent(event)) {
+      state.recovering = false;
+    }
     const delayMs = providerCooldownMsFromEvent(event, this.now());
     if (delayMs) {
-      this.cooldown(key, delayMs);
+      this.cooldown(normalizedKey, delayMs);
+      return;
     }
+    this.pump(normalizedKey, state);
   }
 
   private getOrCreateState(key: string): ProviderAdmissionState {
@@ -128,6 +141,7 @@ export class ProviderAdmissionGate {
       active: 0,
       cooldownUntil: 0,
       maxConcurrent: this.defaultMaxConcurrent,
+      recovering: false,
       queue: [],
       wakeGeneration: 0,
       wakeScheduled: false
@@ -146,7 +160,8 @@ export class ProviderAdmissionGate {
       return;
     }
     state.cooldownUntil = 0;
-    while (state.active < state.maxConcurrent && state.queue.length > 0) {
+    const concurrencyLimit = state.recovering ? 1 : state.maxConcurrent;
+    while (state.active < concurrencyLimit && state.queue.length > 0) {
       const waiter = state.queue.shift();
       if (!waiter) {
         break;
@@ -171,7 +186,7 @@ export class ProviderAdmissionGate {
         }
       });
     }
-    if (state.active === 0 && state.queue.length === 0 && state.cooldownUntil === 0) {
+    if (state.active === 0 && state.queue.length === 0 && state.cooldownUntil === 0 && !state.recovering) {
       this.states.delete(key);
     }
   }
@@ -281,6 +296,8 @@ export async function invokeStructured<T>(
     idleTimeoutMs?: number;
     hardTimeoutMs?: number;
     maxTruncationSteers?: number;
+    terminateOnToolError?: boolean;
+    maxRepeatedToolErrors?: number;
     validate?: (value: unknown) => T;
     admission?: ProviderAdmissionOptions;
   }
@@ -302,6 +319,8 @@ async function invokeStructuredAdmitted<T>(
     idleTimeoutMs?: number;
     hardTimeoutMs?: number;
     maxTruncationSteers?: number;
+    terminateOnToolError?: boolean;
+    maxRepeatedToolErrors?: number;
     validate?: (value: unknown) => T;
   },
   observeAdmissionEvent: (event: unknown) => void
@@ -309,6 +328,9 @@ async function invokeStructuredAdmitted<T>(
   let settled = false;
   let providerError = "";
   let terminalToolError = "";
+  let repeatedToolErrorKey = "";
+  let repeatedToolErrorCount = 0;
+  const terminalToolArgsByCallId = new Map<string, string>();
   let lastAssistantStopReason = "";
   let truncationSteersUsed = 0;
   let idleTimeout: NodeJS.Timeout | undefined;
@@ -322,6 +344,9 @@ async function invokeStructuredAdmitted<T>(
   const idleTimeoutMs = positiveTimeout(input.idleTimeoutMs);
   const hardTimeoutMs = positiveTimeout(input.hardTimeoutMs ?? input.timeoutMs);
   const maxTruncationSteers = Math.max(0, Math.floor(input.maxTruncationSteers ?? 2));
+  const maxRepeatedToolErrors = input.maxRepeatedToolErrors === undefined
+    ? Number.POSITIVE_INFINITY
+    : Math.max(1, Math.floor(input.maxRepeatedToolErrors));
   const rejectOnce = (error: unknown, abortSession = false): void => {
     if (settled) {
       return;
@@ -366,18 +391,34 @@ async function invokeStructuredAdmitted<T>(
     if (event.type === "auto_retry_end" && event.success === true) {
       providerError = "";
     }
-    if (isStructuredInvocationProgressEvent(event.type)) {
+    if (event.type === "tool_execution_start" && event.toolName === input.toolName) {
+      terminalToolArgsByCallId.set(
+        String(event.toolCallId ?? ""),
+        stableValueSignature(event.args)
+      );
+    }
+    if (isStructuredInvocationProgressEvent(event.type) && event.type !== "tool_execution_end") {
       resetIdleTimeout();
     }
     if (event.type !== "tool_execution_end" || event.toolName !== input.toolName) {
       return;
     }
     if (event.isError === true) {
-      terminalToolError = extractStructuredToolError(event, input.toolName);
-      resetIdleTimeout();
+      const nextToolError = extractStructuredToolError(event, input.toolName);
+      const toolErrorKey = `${terminalToolArgsByCallId.get(String(event.toolCallId ?? "")) ?? ""}\n${nextToolError}`;
+      repeatedToolErrorCount = toolErrorKey === repeatedToolErrorKey ? repeatedToolErrorCount + 1 : 1;
+      repeatedToolErrorKey = toolErrorKey;
+      terminalToolError = nextToolError;
+      if (input.terminateOnToolError || repeatedToolErrorCount >= maxRepeatedToolErrors) {
+        session.clearQueue?.();
+        rejectOnce(new StructuredInvocationError(terminalToolError, "invalid_submit"), true);
+        return;
+      }
       return;
     }
     terminalToolError = "";
+    repeatedToolErrorKey = "";
+    repeatedToolErrorCount = 0;
     const result = isRecord(event.result) ? event.result : undefined;
     const details = result?.details;
     try {
@@ -508,6 +549,19 @@ function isStructuredInvocationProgressEvent(eventType: unknown): boolean {
     "compaction_start",
     "compaction_end"
   ].includes(eventType);
+}
+
+function stableValueSignature(value: unknown): string {
+  if (Array.isArray(value)) {
+    return `[${value.map(stableValueSignature).join(",")}]`;
+  }
+  if (value && typeof value === "object") {
+    return `{${Object.entries(value as Record<string, unknown>)
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([key, nested]) => `${JSON.stringify(key)}:${stableValueSignature(nested)}`)
+      .join(",")}}`;
+  }
+  return JSON.stringify(value) ?? String(value);
 }
 
 function positiveTimeout(value: number | undefined): number | undefined {
@@ -668,6 +722,31 @@ function providerCooldownMsFromEvent(event: unknown, now: number): number | unde
   }
   const errorMessage = extractPiErrorMessage(event);
   return errorMessage ? retryAfterMsFromText(errorMessage) : undefined;
+}
+
+function isProviderRateLimitEvent(event: unknown): boolean {
+  if (event instanceof Error) {
+    return classifyLlmErrorKind(event.message) === "provider_rate_limit";
+  }
+  if (!isRecord(event)) {
+    return false;
+  }
+  if (numberValue(event.status) === 429 || numberValue(event.statusCode) === 429) {
+    return true;
+  }
+  const message = extractPiErrorMessage(event);
+  return message ? classifyLlmErrorKind(message) === "provider_rate_limit" : false;
+}
+
+function isSuccessfulProviderEvent(event: unknown): boolean {
+  if (!isRecord(event)) {
+    return false;
+  }
+  if (event.type === "auto_retry_end" && event.success === true) {
+    return true;
+  }
+  const status = numberValue(event.status) ?? numberValue(event.statusCode);
+  return status !== undefined && status >= 200 && status < 400;
 }
 
 function retryAfterHeader(headers: unknown): unknown {
@@ -865,9 +944,16 @@ function normalizePiEvent(
   if (eventType === "tool_execution_end") {
     const toolName = String(event.toolName ?? "unknown");
     const runtimeControl = RUNTIME_CONTROL_TOOL_NAMES.has(toolName);
+    const projectionDraft = toolName === "graph_delta_submit";
     return {
-      eventType: runtimeControl ? "runtime_control" : "tool_finished",
-      summary: `${runtimeControl ? "runtime_control" : "tool_finished"}:${toolName}:${event.isError === true ? "error" : "ok"}`,
+      eventType: projectionDraft
+        ? "projection_draft_received"
+        : runtimeControl
+          ? "runtime_control"
+          : "tool_finished",
+      summary: projectionDraft
+        ? `projection_draft_received:${event.isError === true ? "rejected" : "accepted_pending_commit"}`
+        : `${runtimeControl ? "runtime_control" : "tool_finished"}:${toolName}:${event.isError === true ? "error" : "ok"}`,
       payload: {
         toolCallId: event.toolCallId,
         toolName,

@@ -2,6 +2,8 @@ import { spawn } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
 import { chmod, mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
+import { HostEgressBroker, type HostEgressBrokerEndpoint } from "./host-egress-broker.js";
+import { normalizeScope, parseAuthorizedScope } from "../scope.js";
 
 export const DEFAULT_NETWORK_IMAGE = "luanniao-network:latest";
 const DOCKER_COMMAND_TIMEOUT_MS = 30_000;
@@ -43,6 +45,12 @@ export type TaskGateway = {
   taskId: string;
   epochId: string;
   containerName: string;
+  networkName: string;
+  controlNetworkName?: string;
+  gatewayAddress: string;
+  controlAddress?: string;
+  dnsAddress: string;
+  imageId?: string;
   flowFile: string;
   netFile: string;
 };
@@ -88,6 +96,10 @@ export class NetworkSandboxManager {
   private readonly manageFlowIndex: boolean;
   private readonly captureEnvironment: string[];
   private readonly knownTaskIds: string[];
+  private readonly hostEgressBroker: HostEgressBroker;
+  private hostEgressEndpoint?: HostEgressBrokerEndpoint;
+  private readonly taskNetworks = new Set<string>();
+  private authorizedScope?: string;
   private mutationQueue: Promise<void> = Promise.resolve();
   private started = false;
   private connectorStarted = false;
@@ -105,6 +117,8 @@ export class NetworkSandboxManager {
     fetcher?: typeof fetch;
     manageFlowIndex?: boolean;
     knownTaskIds?: string[];
+    environment?: NodeJS.ProcessEnv;
+    hostEgressBroker?: HostEgressBroker;
   }) {
     this.runtimeDir = resolve(input.runtimeDir);
     this.runRef = input.runRef;
@@ -116,8 +130,22 @@ export class NetworkSandboxManager {
     this.runner = input.runner ?? dockerCommand;
     this.fetcher = input.fetcher ?? fetch;
     this.manageFlowIndex = input.manageFlowIndex ?? true;
-    this.captureEnvironment = networkCaptureDockerEnv();
+    this.captureEnvironment = networkCaptureDockerEnv(input.environment ?? process.env);
     this.knownTaskIds = [...new Set(input.knownTaskIds ?? [])].sort();
+    this.hostEgressBroker = input.hostEgressBroker ?? new HostEgressBroker();
+  }
+
+  configureAuthorizedScope(scope: string): Promise<void> {
+    return this.withMutation(async () => {
+      const normalized = normalizeScope(scope);
+      if (this.authorizedScope && this.authorizedScope !== normalized) {
+        throw new Error("Authorized scope cannot change after network sandbox initialization");
+      }
+      this.authorizedScope = normalized;
+      if (this.started) {
+        await this.adoptPersistedGateways();
+      }
+    });
   }
 
   async start(options: NetworkSandboxStartOptions = {}): Promise<void> {
@@ -139,9 +167,11 @@ export class NetworkSandboxManager {
     await mkdir(join(trafficRoot, "flows"), { recursive: true });
     await mkdir(join(trafficRoot, "ca"), { recursive: true });
     if (this.manageFlowIndex) this.indexToken = await this.loadIndexToken(trafficRoot);
-    const networkCreated = await this.ensureNetwork();
+    await this.ensureHostEgressBroker();
+    let networkCreated = false;
     let indexReconciled = false;
     try {
+      networkCreated = await this.ensureNetwork();
       if (this.manageFlowIndex) {
         await this.reconcileContainer(this.indexName, "index", [
           "--read-only", "--cap-drop", "ALL",
@@ -191,6 +221,12 @@ export class NetworkSandboxManager {
           cleanupFailures.push(cleanupError);
         }
       }
+      try {
+        await this.hostEgressBroker.close();
+      } catch (cleanupError) {
+        cleanupFailures.push(cleanupError);
+      }
+      this.hostEgressEndpoint = undefined;
       if (cleanupFailures.length > 0) {
         throw new AggregateError([error, ...cleanupFailures], "Network sandbox startup cleanup failed");
       }
@@ -264,24 +300,42 @@ export class NetworkSandboxManager {
     const existing = this.gateways.get(input.taskId);
     if (existing) {
       await this.ensureGatewayReady(input.taskId);
-      if (existing.epochId === input.epochId) return existing;
-      return this.beginEpoch(existing, input.epochId);
+      const ready = this.gateways.get(input.taskId);
+      if (!ready) throw new Error(`Gateway ${input.taskId} disappeared during recovery`);
+      const epoch = await this.readGatewayEpoch(ready.containerName);
+      if (epoch?.active === true && epoch.epochRef === input.epochId) return ready;
+      const pendingEpoch = epoch?.epochRef || (ready.epochId !== input.epochId ? ready.epochId : "");
+      if (pendingEpoch) {
+        await this.endGatewayEpoch({ ...ready, epochId: pendingEpoch }, pendingEpoch);
+      }
+      return this.beginEpoch({ ...ready, epochId: "" }, input.epochId);
     }
-    const { containerName, runArgs } = await this.gatewaySpec(input.taskId);
+    const taskNetwork = await this.ensureTaskNetwork(input.taskId);
+    const { containerName, runArgs } = await this.gatewaySpec(input.taskId, taskNetwork);
     let gatewayReconciled = false;
     try {
+      await this.prepareGatewayStorage(input.taskId);
       await this.reconcileContainer(containerName, "gateway", runArgs, {
         runRef: this.runRef,
         taskRef: input.taskId
       });
       gatewayReconciled = true;
       this.partialContainers.set(containerName, "gateway");
+      await this.ensureContainerNetwork(containerName, taskNetwork.name);
       await this.waitForGateway(containerName);
-      await this.rememberContainerAddresses(containerName);
+      const gatewayAddress = await this.containerAddress(containerName, taskNetwork.name);
+      if (!gatewayAddress) throw new Error(`Gateway ${containerName} has no task-network address`);
+      const controlAddress = await this.containerAddress(containerName, this.networkName);
       const gateway: TaskGateway = {
         taskId: input.taskId,
         epochId: "",
         containerName,
+        networkName: taskNetwork.name,
+        controlNetworkName: this.networkName,
+        gatewayAddress,
+        controlAddress,
+        dnsAddress: gatewayAddress,
+        imageId: await this.resolveTargetImageId(),
         flowFile: "",
         netFile: ""
       };
@@ -301,6 +355,7 @@ export class NetworkSandboxManager {
           cleanupFailures.push(cleanupError);
         }
       }
+      await this.removeManagedTaskNetwork(input.taskId).catch((cleanupError: unknown) => cleanupFailures.push(cleanupError));
       if (cleanupFailures.length > 0) {
         throw new AggregateError([error, ...cleanupFailures], "Gateway startup cleanup failed");
       }
@@ -313,19 +368,38 @@ export class NetworkSandboxManager {
     return `luanniao-gateway-${digest}`;
   }
 
-  private async gatewaySpec(taskId: string): Promise<{ containerName: string; runArgs: string[]; configDigest: string }> {
+  taskNetworkName(taskId: string): string {
+    const digest = createHash("sha256").update(`${this.runtimeDir}:${taskId}:task-network`).digest("hex").slice(0, 16);
+    return `luanniao-task-${digest}`;
+  }
+
+  private async gatewaySpec(
+    taskId: string,
+    taskNetwork?: { name: string; subnet: string }
+  ): Promise<{ containerName: string; runArgs: string[]; configDigest: string }> {
+    if (!this.authorizedScope) {
+      throw new Error("Authorized scope must be configured before creating a task Gateway");
+    }
+    const authorizedScope = parseAuthorizedScope(this.authorizedScope);
+    const hostEgress = await this.ensureHostEgressBroker();
+    const indexPort = this.indexUrl ? Number(new URL(this.indexUrl).port) : undefined;
+    const protectedHostPorts = [hostEgress.port, indexPort]
+      .filter((port): port is number => Number.isInteger(port) && (port ?? 0) > 0);
+    taskNetwork ??= await this.ensureTaskNetwork(taskId);
     const containerName = this.gatewayContainerName(taskId);
     const taskFlowName = safeName(taskId);
     const hostDir = join(this.runtimeDir, "traffic", "flows", taskFlowName);
     await mkdir(hostDir, { recursive: true });
     const runArgs = [
       "--network", this.networkName,
+      "--add-host", "host.docker.internal:host-gateway",
       "--sysctl", "net.ipv6.conf.all.disable_ipv6=1",
       "--sysctl", "net.ipv6.conf.default.disable_ipv6=1",
       "--sysctl", "net.netfilter.nf_conntrack_acct=1",
+      "--sysctl", "net.ipv4.ip_forward=1",
       "--read-only", "--cap-drop", "ALL",
       "--cap-add", "NET_ADMIN", "--cap-add", "SETUID", "--cap-add", "SETGID",
-      "--cap-add", "CHOWN", "--cap-add", "FOWNER", "--cap-add", "SETPCAP",
+      "--group-add", "101",
       "--device", "/dev/net/tun:/dev/net/tun",
       "--security-opt", "no-new-privileges",
       "--pids-limit", "256",
@@ -337,6 +411,13 @@ export class NetworkSandboxManager {
       "--env", `LUANNIAO_TASK_FLOW_ROOT=/traffic/flows/${taskFlowName}`,
       "--env", `LUANNIAO_RUN_REF=${this.runRef}`,
       "--env", `LUANNIAO_TASK_REF=${taskId}`,
+      "--env", `LUANNIAO_TASK_NETWORK_CIDR=${taskNetwork.subnet}`,
+      "--env", `LUANNIAO_CONTROL_NETWORK_CIDR=${await this.networkSubnet(this.networkName)}`,
+      "--env", `LUANNIAO_AUTHORIZED_CIDRS=${authorizedScope.cidrs.join(",")}`,
+      "--env", `LUANNIAO_AUTHORIZED_DOMAINS=${authorizedScope.domains.join(",")}`,
+      "--env", `LUANNIAO_DIRECT_BROKER=${hostEgress.host}:${hostEgress.port}`,
+      "--env", `LUANNIAO_DIRECT_BROKER_TOKEN=${hostEgress.token}`,
+      "--env", `LUANNIAO_LOCAL_DIRECT_DENY_PORTS=${protectedHostPorts.join(",")}`,
       ...this.captureEnvironment,
       this.image, "gateway"
     ];
@@ -347,9 +428,28 @@ export class NetworkSandboxManager {
     };
   }
 
+  private async prepareGatewayStorage(taskId: string): Promise<void> {
+    const taskFlowName = safeName(taskId);
+    const flowDir = join(this.runtimeDir, "traffic", "flows", taskFlowName);
+    const caDir = join(this.runtimeDir, "traffic", "ca");
+    const result = await this.runner([
+      "run", "--rm", "--network", "none",
+      "--read-only", "--cap-drop", "ALL", "--cap-add", "CHOWN", "--cap-add", "FOWNER",
+      "--security-opt", "no-new-privileges",
+      "--mount", `type=bind,src=${flowDir},dst=/storage/flows`,
+      "--mount", `type=bind,src=${caDir},dst=/storage/ca`,
+      this.image, "storage-init", "/storage/flows", "/storage/ca"
+    ]);
+    if (result.code !== 0) {
+      throw new Error(`Failed to initialize Gateway storage for ${taskId}: ${result.stderr || result.stdout}`);
+    }
+  }
+
   private async adoptPersistedGateways(): Promise<void> {
+    if (!this.authorizedScope) return;
     for (const taskId of this.knownTaskIds) {
-      const spec = await this.gatewaySpec(taskId);
+      const taskNetwork = await this.ensureTaskNetwork(taskId);
+      const spec = await this.gatewaySpec(taskId, taskNetwork);
       const inspect = await this.runner([
         "inspect", "--format",
         "{{.State.Running}}|{{index .Config.Labels \"luanniao.managed\"}}|{{index .Config.Labels \"luanniao.role\"}}|{{index .Config.Labels \"luanniao.config\"}}|{{index .Config.Labels \"luanniao.run_ref\"}}|{{index .Config.Labels \"luanniao.task_ref\"}}|{{.Image}}",
@@ -380,10 +480,22 @@ export class NetworkSandboxManager {
         ? epochRef
         : "";
       const taskFlowName = safeName(taskId);
+      if (running === "true") await this.ensureContainerNetwork(spec.containerName, taskNetwork.name);
+      const gatewayAddress = running === "true"
+        ? await this.containerAddress(spec.containerName, taskNetwork.name)
+        : "";
       this.gateways.set(taskId, {
         taskId,
         epochId,
         containerName: spec.containerName,
+        networkName: taskNetwork.name,
+        controlNetworkName: this.networkName,
+        gatewayAddress: gatewayAddress ?? "",
+        controlAddress: running === "true"
+          ? await this.containerAddress(spec.containerName, this.networkName)
+          : undefined,
+        dnsAddress: gatewayAddress ?? "",
+        imageId: targetImageId,
         flowFile: epochId
           ? join(this.runtimeDir, "traffic", "flows", taskFlowName, `${safeName(epochId)}.mitm`)
           : "",
@@ -391,20 +503,36 @@ export class NetworkSandboxManager {
           ? join(this.runtimeDir, "traffic", "flows", taskFlowName, `${safeName(epochId)}.net.jsonl`)
           : ""
       });
-      if (running === "true") await this.rememberContainerAddresses(spec.containerName);
+      if (running === "true" && !gatewayAddress) {
+        throw new Error(`Persisted gateway ${spec.containerName} has no task-network address`);
+      }
     }
   }
 
   private async ensureGatewayReady(taskId: string): Promise<void> {
     const gateway = this.gateways.get(taskId);
     if (!gateway) return;
-    const spec = await this.gatewaySpec(taskId);
+    const taskNetwork = await this.ensureTaskNetwork(taskId);
+    const spec = await this.gatewaySpec(taskId, taskNetwork);
+    await this.prepareGatewayStorage(taskId);
     await this.reconcileContainer(spec.containerName, "gateway", spec.runArgs, {
       runRef: this.runRef,
       taskRef: taskId
     });
+    await this.ensureContainerNetwork(spec.containerName, taskNetwork.name);
     await this.waitForGateway(spec.containerName);
-    await this.rememberContainerAddresses(spec.containerName);
+    const gatewayAddress = await this.containerAddress(spec.containerName, taskNetwork.name);
+    if (!gatewayAddress) throw new Error(`Gateway ${spec.containerName} has no task-network address`);
+    const controlAddress = await this.containerAddress(spec.containerName, this.networkName);
+    this.gateways.set(taskId, {
+      ...gateway,
+      networkName: taskNetwork.name,
+      controlNetworkName: this.networkName,
+      gatewayAddress,
+      controlAddress,
+      dnsAddress: gatewayAddress,
+      imageId: await this.resolveTargetImageId()
+    });
     await this.applyRoutes(gateway);
   }
 
@@ -445,12 +573,22 @@ export class NetworkSandboxManager {
     return join(this.runtimeDir, "traffic", "ca", "mitmproxy-ca-cert.pem");
   }
 
+  hostEgress(): Promise<HostEgressBrokerEndpoint> {
+    return this.ensureHostEgressBroker();
+  }
+
   replaceRoutes(routes: NetworkRoute[]): Promise<void> {
     return this.withMutation(() => this.replaceRoutesUnlocked(routes));
   }
 
   routeSnapshot(): NetworkRoute[] {
     return [...this.routes.values()].map((route) => ({ ...route }));
+  }
+
+  pendingEpochs(): Array<{ taskId: string; epochId: string }> {
+    return [...this.gateways.values()]
+      .filter((gateway) => gateway.epochId.length > 0)
+      .map((gateway) => ({ taskId: gateway.taskId, epochId: gateway.epochId }));
   }
 
   private async replaceRoutesUnlocked(routes: NetworkRoute[]): Promise<void> {
@@ -497,6 +635,7 @@ export class NetworkSandboxManager {
     this.gateways.set(taskId, { ...gateway, epochId: "" });
     await this.removeManagedContainer(gateway.containerName, "gateway", taskId);
     this.gateways.delete(taskId);
+    await this.removeManagedTaskNetwork(taskId);
   }
 
   close(): Promise<void> {
@@ -508,6 +647,7 @@ export class NetworkSandboxManager {
       && !this.cleanupNetworkPending
       && !this.indexStarted
       && !this.connectorStarted
+      && !this.hostEgressEndpoint
       && this.gateways.size === 0
       && this.partialContainers.size === 0) return;
     const failures: unknown[] = [];
@@ -539,6 +679,12 @@ export class NetworkSandboxManager {
     failures.push(...removals
       .filter((result): result is PromiseRejectedResult => result.status === "rejected")
       .map((result) => result.reason));
+    const taskNetworkRemovals = await Promise.allSettled(
+      [...this.taskNetworks].map((taskId) => this.removeManagedTaskNetwork(taskId))
+    );
+    failures.push(...taskNetworkRemovals
+      .filter((result): result is PromiseRejectedResult => result.status === "rejected")
+      .map((result) => result.reason));
     if (this.started || this.cleanupNetworkPending) {
       try {
         await this.removeManagedNetwork();
@@ -549,6 +695,12 @@ export class NetworkSandboxManager {
       } catch (error) {
         failures.push(error);
       }
+    }
+    try {
+      await this.hostEgressBroker.close();
+      this.hostEgressEndpoint = undefined;
+    } catch (error) {
+      failures.push(error);
     }
     if (failures.length > 0) {
       if (failures.length === 1) throw failures[0];
@@ -578,6 +730,11 @@ export class NetworkSandboxManager {
       }
     }
     throw new Error(`Failed to remove network ${this.networkName}: ${lastError}`);
+  }
+
+  private async ensureHostEgressBroker(): Promise<HostEgressBrokerEndpoint> {
+    this.hostEgressEndpoint ??= await this.hostEgressBroker.start();
+    return this.hostEgressEndpoint;
   }
 
   private withMutation<T>(operation: () => Promise<T>): Promise<T> {
@@ -684,6 +841,85 @@ export class NetworkSandboxManager {
     ]);
     if (created.code !== 0) throw new Error(`Failed to create network ${this.networkName}: ${created.stderr}`);
     return true;
+  }
+
+  private async ensureTaskNetwork(taskId: string): Promise<{ name: string; subnet: string }> {
+    const name = this.taskNetworkName(taskId);
+    const inspect = await this.runner([
+      "network", "inspect", "--format",
+      "{{index .Labels \"luanniao.managed\"}}|{{index .Labels \"luanniao.role\"}}|{{index .Labels \"luanniao.run_ref\"}}|{{index .Labels \"luanniao.task_ref\"}}|{{(index .IPAM.Config 0).Subnet}}|{{.Internal}}",
+      name
+    ]);
+    if (inspect.code === 0) {
+      const [managed, role, rawRunRef, rawTaskRef, subnet, internal] = inspect.stdout.trim().split("|");
+      if (managed !== "true" || role !== "task-network"
+        || optionalDockerLabel(rawRunRef) !== this.runRef
+        || optionalDockerLabel(rawTaskRef) !== taskId
+        || internal !== "true" || !subnet) {
+        throw new Error(`Refusing to reuse invalid task network ${name}`);
+      }
+      this.taskNetworks.add(taskId);
+      return { name, subnet };
+    }
+    const created = await this.runner([
+      "network", "create", "--driver", "bridge", "--internal",
+      "--label", "luanniao.managed=true", "--label", "luanniao.role=task-network",
+      "--label", `luanniao.run_ref=${this.runRef}`,
+      "--label", `luanniao.task_ref=${taskId}`,
+      name
+    ]);
+    if (created.code !== 0) throw new Error(`Failed to create task network ${name}: ${created.stderr}`);
+    this.taskNetworks.add(taskId);
+    const subnet = await this.networkSubnet(name);
+    return { name, subnet };
+  }
+
+  private async networkSubnet(name: string): Promise<string> {
+    const result = await this.runner([
+      "network", "inspect", "--format", "{{(index .IPAM.Config 0).Subnet}}", name
+    ]);
+    const subnet = result.stdout.trim();
+    if (result.code !== 0 || !subnet) throw new Error(`Failed to inspect network subnet ${name}: ${result.stderr || result.stdout}`);
+    return subnet;
+  }
+
+  private async ensureContainerNetwork(containerName: string, networkName: string): Promise<void> {
+    const attached = await this.runner([
+      "inspect", "--format", `{{with index .NetworkSettings.Networks "${networkName}"}}{{.IPAddress}}{{end}}`, containerName
+    ]);
+    if (attached.code === 0 && attached.stdout.trim()) return;
+    const connected = await this.runner(["network", "connect", networkName, containerName]);
+    if (connected.code !== 0) throw new Error(`Failed to connect ${containerName} to ${networkName}: ${connected.stderr || connected.stdout}`);
+  }
+
+  private async containerAddress(containerName: string, networkName: string): Promise<string | undefined> {
+    const result = await this.runner([
+      "inspect", "--format", `{{with index .NetworkSettings.Networks "${networkName}"}}{{.IPAddress}}{{end}}`, containerName
+    ]);
+    const address = result.stdout.trim();
+    return result.code === 0 && address ? address : undefined;
+  }
+
+  private async removeManagedTaskNetwork(taskId: string): Promise<void> {
+    const name = this.taskNetworkName(taskId);
+    const inspect = await this.runner([
+      "network", "inspect", "--format",
+      "{{index .Labels \"luanniao.managed\"}}|{{index .Labels \"luanniao.role\"}}|{{index .Labels \"luanniao.run_ref\"}}|{{index .Labels \"luanniao.task_ref\"}}",
+      name
+    ]);
+    if (inspect.code !== 0) {
+      this.taskNetworks.delete(taskId);
+      return;
+    }
+    const [managed, role, rawRunRef, rawTaskRef] = inspect.stdout.trim().split("|");
+    if (managed !== "true" || role !== "task-network"
+      || optionalDockerLabel(rawRunRef) !== this.runRef
+      || optionalDockerLabel(rawTaskRef) !== taskId) {
+      throw new Error(`Refusing to remove unmanaged task network ${name}`);
+    }
+    const removed = await this.runner(["network", "rm", name]);
+    if (removed.code !== 0) throw new Error(`Failed to remove task network ${name}: ${removed.stderr || removed.stdout}`);
+    this.taskNetworks.delete(taskId);
   }
 
   private async loadIndexToken(trafficRoot: string): Promise<string> {

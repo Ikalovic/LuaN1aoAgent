@@ -49,6 +49,86 @@ test("tracks multiple epochs for one task without shared lifecycle state", () =>
   });
 });
 
+test("counts task turns cumulatively across epochs and idempotently by event", () => {
+  const runtimeDir = mkdtempSync(join(tmpdir(), "luanniao-runtime-"));
+  const databasePath = join(runtimeDir, "state.sqlite");
+  const firstStore = new RuntimeStore(databasePath);
+
+  assert.equal(firstStore.recordTaskTurn({ taskId: "task:test", eventId: "event:1" }), 1);
+  assert.equal(firstStore.recordTaskTurn({ taskId: "task:test", eventId: "event:1" }), 1);
+  assert.equal(firstStore.recordTaskTurn({ taskId: "task:test", eventId: "event:2" }), 2);
+  assert.equal(firstStore.recordTaskTurn({ taskId: "task:other", eventId: "event:3" }), 1);
+  firstStore.close();
+
+  const reopenedStore = new RuntimeStore(databasePath);
+  assert.equal(reopenedStore.getTaskConsumedTurns("task:test"), 2);
+  assert.equal(reopenedStore.recordTaskTurn({ taskId: "task:test", eventId: "event:4" }), 3);
+  assert.equal(reopenedStore.getTaskConsumedTurns("task:other"), 1);
+  reopenedStore.close();
+});
+
+test("persists EpochOutcome independently from semantic TaskOutcome", () => {
+  const runtimeDir = mkdtempSync(join(tmpdir(), "luanniao-runtime-"));
+  const databasePath = join(runtimeDir, "state.sqlite");
+  const firstStore = new RuntimeStore(databasePath);
+  firstStore.upsertEpochOutcome({
+    epochRef: "epoch:provider-error",
+    taskRef: "task:test",
+    status: "provider_error",
+    reason: "429 Too Many Requests",
+    terminalSeq: 12,
+    retryable: true,
+    createdAt: "2026-07-31T00:00:00.000Z"
+  });
+
+  assert.equal(firstStore.getTaskOutcome("task:test"), undefined);
+  firstStore.close();
+
+  const reopenedStore = new RuntimeStore(databasePath);
+  assert.deepEqual(reopenedStore.getEpochOutcome("epoch:provider-error"), {
+    epochRef: "epoch:provider-error",
+    taskRef: "task:test",
+    status: "provider_error",
+    reason: "429 Too Many Requests",
+    terminalSeq: 12,
+    retryable: true,
+    createdAt: "2026-07-31T00:00:00.000Z"
+  });
+  assert.deepEqual(
+    reopenedStore.listTaskEpochOutcomes("task:test").map((outcome) => outcome.epochRef),
+    ["epoch:provider-error"]
+  );
+  assert.equal(reopenedStore.getTaskOutcome("task:test"), undefined);
+  reopenedStore.close();
+});
+
+test("persists the epoch budget ledger across runtime reopening", () => {
+  const runtimeDir = mkdtempSync(join(tmpdir(), "luanniao-runtime-"));
+  const databasePath = join(runtimeDir, "state.sqlite");
+  const firstStore = new RuntimeStore(databasePath);
+  firstStore.createEpoch({ epochId: "epoch:budget", taskId: "task:budget", attempt: 1 });
+  firstStore.transitionEpoch({ epochId: "epoch:budget", state: "running" });
+  firstStore.upsertEpochBudget({
+    epochId: "epoch:budget",
+    timeLimitMs: 60_000,
+    deadlineAt: 70_000,
+    pausedAt: 15_000,
+    accumulatedPauseMs: 5_000
+  });
+  firstStore.close();
+
+  const reopenedStore = new RuntimeStore(databasePath);
+  assert.deepEqual(reopenedStore.getEpochBudget("epoch:budget"), {
+    epochId: "epoch:budget",
+    timeLimitMs: 60_000,
+    deadlineAt: 70_000,
+    pausedAt: 15_000,
+    accumulatedPauseMs: 5_000
+  });
+  assert.equal(reopenedStore.getEpoch("epoch:budget")?.terminationReason, "shutdown");
+  reopenedStore.close();
+});
+
 test("projection desired sequence does not advance committed sequence", () => {
   const runtimeDir = mkdtempSync(join(tmpdir(), "luanniao-runtime-"));
   const store = new RuntimeStore(join(runtimeDir, "state.sqlite"));

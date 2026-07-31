@@ -47,6 +47,7 @@ export type TaskCreateInput = {
   taskId: string;
   goal: string;
   targetRefs: string[];
+  basisRefs?: string[];
   scopeRef: string;
   constraints: string[];
   successCriteria: string[];
@@ -111,6 +112,15 @@ export type ProjectionCommitResult = {
   delta: GraphDelta;
   remappedNodeCount: number;
   mergedNodeCount: number;
+  nodeStatusChanges: ProjectionNodeStatusChange[];
+};
+
+export type ProjectionNodeStatusChange = {
+  nodeId: string;
+  label: string;
+  fromStatus?: string;
+  toStatus: string;
+  evidenceRefs: string[];
 };
 
 export class SQLiteGraphStore {
@@ -146,6 +156,7 @@ export class SQLiteGraphStore {
     let committedDelta = input.delta;
     let remappedNodeCount = 0;
     let mergedNodeCount = 0;
+    let nodeStatusChanges: ProjectionNodeStatusChange[] = [];
     this.database.exec("BEGIN IMMEDIATE");
     try {
       const state = this.database.prepare(`
@@ -178,6 +189,23 @@ export class SQLiteGraphStore {
       committedDelta = rebased.delta;
       remappedNodeCount = rebased.remappedNodeCount;
       mergedNodeCount = rebased.mergedNodeCount;
+      const readPreviousNode = this.database.prepare(`
+        SELECT id, graph_kind, type, label, properties_json, evidence_refs_json FROM nodes WHERE id = ?
+      `);
+      nodeStatusChanges = committedDelta.nodes.flatMap((node) => {
+        const toStatus = stringProperty(node.properties.status);
+        if (!toStatus) return [];
+        const previousRow = readPreviousNode.get(node.id) as StoredNodeRow | undefined;
+        const fromStatus = previousRow ? stringProperty(rowToNode(previousRow).properties.status) : undefined;
+        if (fromStatus === toStatus) return [];
+        return [{
+          nodeId: node.id,
+          label: node.label,
+          fromStatus,
+          toStatus,
+          evidenceRefs: [...(node.evidenceRefs ?? [])]
+        }];
+      });
       this.assertProjectionSemanticConnectivityInTransaction(committedDelta);
       this.applyDeltaInTransaction(committedDelta, [], true);
       const updated = this.database.prepare(`
@@ -203,7 +231,7 @@ export class SQLiteGraphStore {
       throw error;
     }
     appendDeltaLog(this.deltaLogPath, committedDelta);
-    return { delta: committedDelta, remappedNodeCount, mergedNodeCount };
+    return { delta: committedDelta, remappedNodeCount, mergedNodeCount, nodeStatusChanges };
   }
 
   private assertProjectionSemanticConnectivityInTransaction(delta: GraphDelta): void {
@@ -317,9 +345,10 @@ export class SQLiteGraphStore {
       const previous = edgesById.get(edgeId);
       edgesById.set(edgeId, previous ? {
         ...rewritten,
+        id: edgeId,
         properties: { ...(previous.properties ?? {}), ...(rewritten.properties ?? {}) },
         evidenceRefs: dedupeStringValues([...(previous.evidenceRefs ?? []), ...(rewritten.evidenceRefs ?? [])])
-      } : rewritten);
+      } : { ...rewritten, id: edgeId });
     }
     const rebasedDelta = {
       sourceEventIds: delta.sourceEventIds,
@@ -454,7 +483,7 @@ export class SQLiteGraphStore {
         properties_json: string;
         evidence_refs_json: string;
       } | undefined;
-      if (edge.id && existing
+      if (edge.id && edgeId === edge.id && existing
         && (existing.from_id !== edge.from || existing.to_id !== edge.to || existing.type !== edge.type)) {
         throw new GraphValidationError(
           `Edge identity conflict for ${edge.id}: existing ${existing.from_id}/${existing.type}/${existing.to_id}, submitted ${edge.from}/${edge.type}/${edge.to}`
@@ -663,16 +692,30 @@ export class SQLiteGraphStore {
     const nodeById = new Map([...taskNodes, ...semanticNodes].map((node) => [node.id, node]));
     const taskEdges = this.readEdgesForNodes(taskNodes.map((node) => node.id), 200)
       .filter((edge) => nodeById.has(edge.from) && nodeById.has(edge.to));
-    const anchorTokens = dedupeStringValues(input.anchors ?? [])
-      .map(normalizeProjectionToken)
+    const exactSemanticRefs = new Set((input.targetRefs ?? []).filter((ref) => {
+      const node = nodeById.get(ref);
+      return Boolean(node && node.graphKind !== "task");
+    }));
+    const taskEvidenceRefs = new Set(taskNodes.flatMap((node) => [
+      ...(node.evidenceRefs ?? []),
+      ...stringArray(node.properties.evidenceRefs)
+    ]));
+    const provenanceSemanticRefs = new Set(semanticNodes
+      .filter((node) => (node.evidenceRefs ?? []).some((ref) => taskEvidenceRefs.has(ref)))
+      .map((node) => node.id));
+    const anchorTokens = dedupeStringValues((input.anchors ?? []).flatMap(projectionAnchorTokens))
       .filter((token) => token.length >= 3);
-    const exactSemanticRefs = new Set((input.targetRefs ?? []).filter((ref) => nodeById.get(ref)?.graphKind !== "task"));
     const anchorSeedNodes = semanticNodes.filter((node) => (
-      exactSemanticRefs.has(node.id)
-      || anchorTokens.some((token) => projectionNodeSearchText(node).includes(token))
+      anchorTokens.some((token) => projectionNodeSearchText(node).includes(token))
     ));
 
-    const selectedIds = new Set(taskNodes.slice(0, 8).map((node) => node.id));
+    const taskNodeById = new Map(taskNodes.map((node) => [node.id, node]));
+    const taskSlotLimit = Math.max(2, Math.floor(nodeLimit * 0.4));
+    const selectedTaskNodes = taskContextRefs
+      .map((nodeId) => taskNodeById.get(nodeId))
+      .filter((node): node is GraphNode => Boolean(node))
+      .slice(0, taskSlotLimit);
+    const selectedIds = new Set(selectedTaskNodes.map((node) => node.id));
     const traversedEdges = new Map(taskEdges.map((edge) => [edgeIdFor(edge), edge]));
     const allowedTaskIds = new Set(taskMemoryRefs);
     const collectNeighborhood = (seedIds: string[], maxNewNodes: number, maxDepth: number): void => {
@@ -713,8 +756,12 @@ export class SQLiteGraphStore {
         }
       }
     };
-    const availableSemanticSlots = Math.max(0, nodeLimit - selectedIds.size);
-    collectNeighborhood(taskMemoryRefs, Math.min(8, Math.ceil(availableSemanticSlots * 0.65)), 4);
+
+    collectNeighborhood(
+      [...selectedTaskNodes.map((node) => node.id), ...exactSemanticRefs, ...provenanceSemanticRefs],
+      Math.max(0, nodeLimit - selectedIds.size),
+      4
+    );
     collectNeighborhood(
       anchorSeedNodes.sort(compareProjectionSeedNodes).map((node) => node.id),
       Math.max(0, nodeLimit - selectedIds.size),
@@ -794,7 +841,7 @@ export class SQLiteGraphStore {
         scopeRef: rootScope?.id ?? null
       },
       taskLedger,
-      reasoningDigest: topDigestItems(reasoningNodes, allEdges, context, 10),
+      reasoningDigest: topDigestItems(reasoningNodes, allEdges, context),
       operationDigest: topDigestItems(operationNodes, allEdges, context, 10),
       blockers: topDigestItems(
         taskNodes.filter((node) => node.type === "Blocker"),
@@ -806,15 +853,15 @@ export class SQLiteGraphStore {
         ...summarize(allNodes, allEdges),
         taskStatusCounts: countTaskStatuses(taskNodes),
         digestLimits: {
-          reasoningDigest: 10,
+          reasoningDigest: reasoningNodes.length,
           operationDigest: 10,
           blockers: 5,
           taskLedger: 20
         }
       },
       retrievalHints: {
-        tools: ["graph_query", "graph_trace"],
-        note: "Planner 初始输入是压缩决策视图；信息不足时只能用 graph_query / graph_trace 按需读取限定图窗口或节点邻域。"
+        tools: ["graph_query", "graph_trace", "evidence_list", "evidence_read", "artifact_read"],
+        note: "Planner 按需列出 Task 观察、读取真实 event Ref，并用 artifact_read 检查非凭据持久材料。"
       }
     };
   }
@@ -860,6 +907,7 @@ export class SQLiteGraphStore {
         status: "open",
         version: 1,
         targetRefs: input.targetRefs,
+        basisRefs: input.basisRefs,
         scopeRef: input.scopeRef,
         constraints: input.constraints,
         successCriteria: input.successCriteria,
@@ -1045,6 +1093,7 @@ export class SQLiteGraphStore {
         status: "open",
         version: 1,
         targetRefs: task.targetRefs,
+        basisRefs: task.basisRefs,
         scopeRef: task.scopeRef,
         constraints: task.constraints,
         successCriteria: task.successCriteria,
@@ -1232,68 +1281,12 @@ export class SQLiteGraphStore {
     taskResult: TaskResult;
     sourceEventIds: string[];
   }): GraphDelta {
-    const task = this.requireTaskNode(input.taskEnvelope.taskId);
-    const dependsOnTaskRefs = input.taskEnvelope.dependsOnTaskRefs ?? this.taskDependencyRefs(input.taskEnvelope.taskId);
-    const nextTask: GraphNode = {
-      ...task,
-      label: input.taskEnvelope.goal,
-      properties: {
-        ...withoutTaskDependencyProperty(task.properties),
-        status: input.taskResult.status,
-        targetRefs: input.taskEnvelope.targetRefs,
-        scopeRef: input.taskEnvelope.scopeRef,
-        constraints: input.taskEnvelope.constraints,
-        successCriteria: input.taskEnvelope.successCriteria,
-        parentTaskId: input.taskEnvelope.parentTaskId,
-        parallelGroup: input.taskEnvelope.parallelGroup,
-        budget: input.taskEnvelope.budget,
-        resultSummary: input.taskResult.summary,
-        evidenceRefs: mergeStrings(stringArray(task.properties.evidenceRefs), input.taskResult.evidenceRefs),
-        artifactRefs: mergeStrings(stringArray(task.properties.artifactRefs), input.taskResult.artifactRefs),
-        capabilityRefs: mergeStrings(stringArray(task.properties.capabilityRefs), input.taskResult.capabilityRefs ?? []),
-        blockerReason: input.taskResult.blockerReason,
-        suggestedNextGoal: input.taskResult.suggestedNextGoal,
-        checkpointReason: input.taskResult.checkpointReason,
-        checkpointed: input.taskResult.status === "partial" && Boolean(input.taskResult.checkpointReason),
-        retryable: input.taskResult.retryable,
-        attempt: input.taskResult.attempt,
-        resumeCursor: input.taskResult.resumeCursor,
-        lastEventId: input.taskResult.lastEventId,
-        version: taskVersion(task),
-        runtimeVersion: taskRuntimeVersion(task) + 1
-      },
-      evidenceRefs: mergeStrings(task.evidenceRefs ?? [], input.sourceEventIds)
-    };
-    const delta: GraphDelta = {
+    this.requireTaskNode(input.taskEnvelope.taskId);
+    return {
       sourceEventIds: input.sourceEventIds,
-      nodes: [nextTask],
-      edges: [
-        ...this.existingReferenceEdges(
-          input.taskEnvelope.taskId,
-          [input.taskEnvelope.scopeRef],
-          "within_scope",
-          input.sourceEventIds
-        ),
-        ...this.existingReferenceEdges(
-          input.taskEnvelope.taskId,
-          input.taskEnvelope.targetRefs,
-          "requires_evidence",
-          input.sourceEventIds
-        ),
-        ...dependsOnTaskRefs.map((dependencyRef) => ({
-          from: input.taskEnvelope.taskId,
-          to: dependencyRef,
-          type: "depends_on",
-          evidenceRefs: input.sourceEventIds
-        }))
-      ]
+      nodes: [],
+      edges: []
     };
-    this.applyDelta(delta, [
-      { from: input.taskEnvelope.taskId, type: "within_scope" },
-      { from: input.taskEnvelope.taskId, type: "requires_evidence" },
-      { from: input.taskEnvelope.taskId, type: "depends_on" }
-    ]);
-    return delta;
   }
 
   private existingReferenceEdges(
@@ -1525,27 +1518,37 @@ export class SQLiteGraphStore {
 
   getTaskEnvelope(taskId: string): TaskEnvelope | undefined {
     const task = this.getTaskNode(taskId);
-    return task ? taskNodeToEnvelope(task, this.taskDependencyRefs(taskId)) : undefined;
+    return task ? taskNodeToEnvelope(
+      task,
+      this.taskDependencyRefs(taskId),
+      this.scopeOwnedConstraints(task)
+    ) : undefined;
   }
 
-  listReadyTasks(limit = 4): TaskEnvelope[] {
+  listOpenTasks(limit = 4): TaskEnvelope[] {
     const taskNodes = this.readNodes({ graphKind: "task", limit: 1000 })
       .filter((node) => node.type === "Task");
     const taskById = new Map(taskNodes.map((node) => [node.id, node]));
     const taskIds = taskNodes.map((node) => node.id);
     const taskDependencyEdges = this.readEdgesForNodes(taskIds, 5000)
       .filter((edge) => edge.type === "depends_on" && taskById.has(edge.from) && taskById.has(edge.to));
-    const readyTasks = taskNodes
+    const openTasks = taskNodes
       .filter((task) => isRunnableTaskStatus(task.properties.status))
-      .filter((task) => taskDependencyEdges
-        .filter((edge) => edge.from === task.id)
-        .every((edge) => isDependencyOutcomeAvailable(taskById.get(edge.to)?.properties)))
       .sort(compareTaskPriorityThenId)
       .slice(0, limit);
-    return readyTasks.map((task) => taskNodeToEnvelope(
+    return openTasks.map((task) => taskNodeToEnvelope(
       task,
-      taskDependencyEdges.filter((edge) => edge.from === task.id).map((edge) => edge.to)
+      taskDependencyEdges.filter((edge) => edge.from === task.id).map((edge) => edge.to),
+      this.scopeOwnedConstraints(task)
     ));
+  }
+
+  private scopeOwnedConstraints(task: GraphNode): string[] {
+    const scopeRef = stringProperty(task.properties.scopeRef) ?? "scope:root";
+    const scope = this.readNodes({ focusNodeIds: [scopeRef], limit: 1 })
+      .find((node) => node.graphKind === "task" && node.type === "Scope");
+    const summary = stringProperty(scope?.properties.summary)?.trim();
+    return summary ? [`授权范围原文：${summary}`] : stringArray(task.properties.constraints);
   }
 
   private requireTaskNode(taskId: string): GraphNode {
@@ -1697,7 +1700,66 @@ export class SQLiteGraphStore {
          OR json_type(properties_json, '$.unresolvedTaskRef') IS NOT NULL;
       DROP TABLE IF EXISTS projection_unresolved_nodes;
     `);
+    this.database.prepare(`
+      UPDATE nodes
+      SET properties_json = json_set(properties_json, '$.status', 'open')
+      WHERE graph_kind = 'task'
+        AND type = 'Task'
+        AND json_extract(properties_json, '$.status') = 'partial'
+    `).run();
+    this.migrateOperationalEdgeIdentities();
     this.bootstrapOperationIdentityIndex();
+  }
+
+  private migrateOperationalEdgeIdentities(): void {
+    const rows = this.database.prepare(`
+      SELECT id, from_id, to_id, type, properties_json, evidence_refs_json, updated_at
+      FROM edges WHERE type IN ('tunnels_to', 'proxy_route') ORDER BY updated_at, id
+    `).all() as StoredEdgeRow[];
+    if (rows.length === 0) {
+      return;
+    }
+    const byCanonicalId = new Map<string, GraphEdge & { id: string; updatedAt: string }>();
+    let requiresMigration = false;
+    for (const row of rows) {
+      const edge = rowToEdge(row);
+      const canonicalId = edgeIdFor(edge);
+      requiresMigration ||= row.id !== canonicalId || byCanonicalId.has(canonicalId);
+      const previous = byCanonicalId.get(canonicalId);
+      byCanonicalId.set(canonicalId, {
+        ...edge,
+        id: canonicalId,
+        properties: { ...(previous?.properties ?? {}), ...(edge.properties ?? {}) },
+        evidenceRefs: dedupeStringValues([...(previous?.evidenceRefs ?? []), ...(edge.evidenceRefs ?? [])]),
+        updatedAt: row.updated_at
+      });
+    }
+    if (!requiresMigration) {
+      return;
+    }
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      this.database.prepare("DELETE FROM edges WHERE type IN ('tunnels_to', 'proxy_route')").run();
+      const insert = this.database.prepare(`
+        INSERT INTO edges (id, from_id, to_id, type, properties_json, evidence_refs_json, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+      `);
+      for (const edge of byCanonicalId.values()) {
+        insert.run(
+          edge.id,
+          edge.from,
+          edge.to,
+          edge.type,
+          JSON.stringify(edge.properties ?? {}),
+          JSON.stringify(edge.evidenceRefs ?? []),
+          edge.updatedAt
+        );
+      }
+      this.database.exec("COMMIT");
+    } catch (error) {
+      this.database.exec("ROLLBACK");
+      throw error;
+    }
   }
 
   private queryPlannerView(limit: number): GraphSnapshot {
@@ -1776,25 +1838,16 @@ function normalizeProjectionToken(value: string): string {
   return value.toLowerCase().replace(/\s+/g, " ").trim();
 }
 
-function compareProjectionSeedNodes(left: GraphNode, right: GraphNode): number {
-  return projectionNodePriority(right) - projectionNodePriority(left) || left.id.localeCompare(right.id);
+function projectionAnchorTokens(value: string): string[] {
+  const normalized = normalizeProjectionToken(value);
+  return dedupeStringValues([
+    normalized,
+    ...normalized.split(/[\s,;:|()[\]{}<>，；：（）【】]+/)
+  ]);
 }
 
-function projectionNodePriority(node: GraphNode): number {
-  const typeScore: Record<string, number> = {
-    Exploit: 100,
-    Vulnerability: 90,
-    Hypothesis: 80,
-    AgentSession: 77,
-    ShellSession: 76,
-    Session: 75,
-    Credential: 70,
-    Evidence: 65,
-    WebEndpoint: 60,
-    Service: 50,
-    Host: 40
-  };
-  return typeScore[node.type] ?? 20;
+function compareProjectionSeedNodes(left: GraphNode, right: GraphNode): number {
+  return left.id.localeCompare(right.id);
 }
 
 function compareProjectionEdges(left: GraphEdge, right: GraphEdge): number {
@@ -1838,6 +1891,7 @@ type StoredEdgeRow = {
   type: string;
   properties_json: string;
   evidence_refs_json: string;
+  updated_at: string;
 };
 
 function validateGraphDelta(delta: GraphDelta): void {
@@ -1919,6 +1973,15 @@ function rowToEdge(row: StoredEdgeRow): GraphEdge {
 }
 
 function edgeIdFor(edge: GraphEdge): string {
+  if (edge.type === "tunnels_to" || edge.type === "proxy_route") {
+    const identityKey = edge.type === "tunnels_to" ? "tunnelId" : "routeId";
+    const discriminator = typeof edge.properties?.[identityKey] === "string"
+      ? edge.properties[identityKey].trim()
+      : "";
+    return [edge.type, edge.from, edge.to, discriminator]
+      .map((part) => encodeURIComponent(part))
+      .join(":");
+  }
   return edge.id ?? `${edge.from}::${edge.type}::${edge.to}`;
 }
 
@@ -1936,25 +1999,17 @@ function summarize(nodes: GraphNode[], edges: GraphEdge[]): Record<string, unkno
 }
 
 function buildTaskLedger(taskNodes: GraphNode[]): PlannerTaskLedgerItem[] {
-  return taskNodes
-    .filter((node) => node.type === "Task")
-    .map((node) => ({
-      taskId: node.id,
-      status: stringProperty(node.properties.status) ?? "open",
-      goal: compactPlannerText(node.label, 320) ?? node.label,
-      resultSummary: compactPlannerText(stringProperty(node.properties.resultSummary), 520),
-      checkpointReason: compactPlannerText(stringProperty(node.properties.checkpointReason), 240),
-      resumeCursor: stringProperty(node.properties.resumeCursor),
-      blockerReason: compactPlannerText(stringProperty(node.properties.blockerReason), 240),
-      suggestedNextGoal: compactPlannerText(stringProperty(node.properties.suggestedNextGoal), 240),
-      retryable: booleanProperty(node.properties.retryable),
-      attempt: numberProperty(node.properties.attempt),
-      priority: numberProperty(node.properties.priority),
-      dependsOnTaskRefs: stringArray(node.properties.dependsOnTaskRefs),
-      evidenceRefs: stringArray(node.properties.evidenceRefs),
-      artifactRefs: stringArray(node.properties.artifactRefs),
-      capabilityRefs: stringArray(node.properties.capabilityRefs)
-    }))
+  const tasks = taskNodes.filter((node) => node.type === "Task");
+  return tasks
+    .map((node) => {
+      return {
+        taskId: node.id,
+        status: stringProperty(node.properties.status) ?? "open",
+        goal: compactPlannerText(node.label, 320) ?? node.label,
+        priority: numberProperty(node.properties.priority),
+        dependsOnTaskRefs: stringArray(node.properties.dependsOnTaskRefs)
+      };
+    })
     .sort(compareLedgerItems);
 }
 
@@ -1995,12 +2050,12 @@ function topDigestItems(
   nodes: GraphNode[],
   edges: GraphEdge[],
   context: PlannerDigestContext,
-  limit: number
+  limit?: number
 ): PlannerDigestItem[] {
-  return nodes
+  const items = nodes
     .map((node, index) => scoreDigestItem(node, edges, context, index))
-    .sort((left, right) => right.score - left.score || left.id.localeCompare(right.id))
-    .slice(0, limit);
+    .sort((left, right) => right.score - left.score || left.id.localeCompare(right.id));
+  return limit === undefined ? items : items.slice(0, limit);
 }
 
 function scoreDigestItem(
@@ -2069,6 +2124,9 @@ function scoreStateImportance(node: GraphNode, status: string | undefined): numb
   }
   if (["partial", "blocked", "running", "open"].includes(status ?? "")) {
     return 6;
+  }
+  if (["refuted", "superseded"].includes(status ?? "")) {
+    return 8;
   }
   if (["failed", "invalid", "closed"].includes(status ?? "")) {
     return 3;
@@ -2157,7 +2215,14 @@ const DIGEST_PROPERTY_ALLOWLIST = [
   "targetRefs",
   "successCriteria",
   "checkpointReason",
-  "resultSummary"
+  "resultSummary",
+  "method",
+  "accessMethod",
+  "preconditions",
+  "observedResult",
+  "oracle",
+  "negativeConclusion",
+  "reopenConditions"
 ];
 
 function pickDigestProperties(node: GraphNode): Record<string, unknown> {
@@ -2259,13 +2324,18 @@ function appendDeltaLog(deltaLogPath: string, delta: GraphDelta): void {
   appendFileSync(deltaLogPath, toJsonLine({ timestamp: new Date().toISOString(), delta }));
 }
 
-function taskNodeToEnvelope(node: GraphNode, dependencyTaskIds: string[] = []): TaskEnvelope {
+function taskNodeToEnvelope(
+  node: GraphNode,
+  dependencyTaskIds: string[] = [],
+  constraints: string[] = stringArray(node.properties.constraints)
+): TaskEnvelope {
   return {
     taskId: node.id,
     goal: node.label,
     targetRefs: stringArray(node.properties.targetRefs, ["goal:root"]),
+    basisRefs: stringArray(node.properties.basisRefs),
     scopeRef: typeof node.properties.scopeRef === "string" ? node.properties.scopeRef : "scope:root",
-    constraints: stringArray(node.properties.constraints),
+    constraints,
     successCriteria: stringArray(node.properties.successCriteria),
     availableSessionRefs: stringArray(node.properties.availableSessionRefs),
     dependsOnTaskRefs: dependencyTaskIds,
@@ -2304,11 +2374,8 @@ function withoutTaskDependencyProperty(properties: Record<string, unknown>): Rec
 function applyPlannerTaskPatch(task: GraphNode, patch: PlannerTaskPatch, reason: string | undefined): GraphNode {
   return {
     ...task,
-    label: patch.goal ?? task.label,
     properties: {
       ...withoutTaskDependencyProperty(task.properties),
-      ...(patch.constraints ? { constraints: patch.constraints } : {}),
-      ...(patch.successCriteria ? { successCriteria: patch.successCriteria } : {}),
       ...(patch.budget ? { budget: patch.budget } : {}),
       ...(typeof patch.priority === "number" ? { priority: patch.priority } : {}),
       ...(typeof patch.parallelGroup === "string" ? { parallelGroup: patch.parallelGroup } : {}),
@@ -2355,16 +2422,6 @@ function stringArray(value: unknown, fallback: string[] = []): string[] {
 
 function isRunnableTaskStatus(status: unknown): boolean {
   return status === undefined || status === "open";
-}
-
-function isDependencyOutcomeAvailable(properties: Record<string, unknown> | undefined): boolean {
-  const status = properties?.status;
-  if (status === "partial" || status === "completed") {
-    return true;
-  }
-  return status === "archived"
-    && typeof properties?.resultSummary === "string"
-    && properties.resultSummary.trim().length > 0;
 }
 
 function compareTaskPriorityThenId(left: GraphNode, right: GraphNode): number {

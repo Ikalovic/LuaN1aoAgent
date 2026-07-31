@@ -8,6 +8,15 @@ COPY gateway-tun/*.go ./
 RUN arch="${TARGETARCH:-amd64}" \
     && CGO_ENABLED=0 GOOS=linux GOARCH="${arch}" go build -trimpath -ldflags="-s -w" -o /out/gateway-tun .
 
+FROM golang:1.24-bookworm AS socks-connector-builder
+
+ARG TARGETARCH
+WORKDIR /src
+COPY socks-connector/go.mod ./
+COPY socks-connector/*.go ./
+RUN arch="${TARGETARCH:-amd64}" \
+    && CGO_ENABLED=0 GOOS=linux GOARCH="${arch}" go build -trimpath -ldflags="-s -w" -o /out/socks-connector .
+
 FROM python:3.12-slim-bookworm
 
 ENV PYTHONDONTWRITEBYTECODE=1
@@ -18,7 +27,7 @@ ARG TARGETARCH
 
 RUN apt-get update \
     && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-      ca-certificates conntrack curl iproute2 iptables jq netcat-openbsd openssh-client procps sshpass util-linux \
+      ca-certificates conntrack curl iproute2 iptables jq netcat-openbsd nftables openssh-client procps sshpass util-linux \
     && pip install --no-cache-dir "mitmproxy==${MITMPROXY_VERSION}" "httpx==0.28.1" \
     && arch="${TARGETARCH:-amd64}" \
     && case "${arch}" in amd64|arm64) ;; *) echo "unsupported architecture: ${arch}" >&2; exit 65 ;; esac \
@@ -37,6 +46,7 @@ RUN apt-get update \
 
 COPY --chmod=0755 entrypoint.sh gatewayctl /usr/local/bin/
 COPY --from=gateway-builder --chmod=0755 /out/gateway-tun /usr/local/bin/gateway-tun
-COPY flow_capture.py index_server.py replay_client.py conntrack_telemetry.py segmented_capture.py /opt/luanniao/
+COPY --from=socks-connector-builder --chmod=0755 /out/socks-connector /usr/local/bin/socks-connector
+COPY flow_capture.py index_server.py replay_client.py conntrack_telemetry.py segmented_capture.py scope_dns.py /opt/luanniao/
 
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]

@@ -1,6 +1,7 @@
 export type CliOptions = {
   goal: string;
-  scope: string;
+  scope?: string;
+  proxy?: string;
   runtimeDir?: string;
   resumeDir?: string;
   maxPlannerCycles?: number;
@@ -19,6 +20,7 @@ export function parseCliOptions(rawArgs: string[]): CliOptions {
   const valueOptions = new Set([
     "goal",
     "scope",
+    "proxy",
     "runtime-dir",
     "resume",
     "max-cycles",
@@ -59,7 +61,8 @@ export function parseCliOptions(rawArgs: string[]): CliOptions {
 
   return {
     goal: values.get("goal") ?? "在授权范围内完成 Web 安全评估",
-    scope: values.get("scope") ?? "仅限用户明确授权的目标范围",
+    scope: values.get("scope"),
+    proxy: values.get("proxy"),
     runtimeDir: values.get("runtime-dir"),
     resumeDir: values.get("resume"),
     maxPlannerCycles: optionalNumber(values, "max-cycles"),
@@ -83,7 +86,8 @@ export function cliHelp(): string {
     "",
     "Options:",
     "  --goal <text>                Agent goal",
-    "  --scope <text>               Authorized scope summary",
+    "  --scope <entries>            Authorized IPv4/CIDRs/domains (for example baidu.com,*.baidu.com)",
+    "  --proxy <socks5-url>         Transparently route all scoped Agent TCP through SOCKS5",
     "  --runtime-dir <path>         New runtime directory; must be empty",
     "  --resume <session>           Resume one runtime; do not pass --goal",
     "  --max-cycles <number>        Maximum Planner cycles",

@@ -76,6 +76,61 @@ test("Controller exposes the active ConnectivityRuntime without creating another
   assert.throws(() => controller.routeStatus(), /Connectivity runtime is unavailable/);
 });
 
+test("Controller installs one operator-owned transparent proxy over the normalized root Scope", async () => {
+  const calls: unknown[] = [];
+  const runtime = {
+    configureAuthorizedScope: async (scope: string) => { calls.push({ scope }); },
+    replaceTransparentProxy: async (input: Record<string, unknown>) => {
+      calls.push(input);
+      return {
+        ...route,
+        connector: "socks5" as const,
+        connectionRef: undefined,
+        targetCidrs: input.targetCidrs as string[]
+      };
+    }
+  };
+  const controller = Object.create(SecurityAgentController.prototype) as SecurityAgentController;
+  (controller as unknown as { connectivityRuntime?: typeof runtime }).connectivityRuntime = runtime;
+  (controller as unknown as { artifactStore: unknown }).artifactStore = {
+    writeCredential: async ({ data }: { data: string }) => {
+      assert.equal(data, "secret-value");
+      return { artifactRef: "artifact:credential" };
+    }
+  };
+  const events: unknown[] = [];
+  (controller as unknown as { executionLog: unknown }).executionLog = {
+    append: async (event: unknown) => { events.push(event); return {}; }
+  };
+
+  const configured = await controller.configureTransparentProxy({
+    host: "192.0.2.8",
+    port: 10800,
+    username: "admin",
+    password: "secret-value"
+  }, "10.0.0.0/24,203.0.113.5/32");
+
+  assert.equal(configured.connector, "socks5");
+  assert.deepEqual(calls[0], { scope: "10.0.0.0/24,203.0.113.5/32" });
+  assert.deepEqual(calls[1], {
+    connector: "socks5",
+    pivotHostRef: "192.0.2.8",
+    dialAddress: "192.0.2.8",
+    targetCidrs: ["10.0.0.0/24", "203.0.113.5/32"],
+    credentialRef: "artifact:credential",
+    options: { port: 10800, user: "admin" }
+  });
+  await controller.configureTransparentProxy({
+    host: "192.0.2.8",
+    port: 10800,
+    username: "admin",
+    password: "secret-value"
+  }, "10.0.0.0/24,*.baidu.com");
+  assert.deepEqual(calls[2], { scope: "10.0.0.0/24,*.baidu.com" });
+  assert.deepEqual((calls[3] as { targetCidrs: string[] }).targetCidrs, ["0.0.0.0/0"]);
+  assert.equal(JSON.stringify(events).includes("secret-value"), false);
+});
+
 test("route_open does not wait for asynchronous Host projection", async () => {
   const calls: Array<{ pivotHostRef: string; ownerTaskId: string }> = [];
   const runtime = {
@@ -83,9 +138,9 @@ test("route_open does not wait for asynchronous Host projection", async () => {
       calls.push({ pivotHostRef: input.pivotHostRef, ownerTaskId });
       return route;
     },
-    routeStatus: async () => [route],
-    stopRoute: async () => route,
-    reconnectRoute: async () => route
+    executorRouteStatus: async () => [route],
+    executorStopRoute: async () => route,
+    executorReconnectRoute: async () => route
   };
   const controller = Object.create(SecurityAgentController.prototype) as SecurityAgentController;
   (controller as unknown as { connectivityRuntime?: typeof runtime }).connectivityRuntime = runtime;
@@ -145,12 +200,12 @@ test("Controller quiesces the Executor before accepting the gateway drain acknow
   assert.deepEqual(calls, [
     "executor.quiesce",
     "gateway.epoch.end",
-    "log:network_epoch_flushed"
+    "log:network_capture_finalized"
   ]);
   assert.equal(harness.taskExecutorSandboxes.get("task:drain"), sandbox);
 });
 
-test("Controller surfaces a failed gateway drain and retains the stopped Executor for retry", async () => {
+test("Controller logs a failed gateway drain without throwing and retains the stopped Executor", async () => {
   const calls: string[] = [];
   const sandbox = {
     quiesce: async () => { calls.push("executor.quiesce"); },
@@ -181,17 +236,15 @@ test("Controller surfaces a failed gateway drain and retains the stopped Executo
     terminationFailure: undefined as string | undefined
   };
 
-  await assert.rejects(
-    harness.endExecutorNetworkEpoch(state),
-    /capture drain timed out/
-  );
+  // Best-effort contract: a failed drain must never veto terminal persistence.
+  await harness.endExecutorNetworkEpoch(state);
 
   assert.deepEqual(calls, [
     "executor.quiesce",
     "gateway.epoch.end",
-    "log:network_epoch_flush_failed"
+    "log:network_capture_degraded"
   ]);
-  assert.equal(state.terminationFailure, "capture drain timed out");
+  assert.equal(state.terminationFailure, undefined);
   assert.equal(harness.taskExecutorSandboxes.get("task:retry-drain"), sandbox);
   assert.equal(calls.includes("executor.dispose"), false);
 });
@@ -256,6 +309,59 @@ test("Controller close surfaces ConnectivityRuntime cleanup failure and retries 
   assert.ok(fixture.loggedEventTypes().includes("connectivity_runtime_cleanup_failed"));
 });
 
+test("endExecutorNetworkEpoch is best-effort: drain failure never throws and is logged", async () => {
+  const fixture = createControllerCloseFixture({
+    connectivityRuntime: {
+      endTaskEpoch: async () => { throw new Error("gateway epoch drain timed out (active_flows=0)"); },
+      disposeTask: async () => undefined,
+      close: async () => undefined
+    } as never
+  });
+  const state = {
+    epochId: "epoch:drain-fail",
+    taskEnvelope: { taskId: "task:drain-fail" },
+    terminationFailure: undefined as string | undefined
+  };
+  const endEpoch = (fixture.controller as unknown as {
+    endExecutorNetworkEpoch(state: unknown): Promise<void>;
+  }).endExecutorNetworkEpoch.bind(fixture.controller);
+
+  await endEpoch(state);
+
+  assert.equal(state.terminationFailure, undefined);
+  assert.ok(fixture.loggedEventTypes().includes("network_capture_degraded"));
+  assert.ok(!fixture.loggedEventTypes().includes("network_capture_finalized"));
+});
+
+test("endExecutorNetworkEpoch still drains after quiesce failure", async () => {
+  const ack = gatewayDrainAck("epoch:quiesce-fail");
+  const fixture = createControllerCloseFixture({
+    taskSandboxes: new Map([["task:quiesce-fail", {
+      quiesce: async () => { throw new Error("quiesce boom"); },
+      dispose: async () => undefined
+    }]]) as never,
+    connectivityRuntime: {
+      endTaskEpoch: async () => ack,
+      disposeTask: async () => undefined,
+      close: async () => undefined
+    } as never
+  });
+  const state = {
+    epochId: "epoch:quiesce-fail",
+    taskEnvelope: { taskId: "task:quiesce-fail" },
+    terminationFailure: undefined as string | undefined
+  };
+  const endEpoch = (fixture.controller as unknown as {
+    endExecutorNetworkEpoch(state: unknown): Promise<void>;
+  }).endExecutorNetworkEpoch.bind(fixture.controller);
+
+  await endEpoch(state);
+
+  assert.equal(state.terminationFailure, undefined);
+  assert.ok(fixture.loggedEventTypes().includes("network_capture_degraded"));
+  assert.ok(!fixture.loggedEventTypes().includes("network_capture_finalized"));
+});
+
 function createControllerCloseFixture(input: {
   taskSandboxes?: Map<string, { dispose(): Promise<void> }>;
   connectivityRuntime?: { disposeTask(taskId: string): Promise<void>; close(): Promise<void> };
@@ -277,6 +383,7 @@ function createControllerCloseFixture(input: {
     invocationAbortController: AbortController;
     activeEpochs: Map<string, unknown>;
     activeTaskRuns: Map<string, unknown>;
+    networkFinalizations: Map<string, Promise<void>>;
     projectionRequestsClosed: boolean;
     pendingSupervisorRequests: Map<string, unknown>;
     activeSupervisorSessions: Set<unknown>;
@@ -307,6 +414,7 @@ function createControllerCloseFixture(input: {
     invocationAbortController: new AbortController(),
     activeEpochs: new Map(),
     activeTaskRuns: new Map(),
+    networkFinalizations: new Map(),
     projectionRequestsClosed: false,
     pendingSupervisorRequests: new Map(),
     activeSupervisorSessions: new Set(),

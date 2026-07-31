@@ -14,6 +14,10 @@ import {
   networkCaptureDockerEnv,
   type NetworkRoute
 } from "./network-sandbox-manager.js";
+import {
+  HostEgressBroker,
+  type HostEgressBrokerEndpoint
+} from "./host-egress-broker.js";
 
 type CommandResult = { code: number | null; stdout: string; stderr: string };
 type CommandRunner = (args: string[], stdin?: string, timeoutMs?: number) => Promise<CommandResult>;
@@ -32,19 +36,36 @@ export class ReplayGatewayRuntime {
   readonly runtimeDir: string;
   readonly containerName: string;
   readonly networkName: string;
+  readonly taskNetworkName: string;
   private readonly image: string;
   private readonly runner: CommandRunner;
   private readonly captureEnvironment: string[];
   private targetImageIdPromise?: Promise<string>;
+  private readonly hostEgress: () => Promise<HostEgressBrokerEndpoint>;
+  private readonly ownedHostEgress?: HostEgressBroker;
+  private taskNetworkStarted = false;
 
-  constructor(input: { runtimeDir: string; networkName: string; image?: string; runner?: CommandRunner }) {
+  constructor(input: {
+    runtimeDir: string;
+    networkName: string;
+    image?: string;
+    runner?: CommandRunner;
+    hostEgress?: () => Promise<HostEgressBrokerEndpoint>;
+  }) {
     this.runtimeDir = resolve(input.runtimeDir);
     const digest = createHash("sha256").update(this.runtimeDir).digest("hex").slice(0, 16);
     this.containerName = `luanniao-replay-gateway-${digest}`;
+    this.taskNetworkName = `luanniao-replay-task-${digest}`;
     this.networkName = input.networkName;
     this.image = input.image ?? (process.env.LUANNIAO_NETWORK_IMAGE?.trim() || DEFAULT_NETWORK_IMAGE);
     this.runner = input.runner ?? dockerCommand;
     this.captureEnvironment = networkCaptureDockerEnv();
+    if (input.hostEgress) {
+      this.hostEgress = input.hostEgress;
+    } else {
+      this.ownedHostEgress = new HostEgressBroker();
+      this.hostEgress = () => this.ownedHostEgress!.start();
+    }
   }
 
   replay(
@@ -55,8 +76,13 @@ export class ReplayGatewayRuntime {
     return this.replayUnlocked(client, input, routeSnapshot);
   }
 
-  close(): Promise<void> {
-    return this.removeGateway();
+  async close(): Promise<void> {
+    const failures: unknown[] = [];
+    await this.removeGateway().catch((error: unknown) => failures.push(error));
+    await this.removeTaskNetwork().catch((error: unknown) => failures.push(error));
+    await this.ownedHostEgress?.close().catch((error: unknown) => failures.push(error));
+    if (failures.length === 1) throw failures[0];
+    if (failures.length > 1) throw new AggregateError(failures, "Replay Gateway cleanup failed");
   }
 
   private async replayUnlocked(
@@ -140,8 +166,21 @@ export class ReplayGatewayRuntime {
     await mkdir(join(this.runtimeDir, "traffic", "flows", "web-replay"), { recursive: true });
     await mkdir(join(this.runtimeDir, "traffic", "ca"), { recursive: true });
     const trafficRoot = join(this.runtimeDir, "traffic");
+    const storage = await this.runner([
+      "run", "--rm", "--network", "none",
+      "--read-only", "--cap-drop", "ALL", "--cap-add", "CHOWN", "--cap-add", "FOWNER",
+      "--security-opt", "no-new-privileges",
+      "--mount", `type=bind,src=${join(trafficRoot, "flows", "web-replay")},dst=/storage/flows`,
+      "--mount", `type=bind,src=${join(trafficRoot, "ca")},dst=/storage/ca`,
+      this.image, "storage-init", "/storage/flows", "/storage/ca"
+    ]);
+    if (storage.code !== 0) throw new Error(`Failed to initialize Replay Gateway storage: ${storage.stderr || storage.stdout}`);
+    const taskSubnet = await this.ensureTaskNetwork();
+    const controlSubnet = await this.networkSubnet(this.networkName);
+    const hostEgress = await this.hostEgress();
     const containerArgs = [
       "--network", this.networkName,
+      "--add-host", "host.docker.internal:host-gateway",
       "--sysctl", "net.ipv6.conf.all.disable_ipv6=1",
       "--sysctl", "net.ipv6.conf.default.disable_ipv6=1",
       "--sysctl", "net.netfilter.nf_conntrack_acct=1",
@@ -157,6 +196,12 @@ export class ReplayGatewayRuntime {
       "--env", "LUANNIAO_TASK_FLOW_ROOT=/traffic/flows/web-replay",
       "--env", `LUANNIAO_RUN_REF=${basenameRef(this.runtimeDir)}`,
       "--env", "LUANNIAO_TASK_REF=web-replay",
+      "--env", `LUANNIAO_TASK_NETWORK_CIDR=${taskSubnet}`,
+      "--env", `LUANNIAO_CONTROL_NETWORK_CIDR=${controlSubnet}`,
+      "--env", `LUANNIAO_DIRECT_BROKER=${hostEgress.host}:${hostEgress.port}`,
+      "--env", `LUANNIAO_DIRECT_BROKER_TOKEN=${hostEgress.token}`,
+      "--env", `LUANNIAO_LOCAL_DIRECT_DENY_PORTS=${hostEgress.port}`,
+      "--env", "LUANNIAO_TRUSTED_REPLAY=1",
       ...this.captureEnvironment,
       this.image, "gateway"
     ];
@@ -181,7 +226,52 @@ export class ReplayGatewayRuntime {
       ]);
       if (started.code !== 0) throw new Error(`Failed to start replay gateway: ${started.stderr}`);
     }
+    const attached = await this.runner(["network", "connect", this.taskNetworkName, this.containerName]);
+    if (attached.code !== 0 && !/already exists|already connected/i.test(attached.stderr)) {
+      throw new Error(`Failed to attach Replay Gateway task network: ${attached.stderr || attached.stdout}`);
+    }
     await this.waitForGateway();
+  }
+
+  private async ensureTaskNetwork(): Promise<string> {
+    const inspected = await this.runner([
+      "network", "inspect", "--format",
+      "{{index .Labels \"luanniao.managed\"}}|{{index .Labels \"luanniao.role\"}}|{{(index .IPAM.Config 0).Subnet}}|{{.Internal}}",
+      this.taskNetworkName
+    ]);
+    if (inspected.code === 0) {
+      const [managed, role, subnet, internal] = inspected.stdout.trim().split("|");
+      if (managed !== "true" || role !== "replay-task-network" || internal !== "true" || !subnet) {
+        throw new Error(`Refusing to use unmanaged replay task network ${this.taskNetworkName}`);
+      }
+      this.taskNetworkStarted = true;
+      return subnet;
+    }
+    const created = await this.runner([
+      "network", "create", "--internal",
+      "--label", "luanniao.managed=true",
+      "--label", "luanniao.role=replay-task-network",
+      this.taskNetworkName
+    ]);
+    if (created.code !== 0) throw new Error(`Failed to create replay task network: ${created.stderr || created.stdout}`);
+    this.taskNetworkStarted = true;
+    return this.networkSubnet(this.taskNetworkName);
+  }
+
+  private async networkSubnet(name: string): Promise<string> {
+    const result = await this.runner(["network", "inspect", "--format", "{{(index .IPAM.Config 0).Subnet}}", name]);
+    const subnet = result.stdout.trim();
+    if (result.code !== 0 || !subnet) throw new Error(`Failed to inspect Docker network ${name}: ${result.stderr || result.stdout}`);
+    return subnet;
+  }
+
+  private async removeTaskNetwork(): Promise<void> {
+    if (!this.taskNetworkStarted) return;
+    const removed = await this.runner(["network", "rm", this.taskNetworkName]);
+    if (removed.code !== 0 && !/not found|no such network/i.test(removed.stderr)) {
+      throw new Error(`Failed to remove replay task network: ${removed.stderr || removed.stdout}`);
+    }
+    this.taskNetworkStarted = false;
   }
 
   private resolveTargetImageId(): Promise<string> {

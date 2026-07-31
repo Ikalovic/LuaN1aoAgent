@@ -6,7 +6,6 @@ import os
 from pathlib import Path
 import ipaddress
 import re
-import secrets
 import socket
 import sys
 from urllib.parse import urlparse
@@ -16,7 +15,7 @@ import httpx
 
 MAX_INPUT_BYTES = 2 << 20
 MAX_BODY_BYTES = 1 << 20
-CONTEXT_HEADER = "X-Luanniao-Replay-Context"
+CONTEXT_PATH = Path(os.environ.get("LUANNIAO_REPLAY_CONTEXT", "/run/luanniao-replay-pending.json"))
 CONTEXT_KEYS = {
     "replayOf",
     "runtimeRef",
@@ -72,7 +71,7 @@ def validate_headers(value: object) -> list[tuple[str, str]]:
             raise ValueError("invalid replay header")
         name = validate_text(item["name"], "header name", 256)
         header_value = validate_header_value(item["value"])
-        if not re.fullmatch(r"[!#$%&'*+.^_`|~0-9A-Za-z-]+", name) or name.lower() == CONTEXT_HEADER.lower():
+        if not re.fullmatch(r"[!#$%&'*+.^_`|~0-9A-Za-z-]+", name):
             raise ValueError("invalid replay header name")
         headers.append((name, header_value))
     return headers
@@ -95,13 +94,10 @@ def replay(value: dict) -> dict:
         if len(body) > MAX_BODY_BYTES:
             raise ValueError("replay body exceeds 1 MiB")
 
-    token = secrets.token_hex(32)
-    context_path = Path(f"/run/luanniao-replay-{token}.json")
-    descriptor = os.open(context_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644)
+    descriptor = os.open(CONTEXT_PATH, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644)
     try:
         with os.fdopen(descriptor, "w", encoding="utf-8") as output:
             json.dump(context, output, separators=(",", ":"))
-        headers.append((CONTEXT_HEADER, token))
         with httpx.Client(verify=False, timeout=30.0, follow_redirects=False, trust_env=False) as client:
             with client.stream(method, url, headers=headers, content=body) as response:
                 for _ in response.iter_bytes():
@@ -109,7 +105,7 @@ def replay(value: dict) -> dict:
                 return {"status": response.status_code}
     finally:
         try:
-            context_path.unlink()
+            CONTEXT_PATH.unlink()
         except OSError:
             pass
 

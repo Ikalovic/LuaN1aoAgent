@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"strings"
@@ -68,6 +69,7 @@ func TestRouteDialerChoosesDirectOrSOCKSWithoutFallback(t *testing.T) {
 			go server.Close()
 			return client, nil
 		},
+		allowPrefixes: []netip.Prefix{netip.MustParsePrefix("198.51.100.0/24")},
 		socksDial: func(_ context.Context, proxy string, destination string, _ time.Duration) (net.Conn, error) {
 			socksDestinations = append(socksDestinations, proxy+"->"+destination)
 			return nil, errors.New("route unavailable")
@@ -109,6 +111,7 @@ func TestRouteDialerRejectsOnlyItsOwnInfrastructureEndpoints(t *testing.T) {
 		routes:         store,
 		connectTimeout: time.Second,
 		selfTargets:    []string{"127.0.0.1:1080"},
+		allowPrefixes:  []netip.Prefix{netip.MustParsePrefix("198.51.100.0/24")},
 		directDial: func(_ context.Context, _ string, destination string) (net.Conn, error) {
 			directDestinations = append(directDestinations, destination)
 			client, server := net.Pipe()
@@ -129,6 +132,63 @@ func TestRouteDialerRejectsOnlyItsOwnInfrastructureEndpoints(t *testing.T) {
 	connection.Close()
 	if got := strings.Join(directDestinations, ","); got != "198.51.100.20:1080" {
 		t.Fatalf("direct destinations = %q", got)
+	}
+}
+
+func TestRouteDialerRejectsProtectedNetworksAndLocalPortsBeforeDial(t *testing.T) {
+	store := writeRouteSnapshot(t, `{"routes":[]}`)
+	prefix := netip.MustParsePrefix("172.30.0.0/24")
+	dialer := &routeDialer{
+		routes: store, connectTimeout: time.Second,
+		denyPrefixes:   []netip.Prefix{prefix},
+		allowPrefixes:  []netip.Prefix{netip.MustParsePrefix("192.0.2.0/24")},
+		localDirect:    map[netip.Addr]struct{}{netip.MustParseAddr("192.0.2.10"): {}},
+		localDenyPorts: map[uint16]struct{}{8788: {}},
+		directDial: func(_ context.Context, _, _ string) (net.Conn, error) {
+			t.Fatal("protected destination reached the dialer")
+			return nil, nil
+		},
+	}
+	for _, destination := range []string{"172.30.0.2:22", "192.0.2.10:8788"} {
+		if _, err := dialer.dial(context.Background(), destination); err == nil {
+			t.Fatalf("protected destination %s was allowed", destination)
+		}
+	}
+}
+
+func TestRouteDialerRejectsDirectDestinationOutsideAuthorizedScope(t *testing.T) {
+	dialer := &routeDialer{
+		routes:        writeRouteSnapshot(t, `{"routes":[]}`),
+		allowPrefixes: []netip.Prefix{netip.MustParsePrefix("198.51.100.0/24")},
+		directDial: func(_ context.Context, _, _ string) (net.Conn, error) {
+			t.Fatal("out-of-scope destination reached the direct dialer")
+			return nil, nil
+		},
+	}
+	if _, err := dialer.dial(context.Background(), "203.0.113.10:443"); err == nil {
+		t.Fatal("out-of-scope destination was allowed")
+	}
+}
+
+func TestRouteDialerAcceptsKernelGuardedDomainDestination(t *testing.T) {
+	var destination string
+	dialer := &routeDialer{
+		routes:              writeRouteSnapshot(t, `{"routes":[]}`),
+		allowDomainResolved: true,
+		directDial: func(_ context.Context, _, value string) (net.Conn, error) {
+			destination = value
+			client, server := net.Pipe()
+			go server.Close()
+			return client, nil
+		},
+	}
+	connection, err := dialer.dial(context.Background(), "203.0.113.10:443")
+	if err != nil {
+		t.Fatal(err)
+	}
+	connection.Close()
+	if destination != "203.0.113.10:443" {
+		t.Fatalf("destination = %q", destination)
 	}
 }
 

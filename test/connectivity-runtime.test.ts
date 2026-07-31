@@ -10,7 +10,7 @@ import {
 import { MitmFlowClient } from "../src/connectivity/mitm-flow-client.js";
 import type { NetworkSandboxManager, TaskGateway } from "../src/connectivity/network-sandbox-manager.js";
 import type { ReplayGatewayRuntime } from "../src/connectivity/replay-gateway-runtime.js";
-import type { RouteManager } from "../src/connectivity/route-manager.js";
+import type { RouteManager, RouteStatus } from "../src/connectivity/route-manager.js";
 import type { ArtifactStore } from "../src/stores/artifact-store.js";
 import type { ExecutionLog } from "../src/stores/execution-log.js";
 
@@ -31,7 +31,16 @@ test("ConnectivityRuntime owns startup, task serialization, and non-destructive 
         markFirstStarted();
         await firstPending;
       }
-      return { taskId, epochId, containerName: "gateway", flowFile: `${epochId}.mitm`, netFile: `${epochId}.net.jsonl` };
+      return {
+        taskId,
+        epochId,
+        containerName: "gateway",
+        networkName: "task-network",
+        gatewayAddress: "172.30.0.2",
+        dnsAddress: "172.30.0.2",
+        flowFile: `${epochId}.mitm`,
+        netFile: `${epochId}.net.jsonl`
+      };
     },
     endEpoch: async () => undefined,
     disposeGateway: async () => undefined,
@@ -95,6 +104,49 @@ test("historical runtime shutdown suspends connectors without clearing reconnect
   await runtime.close({ preserveDesiredRoutes: true });
 
   assert.deepEqual(calls, ["routes.suspendAll", "network.close"]);
+});
+
+test("Executor route controls cannot observe or mutate the operator transparent proxy", async (context) => {
+  const runtimeDir = await temporaryRuntimeDir(context);
+  const proxy = {
+    routeRef: "route:proxy", connectorRef: "connector:proxy", connector: "socks5",
+    pivotHostRef: "proxy.example", targetCidrs: ["0.0.0.0/0"], desiredState: "running",
+    status: "live", lastHeartbeat: "2026-07-30T00:00:00.000Z"
+  } satisfies RouteStatus;
+  const ssh = {
+    routeRef: "route:ssh", connectorRef: "connector:ssh", connector: "ssh",
+    pivotHostRef: "host:pivot", targetCidrs: ["10.0.0.0/24"], desiredState: "running",
+    status: "live", lastHeartbeat: "2026-07-30T00:00:00.000Z"
+  } satisfies RouteStatus;
+  const calls: string[] = [];
+  const runtime = new ConnectivityRuntime({
+    runtimeDir,
+    runRef: "run:test",
+    artifactStore: {} as ArtifactStore,
+    executionLog: {} as ExecutionLog,
+    network: {
+      start: async () => undefined,
+      close: async () => undefined
+    } as unknown as NetworkSandboxManager,
+    routes: {
+      restore: async () => undefined,
+      recoverDesired: async () => [],
+      status: async (routeRef?: string) => routeRef === proxy.routeRef ? [proxy] : routeRef === ssh.routeRef ? [ssh] : [proxy, ssh],
+      isTransparentProxyRoute: (routeRef: string) => routeRef === proxy.routeRef,
+      stop: async (routeRef: string) => { calls.push(`stop:${routeRef}`); return ssh; },
+      reconnect: async (routeRef: string) => { calls.push(`reconnect:${routeRef}`); return ssh; },
+      stopAll: async () => undefined
+    } as unknown as RouteManager
+  });
+
+  assert.deepEqual((await runtime.executorRouteStatus()).map((route) => route.routeRef), [ssh.routeRef]);
+  assert.deepEqual(await runtime.executorRouteStatus(proxy.routeRef), []);
+  await assert.rejects(() => runtime.executorStopRoute(proxy.routeRef), /operator-managed/);
+  await assert.rejects(() => runtime.executorReconnectRoute(proxy.routeRef), /operator-managed/);
+  assert.equal((await runtime.executorStopRoute(ssh.routeRef)).routeRef, ssh.routeRef);
+  assert.equal((await runtime.executorReconnectRoute(ssh.routeRef)).routeRef, ssh.routeRef);
+  assert.deepEqual(calls, ["stop:route:ssh", "reconnect:route:ssh"]);
+  await runtime.close();
 });
 
 test("runtime shutdown drains active flow-index readers before network cleanup", async (context) => {

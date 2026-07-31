@@ -53,6 +53,12 @@ test("route_open binds the route to the current task and returns stable refs", a
   assert.match(result.content[0]?.type === "text" ? result.content[0].text : "", /connection:test/);
 });
 
+test("route_open reserves the process-wide SOCKS5 proxy for operator configuration", () => {
+  const open = createExecutorConnectivityTools({} as ExecutorConnectivityRuntime, "task:proxy")[0]!;
+  assert.doesNotMatch(JSON.stringify(open.parameters), /socks5/);
+  assert.match(open.description, /configured by the operator/);
+});
+
 test("route lifecycle tools call the Runtime instead of mutating the store", async () => {
   const calls: string[] = [];
   const runtime: ExecutorConnectivityRuntime = {

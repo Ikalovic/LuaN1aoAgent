@@ -10,7 +10,7 @@ test("allows empty apply_commands as a no-op graph update", () => {
     basedOnRefs: ["task:ready"]
   });
 
-  assert.equal(decision.decision, "apply_commands");
+  assert.equal(decision.decision, undefined);
   assert.deepEqual(decision.commands, []);
   assert.equal(decision.reason, "No graph mutation is needed; schedule existing ready tasks.");
 });
@@ -23,6 +23,55 @@ test("defaults omitted apply_commands commands to an empty no-op list", () => {
   });
 
   assert.deepEqual(decision.commands, []);
+});
+
+test("requires the same Planner reason in structured and text fallback normalization", () => {
+  assert.throws(() => normalizePlannerDecision({ commands: [] }), /Planner reason is required/);
+  assert.throws(() => normalizePlannerDecision({ commands: [], reason: "   " }), /Planner reason is required/);
+});
+
+test("drops legacy Planner-authored constraints from task definitions", () => {
+  const decision = normalizePlannerDecision({
+    decision: "apply_commands",
+    commands: [{
+      kind: "create_tasks",
+      tasks: [{
+        id: "task:legacy",
+        goal: "Resolve the remaining uncertainty",
+        targetRefs: ["goal:root"],
+        scopeRef: "scope:root",
+        constraints: ["Treat an unverified payload as confirmed"],
+        successCriteria: ["Record an observable result"],
+        priority: 1
+      }]
+    }, {
+      kind: "patch_task",
+      taskId: "task:existing",
+      patch: {
+        constraints: ["Force a specific attack step"],
+        priority: 2
+      }
+    }],
+    reason: "Legacy decision",
+    basedOnRefs: ["goal:root"]
+  });
+
+  const create = decision.commands?.[0];
+  const patch = decision.commands?.[1];
+  assert.equal(create?.kind, "create_tasks");
+  assert.equal("constraints" in (create?.kind === "create_tasks" ? create.tasks[0]! : {}), false);
+  assert.equal(patch?.kind, "patch_task");
+  assert.deepEqual(patch?.kind === "patch_task" ? patch.patch : undefined, { priority: 2 });
+  assert.throws(() => normalizePlannerDecision({
+    decision: "apply_commands",
+    commands: [{
+      kind: "patch_task",
+      taskId: "task:existing",
+      patch: { constraints: ["Only legacy constraints"] }
+    }],
+    reason: "Legacy constraint-only patch",
+    basedOnRefs: []
+  }), /patch contains no supported fields/);
 });
 
 test("accepts archived as the logical deletion status for old tasks", () => {
@@ -45,6 +94,20 @@ test("accepts archived as the logical deletion status for old tasks", () => {
   );
 });
 
+test("rejects Executor outcome states as Planner-owned Task lifecycle states", () => {
+  assert.throws(() => normalizePlannerDecision({
+    decision: "apply_commands",
+    commands: [{
+      kind: "set_task_status",
+      taskId: "task:checkpointed",
+      status: "partial",
+      reason: "Mirror the Executor outcome"
+    }],
+    reason: "Mirror the Executor outcome",
+    basedOnRefs: ["task:checkpointed"]
+  }), /Invalid task status: partial/);
+});
+
 test("resolves unambiguous abbreviated Artifact Refs to their full form", async () => {
   const fullRef = "artifact:337dc6f4-5b92-4d6b-8a98-97cd1500cfa7";
   const decision = normalizePlannerDecision({
@@ -59,19 +122,46 @@ test("resolves unambiguous abbreviated Artifact Refs to their full form", async 
         constraints: [],
         successCriteria: ["Reuse the prior evidence"],
         priority: 1
-      }]
+      }],
+      basedOnRefs: ["goal:root", "artifact:337dc6f4"]
     }],
     reason: "Evidence artifact:337dc6f4 confirms reuse",
-    basedOnRefs: ["goal:root", "artifact:337dc6f4"]
+    basedOnRefs: ["legacy:top-level-is-ignored"]
   });
 
   const resolved = await validatePlannerArtifactRefs(decision, async () => [{ artifactRef: fullRef }]);
 
-  assert.deepEqual(resolved.basedOnRefs, ["goal:root", fullRef]);
+  assert.equal(resolved.basedOnRefs, undefined);
   assert.equal(resolved.reason, `Evidence ${fullRef} confirms reuse`);
   const command = resolved.commands?.[0];
+  assert.deepEqual(command?.basedOnRefs, ["goal:root", fullRef]);
   const goal = command?.kind === "create_tasks" ? command.tasks[0]?.goal : undefined;
   assert.equal(goal, `Reuse ${fullRef} before probing`);
+});
+
+test("strips historical Planner control fields while preserving command-local provenance", () => {
+  const decision = normalizePlannerDecision({
+    decision: "apply_commands",
+    commands: [{
+      kind: "set_task_status",
+      taskId: "task:done",
+      status: "completed",
+      reason: "historical duplicate reason",
+      basedOnRefs: ["event:verified"]
+    }],
+    reason: "Accept the persisted result",
+    basedOnRefs: ["legacy:top-level"]
+  });
+
+  assert.deepEqual(decision, {
+    commands: [{
+      kind: "set_task_status",
+      taskId: "task:done",
+      status: "completed",
+      basedOnRefs: ["event:verified"]
+    }],
+    reason: "Accept the persisted result"
+  });
 });
 
 test("does not mangle already-full Artifact Refs sharing the abbreviated prefix", async () => {

@@ -3,9 +3,11 @@ import test from "node:test";
 import { parseCliOptions, shouldUseTui } from "../src/cli-options.js";
 
 test("uses TUI only for an interactive terminal without machine output flags", () => {
-  const options = parseCliOptions(["--goal", "inspect", "--max-cycles", "3"]);
+  const options = parseCliOptions(["--goal", "inspect", "--max-cycles", "3", "--proxy", "socks5://user:pass@proxy.test:1080"]);
   assert.equal(options.goal, "inspect");
   assert.equal(options.maxPlannerCycles, 3);
+  assert.equal(options.scope, undefined);
+  assert.equal(options.proxy, "socks5://user:pass@proxy.test:1080");
   assert.equal(shouldUseTui(options, { stdinIsTTY: true, stdoutIsTTY: true }), true);
   assert.equal(shouldUseTui(options, { stdinIsTTY: false, stdoutIsTTY: true }), false);
   assert.equal(shouldUseTui({ ...options, jsonl: true }, { stdinIsTTY: true, stdoutIsTTY: true }), false);

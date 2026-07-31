@@ -5,8 +5,6 @@ from io import BytesIO
 import json
 import os
 from pathlib import Path
-import re
-import stat
 
 from mitmproxy import http, io, tcp
 from mitmproxy.exceptions import FlowReadException
@@ -21,19 +19,6 @@ ROUTES_PATH = Path(os.environ.get("LUANNIAO_ROUTES_FILE", "/run/luanniao/routes.
 CAPTURE_STATUS_PATH = Path(os.environ.get(
     "LUANNIAO_CAPTURE_STATUS", "/run/luanniao/capture/status.json"
 ))
-REPLAY_CONTEXT_HEADER = "x-luanniao-replay-context"
-REPLAY_CONTEXT_PREFIX = "/run/luanniao-replay-"
-REPLAY_CONTEXT_KEYS = {
-    "replayOf": 1024,
-    "runtimeRef": 512,
-    "taskRef": 512,
-    "runRef": 512,
-    "routeRef": 512,
-    "connectionRef": 512,
-    "attribution": 512,
-}
-
-
 class CaptureWriter:
     def __init__(self) -> None:
         self.base_metadata = {
@@ -66,40 +51,6 @@ class CaptureWriter:
         flow.metadata["epochRef"] = epoch["epochRef"]
         flow.metadata["flowFile"] = epoch["flowFile"]
         self._tag_route(flow)
-
-    def _consume_replay_context(self, flow: http.HTTPFlow) -> None:
-        token = flow.request.headers.get(REPLAY_CONTEXT_HEADER, "")
-        if not token:
-            return
-        del flow.request.headers[REPLAY_CONTEXT_HEADER]
-        if not re.fullmatch(r"[a-f0-9]{64}", token):
-            return
-        path = Path(f"{REPLAY_CONTEXT_PREFIX}{token}.json")
-        try:
-            details = path.stat(follow_symlinks=False)
-            if not stat.S_ISREG(details.st_mode) or details.st_uid != 1000 or details.st_size > 64 << 10:
-                return
-            value = json.loads(path.read_text(encoding="utf-8"))
-        except (FileNotFoundError, OSError, json.JSONDecodeError):
-            return
-        finally:
-            try:
-                path.unlink()
-            except OSError:
-                pass
-        if not isinstance(value, dict) or set(value) - set(REPLAY_CONTEXT_KEYS):
-            return
-        metadata = {}
-        for key, maximum in REPLAY_CONTEXT_KEYS.items():
-            item = value.get(key)
-            if item is None or item == "":
-                continue
-            if not isinstance(item, str) or len(item) > maximum or any(ord(character) < 32 for character in item):
-                return
-            metadata[key] = item
-        if not metadata.get("replayOf"):
-            return
-        flow.metadata.update(metadata)
 
     def _tag_route(self, flow) -> None:
         if flow.metadata.get("routeRef"):
@@ -238,7 +189,6 @@ class CaptureWriter:
             return None
 
     def request(self, flow: http.HTTPFlow) -> None:
-        self._consume_replay_context(flow)
         self._activate(flow, "http")
 
     def response(self, flow: http.HTTPFlow) -> None:

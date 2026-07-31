@@ -1,14 +1,21 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { Check } from "typebox/value";
-import { createExecutorResearchTools, observerToolsForMode } from "../src/agents.js";
+import { SettingsManager } from "@earendil-works/pi-coding-agent";
+import {
+  agentCompactionSettings,
+  createExecutorResearchTools,
+  observerToolsForMode
+} from "../src/agents.js";
 import {
   GRAPH_TOOL_MAX_OUTPUT_BYTES,
   createGraphDeltaSubmitTool,
   createGraphQueryTool,
   createGraphSearchTool,
   createGraphTraceTool,
-  createPlannerSubmitTool
+  createPlannerSubmitTool,
+  createTaskResultSubmitTool,
+  createControlSubmitTool
 } from "../src/tools/pi-tools.js";
 import {
   aliasProjectionGraphContext,
@@ -54,6 +61,53 @@ test("executor exposes bounded public research tools", () => {
   );
 });
 
+test("terminating runtime tools reject undeclared fields", () => {
+  const taskResult = {
+    taskId: "task:test",
+    status: "partial",
+    summary: "phase result",
+    evidenceRefs: ["event:test"],
+    artifactRefs: []
+  };
+  const control = {
+    decision: "continue",
+    reason: "progress remains discriminating",
+    evidenceRefs: []
+  };
+  assert.equal(Check(createTaskResultSubmitTool().parameters, taskResult), true);
+  assert.equal(Check(createTaskResultSubmitTool().parameters, {
+    ...taskResult,
+    status: "blocked",
+    blockerReason: "Target dependency is externally unavailable"
+  }), true);
+  assert.equal(Check(createTaskResultSubmitTool().parameters, { ...taskResult, operation: "submit" }), false);
+  assert.equal(Check(createControlSubmitTool().parameters, control), true);
+  assert.equal(Check(createControlSubmitTool().parameters, { ...control, decision: "handoff" }), true);
+  assert.equal(Check(createControlSubmitTool().parameters, { ...control, decision: "checkpoint" }), false);
+  assert.equal(Check(createControlSubmitTool().parameters, { ...control, decision: "need_planner" }), false);
+  assert.equal(Check(createControlSubmitTool().parameters, { ...control, confidence: "high" }), false);
+  assert.equal(Check(createControlSubmitTool().parameters, { ...control, taskId: "task:test" }), false);
+});
+
+test("agent sessions share the data-grounded auto-compaction trigger", () => {
+  // The session factories pass SettingsManager.inMemory({compaction}) to the
+  // SDK; pin both our constants and the SDK contract we rely on.
+  const settingsManager = SettingsManager.inMemory({ compaction: agentCompactionSettings(128_000) });
+  assert.deepEqual(settingsManager.getCompactionSettings(), {
+    enabled: true,
+    reserveTokens: 32_768,
+    keepRecentTokens: 20_000
+  });
+  assert.deepEqual(agentCompactionSettings(64_000), {
+    reserveTokens: 32_768,
+    keepRecentTokens: 20_000
+  });
+  assert.deepEqual(agentCompactionSettings(undefined), {
+    reserveTokens: 16_384,
+    keepRecentTokens: 20_000
+  });
+});
+
 test("projector terminal tool bounds the wire schema and enforces draft semantics with named errors", async () => {
   const tool = createGraphDeltaSubmitTool();
   const schema = tool.parameters as unknown as {
@@ -87,14 +141,28 @@ test("projector terminal tool bounds the wire schema and enforces draft semantic
   // cross-record identity and connectivity remain deterministic runtime checks.
   assert.equal(schema.properties.nodes.maxItems, 24);
   assert.equal(schema.properties.edges.maxItems, 40);
-  assert.equal(schema.properties.nodes.items?.anyOf?.[0]?.properties?.id?.pattern, "^(existing|new):[1-9][0-9]*$");
+  assert.equal(schema.properties.nodes.items?.anyOf?.[0]?.properties?.id?.pattern, "^existing:[1-9][0-9]*$");
   assert.equal(schema.properties.nodes.items?.anyOf?.[0]?.additionalProperties, false);
   assert.equal(schema.properties.nodes.items?.anyOf?.[1]?.additionalProperties, false);
+  assert.equal(schema.properties.nodes.items?.anyOf?.[2]?.additionalProperties, false);
   assert.equal(schema.properties.edges.items?.properties?.from?.pattern, "^(existing|new):[1-9][0-9]*$");
   assert.equal(schema.properties.edges.items?.properties?.to?.pattern, "^(existing|new):[1-9][0-9]*$");
   assert.equal(schema.properties.sourceEventIds, undefined);
   assert.equal(schema.additionalProperties, false);
 
+  assert.equal(Check(tool.parameters, {
+    nodes: [{ id: "existing:1", properties: { status: "refuted" }, evidenceRefs: ["o1"] }],
+    edges: []
+  }), true);
+  assert.equal(Check(tool.parameters, {
+    nodes: [{
+      id: "existing:1",
+      graphKind: "reasoning",
+      type: "Evidence",
+      label: "Repeated identity"
+    }],
+    edges: []
+  }), false);
   assert.equal(Check(tool.parameters, {
     nodes: [{
       id: "new:1",
@@ -712,6 +780,9 @@ test("planner terminal tool exposes discriminated command schemas", () => {
   const tool = createPlannerSubmitTool();
   const schema = tool.parameters as unknown as {
     properties: {
+      decision?: unknown;
+      basedOnRefs?: unknown;
+      reason?: unknown;
       commands: {
         maxItems?: number;
         items?: {
@@ -722,13 +793,23 @@ test("planner terminal tool exposes discriminated command schemas", () => {
               kind?: { const?: string };
               type?: unknown;
               expectedVersion?: unknown;
+              reason?: unknown;
+              basedOnRefs?: unknown;
               tasks?: {
                 items?: {
                   required?: string[];
                   properties?: {
                     id?: { pattern?: string };
                     scopeRef?: { pattern?: string };
+                    constraints?: unknown;
                   };
+                };
+              };
+              patch?: {
+                properties?: {
+                  goal?: unknown;
+                  constraints?: unknown;
+                  successCriteria?: unknown;
                 };
               };
             };
@@ -741,6 +822,9 @@ test("planner terminal tool exposes discriminated command schemas", () => {
   const branches = schema.properties.commands.items?.anyOf ?? [];
 
   assert.equal(schema.properties.commands.maxItems, 32);
+  assert.equal(schema.properties.decision, undefined);
+  assert.equal(schema.properties.basedOnRefs, undefined);
+  assert.ok(schema.properties.reason);
   assert.deepEqual(
     branches.map((branch) => branch.properties?.kind?.const),
     ["create_tasks", "patch_task", "replace_dependencies", "set_task_status", "set_node_status"]
@@ -749,8 +833,41 @@ test("planner terminal tool exposes discriminated command schemas", () => {
   assert.ok(branches.every((branch) => branch.required?.includes("kind")));
   assert.ok(branches.every((branch) => branch.properties?.type === undefined));
   assert.ok(branches.every((branch) => branch.properties?.expectedVersion === undefined));
+  assert.ok(branches.every((branch) => branch.properties?.reason === undefined));
+  assert.ok(branches.every((branch) => branch.properties?.basedOnRefs !== undefined));
   assert.equal(branches[0]?.properties?.tasks?.items?.properties?.id?.pattern, "^task:.+");
   assert.equal(branches[0]?.properties?.tasks?.items?.properties?.scopeRef?.pattern, "^scope:.+");
+  assert.equal(branches[0]?.properties?.tasks?.items?.properties?.constraints, undefined);
+  assert.equal(branches[1]?.properties?.patch?.properties?.goal, undefined);
+  assert.equal(branches[1]?.properties?.patch?.properties?.constraints, undefined);
+  assert.equal(branches[1]?.properties?.patch?.properties?.successCriteria, undefined);
+  assert.equal(Check(tool.parameters, {
+    decision: "apply_commands",
+    commands: [{
+      kind: "create_tasks",
+      tasks: [{
+        id: "task:owned-boundary",
+        goal: "Resolve an uncertainty",
+        targetRefs: ["goal:root"],
+        scopeRef: "scope:root",
+        constraints: ["Planner-authored hard boundary"],
+        successCriteria: ["Observable result recorded"],
+        priority: 1
+      }]
+    }],
+    reason: "Create one task",
+    basedOnRefs: ["goal:root"]
+  }), false);
+  assert.equal(Check(tool.parameters, {
+    decision: "apply_commands",
+    commands: [{
+      kind: "patch_task",
+      taskId: "task:owned-boundary",
+      patch: { goal: "Rewrite the task around a newly inferred fact" }
+    }],
+    reason: "Rewrite definition",
+    basedOnRefs: ["goal:root"]
+  }), false);
   assert.equal(schema.additionalProperties, false);
 });
 
@@ -767,10 +884,8 @@ test("planner terminal tool validates graph semantics before terminating", async
     () => tool.execute(
       "call:planner",
       {
-        decision: "apply_commands",
         commands: [],
-        reason: "invalid dependency update",
-        basedOnRefs: []
+        reason: "invalid dependency update"
       },
       new AbortController().signal,
       () => undefined,

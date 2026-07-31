@@ -7,6 +7,83 @@ import {
   networkCaptureDockerEnv
 } from "../src/connectivity/network-sandbox-manager.js";
 
+type FakeDockerNetwork = {
+  internal: boolean;
+  labels: Map<string, string>;
+  subnet: string;
+};
+
+function fakeDockerNetworkCommand(
+  args: string[],
+  networks: Map<string, FakeDockerNetwork>,
+  connections?: Set<string>
+): { code: number; stdout: string; stderr: string } | undefined {
+  if (args[0] !== "network") return undefined;
+  const name = args.at(-1) ?? "";
+  if (args[1] === "create") {
+    const labels = new Map<string, string>();
+    for (let index = 0; index < args.length - 1; index += 1) {
+      if (args[index] !== "--label") continue;
+      const value = args[index + 1] ?? "";
+      const separator = value.indexOf("=");
+      labels.set(value.slice(0, separator), value.slice(separator + 1));
+    }
+    networks.set(name, {
+      internal: args.includes("--internal"),
+      labels,
+      subnet: args.includes("--internal") ? "172.31.0.0/24" : "172.30.0.0/24"
+    });
+    return { code: 0, stdout: `${name}\n`, stderr: "" };
+  }
+  if (args[1] === "inspect") {
+    const network = networks.get(name);
+    if (!network) return { code: 1, stdout: "", stderr: "missing" };
+    const format = args[3] ?? "";
+    if (format === "{{(index .IPAM.Config 0).Subnet}}") {
+      return { code: 0, stdout: `${network.subnet}\n`, stderr: "" };
+    }
+    const labels = network.labels;
+    return {
+      code: 0,
+      stdout: format.includes("luanniao.task_ref")
+        ? [labels.get("luanniao.managed") ?? "", labels.get("luanniao.role") ?? "",
+            labels.get("luanniao.run_ref") ?? "", labels.get("luanniao.task_ref") ?? "",
+            network.subnet, String(network.internal)].join("|")
+        : [labels.get("luanniao.managed") ?? "", labels.get("luanniao.role") ?? "",
+            labels.get("luanniao.run_ref") ?? ""].join("|"),
+      stderr: ""
+    };
+  }
+  if (args[1] === "rm") {
+    networks.delete(name);
+    return { code: 0, stdout: `${name}\n`, stderr: "" };
+  }
+  if (args[1] === "connect") {
+    connections?.add(`${args[3]}:${args[2]}`);
+    return { code: 0, stdout: "", stderr: "" };
+  }
+  return undefined;
+}
+
+function ownedNetworkInspect(
+  args: string[],
+  runRef: string,
+  taskId: string
+): { code: number; stdout: string; stderr: string } | undefined {
+  if (args[0] !== "network" || args[1] !== "inspect") return undefined;
+  const taskNetwork = args.at(-1)?.startsWith("luanniao-task-") === true;
+  if (args[3] === "{{(index .IPAM.Config 0).Subnet}}") {
+    return { code: 0, stdout: taskNetwork ? "172.31.0.0/24" : "172.30.0.0/24", stderr: "" };
+  }
+  return {
+    code: 0,
+    stdout: taskNetwork
+      ? `true|task-network|${runRef}|${taskId}|172.31.0.0/24|true`
+      : `true|run-network|${runRef}`,
+    stderr: ""
+  };
+}
+
 test("network capture environment is explicitly allowlisted and validated", () => {
   assert.deepEqual(networkCaptureDockerEnv({
     LUANNIAO_CAPTURE_BYTES: "2097152",
@@ -39,10 +116,17 @@ test("network sandbox gives only the gateway network capability and reconciles l
   const running = new Set<string>();
   const roles = new Map<string, string>();
   const labelsByName = new Map<string, Map<string, string>>();
+  const networks = new Map<string, FakeDockerNetwork>();
+  const connections = new Set<string>();
   const runner = async (args: string[]) => {
     commands.push(args);
+    const networkResult = fakeDockerNetworkCommand(args, networks, connections);
+    if (networkResult) return networkResult;
     if (args[0] === "image" && args[1] === "inspect") return { code: 0, stdout: `${imageId}\n`, stderr: "" };
-    if (args[0] === "network" && args[1] === "inspect") return { code: 1, stdout: "", stderr: "missing" };
+    if (args[0] === "inspect" && args[2]?.includes("with index .NetworkSettings.Networks")) {
+      const networkName = /Networks "([^"]+)"/.exec(args[2] ?? "")?.[1] ?? "";
+      return { code: 0, stdout: connections.has(`${args.at(-1)}:${networkName}`) ? "172.31.0.2" : "", stderr: "" };
+    }
     if (args[0] === "inspect" && args.includes("{{range .NetworkSettings.Networks}}{{.IPAddress}} {{end}}")) {
       return { code: 0, stdout: "172.30.0.9 ", stderr: "" };
     }
@@ -99,6 +183,7 @@ test("network sandbox gives only the gateway network capability and reconciles l
     fetcher: async () => new Response(JSON.stringify({ status: "ok" }), { status: 200 })
   });
   try {
+    await manager.configureAuthorizedScope("198.51.100.0/24");
     await manager.start();
     const gateway = await manager.createGateway({ taskId: "task:test", epochId: "epoch:test" });
     const nextEpoch = await manager.createGateway({ taskId: "task:test", epochId: "epoch:next" });
@@ -121,6 +206,7 @@ test("network sandbox gives only the gateway network capability and reconciles l
     ]);
 
     const runs = commands.filter((args) => args[0] === "run");
+    const persistentRuns = runs.filter((args) => !args.includes("--rm"));
     const connector = runs.find((args) => args.includes(manager.connectorName));
     const index = runs.find((args) => args.includes(manager.indexName));
     const gatewayRun = runs.find((args) => args.includes(gateway.containerName));
@@ -143,19 +229,31 @@ test("network sandbox gives only the gateway network capability and reconciles l
     assert.equal(index.includes("/dev/net/tun:/dev/net/tun"), false);
     assert.ok(gatewayRun.includes("net.ipv6.conf.all.disable_ipv6=1"));
     assert.ok(runs.every((args) => args.includes("no-new-privileges")));
-    assert.ok(runs.every((args) => args.includes("--pids-limit")));
-    assert.ok(runs.every((args) => args.includes("--memory")));
-    assert.ok(runs.every((args) => args.includes("--cpus")));
+    assert.ok(persistentRuns.every((args) => args.includes("--pids-limit")));
+    assert.ok(persistentRuns.every((args) => args.includes("--memory")));
+    assert.ok(persistentRuns.every((args) => args.includes("--cpus")));
     assert.equal(runs.some((args) => args.some((value) => value.includes("docker.sock"))), false);
-    assert.ok(runs.every((args) => args.includes("luanniao.managed=true")));
-    assert.ok(runs.every((args) => args.some((value) => value.startsWith("luanniao.role="))));
-    assert.ok(runs.every((args) => args.some((value) => value.startsWith("luanniao.config="))));
-    assert.ok(runs.every((args) => args.includes("luanniao.run_ref=run:test")));
+    assert.ok(persistentRuns.every((args) => args.includes("luanniao.managed=true")));
+    assert.ok(persistentRuns.every((args) => args.some((value) => value.startsWith("luanniao.role="))));
+    assert.ok(persistentRuns.every((args) => args.some((value) => value.startsWith("luanniao.config="))));
+    assert.ok(persistentRuns.every((args) => args.includes("luanniao.run_ref=run:test")));
     assert.ok(gatewayRun.includes("luanniao.task_ref=task:test"));
+    assert.ok(gatewayRun.includes("LUANNIAO_AUTHORIZED_CIDRS=198.51.100.0/24"));
+    assert.ok(gatewayRun.includes("LUANNIAO_AUTHORIZED_DOMAINS="));
+    await assert.rejects(
+      () => manager.configureAuthorizedScope("203.0.113.0/24"),
+      /cannot change/
+    );
     assert.equal(connector.some((value) => value.startsWith("luanniao.task_ref=")), false);
     assert.equal(index.some((value) => value.startsWith("luanniao.task_ref=")), false);
     const networkCreate = commands.find((args) => args[0] === "network" && args[1] === "create");
     assert.ok(networkCreate?.includes("luanniao.run_ref=run:test"));
+    const taskNetworkCreate = commands.find((args) => args[0] === "network" && args[1] === "create" && args.includes("--internal"));
+    assert.ok(taskNetworkCreate?.includes("luanniao.role=task-network"));
+    assert.ok(taskNetworkCreate?.includes("luanniao.task_ref=task:test"));
+    assert.ok(gatewayRun.includes("--network") && gatewayRun.includes(manager.networkName));
+    assert.ok(commands.some((args) => args[0] === "network" && args[1] === "connect"
+      && args[2] === gateway.networkName && args[3] === gateway.containerName));
     assert.ok(index.some((value) => value === `type=bind,src=${runtimeDir}/traffic,dst=/traffic,readonly`));
     assert.ok(gatewayRun.some((value) => value === `type=bind,src=${runtimeDir}/traffic/flows/task-test,dst=/traffic/flows/task-test`));
     assert.ok(gatewayRun.some((value) => value === `type=bind,src=${runtimeDir}/traffic/ca,dst=/traffic/ca`));
@@ -178,6 +276,45 @@ test("network sandbox gives only the gateway network capability and reconciles l
     assert.ok(epochCommands.some((args) => args.includes("epoch.begin") && args.some((value) => value.includes("epoch:next"))));
   } finally {
     await manager.close();
+    await rm(runtimeDir, { recursive: true, force: true });
+  }
+});
+
+test("network sandbox separates domain rules from CIDRs in the Gateway boundary", async () => {
+  const runtimeDir = await mkdtemp("/tmp/luanniao-domain-scope-");
+  const commands: string[][] = [];
+  const networks = new Map<string, FakeDockerNetwork>();
+  const runner = async (args: string[]) => {
+    commands.push(args);
+    const networkResult = fakeDockerNetworkCommand(args, networks);
+    if (networkResult) return networkResult;
+    if (args[0] === "image") return { code: 0, stdout: "sha256:network-current\n", stderr: "" };
+    if (args[0] === "inspect" && args[2]?.includes("with index .NetworkSettings.Networks")) {
+      return { code: 0, stdout: "172.31.0.2", stderr: "" };
+    }
+    if (args[0] === "inspect" && args.includes("{{range .NetworkSettings.Networks}}{{.IPAddress}} {{end}}")) {
+      return { code: 0, stdout: "172.30.0.9 ", stderr: "" };
+    }
+    if (args[0] === "inspect") return { code: 1, stdout: "", stderr: "missing" };
+    if (args[0] === "port") return { code: 0, stdout: "127.0.0.1:49152\n", stderr: "" };
+    if (args[0] === "exec") return { code: 0, stdout: "{\"ok\":true}\n", stderr: "" };
+    return { code: 0, stdout: "", stderr: "" };
+  };
+  const manager = new NetworkSandboxManager({
+    runtimeDir,
+    runRef: "run:domain",
+    runner,
+    fetcher: async () => new Response(JSON.stringify({ status: "ok" }), { status: 200 })
+  });
+  try {
+    await manager.configureAuthorizedScope("*.Baidu.com,baidu.com");
+    await manager.start();
+    await manager.createGateway({ taskId: "task:domain", epochId: "epoch:domain" });
+    const gatewayRun = commands.find((args) => args[0] === "run" && args.includes("luanniao.role=gateway"));
+    assert.ok(gatewayRun?.includes("LUANNIAO_AUTHORIZED_CIDRS="));
+    assert.ok(gatewayRun?.includes("LUANNIAO_AUTHORIZED_DOMAINS=*.baidu.com,baidu.com"));
+  } finally {
+    await manager.close().catch(() => undefined);
     await rm(runtimeDir, { recursive: true, force: true });
   }
 });
@@ -482,6 +619,7 @@ test("connector startup cleanup failure remains owned for close retry", async ()
   });
   (manager as unknown as { started: boolean }).started = true;
   try {
+    await manager.configureAuthorizedScope("198.51.100.0/24");
     await assert.rejects(
       () => manager.start(),
       (error: unknown) => error instanceof AggregateError
@@ -504,6 +642,17 @@ test("gateway startup cleanup failure remains owned for close retry", async () =
     runtimeDir,
     runRef: "run:gateway-start-cleanup",
     runner: async (args) => {
+      if (args[0] === "network" && args[1] === "inspect") {
+        if (args[3] === "{{(index .IPAM.Config 0).Subnet}}") {
+          return { code: 0, stdout: args.at(-1)?.startsWith("luanniao-task-") ? "172.31.0.0/24" : "172.30.0.0/24", stderr: "" };
+        }
+        return args.at(-1)?.startsWith("luanniao-task-")
+          ? { code: 0, stdout: "true|task-network|run:gateway-start-cleanup|task:partial|172.31.0.0/24|true", stderr: "" }
+          : { code: 0, stdout: "true|run-network|run:gateway-start-cleanup", stderr: "" };
+      }
+      if (args[0] === "inspect" && args[2]?.includes("with index .NetworkSettings.Networks")) {
+        return { code: 0, stdout: args[2]?.includes("luanniao-task-") ? "172.31.0.2" : "172.30.0.8", stderr: "" };
+      }
       if (args[0] === "inspect" && args.includes("{{range .NetworkSettings.Networks}}{{.IPAddress}} {{end}}")) {
         return { code: 0, stdout: "172.30.0.8 ", stderr: "" };
       }
@@ -525,6 +674,7 @@ test("gateway startup cleanup failure remains owned for close retry", async () =
   });
   (manager as unknown as { started: boolean }).started = true;
   try {
+    await manager.configureAuthorizedScope("198.51.100.0/24");
     await assert.rejects(
       () => manager.createGateway({ taskId: "task:partial", epochId: "epoch:partial" }),
       (error: unknown) => error instanceof AggregateError
@@ -640,13 +790,23 @@ test("network control mutations serialize gateway creation and route replacement
   const runtimeDir = await mkdtemp("/tmp/luanniao-network-queue-");
   const running = new Set<string>();
   const roles = new Map<string, string>();
+  const networks = new Map<string, FakeDockerNetwork>();
+  const connections = new Set<string>();
   const routePayloads: string[] = [];
   let releaseInitialRoutes!: () => void;
   let markInitialRoutes!: () => void;
   const initialRoutesStarted = new Promise<void>((resolve) => { markInitialRoutes = resolve; });
   const initialRoutesBlocked = new Promise<void>((resolve) => { releaseInitialRoutes = resolve; });
   const runner = async (args: string[]) => {
-    if (args[0] === "network" && args[1] === "inspect") return { code: 1, stdout: "", stderr: "missing" };
+    const networkResult = fakeDockerNetworkCommand(args, networks, connections);
+    if (networkResult) return networkResult;
+    if (args[0] === "image" && args[1] === "inspect") {
+      return { code: 0, stdout: "sha256:network-current\n", stderr: "" };
+    }
+    if (args[0] === "inspect" && args[2]?.includes("with index .NetworkSettings.Networks")) {
+      const networkName = /Networks "([^"]+)"/.exec(args[2] ?? "")?.[1] ?? "";
+      return { code: 0, stdout: connections.has(`${args.at(-1)}:${networkName}`) ? "172.31.0.2" : "", stderr: "" };
+    }
     if (args[0] === "inspect" && args.includes("{{range .NetworkSettings.Networks}}{{.IPAddress}} {{end}}")) {
       return { code: 0, stdout: "172.30.0.9 ", stderr: "" };
     }
@@ -696,6 +856,7 @@ test("network control mutations serialize gateway creation and route replacement
     fetcher: async () => new Response(JSON.stringify({ status: "ok" }), { status: 200 })
   });
   try {
+    await manager.configureAuthorizedScope("198.51.100.0/24");
     await manager.start();
     const gateway = manager.createGateway({ taskId: "task:queue", epochId: "epoch:one" });
     await initialRoutesStarted;
@@ -784,8 +945,9 @@ test("network sandbox adopts an inactive epoch without a drain ack and retries i
     runner: async (args) => {
       commands.push(args);
       if (args[0] === "image" && args[1] === "inspect") return { code: 0, stdout: `${imageId}\n`, stderr: "" };
+      if (args[0] === "run" && args.includes("storage-init")) return { code: 0, stdout: "", stderr: "" };
       if (args[0] === "network" && args[1] === "inspect") {
-        return { code: 0, stdout: "true|run-network|<no value>", stderr: "" };
+        return ownedNetworkInspect(args, runRef, taskId)!;
       }
       if (args[0] === "network" && args[1] === "rm") {
         return { code: 0, stdout: args.at(-1) ?? "", stderr: "" };
@@ -825,6 +987,7 @@ test("network sandbox adopts an inactive epoch without a drain ack and retries i
     gatewaySpec(taskRef: string): Promise<{ containerName: string; configDigest: string }>;
     gateways: Map<string, { epochId: string }>;
   };
+  await manager.configureAuthorizedScope("198.51.100.0/24");
   const spec = await internal.gatewaySpec(taskId);
   gatewayName = spec.containerName;
   gatewayDigest = spec.configDigest;
@@ -836,7 +999,7 @@ test("network sandbox adopts an inactive epoch without a drain ack and retries i
     const gateway = await manager.createGateway({ taskId, epochId: "epoch:new" });
     assert.equal(gateway.containerName, gatewayName);
     assert.equal(gateway.epochId, "epoch:new");
-    assert.equal(commands.some((args) => args[0] === "run" || args[0] === "start"), false);
+    assert.equal(commands.some((args) => args[0] === "start" || (args[0] === "run" && !args.includes("--rm"))), false);
 
     await manager.close();
     closed = true;
@@ -872,7 +1035,7 @@ test("cross-process recovery retires an owned gateway from a stale image without
         return { code: 0, stdout: `${currentImageId}\n`, stderr: "" };
       }
       if (args[0] === "network" && args[1] === "inspect") {
-        return { code: 0, stdout: `true|run-network|${runRef}`, stderr: "" };
+        return ownedNetworkInspect(args, runRef, taskId)!;
       }
       if (args[0] === "network" && args[1] === "rm") {
         return { code: 0, stdout: args.at(-1) ?? "", stderr: "" };
@@ -901,6 +1064,7 @@ test("cross-process recovery retires an owned gateway from a stale image without
     gatewaySpec(taskRef: string): Promise<{ containerName: string; configDigest: string }>;
     gateways: Map<string, { epochId: string }>;
   };
+  await manager.configureAuthorizedScope("198.51.100.0/24");
   const spec = await internal.gatewaySpec(taskId);
   gatewayName = spec.containerName;
   gatewayDigest = spec.configDigest;
@@ -935,7 +1099,7 @@ test("cross-process recovery never removes an unlabeled gateway with a mismatche
     runner: async (args) => {
       commands.push(args);
       if (args[0] === "network" && args[1] === "inspect") {
-        return { code: 0, stdout: `true|run-network|${runRef}`, stderr: "" };
+        return ownedNetworkInspect(args, runRef, taskId)!;
       }
       if (args[0] === "inspect" && args.at(-1) === gatewayName) {
         return {
@@ -950,6 +1114,7 @@ test("cross-process recovery never removes an unlabeled gateway with a mismatche
   gatewayName = manager.gatewayContainerName(taskId);
 
   try {
+    await manager.configureAuthorizedScope("198.51.100.0/24");
     await assert.rejects(() => manager.start({ connector: false }), /outside this runtime/);
     assert.equal(commands.some((args) => args[0] === "image" && args[1] === "inspect"), false);
     assert.equal(commands.some((args) => args[0] === "stop" || args[0] === "rm"), false);
@@ -972,7 +1137,7 @@ test("network sandbox refuses a labeled persisted gateway owned by another run",
     runner: async (args) => {
       commands.push(args);
       if (args[0] === "network" && args[1] === "inspect") {
-        return { code: 0, stdout: "true|run-network|run:current", stderr: "" };
+        return ownedNetworkInspect(args, "run:current", taskId)!;
       }
       if (args[0] === "inspect" && args.at(-1) === gatewayName) {
         return {
@@ -987,6 +1152,7 @@ test("network sandbox refuses a labeled persisted gateway owned by another run",
   const internal = manager as unknown as {
     gatewaySpec(taskRef: string): Promise<{ containerName: string; configDigest: string }>;
   };
+  await manager.configureAuthorizedScope("198.51.100.0/24");
   const spec = await internal.gatewaySpec(taskId);
   gatewayName = spec.containerName;
   gatewayDigest = spec.configDigest;
@@ -1034,6 +1200,9 @@ test("gateway reconciliation never removes an unmanaged deterministic collision"
     runRef: "run:unmanaged-gateway",
     runner: async (args) => {
       commands.push(args);
+      if (args[0] === "network" && args[1] === "inspect") {
+        return ownedNetworkInspect(args, "run:unmanaged-gateway", "task:collision")!;
+      }
       if (args[0] === "inspect") return { code: 0, stdout: "true|false|other|collision", stderr: "" };
       return { code: 0, stdout: "", stderr: "" };
     }
@@ -1041,6 +1210,7 @@ test("gateway reconciliation never removes an unmanaged deterministic collision"
   (manager as unknown as { started: boolean }).started = true;
 
   try {
+    await manager.configureAuthorizedScope("198.51.100.0/24");
     await assert.rejects(
       () => manager.createGateway({ taskId: "task:collision", epochId: "epoch:one" }),
       /Refusing to replace unmanaged container/

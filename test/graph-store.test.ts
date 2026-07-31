@@ -146,6 +146,200 @@ test("projection closure preserves operation and reasoning paths around touched 
   graphStore.close();
 });
 
+test("projection closure selects task-relevant negative knowledge from semantic anchors", () => {
+  const runtimeDir = mkdtempSync(join(tmpdir(), "luanniao-graph-"));
+  const graphStore = new SQLiteGraphStore(join(runtimeDir, "state.sqlite"), join(runtimeDir, "deltas.jsonl"));
+  graphStore.upsertDelta({
+    sourceEventIds: ["event:negative"],
+    nodes: [
+      { id: "task:test", graphKind: "task", type: "Task", label: "Test session file inclusion", properties: {} },
+      { id: "scope:root", graphKind: "task", type: "Scope", label: "Scope", properties: {} },
+      {
+        id: "hypothesis:session-file",
+        graphKind: "reasoning",
+        type: "Hypothesis",
+        label: "Session file inclusion",
+        properties: {
+          status: "refuted",
+          target: "/include",
+          method: "session file candidates",
+          preconditions: ["unauthenticated"],
+          negativeConclusion: "tested candidates did not resolve",
+          reopenConditions: "valid session id observed"
+        },
+        evidenceRefs: ["event:negative"]
+      },
+      {
+        id: "evidence:session-file-negative",
+        graphKind: "reasoning",
+        type: "Evidence",
+        label: "Controlled session file probes matched baseline",
+        properties: { target: "/include", observedResult: "same response oracle" },
+        evidenceRefs: ["event:negative"]
+      },
+      {
+        id: "hypothesis:unrelated",
+        graphKind: "reasoning",
+        type: "Hypothesis",
+        label: "Unrelated SQL injection",
+        properties: { status: "open" }
+      }
+    ],
+    edges: [{
+      from: "evidence:session-file-negative",
+      to: "hypothesis:session-file",
+      type: "contradicts",
+      evidenceRefs: ["event:negative"]
+    }]
+  });
+
+  const closure = graphStore.projectionClosure({
+    taskId: "task:test",
+    scopeRef: "scope:root",
+    anchors: ["Test session file inclusion at /include"],
+    nodeLimit: 8,
+    edgeLimit: 12
+  });
+
+  assert.ok(closure.nodes.some((node) => node.id === "hypothesis:session-file"));
+  assert.ok(closure.nodes.some((node) => node.id === "evidence:session-file-negative"));
+  assert.ok(closure.edges.some((edge) => edge.type === "contradicts"));
+  assert.equal(closure.nodes.some((node) => node.id === "hypothesis:unrelated"), false);
+  graphStore.close();
+});
+
+test("projection closure reserves topology-linked negative knowledge before text anchors", () => {
+  const runtimeDir = mkdtempSync(join(tmpdir(), "luanniao-graph-"));
+  const graphStore = new SQLiteGraphStore(join(runtimeDir, "state.sqlite"), join(runtimeDir, "deltas.jsonl"));
+  const unrelatedNodes = Array.from({ length: 8 }, (_, index) => ({
+    id: `hypothesis:unrelated-${index}`,
+    graphKind: "reasoning" as const,
+    type: "Hypothesis",
+    label: `Anchor noise ${index}`,
+    properties: { status: "refuted", negativeConclusion: "unrelated negative result" },
+    evidenceRefs: [`event:noise:${index}`]
+  }));
+  graphStore.upsertDelta({
+    sourceEventIds: ["event:negative-topology"],
+    nodes: [
+      { id: "task:test", graphKind: "task", type: "Task", label: "Validate include endpoint", properties: {} },
+      { id: "scope:root", graphKind: "task", type: "Scope", label: "Scope", properties: {} },
+      { id: "endpoint:include", graphKind: "operation", type: "WebEndpoint", label: "GET /include", properties: { path: "/include" } },
+      {
+        id: "hypothesis:session-file",
+        graphKind: "reasoning",
+        type: "Hypothesis",
+        label: "Session file inclusion",
+        properties: { status: "refuted", negativeConclusion: "controlled candidates matched the baseline" },
+        evidenceRefs: ["event:negative-topology"]
+      },
+      {
+        id: "evidence:session-file-negative",
+        graphKind: "reasoning",
+        type: "Evidence",
+        label: "Session candidates matched the negative oracle",
+        properties: { observedResult: "same response hash" },
+        evidenceRefs: ["event:negative-topology"]
+      },
+      ...unrelatedNodes
+    ],
+    edges: [
+      { from: "task:test", to: "endpoint:include", type: "requires_evidence" },
+      { from: "hypothesis:session-file", to: "endpoint:include", type: "affects", evidenceRefs: ["event:negative-topology"] },
+      {
+        from: "evidence:session-file-negative",
+        to: "hypothesis:session-file",
+        type: "contradicts",
+        evidenceRefs: ["event:negative-topology"]
+      }
+    ]
+  });
+
+  const closure = graphStore.projectionClosure({
+    taskId: "task:test",
+    scopeRef: "scope:root",
+    targetRefs: ["endpoint:include"],
+    anchors: ["Anchor noise"],
+    nodeLimit: 8,
+    edgeLimit: 12
+  });
+  const nodeIds = new Set(closure.nodes.map((node) => node.id));
+
+  assert.ok(nodeIds.has("endpoint:include"));
+  assert.ok(nodeIds.has("hypothesis:session-file"));
+  assert.ok(nodeIds.has("evidence:session-file-negative"));
+  assert.ok(closure.edges.some((edge) => edge.type === "contradicts"
+    && edge.from === "evidence:session-file-negative"
+    && edge.to === "hypothesis:session-file"));
+  graphStore.close();
+});
+
+test("projection closure recovers dependency negatives by persisted evidence provenance", () => {
+  const runtimeDir = mkdtempSync(join(tmpdir(), "luanniao-graph-"));
+  const graphStore = new SQLiteGraphStore(join(runtimeDir, "state.sqlite"), join(runtimeDir, "deltas.jsonl"));
+  graphStore.upsertDelta({
+    sourceEventIds: ["event:negative-provenance"],
+    nodes: [
+      {
+        id: "task:predecessor",
+        graphKind: "task",
+        type: "Task",
+        label: "Test prior privilege path",
+        properties: { status: "partial", evidenceRefs: ["event:negative-provenance"] }
+      },
+      {
+        id: "task:successor",
+        graphKind: "task",
+        type: "Task",
+        label: "Continue privilege analysis",
+        properties: { status: "open" }
+      },
+      { id: "goal:root", graphKind: "task", type: "Goal", label: "Root goal", properties: {} },
+      { id: "scope:root", graphKind: "task", type: "Scope", label: "Scope", properties: {} },
+      {
+        id: "hypothesis:prior-path",
+        graphKind: "reasoning",
+        type: "Hypothesis",
+        label: "Prior privilege path",
+        properties: { status: "refuted", negativeConclusion: "controlled attempt lacked the required capability" },
+        evidenceRefs: ["event:negative-provenance"]
+      },
+      {
+        id: "evidence:prior-path",
+        graphKind: "reasoning",
+        type: "Evidence",
+        label: "Prior privilege attempt result",
+        properties: { observedResult: "operation denied under the observed capability set" },
+        evidenceRefs: ["event:negative-provenance"]
+      }
+    ],
+    edges: [{
+      from: "evidence:prior-path",
+      to: "hypothesis:prior-path",
+      type: "contradicts",
+      evidenceRefs: ["event:negative-provenance"]
+    }]
+  });
+
+  const closure = graphStore.projectionClosure({
+    taskId: "task:successor",
+    scopeRef: "scope:root",
+    dependencyTaskIds: ["task:predecessor"],
+    targetRefs: ["goal:root", "scope:root"],
+    anchors: ["unrelated wording with no semantic match"],
+    nodeLimit: 8,
+    edgeLimit: 12
+  });
+  const nodeIds = new Set(closure.nodes.map((node) => node.id));
+
+  assert.ok(nodeIds.has("hypothesis:prior-path"));
+  assert.ok(nodeIds.has("evidence:prior-path"));
+  assert.ok(closure.edges.some((edge) => edge.type === "contradicts"
+    && edge.from === "evidence:prior-path"
+    && edge.to === "hypothesis:prior-path"));
+  graphStore.close();
+});
+
 test("normalizes achieved root goal status to completed", () => {
   const runtimeDir = mkdtempSync(join(tmpdir(), "luanniao-graph-"));
   const graphStore = new SQLiteGraphStore(join(runtimeDir, "state.sqlite"), join(runtimeDir, "deltas.jsonl"));
@@ -200,6 +394,68 @@ test("projection graph merge and committed watermark update atomically", () => {
   assert.equal(projectionState.committedSeq, 9);
   assert.equal(projectionState.terminalTargetSeq, 9);
   assert.equal(graphStore.query("reasoning", ["evidence:9"], 1).nodes[0]?.id, "evidence:9");
+  runtimeStore.close();
+  graphStore.close();
+});
+
+test("projection commit reports the persisted node status transition", () => {
+  const runtimeDir = mkdtempSync(join(tmpdir(), "luanniao-graph-"));
+  const databasePath = join(runtimeDir, "state.sqlite");
+  const graphStore = new SQLiteGraphStore(databasePath, join(runtimeDir, "deltas.jsonl"));
+  const runtimeStore = new RuntimeStore(databasePath);
+  graphStore.upsertDelta({
+    sourceEventIds: ["event:open"],
+    nodes: [
+      {
+        id: "hypothesis:path",
+        graphKind: "reasoning",
+        type: "Hypothesis",
+        label: "Path resolves through session storage",
+        properties: { status: "open" },
+        evidenceRefs: ["event:open"]
+      },
+      {
+        id: "evidence:baseline",
+        graphKind: "reasoning",
+        type: "Evidence",
+        label: "Initial path behavior",
+        properties: {},
+        evidenceRefs: ["event:open"]
+      }
+    ],
+    edges: [{ from: "evidence:baseline", to: "hypothesis:path", type: "supports", evidenceRefs: ["event:open"] }]
+  });
+  runtimeStore.raiseProjectionDesired("task:test", 2);
+  const claim = runtimeStore.claimProjection("task:test");
+  assert.ok(claim);
+
+  const committed = graphStore.commitProjection({
+    ...claim,
+    delta: {
+      sourceEventIds: ["event:negative"],
+      nodes: [{
+        id: "hypothesis:path",
+        graphKind: "reasoning",
+        type: "Hypothesis",
+        label: "Path resolves through session storage",
+        properties: {
+          status: "refuted",
+          negativeConclusion: "controlled candidates matched the negative baseline",
+          reopenConditions: "valid session identifier observed"
+        },
+        evidenceRefs: ["event:negative"]
+      }],
+      edges: []
+    }
+  });
+
+  assert.deepEqual(committed.nodeStatusChanges, [{
+    nodeId: "hypothesis:path",
+    label: "Path resolves through session storage",
+    fromStatus: "open",
+    toStatus: "refuted",
+    evidenceRefs: ["event:negative"]
+  }]);
   runtimeStore.close();
   graphStore.close();
 });
@@ -693,7 +949,7 @@ test("rejects confirmed vulnerability without evidence refs", () => {
   graphStore.close();
 });
 
-test("releases dependent tasks when every dependency has a partial or completed outcome", () => {
+test("lists open task definitions without inferring dependency outcomes from graph status", () => {
   const runtimeDir = mkdtempSync(join(tmpdir(), "luanniao-graph-"));
   const graphStore = new SQLiteGraphStore(join(runtimeDir, "state.sqlite"), join(runtimeDir, "deltas.jsonl"));
   graphStore.createTask({
@@ -731,20 +987,112 @@ test("releases dependent tasks when every dependency has a partial or completed 
   });
 
   assert.deepEqual(
-    graphStore.listReadyTasks(10).map((task) => task.taskId),
-    ["task:recon-a", "task:recon-b"]
+    graphStore.listOpenTasks(10).map((task) => task.taskId),
+    ["task:recon-a", "task:recon-b", "task:exploit"]
   );
 
   graphStore.markTaskStatus({ taskId: "task:recon-a", status: "partial" });
   assert.deepEqual(
-    graphStore.listReadyTasks(10).map((task) => task.taskId),
-    ["task:recon-b"]
+    graphStore.listOpenTasks(10).map((task) => task.taskId),
+    ["task:recon-b", "task:exploit"]
   );
 
   graphStore.markTaskStatus({ taskId: "task:recon-b", status: "completed" });
   assert.deepEqual(
-    graphStore.listReadyTasks(10).map((task) => task.taskId),
+    graphStore.listOpenTasks(10).map((task) => task.taskId),
     ["task:exploit"]
+  );
+  graphStore.close();
+});
+
+test("task envelopes replace legacy Planner constraints with the authoritative Scope summary", () => {
+  const runtimeDir = mkdtempSync(join(tmpdir(), "luanniao-graph-"));
+  const graphStore = new SQLiteGraphStore(join(runtimeDir, "state.sqlite"), join(runtimeDir, "deltas.jsonl"));
+  graphStore.upsertDelta({
+    sourceEventIds: [],
+    nodes: [{
+      id: "scope:root",
+      graphKind: "task",
+      type: "Scope",
+      label: "Authorized scope",
+      properties: { summary: "仅允许测试 10.0.0.8；禁止破坏性操作" }
+    }],
+    edges: []
+  });
+  graphStore.createTasks([{
+    taskId: "task:legacy-constraints",
+    goal: "Resolve one uncertainty",
+    targetRefs: [],
+    scopeRef: "scope:root",
+    constraints: ["PHP:// uppercase is confirmed", "Use this exact payload"],
+    successCriteria: ["Record an observable result"],
+    priority: 1
+  }]);
+
+  assert.deepEqual(graphStore.getTaskEnvelope("task:legacy-constraints")?.constraints, [
+    "授权范围原文：仅允许测试 10.0.0.8；禁止破坏性操作"
+  ]);
+  assert.deepEqual(graphStore.listOpenTasks(10)[0]?.constraints, [
+    "授权范围原文：仅允许测试 10.0.0.8；禁止破坏性操作"
+  ]);
+  graphStore.close();
+});
+
+test("planner task ledger preserves dependency structure without deriving runtime readiness", () => {
+  const runtimeDir = mkdtempSync(join(tmpdir(), "luanniao-graph-"));
+  const graphStore = new SQLiteGraphStore(join(runtimeDir, "state.sqlite"), join(runtimeDir, "deltas.jsonl"));
+  graphStore.createTasks([
+    {
+      taskId: "task:partial-dependency",
+      goal: "Produce a reusable partial outcome",
+      targetRefs: ["goal:root"],
+      scopeRef: "scope:root",
+      constraints: [],
+      successCriteria: ["partial evidence"],
+      priority: 1
+    },
+    {
+      taskId: "task:failed-dependency",
+      goal: "Fail without a reusable outcome",
+      targetRefs: ["goal:root"],
+      scopeRef: "scope:root",
+      constraints: [],
+      successCriteria: ["failure"],
+      priority: 2
+    },
+    {
+      taskId: "task:ready-child",
+      goal: "Consume the partial outcome",
+      targetRefs: ["goal:root"],
+      scopeRef: "scope:root",
+      constraints: [],
+      successCriteria: ["consume outcome"],
+      dependsOnTaskRefs: ["task:partial-dependency"],
+      priority: 3
+    },
+    {
+      taskId: "task:blocked-child",
+      goal: "Must remain blocked after dependency failure",
+      targetRefs: ["goal:root"],
+      scopeRef: "scope:root",
+      constraints: [],
+      successCriteria: ["must not run"],
+      dependsOnTaskRefs: ["task:failed-dependency"],
+      priority: 4
+    }
+  ]);
+  graphStore.markTaskStatus({ taskId: "task:partial-dependency", status: "partial" });
+  graphStore.markTaskStatus({ taskId: "task:failed-dependency", status: "failed" });
+
+  const ledger = new Map(graphStore.plannerDecisionView().taskLedger.map((item) => [item.taskId, item]));
+  assert.equal(ledger.get("task:ready-child")?.ready, undefined);
+  assert.equal(ledger.get("task:ready-child")?.blockedByTaskRefs, undefined);
+  assert.equal(ledger.get("task:ready-child")?.dependencyStatuses, undefined);
+  assert.deepEqual(ledger.get("task:ready-child")?.dependsOnTaskRefs, ["task:partial-dependency"]);
+  assert.deepEqual(ledger.get("task:blocked-child")?.dependsOnTaskRefs, ["task:failed-dependency"]);
+  assert.deepEqual(
+    graphStore.listOpenTasks(10).map((task) => task.taskId),
+    ["task:ready-child", "task:blocked-child"]
   );
   graphStore.close();
 });
@@ -801,7 +1149,7 @@ test("planner dependency preflight reports the exact cycle without mutating the 
   graphStore.close();
 });
 
-test("archived dependency releases children only when it preserves an outcome", () => {
+test("archived dependency summaries do not alter structural open-task listing", () => {
   const runtimeDir = mkdtempSync(join(tmpdir(), "luanniao-graph-"));
   const graphStore = new SQLiteGraphStore(join(runtimeDir, "state.sqlite"), join(runtimeDir, "deltas.jsonl"));
   graphStore.createTasks([
@@ -852,8 +1200,8 @@ test("archived dependency releases children only when it preserves an outcome", 
   graphStore.markTaskStatus({ taskId: "task:archived-without-result", status: "archived" });
 
   assert.deepEqual(
-    graphStore.listReadyTasks(10).map((task) => task.taskId),
-    ["task:child-with-result"]
+    graphStore.listOpenTasks(10).map((task) => task.taskId),
+    ["task:child-with-result", "task:child-without-result"]
   );
   graphStore.close();
 });
@@ -890,7 +1238,7 @@ test("rejects scheduler dependency edges outside Task to Task", () => {
   graphStore.close();
 });
 
-test("archived tasks remain auditable but are excluded from ready scheduling", () => {
+test("archived tasks remain auditable but are excluded from open task definitions", () => {
   const runtimeDir = mkdtempSync(join(tmpdir(), "luanniao-graph-"));
   const graphStore = new SQLiteGraphStore(join(runtimeDir, "state.sqlite"), join(runtimeDir, "deltas.jsonl"));
   graphStore.createTask({
@@ -909,7 +1257,7 @@ test("archived tasks remain auditable but are excluded from ready scheduling", (
     reason: "Superseded by a confirmed capability"
   });
 
-  assert.deepEqual(graphStore.listReadyTasks(10), []);
+  assert.deepEqual(graphStore.listOpenTasks(10), []);
   const archived = graphStore.getTaskNode("task:obsolete");
   assert.equal(archived?.properties.status, "archived");
   assert.equal(archived?.properties.plannerReason, "Superseded by a confirmed capability");
@@ -960,16 +1308,10 @@ test("replaces task dependencies through edges only", () => {
     graphStore.getTaskEnvelope("task:exploit")?.dependsOnTaskRefs,
     ["task:recon-b"]
   );
-  assert.equal(
-    graphStore.listReadyTasks(10).some((task) => task.taskId === "task:exploit"),
-    false
-  );
+  assert.equal(graphStore.listOpenTasks(10).some((task) => task.taskId === "task:exploit"), true);
 
   graphStore.markTaskStatus({ taskId: "task:recon-b", status: "completed" });
-  assert.equal(
-    graphStore.listReadyTasks(10).some((task) => task.taskId === "task:exploit"),
-    true
-  );
+  assert.equal(graphStore.listOpenTasks(10).some((task) => task.taskId === "task:exploit"), true);
   graphStore.close();
 });
 
@@ -990,6 +1332,7 @@ test("runtime task result preserves planner version for later expectedVersion pa
       taskId: "task:extract-flag",
       goal: "Extract flag",
       targetRefs: ["goal:root"],
+      basisRefs: ["evidence:auth-bypass", "artifact:reusable-poc"],
       scopeRef: "scope:root",
       constraints: ["scope"],
       successCriteria: ["flag found"],
@@ -1003,7 +1346,6 @@ test("runtime task result preserves planner version for later expectedVersion pa
     taskId: "task:extract-flag",
     expectedVersion: 1,
     patch: {
-      goal: "Extract flag through auth bypass",
       budget: { maxTurns: 24 }
     }
   });
@@ -1011,6 +1353,7 @@ test("runtime task result preserves planner version for later expectedVersion pa
 
   const taskEnvelope = graphStore.getTaskEnvelope("task:extract-flag");
   assert.ok(taskEnvelope);
+  assert.deepEqual(taskEnvelope.basisRefs, ["evidence:auth-bypass", "artifact:reusable-poc"]);
   graphStore.markTaskStatus({
     taskId: "task:extract-flag",
     status: "running",
@@ -1034,16 +1377,21 @@ test("runtime task result preserves planner version for later expectedVersion pa
   });
   const afterRuntime = graphStore.getTaskNode("task:extract-flag");
   assert.equal(afterRuntime?.properties.version, 2);
-  assert.equal(afterRuntime?.properties.runtimeVersion, 2);
-  assert.equal(afterRuntime?.properties.status, "partial");
+  assert.equal(afterRuntime?.properties.runtimeVersion, 1);
+  assert.equal(afterRuntime?.properties.status, "running");
+  assert.equal(afterRuntime?.properties.lastOutcomeRef, undefined);
+  assert.equal(afterRuntime?.properties.resultSummary, undefined);
+  assert.deepEqual(graphStore.getTaskEnvelope("task:extract-flag")?.basisRefs,
+    ["evidence:auth-bypass", "artifact:reusable-poc"]);
   assert.deepEqual(graphStore.getTaskEnvelope("task:extract-flag")?.dependsOnTaskRefs, ["task:recon"]);
 
   const nextPatch = graphStore.patchTask({
     taskId: "task:extract-flag",
     expectedVersion: 2,
-    patch: { goal: "Extract flag through CONNECT tunnel" }
+    patch: { priority: 1 }
   });
   assert.equal(nextPatch.properties.version, 3);
+  assert.equal(nextPatch.label, "Extract flag");
   graphStore.close();
 });
 
@@ -1140,7 +1488,7 @@ test("planner decision applies all graph mutations atomically", () => {
       commandIndex: 1,
       kind: "patch_task",
       taskId: "task:existing",
-      patch: { goal: "Stale patch" },
+      patch: { priority: 3 },
       expectedVersion: 1,
       sourceEventIds: ["event:planner"]
     }],
@@ -1192,7 +1540,7 @@ test("planner decision applies all graph mutations atomically", () => {
   graphStore.close();
 });
 
-test("builds compact planner decision view from task results and key graph facts", () => {
+test("builds compact planner decision view without copying TaskOutcome fields into Task definitions", () => {
   const runtimeDir = mkdtempSync(join(tmpdir(), "luanniao-graph-"));
   const graphStore = new SQLiteGraphStore(join(runtimeDir, "state.sqlite"), join(runtimeDir, "deltas.jsonl"));
   graphStore.upsertDelta({
@@ -1258,19 +1606,24 @@ test("builds compact planner decision view from task results and key graph facts
   const view = graphStore.plannerDecisionView();
   assert.equal(view.view, "planner_decision");
   assert.equal(view.taskLedger[0]?.taskId, "task:read-flag");
-  assert.equal(view.taskLedger[0]?.resultSummary, "Web shell works; /challenge/flag.txt still needs reading");
-  assert.equal(view.taskLedger[0]?.resumeCursor, "event:tool:3");
+  assert.deepEqual(view.taskLedger[0], {
+    taskId: "task:read-flag",
+    status: "partial",
+    goal: "Read the known flag path",
+    priority: 1,
+    dependsOnTaskRefs: []
+  });
   assert.ok(view.reasoningDigest.some((item) => item.id === "vuln:webshell" && item.reasons.includes("important_state:confirmed")));
   assert.ok(view.reasoningDigest.some((item) => item.id === "evidence:flag-path" && item.reasons.includes("decision_keyword")));
   assert.ok(view.operationDigest.some((item) => item.id === "session:admin" && item.reasons.includes("important_state:valid")));
   assert.ok(view.operationDigest.some((item) => item.id === "endpoint:/c.php"));
   assert.equal(view.reasoningDigest.find((item) => item.id === "evidence:flag-path")?.properties.rawBody, undefined);
   assert.equal(view.operationDigest.find((item) => item.id === "session:admin")?.properties.token, undefined);
-  assert.deepEqual(view.retrievalHints.tools, ["graph_query", "graph_trace"]);
+  assert.deepEqual(view.retrievalHints.tools, ["graph_query", "graph_trace", "evidence_list", "evidence_read", "artifact_read"]);
   graphStore.close();
 });
 
-test("planner task ledger truncates long runtime outcomes", () => {
+test("planner task ledger excludes legacy runtime outcome fields", () => {
   const runtimeDir = mkdtempSync(join(tmpdir(), "luanniao-graph-"));
   const graphStore = new SQLiteGraphStore(join(runtimeDir, "state.sqlite"), join(runtimeDir, "deltas.jsonl"));
   graphStore.upsertDelta({
@@ -1285,9 +1638,35 @@ test("planner task ledger truncates long runtime outcomes", () => {
     edges: []
   });
 
-  const summary = graphStore.plannerDecisionView().taskLedger[0]?.resultSummary ?? "";
-  assert.ok(summary.length <= 520);
-  assert.match(summary, /\[truncated\]$/);
+  assert.deepEqual(graphStore.plannerDecisionView().taskLedger[0], {
+    taskId: "task:long-result",
+    status: "partial",
+    goal: "Long result task",
+    priority: undefined,
+    dependsOnTaskRefs: []
+  });
+  graphStore.close();
+});
+
+test("planner decision view does not discard reasoning conclusions behind a top-ten ranking", () => {
+  const runtimeDir = mkdtempSync(join(tmpdir(), "luanniao-graph-"));
+  const graphStore = new SQLiteGraphStore(join(runtimeDir, "state.sqlite"), join(runtimeDir, "deltas.jsonl"));
+  graphStore.upsertDelta({
+    sourceEventIds: ["event:reasoning"],
+    nodes: Array.from({ length: 14 }, (_, index) => ({
+      id: `hypothesis:${index}`,
+      graphKind: "reasoning" as const,
+      type: "Hypothesis",
+      label: `Branch ${index}`,
+      properties: { status: index === 13 ? "refuted" : "open" },
+      evidenceRefs: [`event:${index}`]
+    })),
+    edges: []
+  });
+
+  const view = graphStore.plannerDecisionView();
+  assert.equal(view.reasoningDigest.length, 14);
+  assert.ok(view.reasoningDigest.some((item) => item.id === "hypothesis:13" && item.status === "refuted"));
   graphStore.close();
 });
 
@@ -1310,7 +1689,7 @@ test("planner decision view exposes the stored Root Goal and Scope references", 
   graphStore.close();
 });
 
-test("stores parallel operational edges by explicit identity and validates topology endpoints", () => {
+test("canonically identifies parallel operational edges after endpoint resolution", () => {
   const runtimeDir = mkdtempSync(join(tmpdir(), "luanniao-graph-"));
   const graphStore = new SQLiteGraphStore(join(runtimeDir, "state.sqlite"), join(runtimeDir, "deltas.jsonl"));
   graphStore.upsertDelta({
@@ -1318,6 +1697,7 @@ test("stores parallel operational edges by explicit identity and validates topol
     nodes: [
       { id: "host:a", graphKind: "operation", type: "Host", label: "A", properties: {} },
       { id: "host:b", graphKind: "operation", type: "Host", label: "B", properties: {} },
+      { id: "host:c", graphKind: "operation", type: "Host", label: "C", properties: {} },
       { id: "agent-session:1", graphKind: "operation", type: "AgentSession", label: "Agent", properties: { status: "live", sessionId: "1" } },
       { id: "shell-session:1", graphKind: "operation", type: "ShellSession", label: "Shell", properties: { status: "degraded", sessionId: "1" } }
     ],
@@ -1325,6 +1705,7 @@ test("stores parallel operational edges by explicit identity and validates topol
       { id: "tunnel:1", from: "host:a", to: "host:b", type: "tunnels_to", properties: { tunnelId: "1", status: "live" } },
       { id: "tunnel:2", from: "host:a", to: "host:b", type: "tunnels_to", properties: { tunnelId: "2", status: "degraded" } },
       { from: "host:a", to: "host:b", type: "proxy_route", properties: { via: "first" } },
+      { from: "host:a", to: "host:c", type: "proxy_route", properties: { routeId: "route:shared", via: "second" } },
       { from: "agent-session:1", to: "host:a", type: "session_on" }
     ]
   });
@@ -1335,12 +1716,16 @@ test("stores parallel operational edges by explicit identity and validates topol
   });
 
   const operation = graphStore.query("operation", [], 100);
-  assert.deepEqual(operation.edges.filter((edge) => edge.type === "tunnels_to").map((edge) => edge.id).sort(), ["tunnel:1", "tunnel:2"]);
+  assert.deepEqual(operation.edges.filter((edge) => edge.type === "tunnels_to").map((edge) => edge.id).sort(), [
+    "tunnels_to:host%3Aa:host%3Ab:1",
+    "tunnels_to:host%3Aa:host%3Ab:2"
+  ]);
   assert.deepEqual(operation.edges.find((edge) => edge.type === "proxy_route")?.properties, { via: "first", transport: "socks" });
   assert.deepEqual(graphStore.query("sessions").nodes.map((node) => node.type).sort(), ["AgentSession", "ShellSession"]);
-  assert.throws(() => graphStore.upsertDelta({
-    sourceEventIds: [], nodes: [], edges: [{ id: "tunnel:1", from: "host:b", to: "host:a", type: "tunnels_to" }]
-  }), /Edge identity conflict/);
+  graphStore.upsertDelta({
+    sourceEventIds: [], nodes: [], edges: [{ id: "ignored-by-canonical-owner", from: "host:a", to: "host:c", type: "tunnels_to", properties: { tunnelId: "1" } }]
+  });
+  assert.equal(graphStore.query("operation", [], 100).edges.filter((edge) => edge.type === "tunnels_to").length, 3);
   assert.throws(() => graphStore.upsertDelta({
     sourceEventIds: [], nodes: [], edges: [{ from: "agent-session:1", to: "host:a", type: "tunnels_to" }]
   }), /Host -> Host/);
@@ -1348,4 +1733,78 @@ test("stores parallel operational edges by explicit identity and validates topol
     sourceEventIds: [], nodes: [], edges: [{ from: "host:a", to: "host:b", type: "session_on" }]
   }), /session_on/);
   graphStore.close();
+});
+
+test("projection commits return GraphStore canonical operational edge identities", () => {
+  const runtimeDir = mkdtempSync(join(tmpdir(), "luanniao-graph-"));
+  const databasePath = join(runtimeDir, "state.sqlite");
+  const graphStore = new SQLiteGraphStore(databasePath, join(runtimeDir, "deltas.jsonl"));
+  const runtimeStore = new RuntimeStore(databasePath);
+  graphStore.upsertDelta({
+    sourceEventIds: [],
+    nodes: [
+      { id: "host:a", graphKind: "operation", type: "Host", label: "A", properties: {} },
+      { id: "host:b", graphKind: "operation", type: "Host", label: "B", properties: {} }
+    ],
+    edges: []
+  });
+  runtimeStore.raiseProjectionDesired("task:projection-edge-id", 1, 1);
+  const claim = runtimeStore.claimProjection("task:projection-edge-id");
+  assert.ok(claim);
+  const committed = graphStore.commitProjection({
+    taskId: "task:projection-edge-id",
+    fromSeq: 0,
+    toSeq: 1,
+    generation: claim.generation,
+    delta: {
+      sourceEventIds: ["event:1"],
+      nodes: [],
+      edges: [{
+        id: "draft-owned-id",
+        from: "host:a",
+        to: "host:b",
+        type: "tunnels_to",
+        properties: { tunnelId: "shared" },
+        evidenceRefs: ["event:1"]
+      }]
+    }
+  });
+
+  assert.equal(committed.delta.edges[0]?.id, "tunnels_to:host%3Aa:host%3Ab:shared");
+  assert.equal(graphStore.query("operation", [], 100).edges[0]?.id, committed.delta.edges[0]?.id);
+  runtimeStore.close();
+  graphStore.close();
+});
+
+test("opening a legacy graph migrates and merges incomplete operational edge ids", () => {
+  const runtimeDir = mkdtempSync(join(tmpdir(), "luanniao-graph-"));
+  const databasePath = join(runtimeDir, "state.sqlite");
+  const deltaLogPath = join(runtimeDir, "deltas.jsonl");
+  const initialStore = new SQLiteGraphStore(databasePath, deltaLogPath);
+  initialStore.upsertDelta({
+    sourceEventIds: [],
+    nodes: [
+      { id: "host:a", graphKind: "operation", type: "Host", label: "A", properties: {} },
+      { id: "host:b", graphKind: "operation", type: "Host", label: "B", properties: {} }
+    ],
+    edges: []
+  });
+  initialStore.close();
+
+  const database = new DatabaseSync(databasePath);
+  const insert = database.prepare(`
+    INSERT INTO edges (id, from_id, to_id, type, properties_json, evidence_refs_json, updated_at)
+    VALUES (?, ?, ?, 'tunnels_to', ?, ?, ?)
+  `);
+  insert.run("tunnel:legacy", "host:a", "host:b", JSON.stringify({ tunnelId: "shared", status: "live" }), JSON.stringify(["event:1"]), "2026-01-01T00:00:00.000Z");
+  insert.run("tunnel:legacy-copy", "host:a", "host:b", JSON.stringify({ tunnelId: "shared", transport: "ssh" }), JSON.stringify(["event:2"]), "2026-01-02T00:00:00.000Z");
+  database.close();
+
+  const migratedStore = new SQLiteGraphStore(databasePath, deltaLogPath);
+  const tunnels = migratedStore.query("operation", [], 100).edges.filter((edge) => edge.type === "tunnels_to");
+  assert.equal(tunnels.length, 1);
+  assert.equal(tunnels[0]?.id, "tunnels_to:host%3Aa:host%3Ab:shared");
+  assert.deepEqual(tunnels[0]?.properties, { tunnelId: "shared", status: "live", transport: "ssh" });
+  assert.deepEqual(tunnels[0]?.evidenceRefs, ["event:1", "event:2"]);
+  migratedStore.close();
 });

@@ -460,7 +460,10 @@ test("opaque mitm flows stay HTTP typed and routed replay fails closed until the
       body: { encoding: "base64", data: "dGVzdA==" }
     }, true);
     const replayedBody = await json(replayed);
-    assert.equal(replayed.status, 200, JSON.stringify({ replayedBody }));
+    assert.equal(replayed.status, 200, JSON.stringify({
+      replayedBody,
+      dockerLog: await readFile(fixture.dockerLog, "utf8")
+    }));
     assert.deepEqual(replayedBody, { exchangeId: "web-replay:one", replayOf: httpFlowRef, status: 200 });
     const replayInput = JSON.parse(await readFile(join(fixture.root, "replay-input.json"), "utf8")) as Record<string, unknown>;
     const replayContext = replayInput.context as Record<string, unknown>;
@@ -523,7 +526,10 @@ test("replay refreshes the flow client after the historical index hands ownershi
     true
   );
   const replayedBody = await json(replayed);
-  assert.equal(replayed.status, 200, JSON.stringify(replayedBody));
+  assert.equal(replayed.status, 200, JSON.stringify({
+    replayedBody,
+    dockerLog: await readFile(fixture.dockerLog, "utf8")
+  }));
   assert.deepEqual(replayedBody, {
     exchangeId: "web-replay:handoff",
     replayOf: "task:handoff:flow/http",
@@ -750,7 +756,9 @@ case "$1" in
     case "$2" in
       inspect)
         case "$*" in
-          *luanniao-net-0123456789abcdef*) exit 0 ;;
+          *IPAM.Config*luanniao-net-*) printf '172.28.0.0/16\\n'; exit 0 ;;
+          *luanniao-net-0123456789abcdef*) printf '172.28.0.0/16\\n'; exit 0 ;;
+          *luanniao-replay-task-*) printf 'true|replay-task-network|172.29.0.0/16|true\\n'; exit 0 ;;
           *) exit 1 ;;
         esac ;;
       *) exit 0 ;;
