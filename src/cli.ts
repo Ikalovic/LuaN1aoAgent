@@ -21,57 +21,53 @@ async function run(options: ReturnType<typeof parseCliOptions>): Promise<void> {
   const transparentProxy = options.proxy ? parseTransparentProxy(options.proxy) : undefined;
   const cwd = process.cwd();
   const runContext = resolveCliRunContext(options, cwd);
-  const agentRuntime = await bootstrapAgentRuntime({
-    cwd,
-    runtimeDir: runContext.runtimeDir,
-    routeRef: "cli-run"
-  });
-  const { controller } = agentRuntime;
   const useTui = shouldUseTui(options, {
     stdinIsTTY: process.stdin.isTTY,
     stdoutIsTTY: process.stdout.isTTY
   });
+  let agentRuntime: Awaited<ReturnType<typeof bootstrapAgentRuntime>> | undefined;
+  let app: AgentCliApp | undefined;
   let receivedSignal: NodeJS.Signals | undefined;
-  let signalCount = 0;
-  let forceExitStarted = false;
   let stopRequest: Promise<void> | undefined;
   let unsubscribeJsonl: (() => void) | undefined;
   let jsonlResult: unknown;
   const requestStop = (signal: NodeJS.Signals): Promise<void> => {
-    signalCount += 1;
-    if (signalCount > 1) {
-      if (!forceExitStarted) {
-        forceExitStarted = true;
-        void withTimeout(agentRuntime.close(), 2_000).finally(() => process.exit(128 + signalNumber(signal)));
-      }
-      return stopRequest ?? Promise.resolve();
-    }
-    receivedSignal = signal;
+    receivedSignal ??= signal;
     process.exitCode = 128 + signalNumber(signal);
-    stopRequest ??= controller.requestStop(`Received ${signal}`);
+    if (!agentRuntime) {
+      return Promise.resolve();
+    }
+    stopRequest ??= agentRuntime.controller.requestStop(`Received ${receivedSignal}`);
     return stopRequest;
   };
   const handleSignal = (signal: NodeJS.Signals): void => {
     void requestStop(signal);
   };
-  const app = useTui
-    ? new AgentCliApp({
-      executionLog: controller.executionLog,
-      artifactStore: controller.artifactStore,
-      goal: runContext.userGoal,
-      runtimeDir: runContext.runtimeDir,
-      resumed: runContext.resumed,
-      onInterrupt: () => requestStop("SIGINT"),
-      onForceInterrupt: () => {
-        void requestStop("SIGINT");
-      }
-    })
-    : undefined;
-
   process.on("SIGINT", handleSignal);
   process.on("SIGTERM", handleSignal);
 
   try {
+    agentRuntime = await bootstrapAgentRuntime({
+      cwd,
+      runtimeDir: runContext.runtimeDir,
+      routeRef: "cli-run"
+    });
+    const { controller } = agentRuntime;
+    app = useTui
+      ? new AgentCliApp({
+        executionLog: controller.executionLog,
+        artifactStore: controller.artifactStore,
+        goal: runContext.userGoal,
+        runtimeDir: runContext.runtimeDir,
+        resumed: runContext.resumed,
+        onInterrupt: () => requestStop("SIGINT"),
+        onForceInterrupt: () => requestStop("SIGINT")
+      })
+      : undefined;
+    if (receivedSignal) {
+      await requestStop(receivedSignal);
+      return;
+    }
     const scopeSummary = runContext.resumed
       ? runContext.scopeSummary!
       : runContext.scopeSummary
@@ -116,21 +112,20 @@ async function run(options: ReturnType<typeof parseCliOptions>): Promise<void> {
   } finally {
     process.off("SIGINT", handleSignal);
     process.off("SIGTERM", handleSignal);
-    await stopRequest;
-    await agentRuntime.close();
-    if (options.jsonl && jsonlResult !== undefined) {
-      process.stdout.write(`${JSON.stringify({ type: "result", result: jsonlResult })}\n`);
+    try {
+      await stopRequest;
+    } finally {
+      try {
+        await agentRuntime?.close();
+      } finally {
+        if (options.jsonl && jsonlResult !== undefined) {
+          process.stdout.write(`${JSON.stringify({ type: "result", result: jsonlResult })}\n`);
+        }
+        unsubscribeJsonl?.();
+        await app?.stop();
+      }
     }
-    unsubscribeJsonl?.();
-    await app?.stop();
   }
-}
-
-async function withTimeout(operation: Promise<unknown>, timeoutMs: number): Promise<void> {
-  await Promise.race([
-    operation.then(() => undefined, () => undefined),
-    new Promise<void>((resolveTimeout) => setTimeout(resolveTimeout, timeoutMs))
-  ]);
 }
 
 function signalNumber(signal: NodeJS.Signals): number {

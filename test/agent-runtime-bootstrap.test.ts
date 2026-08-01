@@ -210,6 +210,15 @@ test("CLI and Web run entrypoints both use the shared bootstrap", async () => {
   assert.match(webSource, /bootstrapAgentRuntime\(\{/);
   assert.doesNotMatch(cliSource, /new SecurityAgentController/);
   assert.doesNotMatch(webSource, /new SecurityAgentController/);
+  assert.ok(
+    cliSource.indexOf('process.on("SIGINT", handleSignal)') < cliSource.indexOf("await bootstrapAgentRuntime"),
+    "CLI must install signal handlers before runtime bootstrap can create resources"
+  );
+  assert.match(
+    cliSource,
+    /try \{\s*await stopRequest;\s*\} finally \{\s*try \{\s*await agentRuntime\?\.close\(\);/,
+    "runtime close must run even when the stop request rejects"
+  );
 });
 
 async function requestThroughProxy(proxyUrl: string, targetUrl: string): Promise<void> {

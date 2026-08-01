@@ -163,6 +163,13 @@ function normalizePlannerTaskPatch(value: unknown): PlannerTaskPatch {
     throw new PlannerProtocolError("patch_task requires a patch object");
   }
   const patch: PlannerTaskPatch = {};
+  if (typeof value.additionalTurns === "number"
+    && Number.isInteger(value.additionalTurns)
+    && value.additionalTurns > 0) {
+    patch.additionalTurns = value.additionalTurns;
+  }
+  // Keep historical text submissions and persisted decisions replayable. The
+  // structured Planner tool exposes only additionalTurns for budget changes.
   if (isRecord(value.budget)) patch.budget = value.budget;
   if (typeof value.priority === "number" && Number.isFinite(value.priority)) patch.priority = value.priority;
   if (typeof value.parallelGroup === "string") patch.parallelGroup = value.parallelGroup;

@@ -30,6 +30,22 @@ test("requires the same Planner reason in structured and text fallback normaliza
   assert.throws(() => normalizePlannerDecision({ commands: [], reason: "   " }), /Planner reason is required/);
 });
 
+test("preserves incremental task budget extensions", () => {
+  const decision = normalizePlannerDecision({
+    commands: [{
+      kind: "patch_task",
+      taskId: "task:checkpointed",
+      patch: { additionalTurns: 6 },
+      basedOnRefs: ["event:checkpoint"]
+    }],
+    reason: "Continue the same causal task"
+  });
+
+  const command = decision.commands?.[0];
+  assert.equal(command?.kind, "patch_task");
+  assert.deepEqual(command?.kind === "patch_task" ? command.patch : undefined, { additionalTurns: 6 });
+});
+
 test("drops legacy Planner-authored constraints from task definitions", () => {
   const decision = normalizePlannerDecision({
     decision: "apply_commands",

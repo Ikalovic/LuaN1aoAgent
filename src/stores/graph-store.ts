@@ -973,6 +973,7 @@ export class SQLiteGraphStore {
         if (!existingById.has(command.nodeId) && !newTaskIds.has(command.nodeId)) {
           throw new GraphValidationError(`Node ${command.nodeId} does not exist`);
         }
+        assertNodeStatusTargetIsNotTask(command.nodeId, existingById.get(command.nodeId), newTaskIds);
         continue;
       }
       if (!existingTaskIds.has(command.taskId) && !newTaskIds.has(command.taskId)) {
@@ -1073,8 +1074,9 @@ export class SQLiteGraphStore {
         if (!newTaskIds.has(command.nodeId)) {
           throw new GraphValidationError(`Node ${command.nodeId} does not exist`);
         }
-        continue;
       }
+      assertNodeStatusTargetIsNotTask(command.nodeId, node, newTaskIds);
+      if (!node) continue;
       if (command.expectedVersion === undefined) {
         throw new GraphValidationError(`Runtime version snapshot missing for ${command.nodeId}`);
       }
@@ -1356,6 +1358,7 @@ export class SQLiteGraphStore {
     if (!node) {
       throw new GraphValidationError(`Node ${input.nodeId} does not exist`);
     }
+    assertNodeStatusTargetIsNotTask(input.nodeId, node);
     assertExpectedVersion(node, input.expectedVersion);
     const normalizedStatus = node.type === "Goal" && input.status === "achieved"
       ? "completed"
@@ -2411,6 +2414,16 @@ function assertExpectedVersion(node: GraphNode, expectedVersion: number | undefi
     throw new GraphValidationError(
       `Version conflict for ${node.id}: expected ${expectedVersion}, current ${currentVersion}`
     );
+  }
+}
+
+function assertNodeStatusTargetIsNotTask(
+  nodeId: string,
+  node: GraphNode | undefined,
+  newTaskIds: ReadonlySet<string> = new Set()
+): void {
+  if (node?.type === "Task" || newTaskIds.has(nodeId)) {
+    throw new GraphValidationError(`Task ${nodeId} status must be changed with set_task_status`);
   }
 }
 

@@ -20,7 +20,7 @@ import { PromptRuntimeError } from "../src/pi-runner.js";
 import type { EpochBudgetClock } from "../src/epoch-budget-clock.js";
 import { renderPlannerInput } from "../src/prompts.js";
 import type { ProjectorGraphRefRegistry } from "../src/projection.js";
-import type { ControlSignal, EpochOutcome, ExecutionEvent, GraphDelta, GraphNode, ObserverProjection, PlannerDecision, PlannerDecisionView, PlannerTaskSpec, TaskEnvelope, TaskResult } from "../src/types.js";
+import type { ControlSignal, EpochOutcome, ExecutionEvent, GraphDelta, GraphNode, ObserverProjection, PlannerDecision, PlannerDecisionView, PlannerTaskSpec, SupervisorVerdict, TaskEnvelope, TaskOutcome, TaskResult } from "../src/types.js";
 
 type ControllerHarness = {
   agents: {
@@ -38,9 +38,9 @@ type ControllerHarness = {
     startSeq: number;
   };
   enqueueProjectionJob: (input: unknown) => Promise<ObserverProjection>;
-  enqueueSupervisorCheck: (input: unknown) => Promise<ControlSignal>;
+  enqueueSupervisorCheck: (input: unknown) => Promise<SupervisorVerdict>;
   runProjectionJob: (input: unknown) => Promise<ObserverProjection>;
-  runSupervisorCheck: (input: unknown) => Promise<ControlSignal>;
+  runSupervisorCheck: (input: unknown) => Promise<SupervisorVerdict>;
   applyControlSignal: (taskEnvelope: TaskEnvelope, controlSignal: ControlSignal, state?: TestActiveState) => void;
   requestEpochStop: (
     taskEnvelope: TaskEnvelope,
@@ -75,7 +75,9 @@ type ControllerHarness = {
   ) => Promise<{ session: ReturnType<typeof createAbortableMockTextSession>; dynamicObserver: boolean }>;
   persistEpochOutcome: (
     state: TestActiveState,
-    input: Pick<EpochOutcome, "status" | "reason" | "retryable" | "taskOutcomeRef">
+    input: Pick<EpochOutcome, "status" | "reason" | "retryable" | "taskOutcomeRef"> & {
+      taskOutcome?: TaskOutcome;
+    }
   ) => Promise<{ outcome: EpochOutcome; eventId: string }>;
   createDependencyOutcomeBrief: (taskEnvelope: TaskEnvelope) => Promise<string>;
   withSessionMaterialRefs: <T extends { evidenceRefs?: string[] }>(
@@ -103,8 +105,10 @@ type ControllerHarness = {
   buildPlannerDecisionView: () => Promise<PlannerDecisionView>;
   notifyProjectorGraphCommitted: (taskId: string, delta: GraphDelta) => Promise<void>;
   activePlannerSessions: Set<{ steer?: (text: string) => Promise<void>; abort?: () => Promise<void> }>;
+  validatePlannerRuntimeBoundary: (plannerDecision: PlannerDecision) => void;
   normalizePlannerDecisionBoundary: (plannerDecision: PlannerDecision) => PlannerDecision;
   taskEnvelopeFromSpec: (taskSpec: PlannerTaskSpec, scopeSummary: string) => TaskEnvelope;
+  assertPlannerRuntimeTransitions: (commands: NonNullable<PlannerDecision["commands"]>) => void;
   projectorCoordinator: {
     waitForCommitted: (taskId: string, targetSeq: number, options?: { timeoutMs?: number }) => Promise<void>;
     waitForSettled: (timeoutMs?: number) => Promise<boolean>;
@@ -125,6 +129,7 @@ type ControllerHarness = {
     };
     logging?: { drain: () => Promise<void> };
   }) => Promise<TaskResult | undefined>;
+  scheduleExecutorNetworkFinalization: (state: TestActiveState) => Promise<void>;
   disposeTaskExecutorResources: (taskId: string) => Promise<void>;
 };
 
@@ -200,6 +205,53 @@ test("an exhausted task budget closes a resumed epoch before sandbox or model st
   assert.equal(result.epochOutcome.status, "checkpointed");
   assert.match(result.epochOutcome.reason, /maxTurns=8, usedTurns=8/);
   assert.equal(harness.controller.runtimeStore.getTaskOutcome(taskEnvelope.taskId), undefined);
+  await harness.controller.close({ drainProjectionJobs: false });
+});
+
+test("Planner cannot reopen an exhausted Task without increasing its cumulative budget", async () => {
+  const harness = createControllerHarness();
+  const taskEnvelope = makeTaskEnvelope({ taskId: "task:exhausted", budget: { maxTurns: 10 } });
+  harness.controller.graphStore.createTask({
+    taskId: taskEnvelope.taskId,
+    goal: taskEnvelope.goal,
+    targetRefs: taskEnvelope.targetRefs,
+    scopeRef: taskEnvelope.scopeRef,
+    constraints: taskEnvelope.constraints,
+    successCriteria: taskEnvelope.successCriteria,
+    budget: taskEnvelope.budget,
+    priority: 1
+  });
+  for (let index = 1; index <= 10; index += 1) {
+    harness.controller.runtimeStore.recordTaskTurn({
+      taskId: taskEnvelope.taskId,
+      eventId: `event:consumed:${index}`
+    });
+  }
+
+  assert.throws(() => harness.controllerHarness.assertPlannerRuntimeTransitions([{
+    kind: "set_task_status",
+    taskId: taskEnvelope.taskId,
+    status: "open",
+    basedOnRefs: []
+  }]), /cannot reopen with exhausted budget: consumedTurns=10, maxTurns=10/);
+
+  assert.doesNotThrow(() => harness.controllerHarness.assertPlannerRuntimeTransitions([{
+    kind: "patch_task",
+    taskId: taskEnvelope.taskId,
+    patch: { additionalTurns: 10 },
+    basedOnRefs: []
+  }, {
+    kind: "set_task_status",
+    taskId: taskEnvelope.taskId,
+    status: "open",
+    basedOnRefs: []
+  }]));
+  assert.throws(() => harness.controllerHarness.assertPlannerRuntimeTransitions([{
+    kind: "patch_task",
+    taskId: taskEnvelope.taskId,
+    patch: { additionalTurns: 31 },
+    basedOnRefs: []
+  }]), /previousMaxTurns=10, additionalTurns=31, maximum=40/);
   await harness.controller.close({ drainProjectionJobs: false });
 });
 
@@ -672,7 +724,6 @@ test("requestStop remains a hard boundary after advisory checkpoint", async () =
 
 test("requestStop immediately aborts active Projector work", async () => {
   const harness = createObserverControllerHarness(JSON.stringify({
-    sourceEventIds: ["event:source"],
     nodes: [],
     edges: []
   }));
@@ -682,7 +733,6 @@ test("requestStop immediately aborts active Projector work", async () => {
   const projectorSession = createDelayedAbortableMockTextSession(async () => {
     await projectorRelease.promise;
     return JSON.stringify({
-      sourceEventIds: ["event:source"],
       nodes: [],
       edges: []
     });
@@ -915,6 +965,45 @@ test("budget checkpoint finalization accepts completed and restores the Executor
   await harness.controller.close({ drainProjectionJobs: false });
 });
 
+test("checkpoint finalization narrows to task_result_submit after one Artifact batch", async () => {
+  const harness = createControllerHarness();
+  const taskEnvelope = makeTaskEnvelope();
+  const state = harness.controllerHarness.beginTaskExecution(taskEnvelope);
+  state.executorStopRequested = true;
+  state.abortContext = {
+    kind: "budget_abort",
+    reason: "Task budget reached: maxTurns=12",
+    controlSignal: { decision: "handoff", reason: "Task budget reached: maxTurns=12", evidenceRefs: [] }
+  };
+  const finalizerSession = createCheckpointArtifactThenResultSession({
+    taskId: taskEnvelope.taskId,
+    status: "partial",
+    summary: "Archived the reusable result and submitted the semantic checkpoint.",
+    evidenceRefs: [],
+    artifactRefs: ["artifact:checkpoint"]
+  });
+
+  const semanticResult = await harness.controllerHarness.collectBudgetCheckpointTaskResult({
+    taskEnvelope,
+    state,
+    executorSession: {
+      session: finalizerSession,
+      dynamicExecutor: true,
+      resumed: false,
+      resumeCount: 0
+    }
+  });
+
+  assert.equal(semanticResult?.status, "partial");
+  assert.deepEqual(finalizerSession.activeToolHistory(), [
+    ["artifact_write", "task_result_submit"],
+    ["task_result_submit"],
+    ["bash", "read", "artifact_write", "task_result_submit"]
+  ]);
+  harness.controllerHarness.finishTaskExecution(taskEnvelope.taskId, "budget_exhausted");
+  await harness.controller.close({ drainProjectionJobs: false });
+});
+
 test("partial checkpoint gets runtime metadata while only its finalization turn is excluded", async () => {
   const harness = createControllerHarness();
   const taskEnvelope = makeTaskEnvelope({ budget: { maxTurns: 10 } });
@@ -1018,6 +1107,55 @@ test("checkpoint finalization provider failure leaves only the mechanical EpochO
   await harness.controller.close({ drainProjectionJobs: false });
 });
 
+test("checkpoint finalization uses the remaining global run deadline instead of a fixed semantic timeout", async () => {
+  const harness = createControllerHarness();
+  const taskEnvelope = makeTaskEnvelope();
+  const state = harness.controllerHarness.beginTaskExecution(taskEnvelope);
+  state.executorStopRequested = true;
+  state.abortContext = {
+    kind: "budget_abort",
+    reason: "Task budget reached: maxTurns=12",
+    controlSignal: { decision: "handoff", reason: "Task budget reached: maxTurns=12", evidenceRefs: [] }
+  };
+  harness.controllerHarness.activeRun = {
+    invocationId: "run:checkpoint-deadline",
+    startedAt: Date.now(),
+    maxRunTimeMs: 30,
+    deadlineAt: Date.now() + 30,
+    startSeq: 0
+  };
+  const pendingPrompt = createDeferred<void>();
+  const finalizerSession = createCheckpointSubmissionSession({
+    taskId: taskEnvelope.taskId,
+    status: "partial",
+    summary: "The global deadline prevents this result from being submitted.",
+    evidenceRefs: [],
+    artifactRefs: []
+  }, () => pendingPrompt.promise);
+  let abortCount = 0;
+  finalizerSession.abort = async () => {
+    abortCount += 1;
+    pendingPrompt.reject(new Error("global run deadline reached"));
+  };
+
+  const semanticResult = await harness.controllerHarness.collectBudgetCheckpointTaskResult({
+    taskEnvelope,
+    state,
+    executorSession: {
+      session: finalizerSession,
+      dynamicExecutor: true,
+      resumed: false,
+      resumeCount: 0
+    }
+  });
+
+  assert.equal(semanticResult, undefined);
+  assert.ok(abortCount >= 1);
+  assert.equal(harness.controller.runtimeStore.getTaskOutcome(taskEnvelope.taskId), undefined);
+  harness.controllerHarness.finishTaskExecution(taskEnvelope.taskId, "global_deadline");
+  await harness.controller.close({ drainProjectionJobs: false });
+});
+
 test("Supervisor handoff advice is not persisted as either result layer", async () => {
   const harness = createControllerHarness();
   const taskEnvelope = makeTaskEnvelope();
@@ -1083,12 +1221,12 @@ test("runtime grounds evidence but keeps incidental observation artifacts out of
     taskId: taskEnvelope.taskId,
     status: "partial",
     summary: "Checkpoint",
-    evidenceRefs: [],
+    evidenceRefs: [intent.id],
     artifactRefs: [],
     retryable: true
   }, taskEnvelope, state);
 
-  assert.ok(enriched.evidenceRefs.includes(intent.id));
+  assert.ok(!enriched.evidenceRefs.includes(intent.id));
   assert.ok(enriched.evidenceRefs.includes(started.id));
   assert.ok(enriched.evidenceRefs.includes(finished.id));
   assert.deepEqual(enriched.artifactRefs, []);
@@ -1369,11 +1507,11 @@ test("supervisor prompt uses natural-language execution state", async () => {
   assert.match(prompt, /时间预算：全局剩余/);
   assert.match(prompt, /当前 Epoch 剩余/);
   assert.match(prompt, /最近执行轨迹：/);
-  assert.match(prompt, /Executor 决定调用工具：bash/);
+  assert.match(prompt, /"toolName":"bash"/);
   assert.match(prompt, /基线为有效开发者会话/);
   assert.match(prompt, /本地工作区漂移：是/);
   assert.doesNotMatch(prompt, /RECENT_COMPACT_EVENTS|TASK_ENVELOPE|BUDGET_STATE|TASK_STATUS|ARTIFACT_MANIFEST|CURRENT_GRAPH_SLICE/);
-  assert.ok(prompt.length < 3_000, `Supervisor prompt too large: ${prompt.length}`);
+  assert.doesNotMatch(prompt, /\.\.\.\[truncated:/);
   harness.controller.close();
 });
 
@@ -1466,7 +1604,7 @@ test("supervisor does not treat distinct script output as semantic progress", as
   const prompt = harness.observerPrompts()[0] ?? "";
   assert.equal(signal.decision, "handoff");
   assert.match(prompt, /hash=abc output=placeholder static=拦截/);
-  assert.match(prompt, /后续理解=两种字段的动态区域和响应哈希相同，当前判定信号不可信/);
+  assert.match(prompt, /"executorCommentary":"两种字段的动态区域和响应哈希相同，当前判定信号不可信/);
   assert.doesNotMatch(prompt, /lastProgressReason|new_result:/);
   harness.controller.close();
 });
@@ -1529,8 +1667,78 @@ test("supervisor context contains only the latest eight executor turns", async (
   assert.doesNotMatch(prompt, /turn-0-|turn-1-/);
   assert.match(prompt, /turn-2-intent/);
   assert.match(prompt, /turn-9-result/);
-  assert.ok(prompt.length < 3_000, `Supervisor prompt too large: ${prompt.length}`);
+  assert.doesNotMatch(prompt, /\.\.\.\[truncated:/);
   harness.controller.close();
+});
+
+test("supervisor reads one immutable event snapshot and returns only refs from that snapshot", async () => {
+  const harness = createObserverControllerHarness(JSON.stringify({
+    decision: "redirect",
+    reason: "inspect the distinguishing result",
+    guidance: "confirm the successful branch",
+    evidenceRefs: ["event:outside-snapshot"]
+  }));
+  const taskEnvelope = makeTaskEnvelope();
+  activateTask(harness.controllerHarness, taskEnvelope);
+  await harness.controller.executionLog.append({
+    taskId: taskEnvelope.taskId,
+    role: "executor",
+    eventType: "assistant_intent",
+    summary: "compare traversal depth",
+    payload: {
+      text: "compare traversal depth",
+      toolCalls: [{ name: "bash", arguments: { command: "probe traversal variants" } }]
+    }
+  });
+  const started = await harness.controller.executionLog.append({
+    taskId: taskEnvelope.taskId,
+    role: "executor",
+    eventType: "tool_started",
+    summary: "tool_started:bash",
+    payload: {
+      toolCallId: "call:traversal",
+      toolName: "bash",
+      args: { command: "probe traversal variants" }
+    }
+  });
+  const result = await harness.controller.executionLog.append({
+    taskId: taskEnvelope.taskId,
+    role: "executor",
+    eventType: "tool_finished",
+    summary: "tool_finished:bash:ok",
+    payload: {
+      toolCallId: "call:traversal",
+      toolName: "bash",
+      result: { content: [{ type: "text", text: "depth=1 rejected\ndepth=4 size=2422 msg=''" }] }
+    }
+  });
+  const future = await harness.controller.executionLog.append({
+    taskId: taskEnvelope.taskId,
+    role: "executor",
+    eventType: "tool_finished",
+    summary: "future event outside snapshot",
+    payload: {
+      toolCallId: "call:future",
+      toolName: "bash",
+      result: { content: [{ type: "text", text: "future-marker" }] }
+    }
+  });
+
+  const verdict = await harness.controllerHarness.runSupervisorCheck({
+    reason: "manual:immutable-snapshot",
+    taskEnvelope,
+    sourceEventIds: [result.id],
+    throughSeq: result.seq
+  });
+
+  const prompt = harness.observerPrompts()[0] ?? "";
+  assert.match(prompt, /depth=4 size=2422 msg=''/);
+  assert.doesNotMatch(prompt, new RegExp(`future-marker|${future.id}`));
+  assert.equal(verdict.throughSeq, result.seq);
+  assert.ok(verdict.evidenceRefs.includes(started.id));
+  assert.ok(verdict.evidenceRefs.includes(result.id));
+  assert.ok(!verdict.evidenceRefs.includes("event:outside-snapshot"));
+  await harness.controller.close({ drainProjectionJobs: false });
 });
 
 test("supervisor checks use fresh sessions without previous prompt history", async () => {
@@ -1876,7 +2084,7 @@ test("projector input uses compact artifact index and graph context", async () =
   assert.match(prompt, /<graph_context>/);
   assert.match(prompt, /相关图节点/);
   assert.match(prompt, /10\.0\.0\.9/);
-  assert.match(prompt, /executor_interpretation_non_evidence: "确认 middle-breakthrough-marker/);
+  assert.doesNotMatch(prompt, /executor_commentary_non_evidence:/);
   assert.match(prompt, /middle-breakthrough-marker/);
   assert.match(prompt, /taskOutcome=.*"status":"partial"/);
   assert.ok(prompt.includes(artifactRefs.at(-1)!));
@@ -2003,17 +2211,14 @@ test("projector consumes typed connectivity facts without skipping their waterma
 
 test("typed live command connection projects one stable ShellSession on the real pivot host", async () => {
   const harness = createObserverControllerHarness(JSON.stringify({
-    sourceEventIds: ["o1"],
     nodes: [{
       id: "new:1",
-      graphKind: "operation",
       type: "Host",
       label: "10.0.0.8",
       properties: { ip: "10.0.0.8" },
       evidenceRefs: ["o1"]
     }, {
       id: "new:2",
-      graphKind: "operation",
       type: "ShellSession",
       label: "SSH on 10.0.0.8",
       properties: { sessionId: "connection:ssh-1", status: "live", transport: "ssh" },
@@ -2331,24 +2536,20 @@ test("projector partitions one huge parallel action group and commits its cursor
   const fragmentSession = createPromptAwareMockTextSession((_prompt, fragmentIndex) => {
     assert.equal(harness.controller.runtimeStore.getProjectionState(taskEnvelope.taskId).committedSeq, 0);
     return JSON.stringify({
-      graphDelta: {
-        sourceEventIds: [],
-        nodes: Array.from({ length: 20 }, (_, nodeIndex) => ({
-          id: `new:${nodeIndex + 1}`,
-          graphKind: "reasoning",
-          type: "Evidence",
-          label: `fragment ${fragmentIndex + 1} evidence ${nodeIndex + 1}`,
-          properties: { fragmentIndex: fragmentIndex + 1, nodeIndex: nodeIndex + 1 },
-          evidenceRefs: ["o1"]
-        })),
-        edges: Array.from({ length: 30 }, (_, edgeIndex) => ({
-          from: `new:${(edgeIndex % 20) + 1}`,
-          to: `new:${((edgeIndex + 1 + Math.floor(edgeIndex / 20)) % 20) + 1}`,
-          type: "supports",
-          properties: { fragmentIndex: fragmentIndex + 1, edgeIndex: edgeIndex + 1 },
-          evidenceRefs: ["o1"]
-        }))
-      }
+      nodes: Array.from({ length: 20 }, (_, nodeIndex) => ({
+        id: `new:${nodeIndex + 1}`,
+        type: "Evidence",
+        label: `fragment ${fragmentIndex + 1} evidence ${nodeIndex + 1}`,
+        properties: { fragmentIndex: fragmentIndex + 1, nodeIndex: nodeIndex + 1 },
+        evidenceRefs: ["o1"]
+      })),
+      edges: Array.from({ length: 30 }, (_, edgeIndex) => ({
+        from: `new:${(edgeIndex % 20) + 1}`,
+        to: `new:${((edgeIndex + 1 + Math.floor(edgeIndex / 20)) % 20) + 1}`,
+        type: "supports",
+        properties: { fragmentIndex: fragmentIndex + 1, edgeIndex: edgeIndex + 1 },
+        evidenceRefs: ["o1"]
+      }))
     });
   });
   harness.controllerHarness.createObserverSessionForMode = async () => ({
@@ -2361,7 +2562,14 @@ test("projector partitions one huge parallel action group and commits its cursor
     role: "executor",
     eventType: "assistant_intent",
     summary: "parallel target validation",
-    payload: { text: "并行验证全部候选，再统一解释结果。" }
+    payload: {
+      text: "并行验证全部候选，再统一解释结果。",
+      toolCalls: Array.from({ length: 60 }, (_, index) => ({
+        id: `call:${index}`,
+        name: "bash",
+        arguments: {}
+      }))
+    }
   });
   seq += 1;
   for (let index = 0; index < 60; index += 1) {
@@ -2379,10 +2587,11 @@ test("projector partitions one huge parallel action group and commits its cursor
     seq += 1;
   }
   const artifactRefs: string[] = [];
+  let lastFinishedEventId = "";
   for (let index = 0; index < 60; index += 1) {
     const artifactRef = `artifact:${index}:${"evidence".repeat(36)}`;
     artifactRefs.push(artifactRef);
-    await harness.controller.executionLog.append({
+    const finished = await harness.controller.executionLog.append({
       taskId: taskEnvelope.taskId,
       role: "executor",
       eventType: "tool_finished",
@@ -2394,6 +2603,7 @@ test("projector partitions one huge parallel action group and commits its cursor
       },
       artifactRefs: [artifactRef]
     });
+    lastFinishedEventId = finished.id;
     seq += 1;
   }
   const interpretation = await harness.controller.executionLog.append({
@@ -2415,7 +2625,7 @@ test("projector partitions one huge parallel action group and commits its cursor
       taskId: taskEnvelope.taskId,
       status: "partial",
       summary: "parallel group reached a bounded checkpoint",
-      evidenceRefs: [interpretation.id],
+      evidenceRefs: [lastFinishedEventId],
       artifactRefs: []
     },
     maxObservations: 16
@@ -2444,11 +2654,12 @@ test("projector partitions one huge parallel action group and commits its cursor
   assert.ok(Number(succeeded?.payload.edgeCount) > 40);
   const projectedSourceIds = new Set((succeeded?.payload.sourceEventIds ?? []) as string[]);
   const actionEvents = events.filter((event) => event.role === "executor" && [
-    "assistant_intent", "tool_started", "tool_finished"
+    "tool_started", "tool_finished"
   ].includes(event.eventType));
-  assert.ok(actionEvents.every((event) => (
-    event.id === interpretation.id || projectedSourceIds.has(event.id)
-  )));
+  assert.ok(actionEvents.every((event) => projectedSourceIds.has(event.id)));
+  assert.ok(events
+    .filter((event) => event.eventType === "assistant_intent")
+    .every((event) => !projectedSourceIds.has(event.id)));
   await harness.controller.close();
 });
 
@@ -2700,7 +2911,6 @@ test("completed task hands off to the next planner cycle without waiting for ter
     projectorPromptStarted = true;
     await projectorRelease.promise;
     return JSON.stringify({
-      sourceEventIds: ["event:source"],
       nodes: [],
       edges: []
     });
@@ -3621,7 +3831,6 @@ test("retries executor when provider returns a retryable concurrency error", asy
     })
   );
   const observerSession = createAbortableMockTextSession(JSON.stringify({
-    sourceEventIds: [],
     nodes: [],
     edges: []
   }));
@@ -3888,6 +4097,146 @@ test("planner cycle is not blocked by lagging projection watermarks", async () =
   assert.match(plannerSession.prompts()[0] ?? "", /"projectionDegradations":\[/);
   assert.match(plannerSession.prompts()[0] ?? "", /task:lagging/);
   await controller.close({ drainProjectionJobs: false });
+});
+
+test("active Planner consumes a persisted TaskOutcome before its terminal decision settles", async () => {
+  const harness = createControllerHarness();
+  harness.controllerHarness.structuredInvocationsEnabled = true;
+  await harness.controllerHarness.ensureRootGraph({
+    userGoal: "Recover the target evidence",
+    scopeSummary: "Authorized target only"
+  });
+  harness.controller.graphStore.createTask({
+    taskId: "task:concurrent-outcome",
+    goal: "Produce a durable result",
+    targetRefs: ["goal:root"],
+    scopeRef: "scope:root",
+    constraints: [],
+    successCriteria: ["result persisted"],
+    priority: 1
+  });
+  const taskEnvelope = harness.controller.graphStore.getTaskEnvelope("task:concurrent-outcome")!;
+  const state = harness.controllerHarness.beginTaskExecution(taskEnvelope);
+  const listeners: Array<(event: unknown) => void> = [];
+  const releaseFirstSubmit = createDeferred<void>();
+  const steers: string[] = [];
+  let pendingMessageCount = 0;
+  const replacementDecision: PlannerDecision = {
+    commands: [{
+      kind: "create_tasks",
+      tasks: [{
+        id: "task:follow-up-after-outcome",
+        goal: "Use the newly persisted outcome",
+        targetRefs: ["goal:root"],
+        scopeRef: "scope:root",
+        successCriteria: ["follow-up completed"],
+        priority: 1
+      }],
+      reason: "Continue from the canonical outcome",
+      basedOnRefs: ["goal:root"]
+    }],
+    reason: "decision after canonical outcome delivery"
+  };
+  const emit = (event: unknown): void => {
+    for (const listener of [...listeners]) listener(event);
+  };
+  const plannerSession = {
+    async prompt(): Promise<void> {
+      await releaseFirstSubmit.promise;
+      let staleSubmitError: unknown;
+      try {
+        harness.controllerHarness.validatePlannerRuntimeBoundary(replacementDecision);
+      } catch (error) {
+        staleSubmitError = error;
+      }
+      assert.ok(staleSubmitError instanceof Error);
+      assert.match(staleSubmitError.message, /rejected and none of its commands were applied/);
+      emit({
+        type: "tool_execution_end",
+        toolName: "planner_submit",
+        isError: true,
+        result: { content: [{ type: "text", text: staleSubmitError.message }] }
+      });
+      pendingMessageCount = 0;
+      emit({
+        type: "message_start",
+        message: { role: "user", content: [{ type: "text", text: steers.at(-1) ?? "" }] }
+      });
+      harness.controllerHarness.validatePlannerRuntimeBoundary(replacementDecision);
+      emit({
+        type: "tool_execution_end",
+        toolName: "planner_submit",
+        isError: false,
+        result: { details: replacementDecision }
+      });
+    },
+    async steer(text: string): Promise<void> {
+      steers.push(text);
+      pendingMessageCount += 1;
+    },
+    subscribe(listener: (event: unknown) => void): () => void {
+      listeners.push(listener);
+      return () => {
+        const index = listeners.indexOf(listener);
+        if (index >= 0) listeners.splice(index, 1);
+      };
+    },
+    get pendingMessageCount(): number {
+      return pendingMessageCount;
+    },
+    clearQueue(): void {
+      pendingMessageCount = 0;
+    },
+    async abort(): Promise<void> {}
+  };
+  harness.controllerHarness.createPlannerSessionForCycle = async () => ({
+    session: plannerSession as unknown as ReturnType<typeof createAbortableMockTextSession>,
+    isolated: false
+  });
+
+  const invocation = harness.controllerHarness.invokePlannerCycle({
+    userGoal: "Recover the target evidence",
+    scopeSummary: "Authorized target only"
+  });
+  await waitFor(() => harness.controllerHarness.activePlannerSessions.size === 1);
+  await harness.controllerHarness.persistEpochOutcome(state, {
+    status: "submitted",
+    reason: "Executor submitted a partial result",
+    retryable: true,
+    taskOutcomeRef: taskEnvelope.taskId,
+    taskOutcome: {
+      taskRef: taskEnvelope.taskId,
+      epochRef: state.epochId,
+      status: "partial",
+      summary: "Canonical result discovered while Planner was running",
+      evidenceRefs: ["event:outcome"],
+      artifactRefs: [],
+      capabilityRefs: [],
+      terminalSeq: 10,
+      createdAt: new Date(0).toISOString()
+    }
+  });
+  assert.equal(steers.length, 1);
+  assert.match(steers[0] ?? "", /Canonical result discovered while Planner was running/);
+  assert.match(steers[0] ?? "", /"epochOutcomes"/);
+  releaseFirstSubmit.resolve();
+
+  const result = await invocation;
+  assert.equal(result.plannerDecision.reason, "decision after canonical outcome delivery");
+  assert.equal(result.plannerDecision.commands?.[0]?.kind, "create_tasks");
+  assert.equal(
+    result.plannerDecision.commands?.[0]?.kind === "create_tasks"
+      ? result.plannerDecision.commands[0].tasks[0]?.id
+      : undefined,
+    "task:follow-up-after-outcome"
+  );
+  assert.equal(harness.controller.runtimeStore.getTaskOutcome(taskEnvelope.taskId)?.status, "partial");
+  assert.equal(harness.controller.runtimeStore.listTaskEpochOutcomes(taskEnvelope.taskId).length, 1);
+  const events = await harness.controller.executionLog.readAll();
+  assert.ok(events.some((event) => event.eventType === "planner_state_update_queued"
+    && event.payload.queuedCount === 1));
+  harness.controllerHarness.finishTaskExecution(taskEnvelope.taskId);
+  await harness.controller.close({ drainProjectionJobs: false });
 });
 
 test("planner decision is not discarded by a concurrent knowledge notification", async () => {
@@ -4218,6 +4567,32 @@ test("controller active-task boundary and GraphStore semantic gate remain indepe
       && error.name === "ActiveTaskMutationError"
       && /cannot mutate active Task/.test(error.message)
   );
+  assert.throws(() => harness.controller.graphStore.validatePlannerDecision({
+    decision: "apply_commands",
+    commands: [{
+      kind: "set_node_status",
+      nodeId: "task:running",
+      status: "archived",
+      basedOnRefs: []
+    }],
+    reason: "attempt to bypass the active Task boundary"
+  }), /Task task:running status must be changed with set_task_status/);
+  for (let index = 0; index < DEFAULT_TASK_BUDGET.maxTurns; index += 1) {
+    harness.controller.runtimeStore.recordTaskTurn({
+      taskId: "task:existing",
+      eventId: `event:exhausted:${index}`
+    });
+  }
+  assert.throws(() => harness.controller.graphStore.validatePlannerDecision({
+    decision: "apply_commands",
+    commands: [{
+      kind: "set_node_status",
+      nodeId: "task:existing",
+      status: "open",
+      basedOnRefs: []
+    }],
+    reason: "attempt to bypass the exhausted Task boundary"
+  }), /Task task:existing status must be changed with set_task_status/);
   assert.throws(
     () => harness.controller.graphStore.validatePlannerDecision(patchDecision("task:missing")),
     /Task task:missing does not exist/
@@ -4472,7 +4847,6 @@ test("provider failure after execution evidence preserves and resumes the same E
 
 test("close drains background projector before closing graph store", async () => {
   const harness = createObserverControllerHarness(JSON.stringify({
-    sourceEventIds: ["event:source"],
     nodes: [],
     edges: []
   }));
@@ -4489,7 +4863,6 @@ test("close drains background projector before closing graph store", async () =>
     await projectorRelease.promise;
     assert.equal(graphStoreClosed, false);
     return JSON.stringify({
-      sourceEventIds: ["event:source"],
       nodes: [],
       edges: []
     });
@@ -5237,7 +5610,7 @@ test("planner task commands in one decision share the same version snapshot", as
         {
           kind: "patch_task",
           taskId: "task:recon-web",
-          patch: { budget: { maxTurns: 16 } },
+          patch: { additionalTurns: 6 },
           reason: "extend recon budget",
           basedOnRefs: ["task:recon-web"]
         }
@@ -5270,7 +5643,14 @@ test("planner task commands in one decision share the same version snapshot", as
   assert.deepEqual(taskNode?.properties.budget, { maxTurns: 16 });
   assert.ok(!events.some((event) => event.eventType === "planner_command_rejected"));
   assert.ok(events.some((event) => event.eventType === "planner_status_applied" && event.taskId === "task:recon-web"));
-  assert.ok(events.some((event) => event.eventType === "planner_task_patched" && event.taskId === "task:recon-web"));
+  const budgetPatch = events.find((event) => event.eventType === "planner_task_patched" && event.taskId === "task:recon-web");
+  assert.deepEqual(budgetPatch?.payload.budgetChange, {
+    consumedTurns: 0,
+    previousMaxTurns: 10,
+    additionalTurns: 6,
+    newMaxTurns: 16,
+    remainingTurns: 16
+  });
   controller.close();
 });
 
@@ -5860,6 +6240,7 @@ test("maxTurns abort gives the same Executor one unmetered structured finalizati
   let abortCount = 0;
   let disposeCount = 0;
   let executorFactoryCount = 0;
+  const networkFinalizationPromptCounts: number[] = [];
   let currentTaskEnvelope: TaskEnvelope | undefined;
   let activeToolNames = ["bash", "read", "artifact_write", "task_result_submit"];
   const executorSession = {
@@ -5886,6 +6267,7 @@ test("maxTurns abort gives the same Executor one unmetered structured finalizati
         throw new Error("Request was aborted");
       }
       assert.equal(promptCount, 2);
+      assert.deepEqual(networkFinalizationPromptCounts, []);
       for (const listener of [...listeners]) {
         const details = {
           taskId: "task:primary",
@@ -5991,6 +6373,9 @@ test("maxTurns abort gives the same Executor one unmetered structured finalizati
       resumeCount: 0
     };
   };
+  controllerHarness.scheduleExecutorNetworkFinalization = async () => {
+    networkFinalizationPromptCounts.push(promptCount);
+  };
 
   const result = await controller.runUntilDone({
     userGoal: "Recover the target artifact",
@@ -6003,6 +6388,7 @@ test("maxTurns abort gives the same Executor one unmetered structured finalizati
   assert.equal(result.cycles.length, 1);
   assert.equal(executorFactoryCount, 1);
   assert.equal(promptCount, 2);
+  assert.deepEqual(networkFinalizationPromptCounts, [2]);
   assert.match(prompts[1] ?? "", /RUNTIME_BUDGET_CHECKPOINT_FINALIZATION/);
   assert.match(prompts[1] ?? "", /artifact_write/);
   const checkpointTaskEvent = events.find((event) => event.eventType === "task_partial"
@@ -6804,7 +7190,9 @@ function createControllerHarness(): {
       decision: "continue",
       reason: "no supervision intervention",
       evidenceRefs: [],
-      confidence: "low"
+      confidence: "low",
+      epochRef: "epoch:test",
+      throughSeq: 0
     };
   };
   controllerHarness.enqueueProjectionJob = async () => ({
@@ -6976,27 +7364,16 @@ function aliasForProjectionLabel(prompt: string, label: string): string | undefi
 
 function observerProjectionJson(): string {
   return JSON.stringify({
-    graphDelta: {
-      sourceEventIds: ["event:source"],
-      nodes: [],
-      edges: []
-    },
-    controlSignal: {
-      decision: "continue",
-      reason: "no intervention",
-      evidenceRefs: ["event:source"],
-      confidence: "low"
-    }
+    nodes: [],
+    edges: []
   });
 }
 
 function projectionDeltaJson(nodeId: string, sourceEventId: string): string {
   return JSON.stringify({
-    sourceEventIds: [sourceEventId],
     nodes: [
       {
         id: "new:1",
-        graphKind: "reasoning",
         type: "Evidence",
         label: nodeId,
         properties: {},
@@ -7004,7 +7381,6 @@ function projectionDeltaJson(nodeId: string, sourceEventId: string): string {
       },
       {
         id: "new:2",
-        graphKind: "operation",
         type: "WebEndpoint",
         label: `endpoint for ${nodeId}`,
         properties: {},
@@ -7058,6 +7434,63 @@ function createCheckpointSubmissionSession(
         listener({
           type: "tool_execution_end",
           toolCallId: "call:checkpoint-finalization",
+          toolName: "task_result_submit",
+          result: { details },
+          isError: false
+        });
+      }
+    },
+    async steer(): Promise<void> {},
+    subscribe(listener: (event: unknown) => void): () => void {
+      listeners.push(listener);
+      return () => {
+        const index = listeners.indexOf(listener);
+        if (index >= 0) listeners.splice(index, 1);
+      };
+    },
+    promptCount: () => prompts.length,
+    prompts: () => [...prompts],
+    steers: () => [],
+    async abort(): Promise<void> {},
+    getActiveToolNames: () => [...activeToolNames],
+    setActiveToolsByName(toolNames: string[]): void {
+      activeToolNames = [...toolNames];
+      toolHistory.push([...toolNames]);
+    },
+    activeToolHistory: () => toolHistory.map((toolNames) => [...toolNames])
+  };
+}
+
+function createCheckpointArtifactThenResultSession(
+  details: TaskResult
+): ReturnType<typeof createCheckpointSubmissionSession> {
+  const listeners: Array<(event: unknown) => void> = [];
+  const prompts: string[] = [];
+  const toolHistory: string[][] = [];
+  let activeToolNames = ["bash", "read", "artifact_write", "task_result_submit"];
+  return {
+    async prompt(text: string): Promise<void> {
+      prompts.push(text);
+      for (const listener of [...listeners]) {
+        listener({
+          type: "tool_execution_end",
+          toolCallId: "call:checkpoint-artifact",
+          toolName: "artifact_write",
+          result: { details: { artifactRef: "artifact:checkpoint" } },
+          isError: false
+        });
+      }
+      assert.deepEqual(activeToolNames, ["task_result_submit"]);
+      for (const listener of [...listeners]) {
+        listener({
+          type: "tool_execution_start",
+          toolCallId: "call:checkpoint-result",
+          toolName: "task_result_submit",
+          args: details
+        });
+        listener({
+          type: "tool_execution_end",
+          toolCallId: "call:checkpoint-result",
           toolName: "task_result_submit",
           result: { details },
           isError: false

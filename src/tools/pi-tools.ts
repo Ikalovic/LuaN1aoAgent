@@ -5,12 +5,11 @@ import { constants } from "node:fs";
 import { chmod, copyFile, lstat, mkdir, realpath, rename, unlink } from "node:fs/promises";
 import { basename, extname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import {
+  PROJECTION_ALL_NODE_TYPES,
   PROJECTION_EDGE_TYPES,
   PROJECTOR_MAX_DELTA_EDGES,
   PROJECTOR_MAX_DELTA_NODES,
-  PROJECTION_OPERATION_NODE_TYPES,
-  PROJECTION_REASONING_NODE_TYPES,
-  validateProjectionDraftIntegrity,
+  normalizeProjectionDraft,
   type ProjectionDraftValidationOptions,
   type ProjectorGraphRefRegistry
 } from "../projection.js";
@@ -28,47 +27,30 @@ const GraphNodeCommonProperties = {
   evidenceRefs: Type.Optional(Type.Array(Type.String()))
 };
 
-const ProjectorGraphNodeCommonProperties = {
-  id: Type.String({ pattern: "^new:[1-9][0-9]*$", maxLength: 32 }),
-  label: Type.String({ minLength: 1 }),
+const ProjectorGraphNodeUpdateProperties = {
   properties: Type.Optional(Type.Record(Type.String(), Type.Unknown(), {
     description: "Node metadata including status, target, description, severity, artifactRef and artifactRefs."
   })),
   evidenceRefs: Type.Optional(Type.Array(Type.String()))
 };
 
-const ProjectorOperationNodeTypeSchema = Type.Union(
-  PROJECTION_OPERATION_NODE_TYPES.map((type) => Type.Literal(type))
-);
-const ProjectorReasoningNodeTypeSchema = Type.Union(
-  PROJECTION_REASONING_NODE_TYPES.map((type) => Type.Literal(type))
-);
-const ProjectorEdgeTypeSchema = Type.Union(
-  PROJECTION_EDGE_TYPES.map((type) => Type.Literal(type))
-);
-
 const ProjectorGraphNodeSchema = Type.Union([
   Type.Object({
     id: Type.String({ pattern: "^existing:[1-9][0-9]*$", maxLength: 32 }),
-    properties: Type.Optional(Type.Record(Type.String(), Type.Unknown())),
-    evidenceRefs: Type.Optional(Type.Array(Type.String()))
+    ...ProjectorGraphNodeUpdateProperties
   }, { additionalProperties: false }),
   Type.Object({
-    ...ProjectorGraphNodeCommonProperties,
-    graphKind: Type.Literal("operation"),
-    type: ProjectorOperationNodeTypeSchema
-  }, { additionalProperties: false }),
-  Type.Object({
-    ...ProjectorGraphNodeCommonProperties,
-    graphKind: Type.Literal("reasoning"),
-    type: ProjectorReasoningNodeTypeSchema
+    id: Type.String({ pattern: "^new:[1-9][0-9]*$", maxLength: 32 }),
+    type: Type.Union(PROJECTION_ALL_NODE_TYPES.map((type) => Type.Literal(type))),
+    label: Type.String({ minLength: 1, maxLength: 500 }),
+    ...ProjectorGraphNodeUpdateProperties
   }, { additionalProperties: false })
 ]);
 
 const ProjectorGraphEdgeSchema = Type.Object({
   from: Type.String({ pattern: "^(existing|new):[1-9][0-9]*$", maxLength: 32 }),
   to: Type.String({ pattern: "^(existing|new):[1-9][0-9]*$", maxLength: 32 }),
-  type: ProjectorEdgeTypeSchema,
+  type: Type.Union(PROJECTION_EDGE_TYPES.map((type) => Type.Literal(type))),
   properties: Type.Optional(Type.Record(Type.String(), Type.Unknown())),
   evidenceRefs: Type.Optional(Type.Array(Type.String()))
 }, { additionalProperties: false });
@@ -106,7 +88,11 @@ const PlannerTaskSpecSchema = Type.Object({
   parallelGroup: Type.Optional(Type.String({ minLength: 1, maxLength: 256 }))
 }, { additionalProperties: false });
 const PlannerTaskPatchSchema = Type.Object({
-  budget: Type.Optional(PlannerTaskBudgetSchema),
+  additionalTurns: Type.Optional(Type.Integer({
+    minimum: 1,
+    maximum: 40,
+    description: "Turns to add to this Task's cumulative maxTurns. This is an increment, not the new total."
+  })),
   priority: Type.Optional(Type.Number({ minimum: 1 })),
   parallelGroup: Type.Optional(Type.String({ maxLength: 256 }))
 }, { additionalProperties: false });
@@ -249,14 +235,14 @@ export function createGraphDeltaSubmitTool(options: ProjectionDraftValidationOpt
     label: "Submit Graph Delta",
     description: "Submit the final Projector GraphDelta and terminate this Projector invocation.",
     parameters: Type.Object({
-      nodes: Type.Array(ProjectorGraphNodeSchema, { maxItems: PROJECTOR_MAX_DELTA_NODES }),
-      edges: Type.Array(ProjectorGraphEdgeSchema, { maxItems: PROJECTOR_MAX_DELTA_EDGES })
+      nodes: Type.Optional(Type.Array(ProjectorGraphNodeSchema, { maxItems: PROJECTOR_MAX_DELTA_NODES })),
+      edges: Type.Optional(Type.Array(ProjectorGraphEdgeSchema, { maxItems: PROJECTOR_MAX_DELTA_EDGES }))
     }, { additionalProperties: false }),
     execute: async (_toolCallId, params) => {
-      validateProjectionDraftIntegrity(params, options);
+      const draft = normalizeProjectionDraft(params, options);
       return {
         content: [{ type: "text", text: "Graph delta draft accepted; graph transaction commit is pending" }],
-        details: params,
+        details: draft,
         terminate: true
       };
     }

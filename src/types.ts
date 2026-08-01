@@ -186,6 +186,9 @@ export type PlannerTaskSpec = {
 };
 
 export type PlannerTaskPatch = {
+  /** Planner-facing incremental extension; Runtime resolves this to cumulative budget.maxTurns. */
+  additionalTurns?: number;
+  /** Historical decisions and Runtime-internal resolved patches only. */
   budget?: TaskBudget;
   priority?: number;
   parallelGroup?: string;
@@ -381,6 +384,9 @@ export type PlannerTaskLedgerItem = {
   status: string;
   goal: string;
   executionState?: "running" | "awaiting_planner" | "queued" | "blocked";
+  maxTurns?: number;
+  consumedTurns?: number;
+  remainingTurns?: number;
   ready?: boolean;
   blockedByTaskRefs?: string[];
   dependencyStatuses?: Record<string, string>;

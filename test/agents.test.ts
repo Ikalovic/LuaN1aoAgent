@@ -118,9 +118,11 @@ test("projector terminal tool bounds the wire schema and enforces draft semantic
           anyOf?: Array<{
             properties?: {
               id?: { pattern?: string };
+              graphKind?: unknown;
             };
             additionalProperties?: boolean;
           }>;
+          additionalProperties?: boolean;
         };
       };
       edges: {
@@ -137,18 +139,21 @@ test("projector terminal tool bounds the wire schema and enforces draft semantic
     additionalProperties?: boolean;
   };
 
-  // The wire schema constrains aliases, graph vocabulary and unexpected keys;
-  // cross-record identity and connectivity remain deterministic runtime checks.
+  // The wire schema guides generation with fixed identity and vocabulary rules.
+  // The deterministic parser remains authoritative for dynamic evidence semantics.
   assert.equal(schema.properties.nodes.maxItems, 24);
   assert.equal(schema.properties.edges.maxItems, 40);
   assert.equal(schema.properties.nodes.items?.anyOf?.[0]?.properties?.id?.pattern, "^existing:[1-9][0-9]*$");
+  assert.equal(schema.properties.nodes.items?.anyOf?.[1]?.properties?.id?.pattern, "^new:[1-9][0-9]*$");
+  assert.equal(schema.properties.nodes.items?.anyOf?.[0]?.properties?.graphKind, undefined);
+  assert.equal(schema.properties.nodes.items?.anyOf?.[1]?.properties?.graphKind, undefined);
   assert.equal(schema.properties.nodes.items?.anyOf?.[0]?.additionalProperties, false);
   assert.equal(schema.properties.nodes.items?.anyOf?.[1]?.additionalProperties, false);
-  assert.equal(schema.properties.nodes.items?.anyOf?.[2]?.additionalProperties, false);
   assert.equal(schema.properties.edges.items?.properties?.from?.pattern, "^(existing|new):[1-9][0-9]*$");
   assert.equal(schema.properties.edges.items?.properties?.to?.pattern, "^(existing|new):[1-9][0-9]*$");
   assert.equal(schema.properties.sourceEventIds, undefined);
   assert.equal(schema.additionalProperties, false);
+  assert.equal(Check(tool.parameters, {}), true);
 
   assert.equal(Check(tool.parameters, {
     nodes: [{ id: "existing:1", properties: { status: "refuted" }, evidenceRefs: ["o1"] }],
@@ -157,7 +162,6 @@ test("projector terminal tool bounds the wire schema and enforces draft semantic
   assert.equal(Check(tool.parameters, {
     nodes: [{
       id: "existing:1",
-      graphKind: "reasoning",
       type: "Evidence",
       label: "Repeated identity"
     }],
@@ -166,7 +170,6 @@ test("projector terminal tool bounds the wire schema and enforces draft semantic
   assert.equal(Check(tool.parameters, {
     nodes: [{
       id: "new:1",
-      graphKind: "reasoning",
       type: "Evidence",
       label: "HTTP evidence",
       properties: {
@@ -180,7 +183,6 @@ test("projector terminal tool bounds the wire schema and enforces draft semantic
   assert.equal(Check(tool.parameters, {
     nodes: [{
       id: "new:1",
-      graphKind: "reasoning",
       type: "Evidence",
       label: "Long evidence",
       properties: { summary: "x".repeat(2_000) },
@@ -189,19 +191,18 @@ test("projector terminal tool bounds the wire schema and enforces draft semantic
     edges: []
   }), true);
   assert.equal(Check(tool.parameters, {
-    nodes: [{ id: "bogus:1", graphKind: "reasoning", type: "Evidence", label: "Bad alias" }],
+    nodes: [{ id: "bogus:1", type: "Evidence", label: "Bad alias" }],
     edges: []
   }), false);
 
-  // Invalid graph vocabulary and misplaced metadata are rejected at the wire
-  // boundary before the terminating tool can accept them.
+  // Fixed vocabulary and conditional identity rules are rejected at the wire boundary.
   const vocabularyDraft = {
-    nodes: [{ id: "new:1", graphKind: "bogus", type: "Nope", label: "Wrong vocabulary" }],
+    nodes: [{ id: "new:1", type: "Nope", label: "Wrong vocabulary" }],
     edges: []
   };
   assert.equal(Check(tool.parameters, vocabularyDraft), false);
   assert.equal(Check(tool.parameters, {
-    nodes: [{ id: "new:1", graphKind: "reasoning", type: "Evidence", label: "Extra keys", status: "confirmed" }],
+    nodes: [{ id: "new:1", type: "Evidence", label: "Extra keys", status: "confirmed" }],
     edges: []
   }), false);
   assert.equal(Check(tool.parameters, {
@@ -209,12 +210,30 @@ test("projector terminal tool bounds the wire schema and enforces draft semantic
     edges: [{ from: "existing:1", to: "existing:2", type: "depends_on" }]
   }), false);
   assert.equal(Check(tool.parameters, {
-    nodes: [{ id: "new:1", graphKind: "reasoning", label: "Missing type" }],
+    nodes: [{ id: "new:1", label: "Missing type" }],
     edges: []
   }), false);
 
-  // Direct execute calls still retain actionable deterministic validation for
-  // providers or legacy paths that do not enforce the advertised schema.
+  const empty = await tool.execute(
+    "call:projector:empty",
+    {},
+    new AbortController().signal,
+    () => undefined,
+    {} as never
+  );
+  assert.deepEqual(empty.details, { nodes: [], edges: [] });
+  const nodeOnly = await tool.execute(
+    "call:projector:node-only",
+    { nodes: [{ id: "new:1", type: "Host", label: "10.0.0.1" }] },
+    new AbortController().signal,
+    () => undefined,
+    {} as never
+  );
+  assert.deepEqual(nodeOnly.details, {
+    nodes: [{ id: "new:1", type: "Host", label: "10.0.0.1" }],
+    edges: []
+  });
+
   await assert.rejects(
     () => tool.execute(
       "call:projector:vocabulary",
@@ -223,13 +242,36 @@ test("projector terminal tool bounds the wire schema and enforces draft semantic
       () => undefined,
       {} as never
     ),
-    /node at index 0 has graphKind "bogus".*No part of the delta was accepted/
+    /node at index 0 has type "Nope"; valid node types:.*No part of the delta was accepted/
+  );
+  await assert.rejects(
+    () => tool.execute(
+      "call:projector:missing-type",
+      { nodes: [{ id: "new:1", label: "Missing type" }] },
+      new AbortController().signal,
+      () => undefined,
+      {} as never
+    ),
+    /node at index 0 has type null; valid node types:.*No part of the delta was accepted/
+  );
+  await assert.rejects(
+    () => tool.execute(
+      "call:projector:existing-identity",
+      {
+        nodes: [{ id: "existing:1", type: "Evidence", label: "Repeated identity" }],
+        edges: []
+      },
+      new AbortController().signal,
+      () => undefined,
+      {} as never
+    ),
+    /must omit existing identity fields \[type, label\].*No part of the delta was accepted/
   );
   await assert.rejects(
     () => tool.execute(
       "call:projector:keys",
       {
-        nodes: [{ id: "new:1", graphKind: "reasoning", type: "Evidence", label: "Extra keys", status: "confirmed" }],
+        nodes: [{ id: "new:1", type: "Evidence", label: "Extra keys", status: "confirmed" }],
         edges: []
       },
       new AbortController().signal,
@@ -262,7 +304,6 @@ test("projector terminal tool rejects incomplete new-alias closures before termi
       {
         nodes: [{
           id: "new:7",
-          graphKind: "operation",
           type: "Port",
           label: "60.205.226.234:8001",
           properties: { port: 8001 }
@@ -285,7 +326,6 @@ test("projector terminal tool enforces one total delta byte boundary", async () 
       {
         nodes: [{
           id: "new:1",
-          graphKind: "reasoning",
           type: "Evidence",
           label: "Oversized evidence",
           properties: { summary: "x".repeat(130 * 1024) },
@@ -329,9 +369,6 @@ test("projector terminal tool validates existing aliases against only its curren
     {
       nodes: [{
         id: "existing:1",
-        graphKind: "operation",
-        type: "Host",
-        label: "Updated host",
         properties: { ip: "10.0.0.1" }
       }],
       edges: [{ from: "existing:2", to: "existing:1", type: "observed_on" }]
@@ -348,9 +385,6 @@ test("projector terminal tool validates existing aliases against only its curren
       {
         nodes: [{
           id: "existing:3",
-          graphKind: "operation",
-          type: "Host",
-          label: "Disguised task node",
           properties: {}
         }],
         edges: []
@@ -387,7 +421,6 @@ test("projector rejects unconnected new semantic nodes and accepts an atomic rel
       {
         nodes: [{
           id: "new:1",
-          graphKind: "reasoning",
           type: "Evidence",
           label: "Observed authentication bypass",
           properties: {}
@@ -405,7 +438,6 @@ test("projector rejects unconnected new semantic nodes and accepts an atomic rel
     {
       nodes: [{
         id: "new:1",
-        graphKind: "reasoning",
         type: "Evidence",
         label: "Observed authentication bypass",
         properties: {}

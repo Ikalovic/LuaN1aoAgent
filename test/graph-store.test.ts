@@ -1540,6 +1540,109 @@ test("planner decision applies all graph mutations atomically", () => {
   graphStore.close();
 });
 
+test("set_node_status rejects Task targets while preserving non-Task status updates", () => {
+  const runtimeDir = mkdtempSync(join(tmpdir(), "luanniao-graph-"));
+  const graphStore = new SQLiteGraphStore(join(runtimeDir, "state.sqlite"), join(runtimeDir, "deltas.jsonl"));
+  graphStore.upsertDelta({
+    sourceEventIds: [],
+    nodes: [
+      { id: "goal:root", graphKind: "task", type: "Goal", label: "Root", properties: { status: "open", version: 1 } },
+      { id: "milestone:foothold", graphKind: "task", type: "Milestone", label: "Foothold", properties: { status: "open", version: 1 } },
+      { id: "blocker:route", graphKind: "task", type: "Blocker", label: "Route", properties: { status: "open", version: 1 } }
+    ],
+    edges: []
+  });
+  graphStore.createTasks([{
+    taskId: "task:existing",
+    goal: "Existing Task",
+    targetRefs: ["goal:root"],
+    scopeRef: "scope:root",
+    constraints: [],
+    successCriteria: ["done"],
+    priority: 1
+  }]);
+
+  assert.throws(() => graphStore.validatePlannerDecision({
+    decision: "apply_commands",
+    commands: [{ kind: "set_node_status", nodeId: "task:existing", status: "open", basedOnRefs: [] }],
+    reason: "bypass Task status command"
+  }), /Task task:existing status must be changed with set_task_status/);
+  assert.throws(() => graphStore.setNodeStatus({
+    nodeId: "task:existing",
+    status: "archived"
+  }), /Task task:existing status must be changed with set_task_status/);
+  assert.throws(() => graphStore.applyPlannerDecision({
+    createTasks: [],
+    taskCommands: [],
+    nodeStatusCommands: [{
+      commandIndex: 0,
+      nodeId: "task:existing",
+      status: "archived",
+      expectedVersion: 1,
+      sourceEventIds: ["event:planner"]
+    }],
+    sourceEventIds: ["event:planner"]
+  }), /Task task:existing status must be changed with set_task_status/);
+  assert.equal(graphStore.getTaskNode("task:existing")?.properties.status, "open");
+
+  assert.throws(() => graphStore.validatePlannerDecision({
+    decision: "apply_commands",
+    commands: [{
+      kind: "create_tasks",
+      tasks: [{
+        id: "task:new",
+        goal: "New Task",
+        targetRefs: ["goal:root"],
+        scopeRef: "scope:root",
+        successCriteria: ["done"],
+        priority: 1
+      }],
+      basedOnRefs: []
+    }, {
+      kind: "set_node_status",
+      nodeId: "task:new",
+      status: "completed",
+      basedOnRefs: []
+    }],
+    reason: "attempt to bypass a same-decision Task status"
+  }), /Task task:new status must be changed with set_task_status/);
+  assert.throws(() => graphStore.applyPlannerDecision({
+    createTasks: [{
+      taskId: "task:new",
+      goal: "New Task",
+      targetRefs: ["goal:root"],
+      scopeRef: "scope:root",
+      constraints: [],
+      successCriteria: ["done"],
+      priority: 1
+    }],
+    taskCommands: [],
+    nodeStatusCommands: [{
+      commandIndex: 1,
+      nodeId: "task:new",
+      status: "completed",
+      sourceEventIds: ["event:planner"]
+    }],
+    sourceEventIds: ["event:planner"]
+  }), /Task task:new status must be changed with set_task_status/);
+  assert.equal(graphStore.getTaskNode("task:new"), undefined);
+
+  graphStore.applyPlannerDecision({
+    createTasks: [],
+    taskCommands: [],
+    nodeStatusCommands: [
+      { commandIndex: 0, nodeId: "goal:root", status: "achieved", expectedVersion: 1, sourceEventIds: [] },
+      { commandIndex: 1, nodeId: "milestone:foothold", status: "completed", expectedVersion: 1, sourceEventIds: [] },
+      { commandIndex: 2, nodeId: "blocker:route", status: "resolved", expectedVersion: 1, sourceEventIds: [] }
+    ],
+    sourceEventIds: []
+  });
+  assert.equal(graphStore.query("task", ["goal:root"], 1).nodes[0]?.properties.status, "completed");
+  assert.equal(graphStore.query("task", ["milestone:foothold"], 1).nodes[0]?.properties.status, "completed");
+  assert.equal(graphStore.query("task", ["blocker:route"], 1).nodes[0]?.properties.status, "resolved");
+  graphStore.close();
+});
+
 test("builds compact planner decision view without copying TaskOutcome fields into Task definitions", () => {
   const runtimeDir = mkdtempSync(join(tmpdir(), "luanniao-graph-"));
   const graphStore = new SQLiteGraphStore(join(runtimeDir, "state.sqlite"), join(runtimeDir, "deltas.jsonl"));

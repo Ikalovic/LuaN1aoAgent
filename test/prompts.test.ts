@@ -116,6 +116,11 @@ test("executor prompt uses bounded experimental method and runtime steering", ()
 });
 
 test("planner prompt teaches evidence-aware planning without an intermediate contract", () => {
+  assert.match(PLANNER_SYSTEM_PROMPT, /先只根据 compact state 形成一份候选 commands/);
+  assert.match(PLANNER_SYSTEM_PROMPT, /不同答案是否会改变 command 的 kind、目标节点、status、budget、依赖或 priority/);
+  assert.match(PLANNER_SYSTEM_PROMPT, /若它不改变候选 commands，继续提交/);
+  assert.match(PLANNER_SYSTEM_PROMPT, /所有仍合理的解释都会得到同一组 commands/);
+  assert.match(PLANNER_SYSTEM_PROMPT, /不要求你重演 Executor 调查/);
   assert.match(PLANNER_SYSTEM_PROMPT, /priority 数字越小优先级越高，1 是最高优先级/);
   assert.match(PLANNER_SYSTEM_PROMPT, /evidence_list 列出 Task 的持久观察/);
   assert.match(PLANNER_SYSTEM_PROMPT, /evidence_read 按真实 event Ref 读取原始观察/);
@@ -220,6 +225,7 @@ test("planner follow-up carries a complete structural delta without repeating fi
       dependsOnTaskRefs: []
     }],
     taskOutcomes: [],
+    epochOutcomes: [],
     reasoningDigest: [],
     operationDigest: [],
     blockers: [],
@@ -247,6 +253,15 @@ test("planner follow-up carries a complete structural delta without repeating fi
       terminalSeq: 12,
       createdAt: new Date(0).toISOString()
     }],
+    epochOutcomes: [{
+      epochRef: "epoch:recon:checkpoint",
+      taskRef: "task:recon",
+      status: "checkpointed",
+      reason: "Task budget reached: maxTurns=10",
+      terminalSeq: 13,
+      retryable: true,
+      createdAt: new Date(0).toISOString()
+    }],
     graphSummary: { nodeCount: 4, edgeCount: 1, taskStatusCounts: { partial: 1 } }
   };
 
@@ -264,6 +279,8 @@ test("planner follow-up carries a complete structural delta without repeating fi
   assert.match(input, /"throughEventSeq":14/);
   assert.match(input, /"taskRef":"task:recon"/);
   assert.match(input, /"suggestedNextGoal":"Try the reported admin endpoint"/);
+  assert.match(input, /"status":"checkpointed"/);
+  assert.match(input, /Task budget reached: maxTurns=10/);
   assert.doesNotMatch(input, /<goal>/);
   assert.doesNotMatch(input, /<authorized_scope>/);
   assert.doesNotMatch(input, /"goal":"Map the target".*"status":"open"/);
@@ -300,40 +317,23 @@ test("planner prompt explains how to use degraded projection outcomes", () => {
 });
 
 test("projector prompt requests semantic changes instead of one node per observation", () => {
-  assert.match(OBSERVER_PROJECTOR_SYSTEM_PROMPT, /语义变化集/);
-  assert.match(OBSERVER_PROJECTOR_SYSTEM_PROMPT, /多个 observation 支持同一事实时合并/);
-  assert.match(OBSERVER_PROJECTOR_SYSTEM_PROMPT, /已有节点已表达该事实时更新 existing 别名/);
-  assert.match(OBSERVER_PROJECTOR_SYSTEM_PROMPT, /禁止写入或连接 Task、Milestone、Blocker、Goal、Scope/);
-  assert.match(OBSERVER_PROJECTOR_SYSTEM_PROMPT, /session opened\/reconnected.*必须创建或更新一个 ShellSession.*sessionId 必须等于 connectionRef.*session_on/s);
-  assert.match(OBSERVER_PROJECTOR_SYSTEM_PROMPT, /Evidence 只描述 observation 直接支持的事实/);
-  assert.match(OBSERVER_PROJECTOR_SYSTEM_PROMPT, /错误投影：Evidence 声称“确认后端调用 request\.json\.get\('url'\)”/);
-  assert.match(OBSERVER_PROJECTOR_SYSTEM_PROMPT, /直接 GET 返回 404 不能证明文件在所有访问方式下不存在/);
-  assert.match(OBSERVER_PROJECTOR_SYSTEM_PROMPT, /确认实验没有可复现基线/);
-  assert.match(OBSERVER_PROJECTOR_SYSTEM_PROMPT, /不得据此创建“该机制无效”/);
-  assert.match(OBSERVER_PROJECTOR_SYSTEM_PROMPT, /executor_interpretation_non_evidence 是 Executor/);
-  assert.match(OBSERVER_PROJECTOR_SYSTEM_PROMPT, /material_integrity/);
-  assert.match(OBSERVER_PROJECTOR_SYSTEM_PROMPT, /不得把 refuted Hypothesis 重开/);
-  assert.match(OBSERVER_PROJECTOR_SYSTEM_PROMPT, /不能补全缺失材料/);
-  assert.match(OBSERVER_PROJECTOR_SYSTEM_PROMPT, /不能单独作为 Evidence/);
-  assert.match(OBSERVER_PROJECTOR_SYSTEM_PROMPT, /artifact:\* 引用必须原样保留到对应节点的 properties\.artifactRef/);
-  assert.match(OBSERVER_PROJECTOR_SYSTEM_PROMPT, /引用是持久材料的指针，不是秘密值/);
-  assert.match(OBSERVER_PROJECTOR_SYSTEM_PROMPT, /existing:N 节点只提交 id 和需要追加的 properties\/evidenceRefs/);
-  assert.match(OBSERVER_PROJECTOR_SYSTEM_PROMPT, /身份字段由 Runtime 从只读别名注册表恢复/);
-  assert.match(OBSERVER_PROJECTOR_SYSTEM_PROMPT, /operation 节点 type 只能是 Host、Port、Service、WebEndpoint、Parameter、Credential、AgentSession、ShellSession、Session、File、Process/);
-  assert.match(OBSERVER_PROJECTOR_SYSTEM_PROMPT, /只修正错误信息点名的节点或边，其余内容原样重交/);
-  assert.match(OBSERVER_PROJECTOR_SYSTEM_PROMPT, /禁止创造 hosted_on、serves_endpoint、targets、exploits、suggests、refines、refutes、extends、uses_parameter/);
+  assert.match(OBSERVER_PROJECTOR_SYSTEM_PROMPT, /Ground claims/);
+  assert.match(OBSERVER_PROJECTOR_SYSTEM_PROMPT, /能够直接指向原始 input\/outcome 的最小 claim/);
+  assert.match(OBSERVER_PROJECTOR_SYSTEM_PROMPT, /命令中提到的候选、Executor commentary、静态页面文字和模型解释都不是结果/);
+  assert.match(OBSERVER_PROJECTOR_SYSTEM_PROMPT, /Project changes/);
+  assert.match(OBSERVER_PROJECTOR_SYSTEM_PROMPT, /相同事实合并 evidenceRefs/);
+  assert.match(OBSERVER_PROJECTOR_SYSTEM_PROMPT, /已有事实没有变化就提交空 delta/);
+  assert.match(OBSERVER_PROJECTOR_SYSTEM_PROMPT, /Evidence 只写 ground claim/);
+  assert.match(OBSERVER_PROJECTOR_SYSTEM_PROMPT, /解释只写成 status=open\/inconclusive 的 Hypothesis/);
+  assert.match(OBSERVER_PROJECTOR_SYSTEM_PROMPT, /只有完整、可绑定的正向结果/);
+  assert.match(OBSERVER_PROJECTOR_SYSTEM_PROMPT, /负面结论不得大于实验范围/);
+  assert.match(OBSERVER_PROJECTOR_SYSTEM_PROMPT, /executor_commentary_non_evidence 只能用于定位原始材料/);
+  assert.match(OBSERVER_PROJECTOR_SYSTEM_PROMPT, /artifact:\* 必须原样写入/);
+  assert.match(OBSERVER_PROJECTOR_SYSTEM_PROMPT, /live session 创建或更新 ShellSession.*sessionId 等于 connectionRef.*session_on/s);
   assert.match(OBSERVER_PROJECTOR_SYSTEM_PROMPT, /Service -exposes_endpoint-> WebEndpoint/);
   assert.match(OBSERVER_PROJECTOR_SYSTEM_PROMPT, /Vulnerability -exploited_by-> Exploit/);
-  assert.match(OBSERVER_PROJECTOR_SYSTEM_PROMPT, /Task、Milestone、Blocker、Goal、Scope 不会作为可用 existing 别名提供/);
-  assert.match(OBSERVER_PROJECTOR_SYSTEM_PROMPT, /没有匹配关系时省略该边.*提交空 delta/);
-  assert.match(OBSERVER_PROJECTOR_SYSTEM_PROMPT, /<example name="semantic-merge">/);
-  assert.match(OBSERVER_PROJECTOR_SYSTEM_PROMPT, /negativeConclusion 和 reopenConditions/);
   assert.match(OBSERVER_PROJECTOR_SYSTEM_PROMPT, /Evidence -contradicts-> Hypothesis/);
-  assert.match(OBSERVER_PROJECTOR_SYSTEM_PROMPT, /随机不存在的 \/\.definitely-missing/);
-  assert.match(OBSERVER_PROJECTOR_SYSTEM_PROMPT, /原样 \.\.\/ 可穿越.*窄 Hypothesis 标为 refuted/);
-  assert.match(OBSERVER_PROJECTOR_SYSTEM_PROMPT, /不得据此反驳其父级漏洞类别/);
-  assert.match(OBSERVER_PROJECTOR_SYSTEM_PROMPT, /有限枚举的 Evidence 必须保留实际候选清单或其 Artifact 引用/);
-  assert.match(OBSERVER_PROJECTOR_SYSTEM_PROMPT, /一次固定调用成功只支持该固定调用/);
+  assert.match(OBSERVER_PROJECTOR_SYSTEM_PROMPT, /Task、Milestone、Blocker、Goal、Scope 不得创建、更新或连接/);
   assert.match(OBSERVER_SUPERVISOR_SYSTEM_PROMPT, /检查近期实验是否真正减少不确定性/);
   assert.match(OBSERVER_SUPERVISOR_SYSTEM_PROMPT, /同时改变多个独立条件后统一失败/);
   assert.match(OBSERVER_SUPERVISOR_SYSTEM_PROMPT, /新的 URL、payload、字段名、工具输出或不同 stdout 指纹本身不等于进展/);

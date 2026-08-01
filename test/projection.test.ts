@@ -20,7 +20,10 @@ import type { ExecutionEvent, GraphEdge, GraphNode } from "../src/types.js";
 
 test("merges Pi tool events into action observations and excludes runtime context reads", () => {
   const events: ExecutionEvent[] = [
-    event(1, "event:intent", "assistant_intent", { text: "验证上传接口认证差异" }),
+    event(1, "event:intent", "assistant_intent", {
+      text: "验证上传接口认证差异",
+      toolCalls: [{ id: "call:upload", name: "bash", arguments: {} }]
+    }),
     event(2, "event:start", "tool_started", {
       toolCallId: "call:upload",
       toolName: "bash",
@@ -52,8 +55,8 @@ test("merges Pi tool events into action observations and excludes runtime contex
   assert.equal(observations.length, 2);
   assert.equal(observations[0]?.action, "bash");
   assert.equal(observations[0]?.intent, "验证上传接口认证差异");
-  assert.match(observations[0]?.interpretation ?? "", /上传接口存在/);
-  assert.deepEqual(observations[0]?.sourceEventIds, ["event:intent", "event:start", "event:end"]);
+  assert.equal(observations[0]?.executorCommentary, undefined);
+  assert.deepEqual(observations[0]?.sourceEventIds, ["event:start", "event:end"]);
   assert.ok(observations[0]?.anchors.includes("10.0.0.5"));
   assert.ok(observations[0]?.anchors.includes("/api/upload.php"));
   assert.equal(observations.some((observation) => observation.outcomeDigest.includes("skill instructions")), false);
@@ -63,10 +66,13 @@ test("merges Pi tool events into action observations and excludes runtime contex
   assert.equal(batch.toSeq, 3);
 });
 
-test("closes a long tool result with the next Executor interpretation without consuming that pending intent", () => {
+test("closes a long tool result with separate Executor commentary without treating it as evidence", () => {
   const longResult = `${"HTTP 403\n".repeat(80)}/keys/../public/static/README.md 200\n${"HTTP 403\n".repeat(80)}`;
   const events: ExecutionEvent[] = [
-    event(1, "event:intent", "assistant_intent", { text: "比较 /keys 路径规范化差异" }),
+    event(1, "event:intent", "assistant_intent", {
+      text: "比较 /keys 路径规范化差异",
+      toolCalls: [{ id: "call:keys", name: "bash", arguments: {} }]
+    }),
     event(2, "event:start", "tool_started", {
       toolCallId: "call:keys",
       toolName: "bash",
@@ -78,7 +84,8 @@ test("closes a long tool result with the next Executor interpretation without co
       result: { content: [{ type: "text", text: longResult }] }
     }),
     event(4, "event:interpretation", "assistant_intent", {
-      text: "利用 /keys 可穿越事实，读取已知静态文件作为 JWT kid 密钥候选。"
+      text: "我认为 /keys 可穿越；下一步改查 10.9.9.9/wrong.php。",
+      toolCalls: [{ id: "call:next", name: "bash", arguments: {} }]
     })
   ];
 
@@ -86,17 +93,25 @@ test("closes a long tool result with the next Executor interpretation without co
   const batch = selectProjectionBatch(events, { fromSeq: 0, maxObservations: 4 });
 
   assert.equal(observations.length, 1);
-  assert.match(observations[0]?.interpretation ?? "", /\/keys 可穿越事实/);
-  assert.doesNotMatch(observations[0]?.sourceEventIds.join(" ") ?? "", /event:interpretation/);
-  assert.match(renderProjectionObservations(observations), /executor_interpretation_non_evidence: "利用 \/keys 可穿越事实/);
-  assert.match(causalObservationDigest(observations), /\/keys 可穿越事实/);
+  assert.match(observations[0]?.executorCommentary ?? "", /我认为 \/keys 可穿越/);
+  assert.deepEqual(observations[0]?.sourceEventIds, ["event:start", "event:end"]);
+  assert.doesNotMatch(observations[0]?.anchors.join(" ") ?? "", /10\.9\.9\.9|wrong\.php/);
+  assert.match(renderProjectionObservations(observations), /executor_commentary_non_evidence: "我认为 \/keys 可穿越/);
+  const digest = causalObservationDigest(observations);
+  assert.ok(digest.indexOf("outcome=") < digest.indexOf("executor_commentary="));
   assert.equal(batch.observations.length, 1);
   assert.equal(batch.toSeq, 3);
 });
 
-test("groups parallel tool results under one Executor interpretation", () => {
+test("groups parallel tool results by their originating Executor turn", () => {
   const observations = buildProjectionObservations([
-    event(1, "event:intent", "assistant_intent", { text: "并行确认两个服务" }),
+    event(1, "event:intent", "assistant_intent", {
+      text: "并行确认两个服务",
+      toolCalls: [
+        { id: "call:http", name: "bash", arguments: {} },
+        { id: "call:ssh", name: "bash", arguments: {} }
+      ]
+    }),
     event(2, "event:start-http", "tool_started", {
       toolCallId: "call:http",
       toolName: "bash",
@@ -125,10 +140,13 @@ test("groups parallel tool results under one Executor interpretation", () => {
   assert.equal(observations.length, 1);
   assert.equal(observations[0]?.action, "tool_group");
   assert.equal(observations[0]?.actions?.length, 2);
-  assert.match(observations[0]?.interpretation ?? "", /同时开放 HTTP 和 SSH/);
+  assert.match(observations[0]?.executorCommentary ?? "", /同时开放 HTTP 和 SSH/);
   const rendered = renderProjectionObservations(observations);
   assert.match(rendered, /tool\[1\]: bash/);
-  assert.equal(rendered.match(/executor_interpretation_non_evidence:/g)?.length, 1);
+  assert.equal(rendered.match(/executor_commentary_non_evidence:/g)?.length, 1);
+  assert.deepEqual(observations[0]?.sourceEventIds, [
+    "event:start-http", "event:end-http", "event:start-ssh", "event:end-ssh"
+  ]);
 });
 
 test("does not advance projection watermark past an unclosed action", () => {
@@ -157,10 +175,11 @@ test("only terminal task result events become task outcome observations", () => 
     event(1, "event:created", "task_created", { goal: "Initial task definition" }),
     event(2, "event:wave", "task_wave_started", { taskIds: ["task:test"] }),
     event(3, "event:epoch", "epoch_transition", { state: "running" }),
-    event(4, "event:partial", "task_partial", {
+    event(4, "event:commentary", "assistant_intent", { text: "I believe the token is confirmed." }),
+    event(5, "event:partial", "task_partial", {
       taskResult: {
         summary: "Confirmed internal admin token and paused for replanning",
-        evidenceRefs: ["event:evidence:1", "event:evidence:2"],
+        evidenceRefs: ["event:commentary", "event:evidence:1", "event:evidence:2"],
         artifactRefs: ["artifact:terminal-proof"],
         capabilityRefs: ["connection:ssh-1", "route:internal"]
       }
@@ -234,17 +253,21 @@ test("keeps complete persisted tool material authoritative over Executor interpr
   const exactMechanism = "posix_mknod($path, 06000 | 0666, $device)";
   const command = `${"setup;".repeat(100)}${exactMechanism}\n${";cleanup".repeat(100)}`;
   const observations = buildProjectionObservations([
-    event(1, "event:start", "tool_started", {
+    event(1, "event:intent", "assistant_intent", {
+      text: "创建并检查块设备节点",
+      toolCalls: [{ id: "call:mechanism", name: "bash", arguments: {} }]
+    }),
+    event(2, "event:start", "tool_started", {
       toolCallId: "call:mechanism",
       toolName: "bash",
       args: { command }
     }),
-    event(2, "event:end", "tool_finished", {
+    event(3, "event:end", "tool_finished", {
       toolCallId: "call:mechanism",
       toolName: "bash",
       result: { content: [{ type: "text", text: "stat_mode=106644\nstat_mode_after=106600" }] }
     }),
-    event(3, "event:interpretation", "assistant_intent", {
+    event(4, "event:interpretation", "assistant_intent", {
       text: "块设备节点已成功创建，重新打开此前被反驳的机制。"
     })
   ]);
@@ -255,7 +278,7 @@ test("keeps complete persisted tool material authoritative over Executor interpr
   assert.equal(observations[0]?.outcomeDigest, "stat_mode=106644\nstat_mode_after=106600");
   const rendered = renderProjectionObservations(observations);
   assert.match(rendered, /material_integrity: input=complete outcome=complete/);
-  assert.match(rendered, /executor_interpretation_non_evidence:/);
+  assert.match(rendered, /executor_commentary_non_evidence:/);
 });
 
 test("marks material truncated only when the unified Projector byte budget compacts it", () => {
@@ -371,7 +394,6 @@ test("expands graph aliases and observation evidence refs into stable GraphDelta
     value: {
       nodes: [{
         id: "new:1",
-        graphKind: "reasoning",
         type: "Vulnerability",
         label: "Hardcoded API key grants upload access",
         properties: { status: "confirmed" },
@@ -387,6 +409,7 @@ test("expands graph aliases and observation evidence refs into stable GraphDelta
   });
 
   assert.deepEqual(delta.sourceEventIds, ["event:1", "event:2", "event:3"]);
+  assert.equal(delta.nodes[0]?.graphKind, "reasoning");
   assert.deepEqual(delta.nodes[0]?.evidenceRefs, ["event:1", "event:2", "event:3"]);
   assert.equal(delta.edges[0]?.to, "endpoint:upload");
   assert.deepEqual(delta.edges[0]?.evidenceRefs, ["event:1", "event:2", "event:3"]);
@@ -476,22 +499,12 @@ test("projector rejects task graph mutations atomically", () => {
     value: {
       nodes: [{
         id: "existing:1",
-        graphKind: "task",
-        type: "Milestone",
-        label: "Incorrectly retyped task",
-        properties: {},
-        evidenceRefs: ["o1"]
-      }, {
-        id: "new:1",
-        graphKind: "task",
-        type: "Blocker",
-        label: "Flag missing",
-        properties: {},
+        properties: { status: "blocked" },
         evidenceRefs: ["o1"]
       }],
-      edges: [{ from: "existing:1", to: "new:1", type: "supports", evidenceRefs: ["o1"] }]
+      edges: []
     }
-  }), /graphKind "task"; expected "operation" or "reasoning".*No part of the delta was accepted/);
+  }), /cannot mutate task graph aliases existing:1\(Task\); no part of the delta was accepted/i);
   assert.throws(() => expandProjectionDraft({
     batch: {
       observations: [{
@@ -512,7 +525,6 @@ test("projector rejects task graph mutations atomically", () => {
     value: {
       nodes: [{
         id: "new:1",
-        graphKind: "operation",
         type: "Host",
         label: "Flag host",
         properties: {},
@@ -546,7 +558,6 @@ test("rejects unknown edge aliases instead of silently dropping relationships", 
     value: {
       nodes: [{
         id: "new:1",
-        graphKind: "reasoning",
         type: "Evidence",
         label: "Observed evidence",
         evidenceRefs: ["o1"]
@@ -576,7 +587,6 @@ test("rejects malformed projection drafts with actionable per-node and per-edge 
   };
   const baseNode = {
     id: "new:1",
-    graphKind: "operation",
     type: "Host",
     label: "host.docker.internal:32856",
     properties: {},
@@ -587,19 +597,19 @@ test("rejects malformed projection drafts with actionable per-node and per-edge 
     batch,
     graphContext,
     value: { nodes: [{ ...baseNode, status: "active", target: "x" }], edges: [] }
-  }), /unexpected top-level keys \[status, target\].*nodes only allow id, graphKind, type, label, properties, evidenceRefs/);
+  }), /unexpected top-level keys \[status, target\].*nodes only allow id, type, label, properties, evidenceRefs/);
 
   assert.throws(() => expandProjectionDraft({
     batch,
     graphContext,
-    value: { nodes: [{ ...baseNode, graphKind: "operational" }], edges: [] }
-  }), /graphKind "operational"; expected "operation" or "reasoning"/);
+    value: { nodes: [{ ...baseNode, graphKind: "operation" }], edges: [] }
+  }), /unexpected top-level keys \[graphKind\].*nodes only allow id, type, label, properties, evidenceRefs/);
 
   assert.throws(() => expandProjectionDraft({
     batch,
     graphContext,
     value: { nodes: [{ ...baseNode, type: "Endpoint" }], edges: [] }
-  }), /\(operation\) has type "Endpoint"; valid operation types: Host, Port, Service, WebEndpoint, Parameter, Credential, AgentSession, ShellSession, Session, File, Process/);
+  }), /has type "Endpoint"; valid node types: Host, Port, Service, WebEndpoint, Parameter, Credential, AgentSession, ShellSession, Session, File, Process, Evidence, Hypothesis, Vulnerability, Exploit/);
 
   assert.doesNotThrow(() => expandProjectionDraft({
     batch,
@@ -645,20 +655,17 @@ test("reports all projection draft errors together with endpoint-aware edge sugg
     value: {
       nodes: [{
         id: "new:1",
-        graphKind: "operation",
         type: "Service",
         label: "HTTP service",
         properties: {}
       }, {
         id: "new:2",
-        graphKind: "operation",
         type: "WebEndpoint",
         label: "GET /",
         properties: {},
         artifactRefs: ["artifact:test"]
       }, {
         id: "new:3",
-        graphKind: "reasoning",
         type: "Evidence",
         label: "Unconnected evidence",
         properties: {},
@@ -706,14 +713,12 @@ test("rejects Vulnerability and succeeded Exploit drafts without resolvable evid
     value: {
       nodes: [{
         id: "new:1",
-        graphKind: "reasoning",
         type: "Vulnerability",
         label: "Confirmed issue",
         properties: { status: "confirmed" },
         evidenceRefs: ["o-missing"]
       }, {
         id: "new:2",
-        graphKind: "reasoning",
         type: "Exploit",
         label: "Successful exploit",
         properties: { status: "succeeded" },
@@ -740,14 +745,12 @@ test("rejects Vulnerability and succeeded Exploit drafts without resolvable evid
     value: {
       nodes: [{
         id: "new:1",
-        graphKind: "reasoning",
         type: "Vulnerability",
         label: "Confirmed issue",
         properties: { status: "confirmed" },
         evidenceRefs: ["o1"]
       }, {
         id: "new:2",
-        graphKind: "reasoning",
         type: "Exploit",
         label: "Successful exploit",
         properties: { status: "succeeded" },
@@ -811,9 +814,6 @@ test("updates existing semantic nodes while preserving their identity", () => {
     value: {
       nodes: [{
         id: "existing:1",
-        graphKind: "reasoning",
-        type: "Evidence",
-        label: "Repeated access denial",
         properties: { count: 2 },
         evidenceRefs: ["o1"]
       }],
@@ -825,7 +825,7 @@ test("updates existing semantic nodes while preserving their identity", () => {
     id: "evidence:access-denied",
     graphKind: "reasoning",
     type: "Evidence",
-    label: "Repeated access denial",
+    label: "Access denied",
     properties: { count: 2 },
     evidenceRefs: ["event:new"]
   }]);
@@ -864,7 +864,6 @@ test("new projector aliases receive runtime identities instead of colliding with
     value: {
       nodes: [{
         id: "new:13",
-        graphKind: "operation",
         type: "WebEndpoint",
         label: "/admin",
         properties: { method: "GET" },
@@ -890,7 +889,6 @@ test("projector rejects explicit global ids outside the alias boundary atomicall
     value: {
       nodes: [{
         id: "evidence:model-chosen-global-id",
-        graphKind: "reasoning",
         type: "Evidence",
         label: "Invalid identity",
         properties: {}
@@ -940,7 +938,8 @@ test("projection compaction advances only through the continuous prefix shown to
     seqStart: index * 2 + 1,
     seqEnd: index * 2 + 2,
     action: index === 3 ? undefined : "bash",
-    interpretation: index === 3 ? undefined : `interpretation ${index + 1}`,
+    executorCommentary: index === 3 ? undefined : `commentary ${index + 1}`,
+    readyForProjection: index === 3 ? undefined : true,
     outcomeDigest: `${"large body ".repeat(100)}result ${index + 1}`,
     status: index === 3 ? "error" : "ok",
     artifactRefs: [`artifact:${index + 1}`],
@@ -1039,7 +1038,14 @@ test("projection compaction measures multibyte text in UTF-8 bytes", () => {
 
 test("partitions one huge grouped observation without losing structure or provenance", () => {
   const events: ExecutionEvent[] = [
-    event(1, "event:intent", "assistant_intent", { text: "并行验证全部候选服务" })
+    event(1, "event:intent", "assistant_intent", {
+      text: "并行验证全部候选服务",
+      toolCalls: Array.from({ length: 80 }, (_, index) => ({
+        id: `call:${index}`,
+        name: "bash",
+        arguments: {}
+      }))
+    })
   ];
   for (let index = 0; index < 80; index += 1) {
     events.push(event(index + 2, `event:start-${index}`, "tool_started", {
@@ -1133,12 +1139,15 @@ test("normalization bounds repeated coalescing without losing provenance", () =>
       })
     );
   }
+  repeatedEvents.push(event(81, "event:commentary", "assistant_intent", {
+    text: "这些相同探测均返回 HTTP 403。"
+  }));
   const repeated = buildProjectionObservations(repeatedEvents);
   assert.equal(repeated.length, 3);
   assert.ok(repeated.every((observation) => (observation.repeatCount ?? 1) <= 16));
   assert.deepEqual(
     repeated.flatMap((observation) => observation.sourceEventIds),
-    repeatedEvents.map((item) => item.id)
+    repeatedEvents.slice(0, -1).map((item) => item.id)
   );
   const firstBatch = selectProjectionBatch(repeatedEvents, { fromSeq: 0, maxObservations: 1 });
   assert.equal(firstBatch.toSeq, 32);
@@ -1309,8 +1318,8 @@ test("canonical operation identities cover agent and shell sessions", () => {
     graphContext,
     value: {
       nodes: [
-        { id: "new:1", graphKind: "operation", type: "AgentSession", label: "Renamed agent", properties: { agentSessionId: "agent-1" } },
-        { id: "new:2", graphKind: "operation", type: "ShellSession", label: "Renamed shell", properties: { sessionId: "shell-1" } }
+        { id: "new:1", type: "AgentSession", label: "Renamed agent", properties: { agentSessionId: "agent-1" } },
+        { id: "new:2", type: "ShellSession", label: "Renamed shell", properties: { sessionId: "shell-1" } }
       ],
       edges: []
     }
@@ -1329,8 +1338,8 @@ test("session labels without business ids do not determine identity", () => {
     graphContext,
     value: {
       nodes: [
-        { id: "new:1", graphKind: "operation", type: "AgentSession", label: "Shared label", properties: {} },
-        { id: "new:2", graphKind: "operation", type: "AgentSession", label: "Shared label", properties: {} }
+        { id: "new:1", type: "AgentSession", label: "Shared label", properties: {} },
+        { id: "new:2", type: "AgentSession", label: "Shared label", properties: {} }
       ],
       edges: []
     }

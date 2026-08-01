@@ -116,6 +116,12 @@ type PlannerTaskCommand = Extract<PlannerCommand, { kind: "patch_task" | "replac
 type PlannerCreateTasksCommand = Extract<PlannerCommand, { kind: "create_tasks" }>;
 type PlannerNodeStatusCommand = Extract<PlannerCommand, { kind: "set_node_status" }>;
 
+type ActivePlannerDeliveryState = {
+  queuedRevision: number;
+  queuedView: PlannerDecisionView;
+  queuedSeq: number;
+};
+
 class ActiveTaskMutationError extends GraphValidationError {
   constructor(readonly taskIds: string[]) {
     super(
@@ -230,7 +236,6 @@ const PROJECTOR_OBSERVATION_EVENT_TYPES = [
 ];
 const EXECUTOR_PROVIDER_RETRY_ATTEMPTS = 2;
 const EXECUTOR_PROVIDER_RETRY_BACKOFF_MS = 250;
-const EXECUTOR_CHECKPOINT_FINALIZATION_TIMEOUT_MS = 60_000;
 const EXECUTOR_SESSION_DIR = "executor-sessions";
 
 type ObserverProjectionRequest = {
@@ -387,6 +392,8 @@ export class SecurityAgentController {
   private supervisorAbortByEpoch = new Map<string, AbortController>();
   private activeSupervisorSessions = new Set<SecurityAgentSession>();
   private activePlannerSessions = new Set<SecurityAgentSession>();
+  private activePlannerDelivery = new Map<SecurityAgentSession, ActivePlannerDeliveryState>();
+  private plannerStateRevision = 0;
   private ownedPlannerSession?: SecurityAgentSession;
   private ownedPlannerLogging?: ReturnType<typeof attachExecutionLogging>;
   private lastPlannerDecisionView?: PlannerDecisionView;
@@ -1203,29 +1210,39 @@ export class SecurityAgentController {
       .some((node) => node.id === "goal:root" && node.properties.status === status);
   }
 
-  private async buildPlannerDecisionView(): Promise<PlannerDecisionView> {
+  private buildPlannerDecisionView(): PlannerDecisionView {
     const view = this.graphStore.plannerDecisionView();
     const taskOutcomes = this.runtimeStore.listTaskOutcomes(Number.MAX_SAFE_INTEGER);
-    const epochOutcomes = this.runtimeStore.listEpochOutcomes(Number.MAX_SAFE_INTEGER);
     const statusByTaskId = new Map(view.taskLedger.map((task) => [task.taskId, task.status]));
     const taskLedger = view.taskLedger.map((task) => {
       const projectionState = this.runtimeStore.getProjectionState(task.taskId);
       const readiness = deriveTaskDefinitionReadiness(task.dependsOnTaskRefs, statusByTaskId);
       const running = this.activeTaskRuns.has(task.taskId) || this.activeEpochIdByTask.has(task.taskId);
       const awaitingPlanner = this.awaitingPlannerTaskIds.has(task.taskId);
+      const taskEnvelope = this.graphStore.getTaskEnvelope(task.taskId);
+      const maxTurns = normalizeTaskBudget(taskEnvelope?.budget).maxTurns;
+      const consumedTurns = this.runtimeStore.getTaskConsumedTurns(task.taskId);
+      const remainingTaskTurns = Math.max(0, maxTurns - consumedTurns);
+      const terminalDefinition = ["completed", "blocked", "failed", "archived"].includes(task.status);
       return {
         ...task,
         ready: task.status === "open"
           && readiness.blockedByTaskRefs.length === 0
           && !running
-          && !awaitingPlanner,
-        executionState: running
+          && !awaitingPlanner
+          && remainingTaskTurns > 0,
+        executionState: terminalDefinition
+          ? undefined
+          : running
           ? "running" as const
-          : awaitingPlanner
+          : awaitingPlanner || remainingTaskTurns === 0
             ? "awaiting_planner" as const
             : readiness.blockedByTaskRefs.length > 0
               ? "blocked" as const
               : "queued" as const,
+        maxTurns,
+        consumedTurns,
+        remainingTurns: remainingTaskTurns,
         ...readiness,
         projection: {
           committedSeq: projectionState.committedSeq,
@@ -1233,6 +1250,9 @@ export class SecurityAgentController {
         }
       };
     });
+    const epochOutcomes = taskLedger.flatMap((task) => (
+      this.runtimeStore.listTaskEpochOutcomes(task.taskId, 1)
+    ));
     return {
       ...view,
       taskLedger,
@@ -1341,6 +1361,7 @@ export class SecurityAgentController {
     const nodeStatusCommands: Array<{ command: PlannerNodeStatusCommand; commandIndex: number }> = [];
     let rejectedCommand: unknown;
     try {
+      const budgetPatchByCommandIndex = this.resolvePlannerBudgetPatches(commands);
       const taskCreateInputs: Array<{
         command: PlannerCreateTasksCommand;
         taskEnvelope: TaskEnvelope;
@@ -1369,6 +1390,7 @@ export class SecurityAgentController {
         taskCommands.push({ command, commandIndex });
       });
       rejectedCommand = commands;
+      this.assertPlannerRuntimeTransitions(commands, budgetPatchByCommandIndex);
       const applied = this.graphStore.applyPlannerDecision({
         createTasks: taskCreateInputs.map(({ taskEnvelope, priority }) => ({
           parentTaskId: taskEnvelope.parentTaskId,
@@ -1387,13 +1409,15 @@ export class SecurityAgentController {
         taskCommands: taskCommands.map(({ command, commandIndex }): PlannerTaskBatchCommand => {
           const commandReason = plannerDecision.reason;
           if (command.kind === "patch_task") {
+            const budgetPatch = budgetPatchByCommandIndex.get(commandIndex);
+            const { additionalTurns: _additionalTurns, ...patch } = command.patch;
             return {
               commandIndex,
               kind: command.kind,
               taskId: command.taskId,
               patch: {
-                ...command.patch,
-                ...(command.patch.budget ? { budget: normalizeTaskBudget(command.patch.budget) } : {})
+                ...patch,
+                ...(budgetPatch ? { budget: { maxTurns: budgetPatch.newMaxTurns } } : {})
               },
               expectedVersion: versionSnapshot[command.taskId],
               sourceEventIds: [plannerEventId],
@@ -1451,12 +1475,25 @@ export class SecurityAgentController {
           const commandReason = plannerDecision.reason;
           const appliedCommand = appliedCommandByIndex.get(commandIndex);
           if (command.kind === "patch_task") {
+            const budgetPatch = budgetPatchByCommandIndex.get(commandIndex);
             await this.executionLog.append({
               taskId: command.taskId,
               role: "runtime",
               eventType: "planner_task_patched",
               summary: commandReason,
-              payload: { command, nodeVersion: appliedCommand?.node.properties.version }
+              payload: {
+                command,
+                nodeVersion: appliedCommand?.node.properties.version,
+                ...(budgetPatch ? {
+                  budgetChange: {
+                    consumedTurns: budgetPatch.consumedTurns,
+                    previousMaxTurns: budgetPatch.previousMaxTurns,
+                    additionalTurns: budgetPatch.additionalTurns,
+                    newMaxTurns: budgetPatch.newMaxTurns,
+                    remainingTurns: Math.max(0, budgetPatch.newMaxTurns - budgetPatch.consumedTurns)
+                  }
+                } : {})
+              }
             });
             continue;
           }
@@ -1508,6 +1545,92 @@ export class SecurityAgentController {
       throw error;
     }
     return createdTaskEnvelopes;
+  }
+
+  private resolvePlannerBudgetPatches(commands: PlannerCommand[]): Map<number, {
+    taskId: string;
+    consumedTurns: number;
+    previousMaxTurns: number;
+    additionalTurns: number;
+    newMaxTurns: number;
+  }> {
+    const resolutions = new Map<number, {
+      taskId: string;
+      consumedTurns: number;
+      previousMaxTurns: number;
+      additionalTurns: number;
+      newMaxTurns: number;
+    }>();
+    const currentMaxTurnsByTaskId = new Map<string, number>();
+    for (const [commandIndex, command] of commands.entries()) {
+      if (command.kind !== "patch_task") {
+        continue;
+      }
+      const taskEnvelope = this.graphStore.getTaskEnvelope(command.taskId);
+      if (!taskEnvelope) {
+        continue;
+      }
+      const previousMaxTurns = currentMaxTurnsByTaskId.get(command.taskId)
+        ?? normalizeTaskBudget(taskEnvelope.budget).maxTurns;
+      let newMaxTurns = previousMaxTurns;
+      let additionalTurns = 0;
+      if (command.patch.additionalTurns !== undefined) {
+        additionalTurns = command.patch.additionalTurns;
+        newMaxTurns = previousMaxTurns + additionalTurns;
+        if (newMaxTurns > MAX_TASK_BUDGET.maxTurns) {
+          throw new GraphValidationError(
+            `Task ${command.taskId} budget extension exceeds the cumulative maximum: `
+            + `previousMaxTurns=${previousMaxTurns}, additionalTurns=${additionalTurns}, `
+            + `maximum=${MAX_TASK_BUDGET.maxTurns}.`
+          );
+        }
+      } else if (command.patch.budget) {
+        // Historical decisions used an absolute cumulative maxTurns patch.
+        newMaxTurns = normalizeTaskBudget(command.patch.budget).maxTurns;
+        additionalTurns = newMaxTurns - previousMaxTurns;
+      } else {
+        continue;
+      }
+      currentMaxTurnsByTaskId.set(command.taskId, newMaxTurns);
+      resolutions.set(commandIndex, {
+        taskId: command.taskId,
+        consumedTurns: this.runtimeStore.getTaskConsumedTurns(command.taskId),
+        previousMaxTurns,
+        additionalTurns,
+        newMaxTurns
+      });
+    }
+    return resolutions;
+  }
+
+  private assertPlannerRuntimeTransitions(
+    commands: PlannerCommand[],
+    budgetPatchByCommandIndex = this.resolvePlannerBudgetPatches(commands)
+  ): void {
+    const maxTurnsByTaskId = new Map<string, number>();
+    for (const resolution of budgetPatchByCommandIndex.values()) {
+      maxTurnsByTaskId.set(resolution.taskId, resolution.newMaxTurns);
+    }
+    for (const command of commands) {
+      if (command.kind !== "set_task_status" || command.status !== "open") {
+        continue;
+      }
+      const taskEnvelope = this.graphStore.getTaskEnvelope(command.taskId);
+      if (!taskEnvelope) {
+        continue;
+      }
+      const maxTurns = maxTurnsByTaskId.get(command.taskId)
+        ?? normalizeTaskBudget(taskEnvelope.budget).maxTurns;
+      const consumedTurns = this.runtimeStore.getTaskConsumedTurns(command.taskId);
+      if (consumedTurns < maxTurns) {
+        continue;
+      }
+      throw new GraphValidationError(
+        `Task ${command.taskId} cannot reopen with exhausted budget: consumedTurns=${consumedTurns}, maxTurns=${maxTurns}. `
+        + `In the same decision, add turns with patch_task.patch.additionalTurns (cumulative maximum ${MAX_TASK_BUDGET.maxTurns}), `
+        + "or archive this Task and create a genuinely distinct successor."
+      );
+    }
   }
 
   private async runReadyTaskGraph(input: { maxParallelTasks: number }): Promise<TaskExecution[]> {
@@ -1606,6 +1729,8 @@ export class SecurityAgentController {
           task.dependsOnTaskRefs,
           statusByTaskId
         ).blockedByTaskRefs.length === 0)
+        .filter((task) => this.runtimeStore.getTaskConsumedTurns(task.taskId)
+          < normalizeTaskBudget(task.budget).maxTurns)
         .filter((task) => !this.activeTaskRuns.has(task.taskId))
         .filter((task) => !this.awaitingPlannerTaskIds.has(task.taskId));
       const occupiedSessionRefs = new Set(
@@ -1687,6 +1812,10 @@ export class SecurityAgentController {
 
   private async restorePlannerHandoffs(): Promise<void> {
     for (const task of this.graphStore.listOpenTasks(Number.MAX_SAFE_INTEGER)) {
+      if (this.runtimeStore.getTaskConsumedTurns(task.taskId) >= normalizeTaskBudget(task.budget).maxTurns) {
+        this.awaitingPlannerTaskIds.add(task.taskId);
+        continue;
+      }
       const outcome = this.runtimeStore.getTaskOutcome(task.taskId);
       const epochOutcome = this.runtimeStore.listTaskEpochOutcomes(task.taskId, 1)[0];
       const terminalSeq = Math.max(outcome?.terminalSeq ?? 0, epochOutcome?.terminalSeq ?? 0);
@@ -1776,6 +1905,7 @@ export class SecurityAgentController {
       let executorError: unknown;
       let executorInputBytes = 0;
       let executorInvocationStatus = "submitted";
+      let networkFinalizationDeferred = false;
       try {
         const taskStatus = this.getTaskStatusSnapshot(taskEnvelope.taskId);
         const rootGoal = this.currentUserGoal ?? this.getRootGoalText() ?? taskEnvelope.goal;
@@ -1852,9 +1982,15 @@ export class SecurityAgentController {
           invocationFinalizationError = error;
         } finally {
           this.clearEpochTimeSlice(taskEnvelope);
-          this.scheduleExecutorNetworkFinalization(state);
+          networkFinalizationDeferred = !taskResult && state.abortContext?.kind === "budget_abort";
+          if (!networkFinalizationDeferred) {
+            this.scheduleExecutorNetworkFinalization(state);
+          }
         }
         if (invocationFinalizationError !== undefined) {
+          if (networkFinalizationDeferred) {
+            this.scheduleExecutorNetworkFinalization(state);
+          }
           throw invocationFinalizationError;
         }
       }
@@ -1909,13 +2045,19 @@ export class SecurityAgentController {
       }
 
       if (!taskResult) {
-        taskResult = await this.collectBudgetCheckpointTaskResult({
-          taskEnvelope,
-          state,
-          executorSession,
-          logging: executorLogging
-        });
-        await executorLogging?.drain();
+        try {
+          taskResult = await this.collectBudgetCheckpointTaskResult({
+            taskEnvelope,
+            state,
+            executorSession,
+            logging: executorLogging
+          });
+          await executorLogging?.drain();
+        } finally {
+          if (networkFinalizationDeferred) {
+            this.scheduleExecutorNetworkFinalization(state);
+          }
+        }
       }
 
       if (!taskResult) {
@@ -1975,16 +2117,17 @@ export class SecurityAgentController {
       });
       state.lastEventId = taskCompletedEvent.id;
       const terminalSeq = taskCompletedEvent.seq ?? this.executionLog.latestSeq(taskEnvelope.taskId);
-      this.runtimeStore.upsertTaskOutcome(createTaskOutcome({
+      const taskOutcome = createTaskOutcome({
         taskResult,
         epochRef: state.epochId,
         terminalSeq
-      }));
+      });
       const epochOutcome = (await this.persistEpochOutcome(state, {
         status: "submitted",
         reason: taskResult.summary,
         retryable: taskResult.retryable === true,
-        taskOutcomeRef: taskResult.taskId
+        taskOutcomeRef: taskResult.taskId,
+        taskOutcome
       })).outcome;
       const taskStatusDelta = this.graphStore.updateTaskResult({
         taskEnvelope,
@@ -2486,6 +2629,73 @@ export class SecurityAgentController {
       ?.label;
   }
 
+  private queuePlannerStateUpdate(input: {
+    reason: string;
+    taskId?: string;
+    message?: string;
+  }): boolean {
+    this.plannerStateRevision += 1;
+    const revision = this.plannerStateRevision;
+    const currentView = this.buildPlannerDecisionView();
+    const deliverySeq = this.executionLog.latestSeq();
+    let queuedCount = 0;
+    for (const plannerSession of this.activePlannerSessions) {
+      const steer = (plannerSession as { steer?: (text: string) => Promise<void> }).steer;
+      if (typeof steer !== "function") {
+        continue;
+      }
+      const delivery = this.activePlannerDelivery.get(plannerSession);
+      const message = input.message ?? (delivery
+        ? `RUNTIME_PLANNER_STATE_UPDATE\n${renderPlannerInput({
+          userGoal: "",
+          scopeSummary: "",
+          plannerDecisionView: currentView,
+          previousPlannerDecisionView: delivery.queuedView,
+          previousDeliverySeq: delivery.queuedSeq,
+          deliverySeq
+        })}`
+        : `RUNTIME_PLANNER_STATE_UPDATE\n${input.reason}`);
+      if (delivery) {
+        delivery.queuedView = currentView;
+        delivery.queuedSeq = deliverySeq;
+      }
+      queuedCount += 1;
+      void steer.call(plannerSession, message).then(() => {
+        if (delivery) {
+          delivery.queuedRevision = Math.max(delivery.queuedRevision, revision);
+        }
+      }).catch((error: unknown) => {
+        void this.executionLog.append({
+          taskId: input.taskId,
+          role: "runtime",
+          eventType: "planner_state_update_steer_failed",
+          summary: `Failed to steer Planner state update: ${error instanceof Error ? error.message : String(error)}`,
+          payload: { reason: input.reason, revision, taskId: input.taskId }
+        });
+      });
+    }
+    if (queuedCount > 0) {
+      void this.executionLog.append({
+        taskId: input.taskId,
+        role: "runtime",
+        eventType: "planner_state_update_queued",
+        summary: input.reason,
+        payload: { revision, deliverySeq, queuedCount, taskId: input.taskId }
+      });
+    }
+    return queuedCount > 0;
+  }
+
+  private plannerSubmissionCanSettle(session: SecurityAgentSession): boolean {
+    const delivery = this.activePlannerDelivery.get(session);
+    if (!delivery) {
+      return true;
+    }
+    const pendingMessageCount = (session as { pendingMessageCount?: unknown }).pendingMessageCount;
+    return delivery.queuedRevision === this.plannerStateRevision
+      && (typeof pendingMessageCount !== "number" || pendingMessageCount === 0);
+  }
+
   private async invokePlannerCycle(input: {
     userGoal: string;
     scopeSummary: string;
@@ -2554,6 +2764,11 @@ export class SecurityAgentController {
       try {
         const plannerSession = plannerSessionResult.session;
         this.activePlannerSessions.add(plannerSession);
+        this.activePlannerDelivery.set(plannerSession, {
+          queuedRevision: this.plannerStateRevision,
+          queuedView: plannerDecisionView,
+          queuedSeq: deliverySeq
+        });
         plannerStatsBefore = readPiSessionStats(plannerSession);
         plannerLogging = plannerSessionResult.isolated
           ? attachExecutionLogging({
@@ -2579,8 +2794,9 @@ export class SecurityAgentController {
               () => void plannerSession.abort()
             )));
         if (!plannerSessionResult.isolated) {
-          this.lastPlannerDecisionView = plannerDecisionView;
-          this.lastPlannerDeliverySeq = deliverySeq;
+          const delivered = this.activePlannerDelivery.get(plannerSession);
+          this.lastPlannerDecisionView = delivered?.queuedView ?? plannerDecisionView;
+          this.lastPlannerDeliverySeq = delivered?.queuedSeq ?? deliverySeq;
         }
         return { plannerDecision, plannerPromptId, versionSnapshot };
       } catch (error) {
@@ -2635,6 +2851,7 @@ export class SecurityAgentController {
       } finally {
         clearInterval(plannerHeartbeat);
         this.activePlannerSessions.delete(plannerSessionResult.session);
+        this.activePlannerDelivery.delete(plannerSessionResult.session);
         await plannerLogging?.drain();
         plannerLogging?.();
         await this.appendInvocationMetrics({
@@ -2717,6 +2934,16 @@ export class SecurityAgentController {
   }
 
   private validatePlannerRuntimeBoundary(decision: PlannerDecision): void {
+    for (const plannerSession of this.activePlannerSessions) {
+      if (!this.plannerSubmissionCanSettle(plannerSession)) {
+        throw new Error(
+          "Planner state changed while this decision was being produced. " +
+          "This planner_submit was rejected and none of its commands were applied. " +
+          "Consume the queued RUNTIME_PLANNER_STATE_UPDATE, then submit one complete replacement decision. " +
+          "Do not assume that any command from this rejected submission exists."
+        );
+      }
+    }
     this.normalizePlannerDecisionBoundary(decision);
   }
 
@@ -2820,7 +3047,9 @@ export class SecurityAgentController {
 
   private async persistEpochOutcome(
     state: ActiveTaskState,
-    input: Pick<EpochOutcome, "status" | "reason" | "retryable" | "taskOutcomeRef">
+    input: Pick<EpochOutcome, "status" | "reason" | "retryable" | "taskOutcomeRef"> & {
+      taskOutcome?: TaskOutcome;
+    }
   ): Promise<{ outcome: EpochOutcome; eventId: string }> {
     const event = await this.executionLog.append({
       epochId: state.epochId,
@@ -2846,7 +3075,16 @@ export class SecurityAgentController {
       retryable: input.retryable,
       createdAt: event.timestamp
     };
+    if (input.taskOutcome) {
+      this.runtimeStore.upsertTaskOutcome(input.taskOutcome);
+    }
     this.runtimeStore.upsertEpochOutcome(outcome);
+    this.queuePlannerStateUpdate({
+      taskId: state.taskEnvelope.taskId,
+      reason: input.taskOutcome
+        ? `TaskOutcome and EpochOutcome persisted for ${state.taskEnvelope.taskId}`
+        : `EpochOutcome persisted for ${state.taskEnvelope.taskId}`
+    });
     return { outcome, eventId: event.id };
   }
 
@@ -2879,7 +3117,7 @@ export class SecurityAgentController {
           .filter((observation) => observation.kind === "task_outcome")
           .map((observation) => observation.outcomeDigest),
         ...input.observations.flatMap((observation) => [
-          compactUtf8HeadTail(observation.interpretation ?? "", 260),
+          compactUtf8HeadTail(observation.executorCommentary ?? "", 260),
           compactUtf8HeadTail(observation.inputDigest ?? "", 600),
           compactUtf8HeadTail(observation.outcomeDigest, 900)
         ]),
@@ -3071,11 +3309,13 @@ export class SecurityAgentController {
     input: SupervisorCheckRequest,
     admissionSignal: AbortSignal = new AbortController().signal
   ): Promise<SupervisorVerdict> {
-    const expectedSourceEventIds = input.sourceEventIds ?? [];
+    const requestedSourceEventIds = input.sourceEventIds ?? [];
+    let snapshotSourceEventIds = requestedSourceEventIds;
+    let snapshotThroughSeq = input.throughSeq ?? 0;
     const state = this.getActiveTaskState(input.taskEnvelope.taskId);
     const discardReason = this.supervisorCheckDiscardReason(input, state);
     if (discardReason) {
-      return this.discardSupervisorCheck(input, discardReason, expectedSourceEventIds);
+      return this.discardSupervisorCheck(input, discardReason, requestedSourceEventIds);
     }
     await this.executionLog.append({
       taskId: input.taskEnvelope.taskId,
@@ -3086,7 +3326,7 @@ export class SecurityAgentController {
         queueId: input.queueId,
         reason: input.reason,
         queuedForMs: input.queuedAt ? Date.now() - input.queuedAt : undefined,
-        sourceEventIds: expectedSourceEventIds
+        sourceEventIds: requestedSourceEventIds
       }
     });
     let supervisorOutput = "";
@@ -3101,6 +3341,7 @@ export class SecurityAgentController {
       const logWindow = await this.executionLog.window({
         taskId: input.taskEnvelope.taskId,
         limit: 96,
+        toSeq: input.throughSeq,
         roles: ["executor", "runtime"],
         eventTypes: [
           "assistant_intent",
@@ -3119,8 +3360,22 @@ export class SecurityAgentController {
           "executor_stop_requested"
         ]
       });
+      const snapshotEvents = selectRecentExecutorTurnEvents(logWindow.events, SUPERVISOR_TURN_WINDOW_SIZE);
+      const snapshotObservations = buildProjectionObservations(snapshotEvents).slice(-8);
+      snapshotSourceEventIds = dedupeStrings(snapshotObservations.flatMap((observation) => observation.sourceEventIds));
+      if (snapshotSourceEventIds.length === 0) {
+        snapshotSourceEventIds = snapshotEvents
+          .filter((event) => event.eventType !== "assistant_intent" && event.eventType !== "turn_usage")
+          .map((event) => event.id);
+      }
+      if (input.throughSeq === undefined) {
+        snapshotThroughSeq = snapshotEvents.reduce(
+          (latest, event) => Math.max(latest, event.seq ?? 0),
+          0
+        );
+      }
       const supervisorTrace = summarizeSupervisorTrace(
-        selectRecentExecutorTurnEvents(logWindow.events, SUPERVISOR_TURN_WINDOW_SIZE)
+        snapshotEvents
       );
       const observerSession = await this.createObserverSessionForMode("supervise", input.taskEnvelope.taskId);
       const activeSupervisorSession = observerSession.session;
@@ -3136,7 +3391,7 @@ export class SecurityAgentController {
         return this.discardSupervisorCheck(
           input,
           String(admissionSignal.reason ?? "superseded supervisor window"),
-          expectedSourceEventIds
+          snapshotSourceEventIds
         );
       }
       const supervisorInput = renderSupervisorInput({
@@ -3166,7 +3421,7 @@ export class SecurityAgentController {
             nodeLimit: 20,
             edgeLimit: 32
           }), 8),
-          sourceEventIds: expectedSourceEventIds,
+          sourceEventIds: snapshotSourceEventIds,
           reason: input.reason
         });
       supervisorInputBytes = Buffer.byteLength(supervisorInput);
@@ -3184,16 +3439,19 @@ export class SecurityAgentController {
           SUPERVISOR_HARD_TIMEOUT_MS,
           () => void supervisorSession?.abort()
         ));
+      const normalizedControlSignal = normalizeSupervisorControlSignal(rawControlSignal, snapshotSourceEventIds);
+      const allowedEvidenceRefs = new Set(snapshotSourceEventIds);
+      const selectedEvidenceRefs = normalizedControlSignal.evidenceRefs.filter((ref) => allowedEvidenceRefs.has(ref));
       const controlSignal: SupervisorVerdict = {
-        ...normalizeSupervisorControlSignal(rawControlSignal, expectedSourceEventIds),
-        evidenceRefs: expectedSourceEventIds,
+        ...normalizedControlSignal,
+        evidenceRefs: selectedEvidenceRefs.length > 0 ? selectedEvidenceRefs : snapshotSourceEventIds,
         epochRef: input.epochRef ?? state?.epochId ?? "unknown",
-        throughSeq: input.throughSeq ?? 0
+        throughSeq: snapshotThroughSeq
       };
       const postPromptDiscardReason = this.supervisorCheckDiscardReason(input, state);
       if (postPromptDiscardReason) {
         supervisorInvocationStatus = "discarded";
-        return this.discardSupervisorCheck(input, postPromptDiscardReason, expectedSourceEventIds);
+        return this.discardSupervisorCheck(input, postPromptDiscardReason, snapshotSourceEventIds);
       }
       supervisorInvocationStatus = "completed";
       await this.executionLog.append({
@@ -3205,7 +3463,7 @@ export class SecurityAgentController {
           queueId: input.queueId,
           reason: input.reason,
           controlSignal,
-          sourceEventIds: expectedSourceEventIds,
+          sourceEventIds: snapshotSourceEventIds,
           outputPreview: supervisorOutput.slice(0, 1000)
         }
       });
@@ -3216,16 +3474,16 @@ export class SecurityAgentController {
         return this.discardSupervisorCheck(
           input,
           String(admissionSignal.reason ?? "superseded supervisor window"),
-          expectedSourceEventIds
+          snapshotSourceEventIds
         );
       }
       supervisorInvocationStatus = "failed";
       const controlSignal: SupervisorVerdict = {
         decision: "continue",
         reason: `Supervisor check failed; continuing hot path: ${error instanceof Error ? error.message : String(error)}`,
-        evidenceRefs: expectedSourceEventIds,
+        evidenceRefs: snapshotSourceEventIds,
         epochRef: input.epochRef ?? state?.epochId ?? "unknown",
-        throughSeq: input.throughSeq ?? 0
+        throughSeq: snapshotThroughSeq
       };
       await this.executionLog.append({
         taskId: input.taskEnvelope.taskId,
@@ -3258,7 +3516,7 @@ export class SecurityAgentController {
           startedAt: supervisorInvocationStartedAt,
           taskId: input.taskEnvelope.taskId,
           inputBytes: supervisorInputBytes,
-          details: { reason: input.reason, sourceEventIds: expectedSourceEventIds }
+          details: { reason: input.reason, sourceEventIds: snapshotSourceEventIds, throughSeq: snapshotThroughSeq }
         });
       }
       if (supervisorSession) {
@@ -4329,27 +4587,34 @@ export class SecurityAgentController {
     ) {
       return undefined;
     }
-    const timeoutMs = this.remainingRunTimeLimit(EXECUTOR_CHECKPOINT_FINALIZATION_TIMEOUT_MS);
-    if (timeoutMs <= 0) {
-      return undefined;
-    }
     const prompt = [
       "RUNTIME_BUDGET_CHECKPOINT_FINALIZATION",
       input.state.abortContext.reason,
       "探索预算已经耗尽。不得调用 bash、read、搜索、图查询或继续探索。",
-      "若本次已生成且明确知道路径的可复用材料尚未归档，可先用现有的 artifact_write 原样归档；不得创建、修改、检查或搜索文件。",
-      "随后只调用一次现有的 task_result_submit，并根据任务成功条件如实选择 completed、partial、blocked 或 failed。",
+      "若本次已生成且明确知道路径的可复用材料尚未归档，可在第一个工具批次用现有的 artifact_write 原样归档；不得创建、修改、检查或搜索文件。",
+      "该归档批次结束后 Runtime 会只保留 task_result_submit。随后调用一次 task_result_submit，并根据任务成功条件如实选择 completed、partial、blocked 或 failed。",
       "summary 写明本次已经验证的能力、最新失效条件和仍未解决的问题；",
       "evidenceRefs 和 artifactRefs 只填写本会话中真实存在的引用；",
       "不要继续探索，也不要输出自由文本 JSON。"
     ].join("\n");
     const session = input.executorSession.session;
     const invocationId = `executor:${input.state.epochId}:checkpoint-finalization`;
+    const remainingGlobalRunMs = this.activeRun
+      ? Math.max(0, this.activeRun.deadlineAt - Date.now())
+      : DEFAULT_RUN_TIME_BUDGET_MS;
+    if (remainingGlobalRunMs === 0) {
+      return undefined;
+    }
+    const globalDeadlineTimer = setTimeout(() => {
+      void session.abort().catch(() => undefined);
+    }, remainingGlobalRunMs);
+    globalDeadlineTimer.unref?.();
     const startedAt = Date.now();
     const statsBefore = readPiSessionStats(session);
     const inputBytes = Buffer.byteLength(prompt);
     let invocationStatus = "failed";
     let originalToolNames: string[] | undefined;
+    let unsubscribeFinalizationPhase: (() => void) | undefined;
     try {
       originalToolNames = session.getActiveToolNames();
       const finalizationToolNames = ["artifact_write", "task_result_submit"]
@@ -4363,10 +4628,17 @@ export class SecurityAgentController {
         throw new Error("Executor checkpoint finalization must expose task_result_submit and may expose artifact_write only");
       }
       input.state.checkpointFinalizationActive = true;
+      unsubscribeFinalizationPhase = session.subscribe((event) => {
+        if (!isRecord(event)
+          || event.type !== "tool_execution_end"
+          || event.toolName !== "artifact_write"
+          || event.isError === true) {
+          return;
+        }
+        session.setActiveToolsByName(["task_result_submit"]);
+      });
       const taskResult = await invokeStructured(session, prompt, {
         toolName: "task_result_submit",
-        idleTimeoutMs: timeoutMs,
-        hardTimeoutMs: timeoutMs,
         maxTruncationSteers: 0,
         validate: (value) => {
           const normalized = normalizeTaskResult(value as Partial<TaskResult>, input.taskEnvelope);
@@ -4408,7 +4680,9 @@ export class SecurityAgentController {
       });
       return undefined;
     } finally {
+      clearTimeout(globalDeadlineTimer);
       input.state.checkpointFinalizationActive = false;
+      unsubscribeFinalizationPhase?.();
       if (originalToolNames) {
         session.setActiveToolsByName(originalToolNames);
       }
@@ -4425,7 +4699,9 @@ export class SecurityAgentController {
         inputBytes,
         details: {
           phase: "checkpoint_finalization",
-          taskResultTurnExcludedFromBudget: true
+          taskResultTurnExcludedFromBudget: true,
+          semanticTimeout: "none",
+          remainingGlobalRunMs
         }
       });
     }
@@ -4536,28 +4812,11 @@ export class SecurityAgentController {
       }
       notifiedTaskIds.push(candidateTaskId);
     }
-    // Planner invocations can span several graph queries; when a commit lands
-    // mid-invocation its input snapshot is stale, so nudge it to re-query.
-    let plannerUpdateQueued = false;
-    if (this.activePlannerSessions.size > 0) {
-      const plannerMessage = `作战图已提交增量。提交 planner_submit 前请自主判断是否需要查询：${updateManifest}`;
-      for (const plannerSession of this.activePlannerSessions) {
-        const steer = (plannerSession as { steer?: (text: string) => Promise<void> }).steer;
-        if (typeof steer !== "function") {
-          continue;
-        }
-        void steer.call(plannerSession, plannerMessage).catch((error: unknown) => {
-          void this.executionLog.append({
-            taskId,
-            role: "runtime",
-            eventType: "graph_update_steer_failed",
-            summary: `Failed to steer planner graph update: ${error instanceof Error ? error.message : String(error)}`,
-            payload: { taskId }
-          });
-        });
-        plannerUpdateQueued = true;
-      }
-    }
+    const plannerUpdateQueued = this.queuePlannerStateUpdate({
+      taskId,
+      reason: `Projector graph commit persisted for ${taskId}`,
+      message: `作战图已提交增量。提交 planner_submit 前请自主判断是否需要查询：${updateManifest}`
+    });
     await this.executionLog.append({
       taskId,
       role: "runtime",
@@ -4887,10 +5146,13 @@ export class SecurityAgentController {
       ? taskResult.retryable
       : taskResult.status === "partial";
     const lastEventId = state?.lastEventId;
-    const submittedEvidenceRefs = taskResult.evidenceRefs.filter((ref) => (
-      this.executionLog.seqForEvent(ref) !== undefined
-      || this.graphStore.trace({ nodeId: ref }).nodes.some((node) => node.id === ref)
-    ));
+    const submittedEvidenceRefs = taskResult.evidenceRefs.filter((ref) => {
+      const event = this.executionLog.eventById(ref);
+      if (event) {
+        return event.eventType !== "assistant_intent";
+      }
+      return this.graphStore.trace({ nodeId: ref }).nodes.some((node) => node.id === ref);
+    });
     const submittedArtifactRefs: string[] = [];
     for (const artifactRef of taskResult.artifactRefs) {
       if (await this.artifactStore.get(artifactRef)) {

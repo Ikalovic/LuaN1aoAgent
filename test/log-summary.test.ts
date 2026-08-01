@@ -40,10 +40,10 @@ test("summarizes supervisor trace as action state and loop signals", () => {
 
   const summary = summarizeSupervisorTrace(events);
 
-  assert.match(summary.actionTraceText, /Executor 决定调用工具：bash/);
+  assert.match(summary.actionTraceText, /"name":"bash"/);
   assert.match(summary.actionTraceText, /基线为有效会话/);
-  assert.match(summary.actionTraceText, /工具 bash 完成/);
-  assert.match(summary.loopSignalsText, /重复动作：bash:ls \.agent-runtime ×2/);
+  assert.match(summary.actionTraceText, /artifactRef=artifact:large-output/);
+  assert.match(summary.loopSignalsText, /重复完全相同动作：未明显出现/);
   assert.match(summary.loopSignalsText, /本地工作区漂移：是/);
   assert.match(summary.loopSignalsText, /大输出\/Artifact 指针结果：1 条/);
 });
@@ -73,7 +73,64 @@ test("supervisor trace preserves the Executor interpretation of a breakthrough h
 
   const summary = summarizeSupervisorTrace(events);
 
-  assert.match(summary.actionTraceText, /后续理解=确认 \/keys 可穿越/);
+  assert.match(summary.actionTraceText, /"outcome":"HTTP 403/);
+  assert.match(summary.actionTraceText, /"executorCommentary":"确认 \/keys 可穿越/);
+});
+
+test("supervisor trace preserves a distinguishing result at the tail of one tool output", () => {
+  const events: ExecutionEvent[] = [
+    makeEvent("event:intent", "assistant_intent", {
+      text: "compare traversal depth",
+      toolCalls: [{ name: "bash", arguments: { command: "probe traversal variants" } }]
+    }, 1),
+    makeEvent("event:start", "tool_started", {
+      toolCallId: "call:traversal",
+      toolName: "bash",
+      args: { command: "probe traversal variants" }
+    }, 2),
+    makeEvent("event:result", "tool_finished", {
+      toolCallId: "call:traversal",
+      toolName: "bash",
+      result: {
+        content: [{
+          type: "text",
+          text: [
+            "depth=1 size=1616 msg=request rejected",
+            "depth=2 size=1616 msg=request rejected",
+            "depth=3 size=1616 msg=request rejected",
+            "padding=".padEnd(260, "x"),
+            "depth=4 size=2422 msg=''"
+          ].join("\n")
+        }]
+      }
+    }, 3)
+  ];
+
+  const summary = summarizeSupervisorTrace(events);
+
+  assert.match(summary.actionTraceText, /depth=1 size=1616/);
+  assert.match(summary.actionTraceText, /depth=4 size=2422 msg=''/);
+  assert.match(summary.actionTraceText, /"evidenceRefs":\["event:start","event:result"\]/);
+  assert.doesNotMatch(summary.actionTraceText, /truncated:/);
+  assert.doesNotMatch(summary.loopSignalsText, /重复失败/);
+});
+
+test("supervisor loop signal only groups byte-identical persisted actions", () => {
+  const commonPrefix = "probe ".padEnd(200, "x");
+  const events: ExecutionEvent[] = [
+    makeEvent("event:start-1", "tool_started", {
+      toolName: "bash",
+      args: { command: `${commonPrefix} first` }
+    }, 1),
+    makeEvent("event:start-2", "tool_started", {
+      toolName: "bash",
+      args: { command: `${commonPrefix} second` }
+    }, 2)
+  ];
+
+  const summary = summarizeSupervisorTrace(events);
+
+  assert.match(summary.loopSignalsText, /重复完全相同动作：未明显出现/);
 });
 
 function makeEvent(

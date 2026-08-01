@@ -111,6 +111,7 @@ export class ExecutionLog {
     eventTypes?: string[];
     roles?: Array<AgentRole | "runtime">;
     direction?: "forward" | "backward";
+    toSeq?: number;
   }): Promise<{ events: ExecutionEvent[]; nextCursor?: string }> {
     const where: string[] = [];
     const parameters: Array<string | number> = [];
@@ -129,6 +130,10 @@ export class ExecutionLog {
     if (input.roles && input.roles.length > 0) {
       where.push(`role IN (${input.roles.map(() => "?").join(",")})`);
       parameters.push(...input.roles);
+    }
+    if (input.toSeq !== undefined) {
+      where.push("seq <= ?");
+      parameters.push(input.toSeq);
     }
     if (input.cursor) {
       const cursor = this.database.prepare("SELECT seq FROM execution_events WHERE id = ?")
