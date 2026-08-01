@@ -211,6 +211,15 @@ test("CLI and Web run entrypoints both use the shared bootstrap", async () => {
   assert.doesNotMatch(cliSource, /new SecurityAgentController/);
   assert.doesNotMatch(webSource, /new SecurityAgentController/);
   assert.ok(
+    cliSource.indexOf("loadLocalEnvFile(process.env)") < cliSource.indexOf("await bootstrapAgentRuntime"),
+    "CLI must load local environment configuration before selecting a sandbox backend"
+  );
+  assert.match(
+    cliSource,
+    /transparentProxy && agentRuntime\.executorSandboxMode !== "docker"/,
+    "CLI must reject transparent SOCKS routing when Docker Gateway ownership is unavailable"
+  );
+  assert.ok(
     cliSource.indexOf('process.on("SIGINT", handleSignal)') < cliSource.indexOf("await bootstrapAgentRuntime"),
     "CLI must install signal handlers before runtime bootstrap can create resources"
   );

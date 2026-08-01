@@ -1,11 +1,13 @@
 import { bootstrapAgentRuntime } from "./agent-runtime-bootstrap.js";
 import { cliHelp, parseCliOptions, shouldUseTui } from "./cli-options.js";
 import { resolveCliRunContext } from "./cli-runtime.js";
+import { loadLocalEnvFile } from "./llm-config.js";
 import { normalizeScope } from "./scope.js";
 import { parseTransparentProxy } from "./proxy-config.js";
 import { AgentCliApp } from "./tui/app.js";
 
 try {
+  loadLocalEnvFile(process.env);
   const options = parseCliOptions(process.argv.slice(2));
   if (options.help) {
     console.log(cliHelp());
@@ -52,6 +54,9 @@ async function run(options: ReturnType<typeof parseCliOptions>): Promise<void> {
       runtimeDir: runContext.runtimeDir,
       routeRef: "cli-run"
     });
+    if (transparentProxy && agentRuntime.executorSandboxMode !== "docker") {
+      throw new Error("--proxy requires EXECUTOR_SANDBOX_MODE=docker because transparent SOCKS5 routing is owned by the Docker Gateway");
+    }
     const { controller } = agentRuntime;
     app = useTui
       ? new AgentCliApp({
