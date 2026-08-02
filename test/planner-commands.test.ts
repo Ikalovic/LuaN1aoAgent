@@ -1,6 +1,10 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { normalizePlannerDecision, validatePlannerArtifactRefs } from "../src/planner-commands.js";
+import {
+  normalizePlannerDecision,
+  validatePlannerArtifactRefs,
+  validatePlannerBasedOnRefs
+} from "../src/planner-commands.js";
 
 test("allows empty apply_commands as a no-op graph update", () => {
   const decision = normalizePlannerDecision({
@@ -244,4 +248,69 @@ test("accepts exact Artifact Refs embedded in Planner task text", async () => {
   });
 
   await validatePlannerArtifactRefs(decision, async () => [{ artifactRef: fullRef }]);
+});
+
+test("resolves unambiguous abbreviated non-Artifact basedOnRefs", async () => {
+  const decision = normalizePlannerDecision({
+    commands: [{
+      kind: "create_tasks",
+      tasks: [{
+        id: "task:follow-up",
+        goal: "Resolve the projected finding",
+        targetRefs: ["goal:root"],
+        scopeRef: "scope:root",
+        successCriteria: ["Persist a decisive result"],
+        priority: 1
+      }],
+      basedOnRefs: ["projected:f6918853"]
+    }],
+    reason: "Follow the projected finding"
+  });
+
+  const validated = await validatePlannerBasedOnRefs(decision, {
+    listArtifacts: async () => [],
+    referenceCandidates: (prefix) => ["projected:f6918853-complete"].filter((ref) => ref.startsWith(prefix))
+  });
+
+  assert.deepEqual(validated.commands?.[0]?.basedOnRefs, ["projected:f6918853-complete"]);
+});
+
+test("accepts exact persisted Graph, Event and capability basedOnRefs", async () => {
+  const persistedRefs = new Set([
+    "projected:f6918853-complete",
+    "event:8f9f5fb0-complete",
+    "route:79d1f4c2-complete"
+  ]);
+  const decision = normalizePlannerDecision({
+    commands: [{
+      kind: "patch_task",
+      taskId: "task:follow-up",
+      patch: { additionalTurns: 5 },
+      basedOnRefs: [...persistedRefs]
+    }],
+    reason: "Continue from exact persisted state"
+  });
+
+  const validated = await validatePlannerBasedOnRefs(decision, {
+    listArtifacts: async () => [],
+    referenceCandidates: (prefix) => [...persistedRefs].filter((reference) => reference.startsWith(prefix))
+  });
+
+  assert.deepEqual(validated.commands?.[0]?.basedOnRefs, [...persistedRefs]);
+});
+
+test("rejects unknown or ambiguous non-Artifact basedOnRefs", async () => {
+  const decision = normalizePlannerDecision({
+    commands: [{
+      kind: "patch_task",
+      taskId: "task:follow-up",
+      patch: { additionalTurns: 5 },
+      basedOnRefs: ["projected:f6918853"]
+    }],
+    reason: "Continue from persisted state"
+  });
+  await assert.rejects(() => validatePlannerBasedOnRefs(decision, {
+    listArtifacts: async () => [],
+    referenceCandidates: () => ["projected:f6918853-a", "projected:f6918853-b"]
+  }), /ambiguous, candidates:/);
 });

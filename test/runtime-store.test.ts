@@ -218,10 +218,15 @@ test("keeps the latest complete task outcome for dependency handoff", () => {
     evidenceRefs: ["event:1"],
     artifactRefs: ["artifact:1"],
     capabilityRefs: ["route:1"],
+    blockerReason: "Need a stable command execution primitive",
     checkpoint: { reason: "resume from foothold", resumeCursor: "artifact:1" },
     terminalSeq: 8,
     createdAt: "2026-07-25T00:00:00.000Z"
   });
+  assert.equal(
+    store.getTaskOutcome("task:test")?.blockerReason,
+    "Need a stable command execution primitive"
+  );
   store.upsertTaskOutcome({
     taskRef: "task:test",
     epochRef: "epoch:2",

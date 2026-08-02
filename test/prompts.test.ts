@@ -62,7 +62,8 @@ test("executor prompt uses bounded experimental method and runtime steering", ()
   assert.match(EXECUTOR_SYSTEM_PROMPT, /末尾用一句自然语言总结/);
   assert.match(EXECUTOR_SYSTEM_PROMPT, /可复用材料（Cookie、凭据、密钥、PoC、solver 脚本）必须及时用 artifact_write 归档/);
   assert.match(EXECUTOR_SYSTEM_PROMPT, /summary 中提到这些材料时给出精确 artifactRef/);
-  assert.match(EXECUTOR_SYSTEM_PROMPT, /artifact_write\(\{path:"\/workspace\/evidence\.json",kind:"json",mediaType:"application\/json"\}\)/);
+  assert.match(EXECUTOR_SYSTEM_PROMPT, /当前工作目录是 Task workspace，跨 epoch 持久/);
+  assert.match(EXECUTOR_SYSTEM_PROMPT, /artifact_write\(\{path:"evidence\.json",kind:"json",mediaType:"application\/json"\}\)/);
   assert.match(EXECUTOR_SYSTEM_PROMPT, /artifact_read\(\{ref:"artifact:\.\.\.",materialize:true\}\)/);
   assert.doesNotMatch(EXECUTOR_SYSTEM_PROMPT, /source=\{type:"(?:file|inline)"/);
   assert.match(EXECUTOR_SYSTEM_PROMPT, /不得把硬编码命令、固定路径或单个 payload 扩大成通用命令/);
@@ -323,6 +324,7 @@ test("projector prompt requests semantic changes instead of one node per observa
   assert.match(OBSERVER_PROJECTOR_SYSTEM_PROMPT, /Project changes/);
   assert.match(OBSERVER_PROJECTOR_SYSTEM_PROMPT, /相同事实合并 evidenceRefs/);
   assert.match(OBSERVER_PROJECTOR_SYSTEM_PROMPT, /已有事实没有变化就提交空 delta/);
+  assert.match(OBSERVER_PROJECTOR_SYSTEM_PROMPT, /不存在 contradicted 状态/);
   assert.match(OBSERVER_PROJECTOR_SYSTEM_PROMPT, /Evidence 只写 ground claim/);
   assert.match(OBSERVER_PROJECTOR_SYSTEM_PROMPT, /解释只写成 status=open\/inconclusive 的 Hypothesis/);
   assert.match(OBSERVER_PROJECTOR_SYSTEM_PROMPT, /只有完整、可绑定的正向结果/);

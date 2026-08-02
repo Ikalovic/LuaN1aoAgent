@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { stableSessionNodeId } from "./operation-identity.js";
+import { HYPOTHESIS_STATUSES } from "./types.js";
 import type { ExecutionEvent, GraphDelta, GraphEdge, GraphNode, GraphSnapshot } from "./types.js";
 
 export type ProjectionObservationKind = "action" | "task_outcome" | "connectivity" | "runtime_error";
@@ -901,6 +902,26 @@ export function normalizeProjectionDraft(
       !availableEvidenceRefs || availableEvidenceRefs.has(ref)
     ));
     const nodeProperties = isRecord(valueNode.properties) ? valueNode.properties : {};
+    if (nodeType === "Hypothesis" && nodeProperties.status !== undefined) {
+      const status = String(nodeProperties.status);
+      if (!(HYPOTHESIS_STATUSES as readonly string[]).includes(status)) {
+        errors.push(
+          `Projection node at index ${index} (Hypothesis) has invalid status ${JSON.stringify(status)}; valid statuses: ${HYPOTHESIS_STATUSES.join(", ")}. Use a contradicts edge for contradictory evidence; use status "refuted" only when the exact hypothesis is disproved`
+        );
+      }
+      if (status === "refuted"
+        && (typeof nodeProperties.negativeConclusion !== "string"
+          || nodeProperties.negativeConclusion.trim().length === 0)) {
+        errors.push(
+          `Projection node at index ${index} (refuted Hypothesis) must include properties.negativeConclusion describing the exact tested boundary`
+        );
+      }
+      if (status === "refuted" && !hasResolvableEvidence) {
+        errors.push(
+          `Projection node at index ${index} (refuted Hypothesis) must include at least one evidenceRef from the current observations`
+        );
+      }
+    }
     if (nodeType === "Vulnerability" && !hasResolvableEvidence) {
       errors.push(
         `Projection node at index ${index} (Vulnerability) must include at least one evidenceRef from the current observations`

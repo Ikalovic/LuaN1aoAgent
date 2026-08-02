@@ -4,6 +4,7 @@ import { randomUUID } from "node:crypto";
 import { DatabaseSync } from "node:sqlite";
 import { toJsonLine } from "../json.js";
 import { operationIdentityKeys, stableOperationIdentityId } from "../operation-identity.js";
+import { HYPOTHESIS_STATUSES } from "../types.js";
 import type {
   GraphDelta,
   GraphEdge,
@@ -939,6 +940,13 @@ export class SQLiteGraphStore {
   plannerVersionSnapshot(): Record<string, number> {
     return Object.fromEntries(this.readNodes({ graphKind: "task", limit: 5000 })
       .map((node) => [node.id, nodeVersion(node)]));
+  }
+
+  nodeIdsWithPrefix(prefix: string, limit = 4): string[] {
+    const rows = this.database.prepare(`
+      SELECT id FROM nodes WHERE substr(id, 1, length(?)) = ? ORDER BY id LIMIT ?
+    `).all(prefix, prefix, Math.max(1, limit)) as Array<{ id: string }>;
+    return rows.map((row) => row.id);
   }
 
   validatePlannerDecision(decision: PlannerDecision): void {
@@ -1907,6 +1915,25 @@ function validateGraphDelta(delta: GraphDelta): void {
     }
     if (node.type === "Exploit" && node.properties.status === "succeeded" && evidenceRefs.length === 0) {
       throw new GraphValidationError(`Succeeded Exploit node ${node.id} must include evidenceRefs`);
+    }
+    if (node.type === "Hypothesis" && node.properties.status !== undefined) {
+      const status = String(node.properties.status);
+      if (!(HYPOTHESIS_STATUSES as readonly string[]).includes(status)) {
+        throw new GraphValidationError(
+          `Hypothesis node ${node.id} has invalid status ${JSON.stringify(status)}; valid statuses: ${HYPOTHESIS_STATUSES.join(", ")}`
+        );
+      }
+      if (status === "refuted") {
+        if (evidenceRefs.length === 0) {
+          throw new GraphValidationError(`Refuted Hypothesis node ${node.id} must include evidenceRefs`);
+        }
+        if (typeof node.properties.negativeConclusion !== "string"
+          || node.properties.negativeConclusion.trim().length === 0) {
+          throw new GraphValidationError(
+            `Refuted Hypothesis node ${node.id} must include a non-empty negativeConclusion`
+          );
+        }
+      }
     }
   }
 }

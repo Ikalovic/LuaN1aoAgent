@@ -30,7 +30,7 @@ import {
 import { getExecutorEnvironmentFacts } from "./executor-environment.js";
 import { EpochBudgetClock } from "./epoch-budget-clock.js";
 import { summarizeSupervisorTrace } from "./log-summary.js";
-import { normalizePlannerDecision, validatePlannerArtifactRefs } from "./planner-commands.js";
+import { normalizePlannerDecision, validatePlannerBasedOnRefs } from "./planner-commands.js";
 import {
   renderExecutorInput,
   renderExecutorResumeInput,
@@ -711,7 +711,7 @@ export class SecurityAgentController {
           plannerEvent.id,
           invocation.versionSnapshot
         );
-        this.releasePlannerWaitingTasks(plannerDecision, plannerVisibleWaitingTaskIds);
+        await this.releasePlannerWaitingTasks(plannerDecision, plannerVisibleWaitingTaskIds);
         break;
       } catch (error) {
         if (!(error instanceof GraphValidationError)) {
@@ -1791,20 +1791,44 @@ export class SecurityAgentController {
     });
   }
 
-  private releasePlannerWaitingTasks(
+  private async releasePlannerWaitingTasks(
     plannerDecision: PlannerDecision,
     plannerVisibleWaitingTaskIds: Set<string>
-  ): void {
-    const reopenedTaskIds = new Set((plannerDecision.commands ?? []).flatMap((command) => (
+  ): Promise<void> {
+    const explicitlyReopenedTaskIds = new Set((plannerDecision.commands ?? []).flatMap((command) => (
       command.kind === "set_task_status" && command.status === "open" ? [command.taskId] : []
     )));
     for (const taskId of plannerVisibleWaitingTaskIds) {
-      if (reopenedTaskIds.has(taskId)) {
+      if (explicitlyReopenedTaskIds.has(taskId)) {
         this.awaitingPlannerTaskIds.delete(taskId);
         continue;
       }
       const status = this.graphStore.getTaskNode(taskId)?.properties.status;
       if (["completed", "blocked", "failed", "archived"].includes(String(status))) {
+        this.awaitingPlannerTaskIds.delete(taskId);
+        continue;
+      }
+      if (status !== "open") {
+        continue;
+      }
+      const taskOutcome = this.runtimeStore.getTaskOutcome(taskId);
+      if (taskOutcome?.status !== "partial") {
+        continue;
+      }
+      const taskEnvelope = this.graphStore.getTaskEnvelope(taskId);
+      const maxTurns = normalizeTaskBudget(taskEnvelope?.budget).maxTurns;
+      if (this.runtimeStore.getTaskConsumedTurns(taskId) < maxTurns) {
+        await this.executionLog.append({
+          taskId,
+          role: "runtime",
+          eventType: "planner_handoff_resolved",
+          summary: plannerDecision.reason,
+          payload: {
+            resolution: "resume_partial",
+            taskOutcomeRef: taskOutcome.taskRef,
+            remainingTurns: maxTurns - this.runtimeStore.getTaskConsumedTurns(taskId)
+          }
+        });
         this.awaitingPlannerTaskIds.delete(taskId);
       }
     }
@@ -1827,7 +1851,7 @@ export class SecurityAgentController {
         afterSeq: terminalSeq,
         toSeq: this.executionLog.latestSeq(task.taskId),
         roles: ["runtime"],
-        eventTypes: ["planner_status_applied"]
+        eventTypes: ["planner_status_applied", "planner_handoff_resolved"]
       });
       if (laterPlannerStatuses.length === 0) {
         this.awaitingPlannerTaskIds.add(task.taskId);
@@ -2911,6 +2935,7 @@ export class SecurityAgentController {
       artifactStore: this.artifactStore,
       llmRuntime: this.llmRuntime,
       executionLog: this.executionLog,
+      plannerReferenceCandidates: (prefix) => this.plannerCapabilityReferenceCandidates(prefix),
       providerAdmission: this.providerAdmission("planner"),
       ...(versionSnapshot
         ? {
@@ -2949,9 +2974,27 @@ export class SecurityAgentController {
 
   private async validateTextPlannerSubmission(value: unknown): Promise<PlannerDecision> {
     const normalized = this.normalizePlannerDecisionBoundary(value);
-    const resolved = await validatePlannerArtifactRefs(normalized, () => this.artifactStore.list());
+    const resolved = await validatePlannerBasedOnRefs(normalized, {
+      listArtifacts: () => this.artifactStore.list(),
+      referenceCandidates: (prefix) => this.plannerReferenceCandidates(prefix)
+    });
     this.graphStore.validatePlannerDecision(resolved);
     return resolved;
+  }
+
+  private plannerReferenceCandidates(prefix: string): string[] {
+    return [...new Set([
+      ...this.graphStore.nodeIdsWithPrefix(prefix),
+      ...this.executionLog.eventIdsWithPrefix(prefix),
+      ...this.plannerCapabilityReferenceCandidates(prefix)
+    ])];
+  }
+
+  private plannerCapabilityReferenceCandidates(prefix: string): string[] {
+    return dedupeStrings(this.runtimeStore.listTaskOutcomes(Number.MAX_SAFE_INTEGER)
+      .flatMap((outcome) => outcome.capabilityRefs)
+      .filter((reference) => reference.startsWith(prefix)))
+      .slice(0, 4);
   }
 
   private async createObserverSessionForMode(
@@ -5572,6 +5615,7 @@ function createTaskOutcome(input: {
     evidenceRefs: [...input.taskResult.evidenceRefs],
     artifactRefs: [...input.taskResult.artifactRefs],
     capabilityRefs: [...(input.taskResult.capabilityRefs ?? [])],
+    blockerReason: input.taskResult.blockerReason,
     suggestedNextGoal: input.taskResult.suggestedNextGoal,
     checkpoint: input.taskResult.checkpointReason || input.taskResult.retryable || input.taskResult.resumeCursor
       ? {
@@ -5596,6 +5640,7 @@ function taskResultFromOutcome(outcome: TaskOutcome | undefined): TaskResult | u
     evidenceRefs: [...outcome.evidenceRefs],
     artifactRefs: [...outcome.artifactRefs],
     capabilityRefs: [...outcome.capabilityRefs],
+    blockerReason: outcome.blockerReason,
     suggestedNextGoal: outcome.suggestedNextGoal,
     checkpointReason: outcome.checkpoint?.reason,
     retryable: outcome.checkpoint?.retryable,

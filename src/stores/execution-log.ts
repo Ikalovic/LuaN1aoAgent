@@ -197,6 +197,13 @@ export class ExecutionLog {
     return row ? rowToEvent(row) : undefined;
   }
 
+  eventIdsWithPrefix(prefix: string, limit = 4): string[] {
+    const rows = this.database.prepare(`
+      SELECT id FROM execution_events WHERE substr(id, 1, length(?)) = ? ORDER BY id LIMIT ?
+    `).all(prefix, prefix, Math.max(1, limit)) as Array<{ id: string }>;
+    return rows.map((row) => row.id);
+  }
+
   artifactRefsForEvents(eventIds: string[]): Map<string, string[]> {
     const uniqueIds = [...new Set(eventIds)].filter((eventId) => eventId.length > 0);
     const refsByEvent = new Map<string, string[]>();

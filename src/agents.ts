@@ -18,7 +18,7 @@ import { ArtifactStore } from "./stores/artifact-store.js";
 import { ExecutionLog } from "./stores/execution-log.js";
 import { SQLiteGraphStore } from "./stores/graph-store.js";
 import type { LlmRuntime } from "./llm-config.js";
-import { normalizePlannerDecision, validatePlannerArtifactRefs } from "./planner-commands.js";
+import { normalizePlannerDecision, validatePlannerBasedOnRefs } from "./planner-commands.js";
 import type {
   ProjectionDraftValidationOptions,
   ProjectorGraphRefRegistry
@@ -223,6 +223,7 @@ export async function createPlannerAgentSession(input: {
   plannerLoader?: DefaultResourceLoader;
   providerAdmission?: ProviderAdmissionOptions;
   validatePlannerCommands?: (decision: PlannerDecision) => void | Promise<void>;
+  plannerReferenceCandidates?: (prefix: string) => string[] | Promise<string[]>;
 }): Promise<CreateAgentSessionResult> {
   const plannerLoader = input.plannerLoader ?? await createPromptLoader(
     input.cwd,
@@ -243,7 +244,13 @@ export async function createPlannerAgentSession(input: {
         createEvidenceReadTool(input.executionLog)
       ] : []),
       createArtifactReadTool(input.artifactStore, { maxReadBytes: 64_000 }),
-      createValidatedPlannerSubmitTool(input.graphStore, input.artifactStore, input.validatePlannerCommands)
+      createValidatedPlannerSubmitTool(
+        input.graphStore,
+        input.artifactStore,
+        input.executionLog,
+        input.validatePlannerCommands,
+        input.plannerReferenceCandidates
+      )
     ],
     authStorage: input.llmRuntime.authStorage,
     modelRegistry: input.llmRuntime.modelRegistry,
@@ -288,12 +295,21 @@ export async function createScopeResolverAgentSession(input: {
 function createValidatedPlannerSubmitTool(
   graphStore: SQLiteGraphStore,
   artifactStore: ArtifactStore,
-  validatePlannerCommands?: (decision: PlannerDecision) => void | Promise<void>
+  executionLog?: ExecutionLog,
+  validatePlannerCommands?: (decision: PlannerDecision) => void | Promise<void>,
+  plannerReferenceCandidates?: (prefix: string) => string[] | Promise<string[]>
 ) {
   return createPlannerSubmitTool({
     validate: async (value) => {
       const decision = normalizePlannerDecision(value);
-      const resolved = await validatePlannerArtifactRefs(decision, () => artifactStore.list());
+      const resolved = await validatePlannerBasedOnRefs(decision, {
+        listArtifacts: () => artifactStore.list(),
+        referenceCandidates: async (prefix) => [...new Set([
+          ...graphStore.nodeIdsWithPrefix(prefix),
+          ...(executionLog?.eventIdsWithPrefix(prefix) ?? []),
+          ...(await plannerReferenceCandidates?.(prefix) ?? [])
+        ])]
+      });
       if (validatePlannerCommands) {
         await validatePlannerCommands(resolved);
       }

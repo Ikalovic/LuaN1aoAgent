@@ -630,6 +630,81 @@ test("rejects malformed projection drafts with actionable per-node and per-edge 
   }), /edge at index 0 has type "tunnel_to"; valid edge types:/);
 });
 
+test("keeps Hypothesis statuses canonical without conflating contrary evidence with refutation", () => {
+  const graphContext = aliasProjectionGraphContext({ nodes: [], edges: [] });
+  const batch = {
+    observations: [{
+      ref: "o1",
+      kind: "action" as const,
+      seqStart: 1,
+      seqEnd: 1,
+      action: "bash",
+      outcomeDigest: "The controlled candidate matched the negative baseline",
+      status: "ok" as const,
+      artifactRefs: [],
+      anchors: [],
+      sourceEventIds: ["event:negative"]
+    }],
+    toSeq: 1,
+    sourceEventIds: ["event:negative"]
+  };
+  const evidenceNode = {
+    id: "new:1",
+    type: "Evidence",
+    label: "Candidate matched the negative baseline",
+    properties: { observedResult: "same response hash" },
+    evidenceRefs: ["o1"]
+  };
+
+  assert.throws(() => expandProjectionDraft({
+    batch,
+    graphContext,
+    value: {
+      nodes: [evidenceNode, {
+        id: "new:2",
+        type: "Hypothesis",
+        label: "Candidate reaches the target sink",
+        properties: { status: "contradicted" },
+        evidenceRefs: ["o1"]
+      }],
+      edges: [{ from: "new:1", to: "new:2", type: "contradicts", evidenceRefs: ["o1"] }]
+    }
+  }), /Hypothesis.*invalid status "contradicted"/);
+
+  assert.doesNotThrow(() => expandProjectionDraft({
+    batch,
+    graphContext,
+    value: {
+      nodes: [evidenceNode, {
+        id: "new:2",
+        type: "Hypothesis",
+        label: "Candidate reaches the target sink",
+        properties: { status: "inconclusive" },
+        evidenceRefs: ["o1"]
+      }],
+      edges: [{ from: "new:1", to: "new:2", type: "contradicts", evidenceRefs: ["o1"] }]
+    }
+  }));
+
+  assert.doesNotThrow(() => expandProjectionDraft({
+    batch,
+    graphContext,
+    value: {
+      nodes: [evidenceNode, {
+        id: "new:2",
+        type: "Hypothesis",
+        label: "Candidate reaches the target sink",
+        properties: {
+          status: "refuted",
+          negativeConclusion: "Under the tested transform, the candidate is indistinguishable from the negative baseline"
+        },
+        evidenceRefs: ["o1"]
+      }],
+      edges: [{ from: "new:1", to: "new:2", type: "contradicts", evidenceRefs: ["o1"] }]
+    }
+  }));
+});
+
 test("reports all projection draft errors together with endpoint-aware edge suggestions", () => {
   const graphContext = aliasProjectionGraphContext({ nodes: [], edges: [] });
   const batch = {

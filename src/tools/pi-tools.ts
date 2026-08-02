@@ -192,7 +192,9 @@ export function createTaskResultSubmitTool() {
       evidenceRefs: Type.Array(Type.String()),
       artifactRefs: Type.Array(Type.String()),
       capabilityRefs: Type.Optional(Type.Array(Type.String())),
-      blockerReason: Type.Optional(Type.String()),
+      blockerReason: Type.Optional(Type.String({
+        description: "The exact unresolved condition or last failed boundary that prevents completion."
+      })),
       suggestedNextGoal: Type.Optional(Type.String()),
       checkpointReason: Type.Optional(Type.String()),
       retryable: Type.Optional(Type.Boolean())
@@ -1129,7 +1131,7 @@ export function createArtifactWriteTool(
   return defineTool({
     name: "artifact_write",
     label: "Artifact Write",
-    description: "Import a complete existing file from the Executor sandbox (for example /workspace/evidence.json or /tmp/response.bin) into persistent Artifact storage.",
+    description: "Import a complete existing file from the persistent Task workspace (for example evidence.json or poc.py) into Artifact storage. Temporary files under /tmp are not a durable handoff boundary.",
     parameters,
     execute: async (_toolCallId, params) => {
       const record: ArtifactRecord = options.readExecutorFile

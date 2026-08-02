@@ -65,6 +65,45 @@ export async function validatePlannerArtifactRefs(
   return rewriteArtifactRefs(decision, resolutions);
 }
 
+export async function validatePlannerBasedOnRefs(
+  decision: PlannerDecision,
+  input: {
+    listArtifacts: () => Promise<Array<{ artifactRef: string }>>;
+    referenceCandidates: (prefix: string) => string[] | Promise<string[]>;
+  }
+): Promise<PlannerDecision> {
+  const resolved = await validatePlannerArtifactRefs(decision, input.listArtifacts);
+  const references = [...new Set((resolved.commands ?? []).flatMap((command) => command.basedOnRefs ?? []))];
+  const resolutions = new Map<string, string>();
+  const problems: string[] = [];
+  for (const reference of references) {
+    if (reference.startsWith("artifact:")) continue;
+    const candidates = [...new Set(await input.referenceCandidates(reference))];
+    const exact = candidates.find((candidate) => candidate === reference);
+    if (exact) continue;
+    if (candidates.length === 1) {
+      resolutions.set(reference, candidates[0]!);
+      continue;
+    }
+    problems.push(candidates.length > 1
+      ? `${reference} (ambiguous, candidates: ${candidates.slice(0, 3).join(", ")})`
+      : reference);
+  }
+  if (problems.length > 0) {
+    throw new PlannerProtocolError(
+      `Planner command contains unknown or ambiguous persisted Ref(s): ${problems.join(", ")}. Use an exact Ref or an unambiguous prefix from Planner input.`
+    );
+  }
+  if (resolutions.size === 0) return resolved;
+  return {
+    ...resolved,
+    commands: resolved.commands?.map((command) => ({
+      ...command,
+      basedOnRefs: command.basedOnRefs?.map((reference) => resolutions.get(reference) ?? reference)
+    }))
+  };
+}
+
 function rewriteArtifactRefs<T>(value: T, resolutions: ReadonlyMap<string, string>): T {
   if (typeof value === "string") {
     let rewritten: string = value;

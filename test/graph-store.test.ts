@@ -146,6 +146,39 @@ test("projection closure preserves operation and reasoning paths around touched 
   graphStore.close();
 });
 
+test("rejects non-canonical and ungrounded Hypothesis terminal states", () => {
+  const runtimeDir = mkdtempSync(join(tmpdir(), "luanniao-graph-"));
+  const graphStore = new SQLiteGraphStore(join(runtimeDir, "state.sqlite"), join(runtimeDir, "deltas.jsonl"));
+
+  assert.throws(() => graphStore.upsertDelta({
+    sourceEventIds: ["event:negative"],
+    nodes: [{
+      id: "hypothesis:invalid-status",
+      graphKind: "reasoning",
+      type: "Hypothesis",
+      label: "Invalid negative state",
+      properties: { status: "contradicted" },
+      evidenceRefs: ["event:negative"]
+    }],
+    edges: []
+  }), /invalid status "contradicted"/);
+
+  assert.throws(() => graphStore.upsertDelta({
+    sourceEventIds: ["event:negative"],
+    nodes: [{
+      id: "hypothesis:missing-conclusion",
+      graphKind: "reasoning",
+      type: "Hypothesis",
+      label: "Missing negative boundary",
+      properties: { status: "refuted" },
+      evidenceRefs: ["event:negative"]
+    }],
+    edges: []
+  }), /non-empty negativeConclusion/);
+
+  graphStore.close();
+});
+
 test("projection closure selects task-relevant negative knowledge from semantic anchors", () => {
   const runtimeDir = mkdtempSync(join(tmpdir(), "luanniao-graph-"));
   const graphStore = new SQLiteGraphStore(join(runtimeDir, "state.sqlite"), join(runtimeDir, "deltas.jsonl"));
@@ -1761,7 +1794,9 @@ test("planner decision view does not discard reasoning conclusions behind a top-
       graphKind: "reasoning" as const,
       type: "Hypothesis",
       label: `Branch ${index}`,
-      properties: { status: index === 13 ? "refuted" : "open" },
+      properties: index === 13
+        ? { status: "refuted", negativeConclusion: "controlled test refuted this branch" }
+        : { status: "open" },
       evidenceRefs: [`event:${index}`]
     })),
     edges: []

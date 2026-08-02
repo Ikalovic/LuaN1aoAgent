@@ -3943,6 +3943,55 @@ test("pure provider failure records an EpochOutcome without fabricating TaskOutc
   await reopened.close();
 });
 
+test("initialize preserves a persisted partial handoff resolution", async () => {
+  const runtimeDir = mkdtempSync(join(tmpdir(), "luanniao-controller-"));
+  const first = createControllerWithTestLlmEnv(runtimeDir);
+  first.graphStore.createTasks([{
+    taskId: "task:resolved-partial",
+    goal: "Continue a reviewed partial task",
+    targetRefs: ["goal:root"],
+    scopeRef: "scope:root",
+    constraints: [],
+    successCriteria: ["complete the remaining work"],
+    budget: { maxTurns: 10 },
+    priority: 1
+  }]);
+  const partial = await first.executionLog.append({
+    taskId: "task:resolved-partial",
+    role: "executor",
+    eventType: "task_partial",
+    summary: "A reusable capability exists and the remaining work is known",
+    payload: {}
+  });
+  first.runtimeStore.upsertTaskOutcome({
+    taskRef: "task:resolved-partial",
+    epochRef: "epoch:resolved-partial",
+    status: "partial",
+    summary: "A reusable capability exists and the remaining work is known",
+    evidenceRefs: [partial.id],
+    artifactRefs: [],
+    capabilityRefs: [],
+    terminalSeq: partial.seq ?? 0,
+    createdAt: new Date().toISOString()
+  });
+  await first.executionLog.append({
+    taskId: "task:resolved-partial",
+    role: "runtime",
+    eventType: "planner_handoff_resolved",
+    summary: "Continue the reviewed partial task",
+    payload: { resolution: "resume_partial", taskOutcomeRef: "task:resolved-partial", remainingTurns: 10 }
+  });
+  await first.close({ drainProjectionJobs: false });
+
+  const reopened = createControllerWithTestLlmEnv(runtimeDir);
+  await reopened.initialize();
+  assert.equal((reopened as unknown as { awaitingPlannerTaskIds: Set<string> })
+    .awaitingPlannerTaskIds.has("task:resolved-partial"), false);
+  assert.equal((await (reopened as unknown as ControllerHarness).buildPlannerDecisionView())
+    .taskLedger.find((task) => task.taskId === "task:resolved-partial")?.executionState, "queued");
+  await reopened.close({ drainProjectionJobs: false });
+});
+
 test("pure provider failure does not create a Planner projection fence", async () => {
   const runtimeDir = mkdtempSync(join(tmpdir(), "luanniao-controller-"));
   const controller = createControllerWithTestLlmEnv(runtimeDir);
@@ -5936,7 +5985,7 @@ test("cyclic Planner dependency update is rejected and replanned without ending 
   await controller.close({ drainProjectionJobs: false });
 });
 
-test("same partial task resumes the existing Executor session with Root Goal and Planner hint", async () => {
+test("same partial task resumes without a redundant open status write", async () => {
   const runtimeDir = mkdtempSync(join(tmpdir(), "luanniao-controller-"));
   const controller = createControllerWithTestLlmEnv(runtimeDir);
   const controllerHarness = controller as unknown as ControllerHarness;
@@ -5947,6 +5996,7 @@ test("same partial task resumes the existing Executor session with Root Goal and
       summary: "Confirmed arbitrary file read from the application contract directory.",
       evidenceRefs: [],
       artifactRefs: [],
+      blockerReason: "The confirmed primitive has not yet been applied to /challenge/flag.txt.",
       checkpointReason: "Need more budget to apply the confirmed capability to the remaining goal.",
       retryable: true
     }),
@@ -5993,22 +6043,13 @@ test("same partial task resumes the existing Executor session with Root Goal and
       }),
       JSON.stringify({
         decision: "apply_commands",
-        commands: [
-          {
-            kind: "patch_task",
-            taskId: "task:primary",
-            patch: { budget: { maxTurns: 16 } },
-            reason: "Extend the same task budget because it has a confirmed capability.",
-            basedOnRefs: ["task:primary"]
-          },
-          {
-            kind: "set_task_status",
-            taskId: "task:primary",
-            status: "open",
-            reason: "Continue the same task; the Root Goal candidate /challenge/flag.txt remains untested through the confirmed file-read capability.",
-            basedOnRefs: ["task:primary"]
-          }
-        ],
+        commands: [{
+          kind: "patch_task",
+          taskId: "task:primary",
+          patch: { budget: { maxTurns: 16 } },
+          reason: "Extend the same task budget because it has a confirmed capability.",
+          basedOnRefs: ["task:primary"]
+        }],
         reason: "Resume the confirmed path and archive the redundant task.",
         basedOnRefs: ["task:primary"]
       })
@@ -6046,18 +6087,24 @@ test("same partial task resumes the existing Executor session with Root Goal and
   assert.match(prompts[1] ?? "", /继续执行同一个 Task/);
   assert.match(prompts[1] ?? "", /<planner_hint>[\s\S]*Resume the confirmed path and archive the redundant task/);
   assert.match(prompts[1] ?? "", /<execution_brief>[\s\S]*Confirmed arbitrary file read/);
+  assert.match(prompts[1] ?? "", /The confirmed primitive has not yet been applied to \/challenge\/flag\.txt/);
   assert.match(prompts[1] ?? "", /turns: 0\/16/);
   assert.equal(executorDisposeCount, 2);
   const firstPartialIndex = events.findIndex((event) => event.eventType === "task_partial" && event.taskId === "task:primary");
-  const reopenIndex = events.findIndex((event) => event.eventType === "planner_status_applied"
-    && event.taskId === "task:primary"
-    && event.payload.status === "open");
+  const resumeDecisionIndex = events.findIndex((event) => event.eventType === "planner_task_patched"
+    && event.taskId === "task:primary");
   const secondEpochIndex = events.findIndex((event, index) => index > firstPartialIndex
     && event.eventType === "epoch_transition"
     && event.taskId === "task:primary");
   assert.ok(firstPartialIndex >= 0);
-  assert.ok(reopenIndex > firstPartialIndex);
-  assert.ok(secondEpochIndex > reopenIndex);
+  assert.ok(resumeDecisionIndex > firstPartialIndex);
+  assert.ok(secondEpochIndex > resumeDecisionIndex);
+  assert.equal(events.some((event) => event.eventType === "planner_status_applied"
+    && event.taskId === "task:primary"
+    && event.payload.status === "open"), false);
+  assert.ok(events.some((event) => event.eventType === "planner_handoff_resolved"
+    && event.taskId === "task:primary"
+    && event.payload.resolution === "resume_partial"));
   await controller.close({ drainProjectionJobs: false, projectionCancelGraceMs: 100 });
 });
 
@@ -7117,6 +7164,12 @@ test("runUntilDone continues planning after task graph command cycles", async ()
           }],
           reason: "Planner continues after graph checkpoint.",
           basedOnRefs: ["goal:root"]
+        }, {
+          kind: "set_task_status",
+          taskId: "task:first-wave",
+          status: "archived",
+          reason: "The first wave handed off to the distinct second wave.",
+          basedOnRefs: ["task:first-wave"]
         }],
         reason: "Planner continues after graph checkpoint.",
         basedOnRefs: ["goal:root"]

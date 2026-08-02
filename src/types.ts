@@ -257,6 +257,7 @@ export type TaskOutcome = {
   evidenceRefs: string[];
   artifactRefs: string[];
   capabilityRefs: string[];
+  blockerReason?: string;
   suggestedNextGoal?: string;
   checkpoint?: {
     reason?: string;
@@ -371,6 +372,16 @@ export type ArtifactRecord = {
 };
 
 export type GraphView = "planner" | "reasoning" | "operation" | "task" | "sessions";
+
+export const HYPOTHESIS_STATUSES = [
+  "open",
+  "inconclusive",
+  "confirmed",
+  "refuted",
+  "superseded"
+] as const;
+
+export type HypothesisStatus = typeof HYPOTHESIS_STATUSES[number];
 
 export type GraphSnapshot = {
   view: GraphView;
