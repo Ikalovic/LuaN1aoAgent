@@ -1811,22 +1811,32 @@ export class SecurityAgentController {
       if (status !== "open") {
         continue;
       }
-      const taskOutcome = this.runtimeStore.getTaskOutcome(taskId);
-      if (taskOutcome?.status !== "partial") {
-        continue;
-      }
       const taskEnvelope = this.graphStore.getTaskEnvelope(taskId);
       const maxTurns = normalizeTaskBudget(taskEnvelope?.budget).maxTurns;
-      if (this.runtimeStore.getTaskConsumedTurns(taskId) < maxTurns) {
+      const consumedTurns = this.runtimeStore.getTaskConsumedTurns(taskId);
+      const taskOutcome = this.runtimeStore.getTaskOutcome(taskId);
+      const epochOutcome = this.runtimeStore.listTaskEpochOutcomes(taskId, 1)[0];
+      const resumablePartial = taskOutcome?.status === "partial"
+        && epochOutcome?.epochRef === taskOutcome.epochRef
+        && epochOutcome.taskOutcomeRef === taskOutcome.taskRef;
+      const resumableProviderError = epochOutcome?.status === "provider_error"
+        && epochOutcome.retryable
+        && epochOutcome.taskOutcomeRef === undefined
+        && epochOutcome.terminalSeq > (taskOutcome?.terminalSeq ?? 0);
+      if (consumedTurns < maxTurns && (resumablePartial || resumableProviderError)) {
+        const resolution = resumablePartial
+          ? "resume_partial"
+          : "resume_retryable_provider_error";
         await this.executionLog.append({
           taskId,
           role: "runtime",
           eventType: "planner_handoff_resolved",
           summary: plannerDecision.reason,
           payload: {
-            resolution: "resume_partial",
-            taskOutcomeRef: taskOutcome.taskRef,
-            remainingTurns: maxTurns - this.runtimeStore.getTaskConsumedTurns(taskId)
+            resolution,
+            taskOutcomeRef: taskOutcome?.taskRef,
+            epochOutcomeRef: epochOutcome?.epochRef,
+            remainingTurns: maxTurns - consumedTurns
           }
         });
         this.awaitingPlannerTaskIds.delete(taskId);

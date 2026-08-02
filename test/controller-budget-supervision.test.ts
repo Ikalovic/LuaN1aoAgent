@@ -4839,14 +4839,8 @@ test("provider failure after execution evidence preserves and resumes the same E
       }),
       JSON.stringify({
         decision: "apply_commands",
-        commands: [{
-          kind: "set_task_status",
-          taskId: "task:provider-resume",
-          status: "open",
-          reason: "Resume the same task after the transient provider failure.",
-          basedOnRefs: ["task:provider-resume"]
-        }],
-        reason: "Resume the established capability without rediscovery.",
+        commands: [],
+        reason: "The retryable provider failure left the Task open with remaining turns; continue it without changing the graph.",
         basedOnRefs: ["task:provider-resume"]
       })
     ]),
@@ -4886,6 +4880,9 @@ test("provider failure after execution evidence preserves and resumes the same E
   assert.ok(events.some((event) => event.eventType === "tool_finished"
     && event.taskId === "task:provider-resume"
     && JSON.stringify(event.payload).includes("Confirmed upload endpoint /upload")));
+  assert.ok(events.some((event) => event.eventType === "planner_handoff_resolved"
+    && event.taskId === "task:provider-resume"
+    && event.payload.resolution === "resume_retryable_provider_error"));
   assert.equal(events.some((event) => event.eventType === "task_failed"
     && event.taskId === "task:provider-resume"), false);
   assert.equal(disposeCount, 2);
