@@ -16,7 +16,7 @@ import {
 import type { ArtifactStore } from "../stores/artifact-store.js";
 import type { ExecutionLog } from "../stores/execution-log.js";
 import type { SQLiteGraphStore } from "../stores/graph-store.js";
-import type { ArtifactRecord, GraphEdge, GraphNode, GraphSnapshot, GraphView } from "../types.js";
+import type { ArtifactRecord, ExecutionEvent, GraphEdge, GraphNode, GraphSnapshot, GraphView } from "../types.js";
 
 export const GRAPH_TOOL_MAX_OUTPUT_BYTES = 10_000;
 export const EVIDENCE_TOOL_DEFAULT_READ_BYTES = 12_000;
@@ -882,17 +882,14 @@ export function createEvidenceReadTool(
   return defineTool({
     name: "evidence_read",
     label: "Evidence Read",
-    description: "Read one real event Ref as byte-paged canonical JSON.",
+    description: "Read one persisted event as byte-paged canonical JSON. Accepts an exact event Ref or an unambiguous Ref prefix; never invent UUIDs.",
     parameters: Type.Object({
       ref: Type.String({ pattern: "^event:.+", minLength: 7, maxLength: 256 }),
       offset: Type.Optional(Type.Integer({ minimum: 0 })),
       length: Type.Optional(Type.Integer({ minimum: 1, maximum: 64_000 }))
     }, { additionalProperties: false }),
     execute: async (_toolCallId, params) => {
-      const event = executionLog.eventById(params.ref);
-      if (!event) {
-        throw new Error(`evidence_read cannot resolve event Ref: ${params.ref}`);
-      }
+      const event = resolveEvidenceEvent(executionLog, params.ref);
       const canonical = JSON.stringify(event, null, 2);
       const totalBytes = Buffer.byteLength(canonical, "utf8");
       const offset = params.offset ?? 0;
@@ -904,6 +901,7 @@ export function createEvidenceReadTool(
           type: "text",
           text: JSON.stringify({
             ref: event.id,
+            requestedRef: params.ref === event.id ? undefined : params.ref,
             offset: page.startOffset,
             totalBytes,
             nextOffset,
@@ -914,6 +912,29 @@ export function createEvidenceReadTool(
       };
     }
   });
+}
+
+function resolveEvidenceEvent(executionLog: ExecutionLog, requestedRef: string): ExecutionEvent {
+  const exact = executionLog.eventById(requestedRef);
+  if (exact) {
+    return exact;
+  }
+  const matches = executionLog.eventIdsWithPrefix(requestedRef);
+  if (matches.length === 1) {
+    const byPrefix = executionLog.eventById(matches[0]!);
+    if (byPrefix) {
+      return byPrefix;
+    }
+  }
+  if (matches.length > 1) {
+    throw new Error(
+      `evidence_read event Ref is ambiguous: ${requestedRef} (candidates: ${matches.slice(0, 3).join(", ")}); `
+      + "use a longer prefix or an exact Ref from evidence_list"
+    );
+  }
+  throw new Error(
+    `evidence_read cannot resolve event Ref: ${requestedRef}; call evidence_list and use its exact ref or a unique prefix`
+  );
 }
 
 function evidenceIndexRecord(event: import("../types.js").ExecutionEvent): Record<string, unknown> {

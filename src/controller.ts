@@ -153,6 +153,7 @@ export const MAX_TASK_BUDGET: Required<TaskBudget> = {
   maxTurns: 40
 };
 
+export const DEFAULT_EPOCH_TURN_SLICE = 12;
 export const DEFAULT_RUN_TIME_BUDGET_MS = 900_000;
 export const TASK_EPOCH_RUN_TIME_SHARE = 0.5;
 
@@ -675,11 +676,13 @@ export class SecurityAgentController {
     taskResults?: TaskResult[];
     graphDelta?: GraphDelta;
     controlSignal?: ControlSignal;
+    quiescent: boolean;
   }> {
     await this.ensureRootGraph(input);
     const plannerVisibleWaitingTaskIds = new Set(this.awaitingPlannerTaskIds);
     let plannerDecision!: PlannerDecision;
     let taskEnvelopes: TaskEnvelope[] = [];
+    let releasedTaskIds: string[] = [];
     let repairFeedback: string | undefined;
     for (let decisionAttempt = 1; decisionAttempt <= PLANNER_DECISION_REPAIR_ATTEMPTS; decisionAttempt += 1) {
       try {
@@ -711,7 +714,7 @@ export class SecurityAgentController {
           plannerEvent.id,
           invocation.versionSnapshot
         );
-        await this.releasePlannerWaitingTasks(plannerDecision, plannerVisibleWaitingTaskIds);
+        releasedTaskIds = await this.releasePlannerWaitingTasks(plannerDecision, plannerVisibleWaitingTaskIds);
         break;
       } catch (error) {
         if (!(error instanceof GraphValidationError)) {
@@ -745,7 +748,8 @@ export class SecurityAgentController {
         plannerDecision,
         taskEnvelope: taskEnvelopes[0],
         taskEnvelopes,
-        taskResults: []
+        taskResults: [],
+        quiescent: false
       };
     }
     const taskExecutions = await this.runReadyTaskGraph({
@@ -759,7 +763,11 @@ export class SecurityAgentController {
       taskResult: firstExecution?.taskResult,
       taskResults: taskExecutions.flatMap((execution) => execution.taskResult ? [execution.taskResult] : []),
       graphDelta: firstExecution?.graphDelta,
-      controlSignal: firstExecution?.controlSignal
+      controlSignal: firstExecution?.controlSignal,
+      quiescent: (plannerDecision.commands?.length ?? 0) === 0
+        && releasedTaskIds.length === 0
+        && taskExecutions.length === 0
+        && this.activeTaskRuns.size === 0
     };
   }
 
@@ -921,6 +929,13 @@ export class SecurityAgentController {
         }
         if (this.isRootGoalStatus("blocked")) {
           return await decideRun({ cycles, completed: false, stoppedReason: cycleResult.plannerDecision.reason });
+        }
+        if (cycleResult.quiescent) {
+          return await decideRun({
+            cycles,
+            completed: false,
+            stoppedReason: `Runtime quiescent after Planner decision: ${cycleResult.plannerDecision.reason}`
+          });
         }
       }
       const taskGraphDrained = await this.drainReadyTaskGraph({ maxParallelTasks, deadlineAt });
@@ -1310,7 +1325,7 @@ export class SecurityAgentController {
 
   private taskEnvelopeFromSpec(taskSpec: PlannerTaskSpec, scopeSummary: string): TaskEnvelope {
     const taskId = taskSpec.id;
-    const budget = normalizeTaskBudget(taskSpec.budget);
+    const budget = normalizeInitialTaskBudget(taskSpec.budget);
     const constraints = [`授权范围原文：${scopeSummary}`];
     const dependsOnTaskRefs = dedupeStrings(taskSpec.dependsOnTaskRefs ?? []);
     const parentTaskId = taskSpec.parentTaskId ?? "goal:root";
@@ -1577,11 +1592,10 @@ export class SecurityAgentController {
       if (command.patch.additionalTurns !== undefined) {
         additionalTurns = command.patch.additionalTurns;
         newMaxTurns = previousMaxTurns + additionalTurns;
-        if (newMaxTurns > MAX_TASK_BUDGET.maxTurns) {
+        if (!Number.isSafeInteger(newMaxTurns)) {
           throw new GraphValidationError(
-            `Task ${command.taskId} budget extension exceeds the cumulative maximum: `
-            + `previousMaxTurns=${previousMaxTurns}, additionalTurns=${additionalTurns}, `
-            + `maximum=${MAX_TASK_BUDGET.maxTurns}.`
+            `Task ${command.taskId} budget extension exceeds the safe cumulative allocation: `
+            + `previousMaxTurns=${previousMaxTurns}, additionalTurns=${additionalTurns}.`
           );
         }
       } else if (command.patch.budget) {
@@ -1627,7 +1641,7 @@ export class SecurityAgentController {
       }
       throw new GraphValidationError(
         `Task ${command.taskId} cannot reopen with exhausted budget: consumedTurns=${consumedTurns}, maxTurns=${maxTurns}. `
-        + `In the same decision, add turns with patch_task.patch.additionalTurns (cumulative maximum ${MAX_TASK_BUDGET.maxTurns}), `
+        + `In the same decision, add an execution allocation with patch_task.patch.additionalTurns, `
         + "or archive this Task and create a genuinely distinct successor."
       );
     }
@@ -1794,18 +1808,21 @@ export class SecurityAgentController {
   private async releasePlannerWaitingTasks(
     plannerDecision: PlannerDecision,
     plannerVisibleWaitingTaskIds: Set<string>
-  ): Promise<void> {
+  ): Promise<string[]> {
+    const releasedTaskIds: string[] = [];
     const explicitlyReopenedTaskIds = new Set((plannerDecision.commands ?? []).flatMap((command) => (
       command.kind === "set_task_status" && command.status === "open" ? [command.taskId] : []
     )));
     for (const taskId of plannerVisibleWaitingTaskIds) {
       if (explicitlyReopenedTaskIds.has(taskId)) {
         this.awaitingPlannerTaskIds.delete(taskId);
+        releasedTaskIds.push(taskId);
         continue;
       }
       const status = this.graphStore.getTaskNode(taskId)?.properties.status;
       if (["completed", "blocked", "failed", "archived"].includes(String(status))) {
         this.awaitingPlannerTaskIds.delete(taskId);
+        releasedTaskIds.push(taskId);
         continue;
       }
       if (status !== "open") {
@@ -1840,8 +1857,10 @@ export class SecurityAgentController {
           }
         });
         this.awaitingPlannerTaskIds.delete(taskId);
+        releasedTaskIds.push(taskId);
       }
     }
+    return releasedTaskIds;
   }
 
   private async restorePlannerHandoffs(): Promise<void> {
@@ -3267,6 +3286,8 @@ export class SecurityAgentController {
       });
       if (state.taskTurnCount >= (taskEnvelope.budget?.maxTurns ?? DEFAULT_TASK_BUDGET.maxTurns)) {
         this.requestBudgetCheckpoint(taskEnvelope, event, "maxTurns", state);
+      } else if (state.epochTurnCount >= DEFAULT_EPOCH_TURN_SLICE) {
+        this.requestBudgetCheckpoint(taskEnvelope, event, "epochTurns", state);
       } else if (state.epochTurnCount % SUPERVISOR_TURN_WINDOW_SIZE === 0) {
         void this.enqueueSupervisorCheck({
           reason: `${TURN_WINDOW_REASON_PREFIX}${state.epochTurnCount}`,
@@ -4612,16 +4633,18 @@ export class SecurityAgentController {
   private requestBudgetCheckpoint(
     taskEnvelope: TaskEnvelope,
     event: ExecutionEvent,
-    budgetKey: "maxTurns",
+    budgetKey: "maxTurns" | "epochTurns",
     state = this.getActiveTaskState(taskEnvelope.taskId)
   ): void {
     if (!state || state.executorStopRequested) {
       return;
     }
-    const limit = taskEnvelope.budget?.[budgetKey] ?? DEFAULT_TASK_BUDGET[budgetKey];
+    const reason = budgetKey === "epochTurns"
+      ? `Epoch turn slice reached: maxTurns=${DEFAULT_EPOCH_TURN_SLICE}`
+      : `Task budget reached: maxTurns=${taskEnvelope.budget?.maxTurns ?? DEFAULT_TASK_BUDGET.maxTurns}`;
     const budgetSignal: ControlSignal = {
       decision: "handoff",
-      reason: `Task budget reached: ${budgetKey}=${limit}`,
+      reason,
       evidenceRefs: [event.id]
     };
     void this.requestEpochStop(taskEnvelope, budgetSignal, state, "executor_checkpoint_requested");
@@ -5463,6 +5486,17 @@ function normalizeControlSignal(signal: Record<string, unknown> | undefined, fal
 }
 
 export function normalizeTaskBudget(input?: TaskBudget): Required<TaskBudget> {
+  return {
+    maxTurns: normalizeBudgetNumber(
+      input?.maxTurns,
+      DEFAULT_TASK_BUDGET.maxTurns,
+      Number.MAX_SAFE_INTEGER,
+      MIN_TASK_BUDGET.maxTurns
+    )
+  };
+}
+
+function normalizeInitialTaskBudget(input?: TaskBudget): Required<TaskBudget> {
   return {
     maxTurns: normalizeBudgetNumber(
       input?.maxTurns,
@@ -6336,15 +6370,21 @@ function taskTurnIdentity(event: ExecutionEvent): string {
 
 function budgetStatusSnapshot(taskEnvelope: TaskEnvelope, state?: ActiveTaskState): Record<string, unknown> {
   const budget = normalizeTaskBudget(taskEnvelope.budget);
-  const usedTurns = state?.taskTurnCount ?? 0;
-  const remaining = Math.max(0, budget.maxTurns - usedTurns);
+  const taskUsedTurns = state?.taskTurnCount ?? 0;
+  const taskRemainingTurns = Math.max(0, budget.maxTurns - taskUsedTurns);
+  const epochUsedTurns = state?.epochTurnCount ?? 0;
+  const epochMaxTurns = Math.min(DEFAULT_EPOCH_TURN_SLICE, taskRemainingTurns + epochUsedTurns);
+  const epochRemainingTurns = Math.max(0, epochMaxTurns - epochUsedTurns);
   const epochBudget = state?.epochBudgetClock?.snapshot();
   return {
     taskId: taskEnvelope.taskId,
     budget: { maxTurns: budget.maxTurns },
-    usedTurns,
-    remainingTurns: remaining,
-    nearTurnLimit: remaining <= BUDGET_PRESSURE_TURNS,
+    usedTurns: taskUsedTurns,
+    remainingTurns: taskRemainingTurns,
+    epochUsedTurns,
+    epochMaxTurns,
+    epochRemainingTurns,
+    nearTurnLimit: Math.min(taskRemainingTurns, epochRemainingTurns) <= BUDGET_PRESSURE_TURNS,
     stopRequested: state?.executorStopRequested ?? false,
     abortReason: state?.abortContext?.reason,
     globalRemainingMs: state?.runDeadlineAt === undefined
@@ -6370,7 +6410,11 @@ function budgetStatusSteerKey(
   },
   status: Record<string, unknown>
 ): string | undefined {
-  const remaining = typeof status.remainingTurns === "number" ? status.remainingTurns : undefined;
+  const taskRemaining = typeof status.remainingTurns === "number" ? status.remainingTurns : undefined;
+  const epochRemaining = typeof status.epochRemainingTurns === "number" ? status.epochRemainingTurns : undefined;
+  const remaining = taskRemaining === undefined
+    ? epochRemaining
+    : epochRemaining === undefined ? taskRemaining : Math.min(taskRemaining, epochRemaining);
   if (input.force) {
     const budget = status.budget as { maxTurns?: number } | undefined;
     return `force:${input.reason}:maxTurns=${budget?.maxTurns ?? "unknown"}`;
@@ -6406,13 +6450,14 @@ function formatExecutorBudgetStatus(
   return [
     update ? "RUNTIME_BUDGET_STATUS_UPDATE" : "RUNTIME_BUDGET_STATUS",
     `reason: ${reason}`,
-    `turns: ${status.usedTurns}/${budget.maxTurns ?? "unknown"}; remaining: ${status.remainingTurns}`,
+    `taskAllocation: ${status.usedTurns}/${budget.maxTurns ?? "unknown"}; remaining: ${status.remainingTurns}`,
+    `epochSlice: ${status.epochUsedTurns}/${status.epochMaxTurns}; remaining: ${status.epochRemainingTurns}`,
     `globalRemainingMs: ${status.globalRemainingMs ?? "unbounded"}`,
     `epochRemainingMs: ${status.epochRemainingMs ?? "unbounded"}; epochTimeLimitMs: ${status.epochTimeLimitMs ?? "unbounded"}; providerDowntimeMs: ${status.providerDowntimeMs ?? 0}`,
     `nearTurnLimit: ${yesNo(status.nearTurnLimit)}`,
     `stopRequested: ${yesNo(status.stopRequested)}${status.abortReason ? `; abortReason: ${status.abortReason}` : ""}`,
     `constraints: ${taskEnvelope.constraints.join("；") || "none"}`,
-    "Rule: if stopRequested=yes, remaining<=0, or epochRemainingMs is near zero, immediately return a phase TaskResult; otherwise continue within scope."
+    "Rule: if stopRequested=yes, task allocation remaining<=0, epoch slice remaining<=0, or epochRemainingMs is near zero, immediately return a phase TaskResult; otherwise continue within scope."
   ].join("\n");
 }
 

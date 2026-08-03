@@ -5,6 +5,7 @@ import { join } from "node:path";
 import test from "node:test";
 import {
   DEFAULT_TASK_BUDGET,
+  DEFAULT_EPOCH_TURN_SLICE,
   MAX_TASK_BUDGET,
   MIN_TASK_BUDGET,
   normalizeObserverProjection,
@@ -246,12 +247,12 @@ test("Planner cannot reopen an exhausted Task without increasing its cumulative 
     status: "open",
     basedOnRefs: []
   }]));
-  assert.throws(() => harness.controllerHarness.assertPlannerRuntimeTransitions([{
+  assert.doesNotThrow(() => harness.controllerHarness.assertPlannerRuntimeTransitions([{
     kind: "patch_task",
     taskId: taskEnvelope.taskId,
     patch: { additionalTurns: 31 },
     basedOnRefs: []
-  }]), /previousMaxTurns=10, additionalTurns=31, maximum=40/);
+  }]));
   await harness.controller.close({ drainProjectionJobs: false });
 });
 
@@ -406,10 +407,26 @@ test("clamps undersized planner maxTurns to controller minimum", () => {
   assert.equal(normalizeTaskBudget({ maxTurns: 6 }).maxTurns, MIN_TASK_BUDGET.maxTurns);
 });
 
-test("clamps oversized planner budget to controller maximums", () => {
+test("preserves cumulative Task allocation above a single allocation chunk", () => {
   assert.deepEqual(normalizeTaskBudget({
     maxTurns: 999
-  }), MAX_TASK_BUDGET);
+  }), { maxTurns: 999 });
+});
+
+test("clamps a newly created Task to one bounded initial allocation chunk", () => {
+  const harness = createControllerHarness();
+  const envelope = harness.controllerHarness.taskEnvelopeFromSpec({
+    id: "task:bounded-initial-allocation",
+    goal: "Resolve one observable uncertainty",
+    targetRefs: ["goal:root"],
+    scopeRef: "scope:root",
+    successCriteria: ["An observable result is persisted"],
+    priority: 1,
+    budget: { maxTurns: 999 }
+  }, "仅允许测试 10.0.0.8");
+
+  assert.deepEqual(envelope.budget, MAX_TASK_BUDGET);
+  harness.controller.close();
 });
 
 test("ignores invalid planner budget values", () => {
@@ -1323,41 +1340,34 @@ test("steers runtime budget status near turn limit", async () => {
   harness.controller.close();
 });
 
-test("budget steer re-lands full constraints every 25 turns mid-epoch", async () => {
+test("epoch turn slice checkpoints before a larger cumulative Task allocation is exhausted", async () => {
   const harness = createControllerHarness();
   const taskEnvelope = makeTaskEnvelope({
     budget: { maxTurns: MAX_TASK_BUDGET.maxTurns },
     constraints: ["授权范围原文：仅允许测试 10.0.0.8", "禁止 JWT kid 遍历", "禁止爆破内网服务"]
   });
   activateTask(harness.controllerHarness, taskEnvelope);
-  const fireTurns = (from: number, to: number) => {
-    for (let index = from; index < to; index += 1) {
+  for (let index = 0; index < DEFAULT_EPOCH_TURN_SLICE; index += 1) {
       harness.controllerHarness.handleExecutorEventPersisted(makeExecutionEvent(
         taskEnvelope.taskId,
         "turn_end",
         {},
         `event:turn:${index}`
       ));
-    }
-  };
+  }
   const budgetSteers = () => harness.steers().filter((message) => message.includes("RUNTIME_BUDGET_STATUS_UPDATE"));
-
-  fireTurns(0, 24);
-  await new Promise((resolve) => setTimeout(resolve, 20));
-  assert.equal(budgetSteers().length, 0, "no periodic steer before the 25-turn bucket");
-
-  fireTurns(24, 25);
-  await waitFor(() => budgetSteers().length === 1);
-  const steer = budgetSteers()[0];
+  await waitFor(() => harness.abortCount() === 1);
+  await waitFor(async () => (await harness.controller.executionLog.readAll())
+    .some((event) => event.eventType === "executor_checkpoint_requested"));
+  const events = await harness.controller.executionLog.readAll();
+  assert.equal(harness.controller.runtimeStore.getTaskConsumedTurns(taskEnvelope.taskId), DEFAULT_EPOCH_TURN_SLICE);
+  assert.ok(events.some((event) => event.eventType === "executor_checkpoint_requested"
+    && event.summary === `Epoch turn slice reached: maxTurns=${DEFAULT_EPOCH_TURN_SLICE}`));
+  assert.ok(DEFAULT_EPOCH_TURN_SLICE < MAX_TASK_BUDGET.maxTurns);
+  const steer = budgetSteers().at(-1) ?? "";
   assert.ok(steer.includes("禁止 JWT kid 遍历"), "steer carries planner bans verbatim");
   assert.ok(steer.includes("禁止爆破内网服务"));
   assert.ok(steer.includes("授权范围原文：仅允许测试 10.0.0.8"), "scope statement stays first");
-  await waitFor(async () => (await harness.controller.executionLog.readAll())
-    .some((event) => event.eventType === "budget_status_updated" && event.payload.delivery === "steer"));
-
-  fireTurns(25, 30);
-  await new Promise((resolve) => setTimeout(resolve, 20));
-  assert.equal(budgetSteers().length, 1, "same bucket does not re-steer");
   harness.controller.close();
 });
 
@@ -3235,7 +3245,8 @@ test("defers a retryable Planner outage without failing the run", async () => {
         commands: [],
         reason: "Recovered after the outage",
         basedOnRefs: []
-      }
+      },
+      quiescent: false
     };
   };
 
@@ -6085,7 +6096,8 @@ test("same partial task resumes without a redundant open status write", async ()
   assert.match(prompts[1] ?? "", /<planner_hint>[\s\S]*Resume the confirmed path and archive the redundant task/);
   assert.match(prompts[1] ?? "", /<execution_brief>[\s\S]*Confirmed arbitrary file read/);
   assert.match(prompts[1] ?? "", /The confirmed primitive has not yet been applied to \/challenge\/flag\.txt/);
-  assert.match(prompts[1] ?? "", /turns: 0\/16/);
+  assert.match(prompts[1] ?? "", /taskAllocation: 0\/16; remaining: 16/);
+  assert.match(prompts[1] ?? "", /epochSlice: 0\/12; remaining: 12/);
   assert.equal(executorDisposeCount, 2);
   const firstPartialIndex = events.findIndex((event) => event.eventType === "task_partial" && event.taskId === "task:primary");
   const resumeDecisionIndex = events.findIndex((event) => event.eventType === "planner_task_patched"
@@ -6964,6 +6976,7 @@ test("Planner exhausting active Task mutation repairs keeps active Executors run
   assert.ok(!events.some((event) => event.eventType === "runtime_control"
     && event.summary === "runtime_abort:controller_abort"));
   assert.equal(events.filter((event) => event.eventType === "planner_decision_rejected").length, 2);
+  assert.equal(events.filter((event) => event.eventType === "planner_cycle_deferred").length, 1);
   await controller.close({ drainProjectionJobs: false });
 });
 
@@ -6999,17 +7012,17 @@ test("empty apply_commands schedules existing open tasks", async () => {
     observer: createMockTextSession(observerProjectionJson())
   };
 
-  const result = await controller.runUntilDone({
+  const result = await controller.runOnce({
     userGoal: "Get flag",
     scopeSummary: "Authorized target only",
-    maxPlannerCycles: 1,
     maxParallelTasks: 1
   });
   const events = await controller.executionLog.readAll();
 
-  assert.equal(result.cycles[0].plannerDecision.decision, undefined);
-  assert.deepEqual(result.cycles[0].plannerDecision.commands, []);
-  assert.equal(result.cycles[0].taskResult, undefined);
+  assert.equal(result.plannerDecision.decision, undefined);
+  assert.deepEqual(result.plannerDecision.commands, []);
+  assert.equal(result.taskResult?.status, "completed");
+  assert.equal(result.quiescent, false);
   assert.ok(events.some((event) => event.eventType === "task_completed"
     && event.taskId === "task:ready-existing"));
   assert.equal(
@@ -7018,6 +7031,54 @@ test("empty apply_commands schedules existing open tasks", async () => {
   );
   assert.equal(controller.runtimeStore.getTaskOutcome("task:ready-existing")?.status, "completed");
   controller.close();
+});
+
+test("empty Planner decision becomes quiescent after completed work instead of cycling", async () => {
+  const runtimeDir = mkdtempSync(join(tmpdir(), "luanniao-controller-"));
+  const controller = createControllerWithTestLlmEnv(runtimeDir);
+  const controllerHarness = controller as unknown as ControllerHarness;
+  controller.graphStore.createTasks([{
+    parentTaskId: "goal:root",
+    taskId: "task:completed-awaiting-planner",
+    goal: "Complete one bounded task",
+    targetRefs: ["goal:root"],
+    scopeRef: "scope:root",
+    constraints: [],
+    successCriteria: ["task completed"],
+    budget: { maxTurns: 1 },
+    priority: 1
+  }]);
+  const plannerSession = createMockTextSession(JSON.stringify({
+    decision: "apply_commands",
+    commands: [],
+    reason: "No graph change",
+    basedOnRefs: ["task:completed-awaiting-planner"]
+  }));
+  controllerHarness.agents = {
+    planner: plannerSession,
+    executor: createAbortableMockTextSession(JSON.stringify({
+      taskId: "task:completed-awaiting-planner",
+      status: "completed",
+      summary: "Bounded task completed",
+      evidenceRefs: [],
+      artifactRefs: []
+    })),
+    observer: createMockTextSession(observerProjectionJson())
+  };
+
+  const result = await controller.runUntilDone({
+    userGoal: "Complete one bounded task",
+    scopeSummary: "Authorized target only",
+    maxPlannerCycles: 1_000,
+    maxParallelTasks: 1
+  });
+
+  assert.match(result.stoppedReason, /Runtime quiescent after Planner decision/);
+  assert.equal(result.cycles.length, 1);
+  assert.equal(plannerSession.promptCount(), 1);
+  assert.equal((await controller.executionLog.readAll())
+    .filter((event) => event.eventType === "planner_cycle_deferred").length, 0);
+  await controller.close({ drainProjectionJobs: false });
 });
 
 test("max Planner cycles drains already scheduled parallel tasks", async () => {

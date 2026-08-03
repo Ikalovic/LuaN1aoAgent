@@ -60,7 +60,8 @@ test("executor prompt uses bounded experimental method and runtime steering", ()
   assert.match(EXECUTOR_SYSTEM_PROMPT, /reopenConditions/);
   assert.match(EXECUTOR_SYSTEM_PROMPT, /原始响应写入 artifact/);
   assert.match(EXECUTOR_SYSTEM_PROMPT, /末尾用一句自然语言总结/);
-  assert.match(EXECUTOR_SYSTEM_PROMPT, /可复用材料（Cookie、凭据、密钥、PoC、solver 脚本）必须及时用 artifact_write 归档/);
+  assert.match(EXECUTOR_SYSTEM_PROMPT, /首次成为后续步骤依赖或产生可复现正向结果时，立即用 artifact_write 归档/);
+  assert.match(EXECUTOR_SYSTEM_PROMPT, /不要等到 nearTurnLimit、checkpoint 或 task_result_submit/);
   assert.match(EXECUTOR_SYSTEM_PROMPT, /summary 中提到这些材料时给出精确 artifactRef/);
   assert.match(EXECUTOR_SYSTEM_PROMPT, /当前工作目录是 Task workspace，跨 epoch 持久/);
   assert.match(EXECUTOR_SYSTEM_PROMPT, /artifact_write\(\{path:"evidence\.json",kind:"json",mediaType:"application\/json"\}\)/);
@@ -123,8 +124,8 @@ test("planner prompt teaches evidence-aware planning without an intermediate con
   assert.match(PLANNER_SYSTEM_PROMPT, /所有仍合理的解释都会得到同一组 commands/);
   assert.match(PLANNER_SYSTEM_PROMPT, /不要求你重演 Executor 调查/);
   assert.match(PLANNER_SYSTEM_PROMPT, /priority 数字越小优先级越高，1 是最高优先级/);
-  assert.match(PLANNER_SYSTEM_PROMPT, /evidence_list 列出 Task 的持久观察/);
-  assert.match(PLANNER_SYSTEM_PROMPT, /evidence_read 按真实 event Ref 读取原始观察/);
+  assert.match(PLANNER_SYSTEM_PROMPT, /需要区分候选 graph commands 时，使用 graph_query\/graph_trace、evidence_list\/evidence_read 或 artifact_read/);
+  assert.match(PLANNER_SYSTEM_PROMPT, /无法解析时重新 list，不猜测或修补 UUID/);
   assert.match(PLANNER_SYSTEM_PROMPT, /Task status=completed 表示 Planner 已接受/);
   assert.match(PLANNER_SYSTEM_PROMPT, /completed TaskOutcome 是局部完成报告/);
   assert.match(PLANNER_SYSTEM_PROMPT, /replace_dependencies 显式调整依赖/);
@@ -162,6 +163,11 @@ test("planner prompt teaches evidence-aware planning without an intermediate con
   assert.match(PLANNER_SYSTEM_PROMPT, /持久化依据只写在对应 command 的 basedOnRefs/);
   assert.match(PLANNER_SYSTEM_PROMPT, /Root Goal 含“全部”“所有”“每个”等全称完成条件时，按开放集合处理/);
   assert.match(PLANNER_SYSTEM_PROMPT, /EpochOutcome 只说明执行实例为何结束/);
+  assert.match(PLANNER_SYSTEM_PROMPT, /不存在固定的 Task 生命周期 40-turn 上限/);
+  assert.match(PLANNER_SYSTEM_PROMPT, /<example name="task-outcome-sufficient">/);
+  assert.match(PLANNER_SYSTEM_PROMPT, /所有仍合理的解释都会得到同一组 commands 时，信息已经足够/);
+  assert.match(PLANNER_SYSTEM_PROMPT, /读取 ELF、PoC、bash 事件或原始响应/);
+  assert.doesNotMatch(PLANNER_SYSTEM_PROMPT, /patch 原 Task 并 set_task_status=open/);
   assert.doesNotMatch(PLANNER_SYSTEM_PROMPT, /need_user_input/);
   assert.match(EXECUTOR_SYSTEM_PROMPT, /只有全部 successCriteria 满足时提交 completed/);
   assert.match(EXECUTOR_SYSTEM_PROMPT, /成功条件满足后立即调用 task_result_submit/);

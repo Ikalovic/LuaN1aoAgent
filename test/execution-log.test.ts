@@ -340,6 +340,14 @@ test("evidence tools expose scoped mechanical indexes and byte-paged canonical e
     offset = page.nextOffset;
   }
   assert.deepEqual(JSON.parse(canonical), JSON.parse(JSON.stringify(first)));
+  const uniquePrefix = first.id.slice(0, -1);
+  const prefixRead = await invokeRead({ ref: uniquePrefix });
+  const prefixPayload = JSON.parse(String(prefixRead.content[0]?.type === "text" ? prefixRead.content[0].text : "{}")) as {
+    ref: string;
+    requestedRef?: string;
+  };
+  assert.equal(prefixPayload.ref, first.id);
+  assert.equal(prefixPayload.requestedRef, uniquePrefix);
   const crossTaskRead = await invokeRead({ ref: denied.id });
   const crossTaskPage = JSON.parse(String(
     crossTaskRead.content[0]?.type === "text" ? crossTaskRead.content[0].text : "{}"
@@ -347,7 +355,7 @@ test("evidence tools expose scoped mechanical indexes and byte-paged canonical e
   assert.equal(JSON.parse(crossTaskPage.content).id, denied.id);
   await assert.rejects(
     () => invokeRead({ ref: "event:missing" }),
-    /cannot resolve event Ref/
+    /call evidence_list/
   );
   await assert.rejects(
     () => invokeList({ taskRef: "task:denied" }),
