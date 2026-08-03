@@ -859,10 +859,6 @@ export class SQLiteGraphStore {
           blockers: 5,
           taskLedger: 20
         }
-      },
-      retrievalHints: {
-        tools: ["graph_query", "graph_trace", "evidence_list", "evidence_read", "artifact_read"],
-        note: "Planner 按需列出 Task 观察、读取真实 event Ref，并用 artifact_read 检查非凭据持久材料。"
       }
     };
   }

@@ -1755,7 +1755,6 @@ test("builds compact planner decision view without copying TaskOutcome fields in
   assert.ok(view.operationDigest.some((item) => item.id === "endpoint:/c.php"));
   assert.equal(view.reasoningDigest.find((item) => item.id === "evidence:flag-path")?.properties.rawBody, undefined);
   assert.equal(view.operationDigest.find((item) => item.id === "session:admin")?.properties.token, undefined);
-  assert.deepEqual(view.retrievalHints.tools, ["graph_query", "graph_trace", "evidence_list", "evidence_read", "artifact_read"]);
   graphStore.close();
 });
 

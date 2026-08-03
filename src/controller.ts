@@ -1239,8 +1239,18 @@ export class SecurityAgentController {
       const consumedTurns = this.runtimeStore.getTaskConsumedTurns(task.taskId);
       const remainingTaskTurns = Math.max(0, maxTurns - consumedTurns);
       const terminalDefinition = ["completed", "blocked", "failed", "archived"].includes(task.status);
+      const includeDecisionDefinition = !["completed", "archived"].includes(task.status);
       return {
         ...task,
+        ...(includeDecisionDefinition && taskEnvelope ? {
+          goal: taskEnvelope.goal,
+          targetRefs: taskEnvelope.targetRefs,
+          basisRefs: taskEnvelope.basisRefs,
+          scopeRef: taskEnvelope.scopeRef,
+          successCriteria: taskEnvelope.successCriteria,
+          parentTaskId: taskEnvelope.parentTaskId,
+          dependsOnTaskRefs: taskEnvelope.dependsOnTaskRefs
+        } : {}),
         ready: task.status === "open"
           && readiness.blockedByTaskRefs.length === 0
           && !running

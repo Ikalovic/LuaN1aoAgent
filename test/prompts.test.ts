@@ -118,57 +118,26 @@ test("executor prompt uses bounded experimental method and runtime steering", ()
 });
 
 test("planner prompt teaches evidence-aware planning without an intermediate contract", () => {
-  assert.match(PLANNER_SYSTEM_PROMPT, /先只根据 compact state 形成一份候选 commands/);
-  assert.match(PLANNER_SYSTEM_PROMPT, /不同答案是否会改变 command 的 kind、目标节点、status、budget、依赖或 priority/);
-  assert.match(PLANNER_SYSTEM_PROMPT, /若它不改变候选 commands，继续提交/);
-  assert.match(PLANNER_SYSTEM_PROMPT, /所有仍合理的解释都会得到同一组 commands/);
-  assert.match(PLANNER_SYSTEM_PROMPT, /不要求你重演 Executor 调查/);
+  assert.match(PLANNER_SYSTEM_PROMPT, /职责是把用户的 Root Goal 持续转化为当前最值得执行的目标级 Task/);
+  assert.match(PLANNER_SYSTEM_PROMPT, /Task Graph 是这些规划决定的持久表达，不是规划目的/);
+  assert.match(PLANNER_SYSTEM_PROMPT, /你决定“接下来完成什么以及为什么”；Executor 决定“具体怎么完成”/);
+  assert.match(PLANNER_SYSTEM_PROMPT, /默认只根据 Planner State.*TaskOutcome.*EpochOutcome/s);
+  assert.match(PLANNER_SYSTEM_PROMPT, /不要求你重演调查/);
   assert.match(PLANNER_SYSTEM_PROMPT, /priority 数字越小优先级越高，1 是最高优先级/);
-  assert.match(PLANNER_SYSTEM_PROMPT, /需要区分候选 graph commands 时，使用 graph_query\/graph_trace、evidence_list\/evidence_read 或 artifact_read/);
-  assert.match(PLANNER_SYSTEM_PROMPT, /无法解析时重新 list，不猜测或修补 UUID/);
-  assert.match(PLANNER_SYSTEM_PROMPT, /Task status=completed 表示 Planner 已接受/);
-  assert.match(PLANNER_SYSTEM_PROMPT, /completed TaskOutcome 是局部完成报告/);
-  assert.match(PLANNER_SYSTEM_PROMPT, /replace_dependencies 显式调整依赖/);
-  assert.match(PLANNER_SYSTEM_PROMPT, /partial 只存在于 TaskOutcome/);
-  assert.match(PLANNER_SYSTEM_PROMPT, /Controller 只会执行 status=open.*Planner 接受为 status=completed/);
-  assert.match(PLANNER_SYSTEM_PROMPT, /archived 只用于停止仍为 open 的过期或重叠 Task/);
-  assert.match(PLANNER_SYSTEM_PROMPT, /相互冲突的解释/);
-  assert.match(PLANNER_SYSTEM_PROMPT, /能够消除关键不确定性的目标/);
-  assert.match(PLANNER_SYSTEM_PROMPT, /一个当前可判定的因果目标.*短连续链/);
-  assert.match(PLANNER_SYSTEM_PROMPT, /路径、工具、payload 和技术细节可以出现/);
-  assert.match(PLANNER_SYSTEM_PROMPT, /中间结果.*全局决策点/);
-  assert.match(PLANNER_SYSTEM_PROMPT, /固定命令、固定路径或单个 payload 成功，只能规划其精确复用/);
-  assert.match(PLANNER_SYSTEM_PROMPT, /创建 dependent Task/);
-  assert.match(PLANNER_SYSTEM_PROMPT, /dependsOnTaskRefs 只列必须 completed 的硬前置/);
-  assert.match(PLANNER_SYSTEM_PROMPT, /partial 阶段成果通过 create_tasks\.basedOnRefs 继承，不复用前驱 Session/);
+  assert.match(PLANNER_SYSTEM_PROMPT, /TaskOutcome=partial 表示本次执行有阶段结果/);
+  assert.match(PLANNER_SYSTEM_PROMPT, /partial 阶段成果通过 create_tasks\.basedOnRefs 继承/);
+  assert.match(PLANNER_SYSTEM_PROMPT, /awaiting_planner Task 保持 open 且 remainingTurns>0 时，空 commands 会恢复同一 Task/);
+  assert.match(PLANNER_SYSTEM_PROMPT, /budget\.maxTurns 是 Task 已累计分配的 turns，不是生命周期硬上限/);
   assert.match(PLANNER_SYSTEM_PROMPT, /不得反转依赖/);
-  assert.match(PLANNER_SYSTEM_PROMPT, /版本由 Runtime 自动绑定并进行原子冲突检测/);
-  assert.match(PLANNER_SYSTEM_PROMPT, /<example name="conflicting-observations">/);
-  assert.match(PLANNER_SYSTEM_PROMPT, /<example name="confirmed-capability">/);
-  assert.match(PLANNER_SYSTEM_PROMPT, /<example name="capability-chain-split">/);
-  assert.match(PLANNER_SYSTEM_PROMPT, /<example name="tactical-task-definition">/);
-  assert.match(PLANNER_SYSTEM_PROMPT, /goal 可以直接写明该参数和路径/);
-  assert.doesNotMatch(PLANNER_SYSTEM_PROMPT, /不要写入具体 payload、命令、工具步骤/);
-  assert.match(PLANNER_SYSTEM_PROMPT, /初始图只有 Goal\/Scope.*默认只创建一个入口认知 Task/s);
-  assert.match(PLANNER_SYSTEM_PROMPT, /<example name="initial-fanout">/);
-  assert.match(PLANNER_SYSTEM_PROMPT, /<example name="evidence-backed-parallelism">/);
-  assert.match(PLANNER_SYSTEM_PROMPT, /因为共享 Root Goal 就强制串行这些已经独立的分支/);
-  assert.match(PLANNER_SYSTEM_PROMPT, /历史漏洞与目标适用性/);
-  assert.match(PLANNER_SYSTEM_PROMPT, /有限候选列表只限制探索投入，不证明候选空间已经穷尽/);
-  assert.match(PLANNER_SYSTEM_PROMPT, /persisted Evidence、Session 或 Route 能证明该资产由 authorized_scope 中的根入口派生/);
-  assert.match(PLANNER_SYSTEM_PROMPT, /<example name="known-vulnerability-research">/);
-  assert.doesNotMatch(PLANNER_SYSTEM_PROMPT, /Runtime 会复用原 Executor Session/);
-  assert.doesNotMatch(PLANNER_SYSTEM_PROMPT, /<example name="same-task-resume">/);
-  assert.match(PLANNER_SYSTEM_PROMPT, /整个提交只在顶层给出一次总体 reason/);
-  assert.match(PLANNER_SYSTEM_PROMPT, /持久化依据只写在对应 command 的 basedOnRefs/);
-  assert.match(PLANNER_SYSTEM_PROMPT, /Root Goal 含“全部”“所有”“每个”等全称完成条件时，按开放集合处理/);
+  assert.match(PLANNER_SYSTEM_PROMPT, /检索只服务于全局任务选择，不服务于目标侧技术调查/);
+  assert.match(PLANNER_SYSTEM_PROMPT, /不要为了改进 Executor 的技术方法、复核 blocker/);
+  assert.match(PLANNER_SYSTEM_PROMPT, /无法解析时重新 list，不猜测 UUID/);
+  assert.match(PLANNER_SYSTEM_PROMPT, /Root Goal 的“全部”“所有”“每个”按开放集合处理/);
   assert.match(PLANNER_SYSTEM_PROMPT, /EpochOutcome 只说明执行实例为何结束/);
-  assert.match(PLANNER_SYSTEM_PROMPT, /不存在固定的 Task 生命周期 40-turn 上限/);
-  assert.match(PLANNER_SYSTEM_PROMPT, /<example name="task-outcome-sufficient">/);
-  assert.match(PLANNER_SYSTEM_PROMPT, /所有仍合理的解释都会得到同一组 commands 时，信息已经足够/);
-  assert.match(PLANNER_SYSTEM_PROMPT, /读取 ELF、PoC、bash 事件或原始响应/);
-  assert.doesNotMatch(PLANNER_SYSTEM_PROMPT, /patch 原 Task 并 set_task_status=open/);
-  assert.doesNotMatch(PLANNER_SYSTEM_PROMPT, /need_user_input/);
+  assert.match(PLANNER_SYSTEM_PROMPT, /<example name="continue-current-task">/);
+  assert.match(PLANNER_SYSTEM_PROMPT, /<example name="create-planning-branch">/);
+  assert.match(PLANNER_SYSTEM_PROMPT, /<example name="initial-planning">/);
+  assert.equal((PLANNER_SYSTEM_PROMPT.match(/<example name=/g) ?? []).length, 3);
   assert.match(EXECUTOR_SYSTEM_PROMPT, /只有全部 successCriteria 满足时提交 completed/);
   assert.match(EXECUTOR_SYSTEM_PROMPT, /成功条件满足后立即调用 task_result_submit/);
 });
@@ -201,11 +170,7 @@ test("planner prompt carries the canonical TaskOutcome without ledger summary tr
     reasoningDigest: [],
     operationDigest: [],
     blockers: [],
-    graphSummary: { nodeCount: 1, edgeCount: 0, taskStatusCounts: { partial: 1 } },
-    retrievalHints: {
-      tools: ["graph_query", "graph_trace", "evidence_read"],
-      note: "Read more only when needed"
-    }
+    graphSummary: { nodeCount: 1, edgeCount: 0, taskStatusCounts: { partial: 1 } }
   };
 
   const input = renderPlannerInput({
@@ -228,6 +193,10 @@ test("planner follow-up carries a complete structural delta without repeating fi
       taskId: "task:recon",
       status: "open",
       goal: "Map the target",
+      targetRefs: ["asset:target"],
+      basisRefs: ["event:task-basis"],
+      scopeRef: "scope:root",
+      successCriteria: ["Persist the reachable service inventory"],
       priority: 1,
       dependsOnTaskRefs: []
     }],
@@ -236,11 +205,7 @@ test("planner follow-up carries a complete structural delta without repeating fi
     reasoningDigest: [],
     operationDigest: [],
     blockers: [],
-    graphSummary: { nodeCount: 3, edgeCount: 0, taskStatusCounts: { open: 1 } },
-    retrievalHints: {
-      tools: ["graph_query", "graph_trace", "evidence_read"],
-      note: "Read authoritative stores when needed"
-    }
+    graphSummary: { nodeCount: 3, edgeCount: 0, taskStatusCounts: { open: 1 } }
   };
   const current: PlannerDecisionView = {
     ...previous,
@@ -290,7 +255,9 @@ test("planner follow-up carries a complete structural delta without repeating fi
   assert.match(input, /Task budget reached: maxTurns=10/);
   assert.doesNotMatch(input, /<goal>/);
   assert.doesNotMatch(input, /<authorized_scope>/);
-  assert.doesNotMatch(input, /"goal":"Map the target".*"status":"open"/);
+  assert.match(input, /"goal":"Map the target"/);
+  assert.match(input, /"targetRefs":\["asset:target"\]/);
+  assert.match(input, /"successCriteria":\["Persist the reachable service inventory"\]/);
 });
 
 test("executor input exposes existing basis refs for transitive material reuse", () => {
@@ -319,8 +286,8 @@ test("executor input exposes existing basis refs for transitive material reuse",
 });
 
 test("planner prompt explains how to use degraded projection outcomes", () => {
-  assert.match(PLANNER_SYSTEM_PROMPT, /projectionDegradations 表示对应 Task 的语义图尚未追平/);
-  assert.match(PLANNER_SYSTEM_PROMPT, /优先使用 taskOutcomes 中的持久化结果/);
+  assert.match(PLANNER_SYSTEM_PROMPT, /projectionDegradations 表示语义图未追平/);
+  assert.match(PLANNER_SYSTEM_PROMPT, /优先使用最新 TaskOutcome 决策/);
 });
 
 test("projector prompt requests semantic changes instead of one node per observation", () => {

@@ -255,7 +255,8 @@ export function createGraphQueryTool(
   graphStore: SQLiteGraphStore,
   references?: ProjectorGraphRefRegistry,
   cache?: Map<string, string>,
-  materials?: GraphToolMaterialsResolver
+  materials?: GraphToolMaterialsResolver,
+  description?: string
 ) {
   const viewSchema = references
     ? Type.Union([
@@ -273,7 +274,7 @@ export function createGraphQueryTool(
   return defineTool({
     name: "graph_query",
     label: "Graph Query",
-    description: "Read a byte-bounded closed tri-graph page when the initial view is insufficient. Returned edges always include both endpoint nodes; use nextCursor with unchanged arguments for continuation.",
+    description: description ?? "Read a byte-bounded closed tri-graph page when the initial view is insufficient. Returned edges always include both endpoint nodes; use nextCursor with unchanged arguments for continuation.",
     parameters: Type.Object({
       view: viewSchema,
       focusNodeIds: Type.Optional(Type.Array(Type.String({ minLength: 1, maxLength: 256 }), { maxItems: 32 })),
@@ -318,12 +319,13 @@ export function createGraphTraceTool(
   graphStore: SQLiteGraphStore,
   references?: ProjectorGraphRefRegistry,
   cache?: Map<string, string>,
-  materials?: GraphToolMaterialsResolver
+  materials?: GraphToolMaterialsResolver,
+  description?: string
 ) {
   return defineTool({
     name: "graph_trace",
     label: "Graph Trace",
-    description: "Trace one real graph reference through a byte-bounded closed graph page. Returned edges always include both endpoint nodes; use nextCursor with unchanged arguments for continuation.",
+    description: description ?? "Trace one real graph reference through a byte-bounded closed graph page. Returned edges always include both endpoint nodes; use nextCursor with unchanged arguments for continuation.",
     parameters: Type.Object({
       ref: Type.String({ minLength: 1, maxLength: 256 }),
       cursor: Type.Optional(Type.String({ minLength: 1, maxLength: 256 }))
@@ -830,6 +832,7 @@ type EvidenceToolOptions = {
   allowedTaskIds?: ReadonlySet<string>;
   maxListLimit?: number;
   maxReadBytes?: number;
+  description?: string;
 };
 
 export function createEvidenceListTool(
@@ -840,7 +843,7 @@ export function createEvidenceListTool(
   return defineTool({
     name: "evidence_list",
     label: "Evidence List",
-    description: "List an authorized Task's persisted observations as a mechanical index without semantic ranking.",
+    description: options.description ?? "List an authorized Task's persisted observations as a mechanical index without semantic ranking.",
     parameters: Type.Object({
       taskRef: Type.String({ minLength: 1, maxLength: 256 }),
       cursor: Type.Optional(Type.String({ minLength: 1, maxLength: 256 })),
@@ -882,7 +885,7 @@ export function createEvidenceReadTool(
   return defineTool({
     name: "evidence_read",
     label: "Evidence Read",
-    description: "Read one persisted event as byte-paged canonical JSON. Accepts an exact event Ref or an unambiguous Ref prefix; never invent UUIDs.",
+    description: options.description ?? "Read one persisted event as byte-paged canonical JSON. Accepts an exact event Ref or an unambiguous Ref prefix; never invent UUIDs.",
     parameters: Type.Object({
       ref: Type.String({ pattern: "^event:.+", minLength: 7, maxLength: 256 }),
       offset: Type.Optional(Type.Integer({ minimum: 0 })),
@@ -993,6 +996,7 @@ export function createArtifactReadTool(
   options: {
     maxReadBytes?: number;
     workspace?: { hostDir: string; visibleRoot: string; sharedWithContainer?: boolean };
+    description?: string;
   } = {}
 ) {
   const readProperties = {
@@ -1006,9 +1010,9 @@ export function createArtifactReadTool(
   return defineTool({
     name: "artifact_read",
     label: "Artifact Read",
-    description: options.workspace
+    description: options.description ?? (options.workspace
       ? "Read a bounded artifact range by artifact ref, or explicitly materialize the complete artifact into the persistent Executor workspace."
-      : "Read a bounded artifact range by artifact ref.",
+      : "Read a bounded artifact range by artifact ref."),
     parameters,
     execute: async (_toolCallId, rawParams) => {
       const params = rawParams as {

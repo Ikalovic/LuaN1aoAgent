@@ -233,17 +233,21 @@ export async function createPlannerAgentSession(input: {
   );
   rejectUnmanagedProviderAdmission(input.plannerLoader, input.providerAdmission);
   const graphMaterials = graphToolMaterialsResolver(input.executionLog);
+  const plannerRetrievalPurpose = "Use only when a missing persisted fact would change Task status, topology, dependencies, priority, or budget; not for target-side technical investigation.";
   return createAgentSession({
     cwd: input.cwd,
     noTools: "builtin",
     customTools: [
-      createGraphQueryTool(input.graphStore, undefined, undefined, graphMaterials),
-      createGraphTraceTool(input.graphStore, undefined, undefined, graphMaterials),
+      createGraphQueryTool(input.graphStore, undefined, undefined, graphMaterials, plannerRetrievalPurpose),
+      createGraphTraceTool(input.graphStore, undefined, undefined, graphMaterials, plannerRetrievalPurpose),
       ...(input.executionLog ? [
-        createEvidenceListTool(input.executionLog),
-        createEvidenceReadTool(input.executionLog)
+        createEvidenceListTool(input.executionLog, { description: plannerRetrievalPurpose }),
+        createEvidenceReadTool(input.executionLog, { description: plannerRetrievalPurpose })
       ] : []),
-      createArtifactReadTool(input.artifactStore, { maxReadBytes: 64_000 }),
+      createArtifactReadTool(input.artifactStore, {
+        maxReadBytes: 64_000,
+        description: plannerRetrievalPurpose
+      }),
       createValidatedPlannerSubmitTool(
         input.graphStore,
         input.artifactStore,

@@ -394,6 +394,11 @@ export type PlannerTaskLedgerItem = {
   taskId: string;
   status: string;
   goal: string;
+  targetRefs?: string[];
+  basisRefs?: string[];
+  scopeRef?: string;
+  successCriteria?: string[];
+  parentTaskId?: string;
   executionState?: "running" | "awaiting_planner" | "queued" | "blocked";
   maxTurns?: number;
   consumedTurns?: number;
@@ -443,8 +448,4 @@ export type PlannerDecisionView = {
   operationDigest: PlannerDigestItem[];
   blockers: PlannerDigestItem[];
   graphSummary: JsonObject;
-  retrievalHints: {
-    tools: Array<"graph_query" | "graph_trace" | "evidence_list" | "evidence_read" | "artifact_read">;
-    note: string;
-  };
 };

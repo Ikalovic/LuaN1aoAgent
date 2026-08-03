@@ -3011,7 +3011,7 @@ test("completed task hands off to the next planner cycle without waiting for ter
   await controller.close();
 });
 
-test("planner prompt uses compact decision view and keeps graph retrieval tools available", async () => {
+test("planner prompt uses compact decision state without retrieval hints", async () => {
   const runtimeDir = mkdtempSync(join(tmpdir(), "luanniao-controller-"));
   const controller = createControllerWithTestLlmEnv(runtimeDir);
   const plannerSession = createMockTextSession(JSON.stringify({
@@ -3043,8 +3043,7 @@ test("planner prompt uses compact decision view and keeps graph retrieval tools 
   assert.match(prompt, /"taskLedger"/);
   assert.match(prompt, /"reasoningDigest"/);
   assert.match(prompt, /"operationDigest"/);
-  assert.match(prompt, /graph_query/);
-  assert.match(prompt, /graph_trace/);
+  assert.doesNotMatch(prompt, /retrievalHints|graph_query|graph_trace/);
   assert.doesNotMatch(prompt, /PLANNER_GRAPH_SNAPSHOT:|OPEN_TASKS:|AVAILABLE_SESSIONS:/);
   assert.ok(prompt.length < 8_000, `Planner prompt too large: ${prompt.length}`);
   controller.close();
@@ -3078,8 +3077,7 @@ test("retries a retryable Planner provider failure with a fresh session", async 
     reasoningDigest: [],
     operationDigest: [],
     blockers: [],
-    graphSummary: { nodeCount: viewVersion += 1 },
-    retrievalHints: { tools: ["graph_query", "graph_trace", "evidence_list", "evidence_read"], note: "Read more when needed" }
+    graphSummary: { nodeCount: viewVersion += 1 }
   });
   harness.controllerHarness.createPlannerSessionForCycle = async () => ({
     session: sessions[Math.min(sessionIndex++, sessions.length - 1)]!,
@@ -3710,7 +3708,10 @@ test("planner uses the canonical task ledger and marks terminal projection degra
 test("planner decision view reports projection lag without synthesizing event semantics", async () => {
   const harness = createControllerHarness();
   for (let index = 0; index < 5; index += 1) {
-    const taskEnvelope = makeTaskEnvelope({ taskId: `task:runtime-tail-${index}` });
+    const taskEnvelope = makeTaskEnvelope({
+      taskId: `task:runtime-tail-${index}`,
+      successCriteria: [`Persist projection result ${index}`]
+    });
     harness.controller.graphStore.upsertDelta({
       sourceEventIds: [],
       nodes: [{
@@ -3754,7 +3755,9 @@ test("planner decision view reports projection lag without synthesizing event se
   const view = await harness.controllerHarness.buildPlannerDecisionView();
 
   assert.ok(view.projectionDegradations?.some((item) => item.taskRef === pendingTaskId));
-  assert.ok(view.retrievalHints.tools.includes("evidence_read"));
+  const pendingTask = view.taskLedger.find((task) => task.taskId === pendingTaskId);
+  assert.deepEqual(pendingTask?.successCriteria, ["Persist projection result 4"]);
+  assert.equal(pendingTask?.scopeRef, "scope:root");
   harness.controller.close();
 });
 
