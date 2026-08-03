@@ -1836,14 +1836,13 @@ export class SecurityAgentController {
       const resumablePartial = taskOutcome?.status === "partial"
         && epochOutcome?.epochRef === taskOutcome.epochRef
         && epochOutcome.taskOutcomeRef === taskOutcome.taskRef;
-      const resumableProviderError = epochOutcome?.status === "provider_error"
-        && epochOutcome.retryable
+      const resumableEpoch = epochOutcome?.retryable
         && epochOutcome.taskOutcomeRef === undefined
         && epochOutcome.terminalSeq > (taskOutcome?.terminalSeq ?? 0);
-      if (consumedTurns < maxTurns && (resumablePartial || resumableProviderError)) {
+      if (consumedTurns < maxTurns && (resumablePartial || resumableEpoch)) {
         const resolution = resumablePartial
           ? "resume_partial"
-          : "resume_retryable_provider_error";
+          : "resume_retryable_epoch";
         await this.executionLog.append({
           taskId,
           role: "runtime",
@@ -4647,7 +4646,7 @@ export class SecurityAgentController {
       reason,
       evidenceRefs: [event.id]
     };
-    void this.requestEpochStop(taskEnvelope, budgetSignal, state, "executor_checkpoint_requested");
+    void this.requestEpochStop(taskEnvelope, budgetSignal, state, "executor_checkpoint_requested", "budget_abort");
   }
 
   private async collectBudgetCheckpointTaskResult(input: {
@@ -5043,14 +5042,15 @@ export class SecurityAgentController {
     taskEnvelope: TaskEnvelope,
     controlSignal: ControlSignal,
     state: ActiveTaskState,
-    eventType: "executor_checkpoint_requested" | "executor_stop_requested"
+    eventType: "executor_checkpoint_requested" | "executor_stop_requested",
+    abortKind?: RuntimeAbortContext["kind"]
   ): Promise<void> {
     if (state.terminationPromise) {
       return state.terminationPromise;
     }
     state.lifecycleState = "closing";
     state.executorStopRequested = true;
-    state.abortContext = createRuntimeAbortContext(controlSignal);
+    state.abortContext = createRuntimeAbortContext(controlSignal, abortKind);
     state.controlSignal = controlSignal;
     state.invocationAbortController.abort(controlSignal.reason);
     state.terminationPromise = this.terminateExecutorSession(state);
@@ -5155,7 +5155,7 @@ export class SecurityAgentController {
           reason: `Epoch time slice reached: ${epochTimeLimitMs}ms of ${this.activeRun?.maxRunTimeMs ?? "unknown"}ms global run budget`,
           evidenceRefs: []
         };
-        void this.requestEpochStop(taskEnvelope, signal, state, "executor_checkpoint_requested");
+        void this.requestEpochStop(taskEnvelope, signal, state, "executor_checkpoint_requested", "budget_abort");
       }
     });
   }
@@ -5605,9 +5605,12 @@ function positiveIntegerEnv(name: string, fallback: number): number {
   return Number.isFinite(value) && value > 0 ? Math.floor(value) : fallback;
 }
 
-function createRuntimeAbortContext(controlSignal: ControlSignal): RuntimeAbortContext {
+function createRuntimeAbortContext(
+  controlSignal: ControlSignal,
+  kind = runtimeAbortKindForControlSignal(controlSignal)
+): RuntimeAbortContext {
   return {
-    kind: runtimeAbortKindForControlSignal(controlSignal),
+    kind,
     reason: controlSignal.reason,
     controlSignal
   };

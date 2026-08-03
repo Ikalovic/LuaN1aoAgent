@@ -80,6 +80,10 @@ type ControllerHarness = {
       taskOutcome?: TaskOutcome;
     }
   ) => Promise<{ outcome: EpochOutcome; eventId: string }>;
+  releasePlannerWaitingTasks: (
+    plannerDecision: PlannerDecision,
+    plannerVisibleWaitingTaskIds: Set<string>
+  ) => Promise<string[]>;
   createDependencyOutcomeBrief: (taskEnvelope: TaskEnvelope) => Promise<string>;
   withSessionMaterialRefs: <T extends { evidenceRefs?: string[] }>(
     nodes: T[]
@@ -1346,7 +1350,7 @@ test("epoch turn slice checkpoints before a larger cumulative Task allocation is
     budget: { maxTurns: MAX_TASK_BUDGET.maxTurns },
     constraints: ["授权范围原文：仅允许测试 10.0.0.8", "禁止 JWT kid 遍历", "禁止爆破内网服务"]
   });
-  activateTask(harness.controllerHarness, taskEnvelope);
+  const state = activateTask(harness.controllerHarness, taskEnvelope);
   for (let index = 0; index < DEFAULT_EPOCH_TURN_SLICE; index += 1) {
       harness.controllerHarness.handleExecutorEventPersisted(makeExecutionEvent(
         taskEnvelope.taskId,
@@ -1363,6 +1367,7 @@ test("epoch turn slice checkpoints before a larger cumulative Task allocation is
   assert.equal(harness.controller.runtimeStore.getTaskConsumedTurns(taskEnvelope.taskId), DEFAULT_EPOCH_TURN_SLICE);
   assert.ok(events.some((event) => event.eventType === "executor_checkpoint_requested"
     && event.summary === `Epoch turn slice reached: maxTurns=${DEFAULT_EPOCH_TURN_SLICE}`));
+  assert.equal(state.abortContext?.kind, "budget_abort");
   assert.ok(DEFAULT_EPOCH_TURN_SLICE < MAX_TASK_BUDGET.maxTurns);
   const steer = budgetSteers().at(-1) ?? "";
   assert.ok(steer.includes("禁止 JWT kid 遍历"), "steer carries planner bans verbatim");
@@ -3954,6 +3959,46 @@ test("pure provider failure records an EpochOutcome without fabricating TaskOutc
   await reopened.close();
 });
 
+test("retryable checkpoint EpochOutcome resumes an open Task with remaining allocation", async () => {
+  const harness = createControllerHarness();
+  const taskEnvelope = makeTaskEnvelope({
+    taskId: "task:checkpoint-resume",
+    budget: { maxTurns: 30 }
+  });
+  harness.controller.graphStore.createTask({ ...taskEnvelope, priority: 1 });
+  const state = harness.controllerHarness.beginTaskExecution(taskEnvelope);
+  for (let turn = 1; turn <= DEFAULT_EPOCH_TURN_SLICE; turn += 1) {
+    harness.controller.runtimeStore.recordTaskTurn({
+      taskId: taskEnvelope.taskId,
+      eventId: `event:checkpoint-resume:${turn}`
+    });
+  }
+  const persisted = await harness.controllerHarness.persistEpochOutcome(state, {
+    status: "checkpointed",
+    reason: `Epoch turn slice reached: maxTurns=${DEFAULT_EPOCH_TURN_SLICE}`,
+    retryable: true
+  });
+  harness.controllerHarness.finishTaskExecution(taskEnvelope.taskId, "budget_exhausted");
+  const schedulerState = harness.controller as unknown as { awaitingPlannerTaskIds: Set<string> };
+  schedulerState.awaitingPlannerTaskIds.add(taskEnvelope.taskId);
+
+  const released = await harness.controllerHarness.releasePlannerWaitingTasks({
+    commands: [],
+    reason: "Continue the same Task after its retryable Epoch checkpoint"
+  }, new Set([taskEnvelope.taskId]));
+  const events = await harness.controller.executionLog.readAll();
+
+  assert.deepEqual(released, [taskEnvelope.taskId]);
+  assert.equal(schedulerState.awaitingPlannerTaskIds.has(taskEnvelope.taskId), false);
+  assert.equal(persisted.outcome.taskOutcomeRef, undefined);
+  assert.equal(harness.controller.runtimeStore.getTaskConsumedTurns(taskEnvelope.taskId), DEFAULT_EPOCH_TURN_SLICE);
+  assert.ok(events.some((event) => event.eventType === "planner_handoff_resolved"
+    && event.taskId === taskEnvelope.taskId
+    && event.payload.resolution === "resume_retryable_epoch"
+    && event.payload.remainingTurns === 30 - DEFAULT_EPOCH_TURN_SLICE));
+  await harness.controller.close({ drainProjectionJobs: false });
+});
+
 test("initialize preserves a persisted partial handoff resolution", async () => {
   const runtimeDir = mkdtempSync(join(tmpdir(), "luanniao-controller-"));
   const first = createControllerWithTestLlmEnv(runtimeDir);
@@ -4893,7 +4938,7 @@ test("provider failure after execution evidence preserves and resumes the same E
     && JSON.stringify(event.payload).includes("Confirmed upload endpoint /upload")));
   assert.ok(events.some((event) => event.eventType === "planner_handoff_resolved"
     && event.taskId === "task:provider-resume"
-    && event.payload.resolution === "resume_retryable_provider_error"));
+    && event.payload.resolution === "resume_retryable_epoch"));
   assert.equal(events.some((event) => event.eventType === "task_failed"
     && event.taskId === "task:provider-resume"), false);
   assert.equal(disposeCount, 2);
@@ -7406,10 +7451,11 @@ function activateTask(
   controllerHarness: ControllerHarness,
   taskEnvelope: TaskEnvelope,
   overrides: { executorStopRequested?: boolean } = {}
-): void {
+): TestActiveState {
   const state = controllerHarness.beginTaskExecution(taskEnvelope);
   state.executorSession = controllerHarness.agents.executor;
   state.executorStopRequested = overrides.executorStopRequested ?? false;
+  return state;
 }
 
 function makeExecutionEvent(
