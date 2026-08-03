@@ -755,10 +755,8 @@ test("reports all projection draft errors together with endpoint-aware edge sugg
     }
   }), (error: unknown) => {
     assert.ok(error instanceof Error);
-    assert.match(error.message, /has 3 validation errors/);
-    assert.match(error.message, /unexpected top-level keys \[artifactRefs\]/);
+    assert.match(error.message, /has 1 validation error/);
     assert.match(error.message, /for Service -> WebEndpoint, use "exposes_endpoint"/);
-    assert.match(error.message, /unconnected semantic nodes new:3/);
     return true;
   });
 });
@@ -841,19 +839,28 @@ test("rejects Vulnerability and succeeded Exploit drafts without resolvable evid
   }));
 });
 
-test("rejects one Projector submission above the 24/40 delta contract instead of slicing it", () => {
+test("accepts large Projector closures within the total byte boundary", () => {
   const graphContext = aliasProjectionGraphContext({ nodes: [], edges: [] });
   const batch = { observations: [], toSeq: 0, sourceEventIds: [] };
-  assert.throws(() => expandProjectionDraft({
+  const nodes = Array.from({ length: 42 }, (_, index) => ({
+    id: `new:${index + 1}`,
+    type: "Evidence",
+    label: `Evidence ${index + 1}`
+  }));
+  const delta = expandProjectionDraft({
     batch,
     graphContext,
-    value: { nodes: Array.from({ length: 25 }, () => ({})), edges: [] }
-  }), /nodes contains 25 items; maximum per submission is 24/);
-  assert.throws(() => expandProjectionDraft({
-    batch,
-    graphContext,
-    value: { nodes: [], edges: Array.from({ length: 41 }, () => ({})) }
-  }), /edges contains 41 items; maximum per submission is 40/);
+    value: {
+      nodes,
+      edges: Array.from({ length: 41 }, (_, index) => ({
+        from: `new:${index + 1}`,
+        to: `new:${index + 2}`,
+        type: "supports"
+      }))
+    }
+  });
+  assert.equal(delta.nodes.length, 42);
+  assert.equal(delta.edges.length, 41);
 });
 
 test("updates existing semantic nodes while preserving their identity", () => {
@@ -904,6 +911,26 @@ test("updates existing semantic nodes while preserving their identity", () => {
     properties: { count: 2 },
     evidenceRefs: ["event:new"]
   }]);
+});
+
+test("normalizes natural top-level Projector artifact references into node properties", () => {
+  const delta = expandProjectionDraft({
+    batch: { observations: [], toSeq: 0, sourceEventIds: [] },
+    graphContext: aliasProjectionGraphContext({ nodes: [], edges: [] }),
+    value: {
+      nodes: [{
+        id: "new:1",
+        type: "File",
+        label: "Reusable PoC",
+        artifactRef: "artifact:poc",
+        artifactRefs: ["artifact:trace", "artifact:poc"]
+      }],
+      edges: []
+    }
+  });
+
+  assert.deepEqual(delta.nodes[0]?.properties.artifactRefs, ["artifact:poc", "artifact:trace"]);
+  assert.equal(delta.nodes[0]?.properties.artifactRef, undefined);
 });
 
 test("new projector aliases receive runtime identities instead of colliding with graph ids", () => {

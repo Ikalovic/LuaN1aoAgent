@@ -24,6 +24,7 @@ import {
 } from "./executor-sandbox-docker.js";
 import {
   createExecutorSandbox,
+  listExecutorWorkspaceFiles,
   type ExecutorSandbox,
   type ExecutorSandboxRequestedMode
 } from "./executor-sandbox.js";
@@ -57,7 +58,6 @@ import {
   expandProjectionDraft,
   filterProjectorSemanticGraph,
   partitionProjectionBatchForInput,
-  PROJECTOR_MAX_DELTA_NODES,
   ProjectorGraphRefRegistry,
   ProjectionObservationEnvelopeTooLargeError,
   renderProjectionGraphContext,
@@ -3046,6 +3046,7 @@ export class SecurityAgentController {
     return [...new Set([
       ...this.graphStore.nodeIdsWithPrefix(prefix),
       ...this.executionLog.eventIdsWithPrefix(prefix),
+      ...this.runtimeStore.epochRefsWithPrefix(prefix),
       ...this.plannerCapabilityReferenceCandidates(prefix)
     ])];
   }
@@ -4692,11 +4693,31 @@ export class SecurityAgentController {
     ) {
       return undefined;
     }
+    const sandbox = (() => {
+      try {
+        return this.requireExecutorSandbox(input.taskEnvelope.taskId);
+      } catch {
+        return undefined;
+      }
+    })();
+    const workspaceFiles = sandbox?.workspaceDir
+      ? await listExecutorWorkspaceFiles(sandbox.workspaceDir)
+      : [];
+    const durableArtifactRefs = (await this.artifactStore.list({ taskId: input.taskEnvelope.taskId }))
+      .map((artifact) => artifact.artifactRef);
     const prompt = [
       "RUNTIME_BUDGET_CHECKPOINT_FINALIZATION",
       input.state.abortContext.reason,
       "探索预算已经耗尽。不得调用 bash、read、搜索、图查询或继续探索。",
-      "若本次已生成且明确知道路径的可复用材料尚未归档，可用 artifact_write 原样归档；需要时可连续归档多个已有文件，但不得创建、修改、检查或搜索文件。",
+      durableArtifactRefs.length > 0
+        ? `已持久化 Artifact（直接在 TaskOutcome 中引用，不要重复归档）：\n${durableArtifactRefs.map((ref) => `- ${JSON.stringify(ref)}`).join("\n")}`
+        : "当前 Task 尚无已持久化 Artifact。",
+      workspaceFiles.length > 0
+        ? `workspace 中可归档的真实文件（artifact_write.path 只能从下列 JSON 字符串选择）：\n${workspaceFiles.map((path) => `- ${JSON.stringify(path)}`).join("\n")}`
+        : "workspace 中没有可归档文件；直接调用 task_result_submit，不要调用或提及 artifact_write。",
+      ...(workspaceFiles.length > 0 ? [
+        "仅当上述文件是后继执行需要的原始证据、脚本或能力状态时，才用 artifact_write 原样归档；可连续归档多个文件，但不得创建、修改、检查或搜索文件。"
+      ] : []),
       "TaskOutcome 本身就是结构化结论，不要为结论临时虚构或创建总结文件。已有材料归档完成后调用一次 task_result_submit，并根据任务成功条件如实选择 completed、partial、blocked 或 failed。",
       "summary 写明本次已经验证的能力、最新失效条件和仍未解决的问题；",
       "evidenceRefs 和 artifactRefs 只填写本会话中真实存在的引用；",
@@ -4721,7 +4742,10 @@ export class SecurityAgentController {
     let originalToolNames: string[] | undefined;
     try {
       originalToolNames = session.getActiveToolNames();
-      const finalizationToolNames = ["artifact_write", "task_result_submit"]
+      const finalizationToolNames = [
+        ...(workspaceFiles.length > 0 ? ["artifact_write"] : []),
+        "task_result_submit"
+      ]
         .filter((toolName) => originalToolNames?.includes(toolName));
       session.setActiveToolsByName(finalizationToolNames);
       const activeFinalizationToolNames = session.getActiveToolNames();

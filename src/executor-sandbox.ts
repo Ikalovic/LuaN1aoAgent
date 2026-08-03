@@ -63,6 +63,26 @@ export type ExecutorSandbox = {
   dispose?: () => Promise<void>;
 };
 
+export async function listExecutorWorkspaceFiles(workspaceDir: string, limit = 64): Promise<string[]> {
+  const files: string[] = [];
+  const pending = [{ directory: workspaceDir, prefix: "", depth: 0 }];
+  while (pending.length > 0 && files.length < limit) {
+    const { directory, prefix, depth } = pending.shift()!;
+    const entries = await readdir(directory, { withFileTypes: true }).catch(() => []);
+    for (const entry of entries.sort((left, right) => left.name.localeCompare(right.name))) {
+      if (files.length >= limit) break;
+      const relativePath = prefix ? `${prefix}/${entry.name}` : entry.name;
+      if (relativePath === ".artifacts" || relativePath.startsWith(".artifacts/")) continue;
+      if (entry.isFile()) {
+        files.push(relativePath);
+      } else if (entry.isDirectory() && depth < 8) {
+        pending.push({ directory: join(directory, entry.name), prefix: relativePath, depth: depth + 1 });
+      }
+    }
+  }
+  return files;
+}
+
 export async function createExecutorSandbox(input: {
   runtimeDir: string;
   runId: string;

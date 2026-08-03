@@ -462,6 +462,15 @@ export class RuntimeStore {
     return rows.map(epochOutcomeRowToRecord);
   }
 
+  epochRefsWithPrefix(prefix: string, limit = 4): string[] {
+    const rows = this.database.prepare(`
+      SELECT epoch_id FROM epoch_outcomes
+      WHERE substr(epoch_id, 1, ?) = ?
+      ORDER BY terminal_seq DESC LIMIT ?
+    `).all(prefix.length, prefix, Math.max(1, Math.floor(limit))) as Array<{ epoch_id: string }>;
+    return rows.map((row) => row.epoch_id);
+  }
+
   listTaskEpochOutcomes(taskId: string, limit = 32): EpochOutcome[] {
     const rows = this.database.prepare(`
       SELECT * FROM epoch_outcomes WHERE task_id = ? ORDER BY terminal_seq DESC LIMIT ?

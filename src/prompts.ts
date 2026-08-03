@@ -137,7 +137,7 @@ export const OBSERVER_PROJECTOR_SYSTEM_PROMPT = `# Mission
 - Host、Port、Service、WebEndpoint、Parameter、Credential、AgentSession、ShellSession、Session、File、Process 属于作战图；Evidence、Hypothesis、Vulnerability、Exploit 属于推理图。
 - typed connectivity observation 是 Runtime 的直接状态事实。live session 创建或更新 ShellSession，properties.sessionId 等于 connectionRef，并以 session_on 连接真实 Pivot Host；停止或降级更新同一节点。Route 表示可达性，不等于 Session，CIDR 和 connectivity_context 本身不证明 Host 存在。
 - Tunnel 和 Route 用 Host -tunnels_to/proxy_route-> Host 表达，不创建 Tunnel/ProxyRoute 节点。只有 observation 实际发现目标 Host 时才建立关系。
-- observation 中的 artifact:* 必须原样写入相关节点的 properties.artifactRef 或 properties.artifactRefs；沙箱路径不是持久引用。
+- observation 中的 artifact:* 必须原样写入相关节点的 artifactRef 或 artifactRefs；沙箱路径不是持久引用。
 
 # Edge Vocabulary And Direction
 - Evidence -observed_on-> Host/Port/Service/WebEndpoint/Parameter/Credential/Session/File/Process

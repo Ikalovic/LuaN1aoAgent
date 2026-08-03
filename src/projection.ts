@@ -25,11 +25,11 @@ const EPOCH_OUTCOME_EVENT_TYPES = new Set([
 ]);
 
 const MAX_REPEATED_ACTIONS_PER_OBSERVATION = 16;
-export const PROJECTOR_MAX_DELTA_NODES = 24;
-export const PROJECTOR_MAX_DELTA_EDGES = 40;
 export const PROJECTOR_MAX_DELTA_BYTES = 128 * 1024;
 
-const PROJECTION_NODE_KEYS = new Set(["id", "type", "label", "properties", "evidenceRefs"]);
+const PROJECTION_NODE_KEYS = new Set([
+  "id", "type", "label", "properties", "evidenceRefs", "artifactRef", "artifactRefs"
+]);
 const PROJECTION_EDGE_KEYS = new Set(["from", "to", "type", "properties", "evidenceRefs"]);
 export const PROJECTION_OPERATION_NODE_TYPES = [
   "Host", "Port", "Service", "WebEndpoint", "Parameter", "Credential",
@@ -93,13 +93,6 @@ export class ProjectionObservationEnvelopeTooLargeError extends Error {
   constructor(readonly minimumBytes: number, readonly maxBytes: number) {
     super(`Projection observation envelope requires ${minimumBytes} UTF-8 bytes; maximum is ${maxBytes}`);
     this.name = "ProjectionObservationEnvelopeTooLargeError";
-  }
-}
-
-export class ProjectionDeltaLimitError extends Error {
-  constructor(readonly field: "nodes" | "edges", readonly actual: number, readonly maximum: number) {
-    super(`Projection delta ${field} contains ${actual} items; maximum per submission is ${maximum}`);
-    this.name = "ProjectionDeltaLimitError";
   }
 }
 
@@ -684,9 +677,6 @@ export function expandProjectionDraft(input: {
   };
   const nodesById = new Map<string, GraphNode>();
   const submittedNodes = draft.nodes;
-  if (submittedNodes.length > PROJECTOR_MAX_DELTA_NODES) {
-    throw new ProjectionDeltaLimitError("nodes", submittedNodes.length, PROJECTOR_MAX_DELTA_NODES);
-  }
   if (submittedNodes.length > 0) {
     for (const node of submittedNodes) {
       const submittedRef = String(node.id ?? "").trim();
@@ -747,9 +737,6 @@ export function expandProjectionDraft(input: {
     ...nodes.map((node) => [node.id, node] as const)
   ]);
   const submittedEdges = draft.edges;
-  if (submittedEdges.length > PROJECTOR_MAX_DELTA_EDGES) {
-    throw new ProjectionDeltaLimitError("edges", submittedEdges.length, PROJECTOR_MAX_DELTA_EDGES);
-  }
   const edges = submittedEdges.length > 0
     ? submittedEdges.map((edge): GraphEdge => {
       const type = String(edge.type ?? "supports");
@@ -822,13 +809,6 @@ export function normalizeProjectionDraft(
       `Projection delta requires ${serializedBytes} UTF-8 bytes; maximum is ${PROJECTOR_MAX_DELTA_BYTES}`
     );
   }
-  if (draftNodes.length > PROJECTOR_MAX_DELTA_NODES) {
-    throw new ProjectionDeltaLimitError("nodes", draftNodes.length, PROJECTOR_MAX_DELTA_NODES);
-  }
-  if (draftEdges.length > PROJECTOR_MAX_DELTA_EDGES) {
-    throw new ProjectionDeltaLimitError("edges", draftEdges.length, PROJECTOR_MAX_DELTA_EDGES);
-  }
-
   const declaredAliases = new Set<string>();
   const existingAliases = options.existingAliases ?? new Map();
   const aliasTypes = new Map<string, { graphKind: GraphNode["graphKind"]; type: string }>(
@@ -844,7 +824,7 @@ export function normalizeProjectionDraft(
     const unexpectedNodeKeys = Object.keys(valueNode).filter((key) => !PROJECTION_NODE_KEYS.has(key));
     if (unexpectedNodeKeys.length > 0) {
       errors.push(
-        `Projection node at index ${index} has unexpected top-level keys [${unexpectedNodeKeys.join(", ")}]; nodes only allow id, type, label, properties, evidenceRefs — move metadata such as status/target/description into properties`
+        `Projection node at index ${index} has unexpected top-level keys [${unexpectedNodeKeys.join(", ")}]; nodes only allow id, type, label, properties, evidenceRefs, artifactRef and artifactRefs — move other metadata such as status/target/description into properties`
       );
     }
     const alias = String(valueNode.id ?? "").trim();
@@ -865,6 +845,15 @@ export function normalizeProjectionDraft(
       && (!Array.isArray(valueNode.evidenceRefs) || valueNode.evidenceRefs.some((ref) => typeof ref !== "string"))
     ) {
       errors.push(`Projection node at index ${index} evidenceRefs must be an array of strings`);
+    }
+    if (valueNode.artifactRef !== undefined && typeof valueNode.artifactRef !== "string") {
+      errors.push(`Projection node at index ${index} artifactRef must be a string`);
+    }
+    if (
+      valueNode.artifactRefs !== undefined
+      && (!Array.isArray(valueNode.artifactRefs) || valueNode.artifactRefs.some((ref) => typeof ref !== "string"))
+    ) {
+      errors.push(`Projection node at index ${index} artifactRefs must be an array of strings`);
     }
     const existingIdentity = alias.startsWith("existing:") ? existingAliases.get(alias) : undefined;
     let nodeGraphKind = existingIdentity?.graphKind;
@@ -935,7 +924,6 @@ export function normalizeProjectionDraft(
   }
 
   const missingNewAliases = new Set<string>();
-  const referencedNewAliases = new Set<string>();
   for (const [index, valueEdge] of draftEdges.entries()) {
     if (!isRecord(valueEdge)) {
       errors.push(`Projection edge at index ${index} is not an object`);
@@ -976,9 +964,6 @@ export function normalizeProjectionDraft(
       if (alias.startsWith("new:") && !declaredAliases.has(alias)) {
         missingNewAliases.add(alias);
       }
-      if (alias.startsWith("new:")) {
-        referencedNewAliases.add(alias);
-      }
       if (alias.startsWith("existing:")) {
         const existing = existingAliases.get(alias);
         if (!existing) {
@@ -1004,16 +989,6 @@ export function normalizeProjectionDraft(
       `Projection delta cannot mutate task graph aliases ${[...taskGraphAliases].map(([alias, type]) => `${alias}(${type})`).join(", ")}`
     );
   }
-  const unconnectedSemanticAliases = [...declaredAliases].filter((alias) => {
-    return alias.startsWith("new:")
-      && aliasTypes.get(alias)?.graphKind === "reasoning"
-      && !referencedNewAliases.has(alias);
-  });
-  if (unconnectedSemanticAliases.length > 0) {
-    errors.push(
-      `Projection delta contains unconnected semantic nodes ${unconnectedSemanticAliases.join(", ")}; connect each node with evidence-backed edges or omit it, then re-submit the complete delta`
-    );
-  }
   if (errors.length > 0) {
     throw new ProjectionDraftIntegrityError(
       `Projection delta has ${errors.length} validation error${errors.length === 1 ? "" : "s"}: ${
@@ -1022,13 +997,28 @@ export function normalizeProjectionDraft(
     );
   }
   return {
-    nodes: draftNodes.filter(isRecord).map((node) => ({
-      id: String(node.id).trim(),
-      ...(node.type !== undefined ? { type: String(node.type).trim() } : {}),
-      ...(node.label !== undefined ? { label: String(node.label).trim() } : {}),
-      ...(isRecord(node.properties) ? { properties: node.properties } : {}),
-      ...(node.evidenceRefs !== undefined ? { evidenceRefs: stringArray(node.evidenceRefs) } : {})
-    })),
+    nodes: draftNodes.filter(isRecord).map((node) => {
+      const artifactRefs = dedupeStrings([
+        ...(isRecord(node.properties) && typeof node.properties.artifactRef === "string"
+          ? [node.properties.artifactRef]
+          : []),
+        ...stringArray(isRecord(node.properties) ? node.properties.artifactRefs : undefined),
+        ...(typeof node.artifactRef === "string" ? [node.artifactRef] : []),
+        ...stringArray(node.artifactRefs)
+      ]);
+      const properties: Record<string, unknown> = {
+        ...(isRecord(node.properties) ? node.properties : {}),
+        ...(artifactRefs.length > 0 ? { artifactRefs } : {})
+      };
+      delete properties.artifactRef;
+      return {
+        id: String(node.id).trim(),
+        ...(node.type !== undefined ? { type: String(node.type).trim() } : {}),
+        ...(node.label !== undefined ? { label: String(node.label).trim() } : {}),
+        ...(Object.keys(properties).length > 0 ? { properties } : {}),
+        ...(node.evidenceRefs !== undefined ? { evidenceRefs: stringArray(node.evidenceRefs) } : {})
+      };
+    }),
     edges: draftEdges.filter(isRecord).map((edge) => ({
       from: String(edge.from).trim(),
       to: String(edge.to).trim(),

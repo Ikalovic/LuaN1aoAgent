@@ -115,13 +115,12 @@ test("projector terminal tool bounds the wire schema and enforces draft semantic
       nodes: {
         maxItems?: number;
         items?: {
-          anyOf?: Array<{
-            properties?: {
-              id?: { pattern?: string };
-              graphKind?: unknown;
-            };
-            additionalProperties?: boolean;
-          }>;
+          properties?: {
+            id?: { pattern?: string };
+            graphKind?: unknown;
+            artifactRef?: unknown;
+            artifactRefs?: unknown;
+          };
           additionalProperties?: boolean;
         };
       };
@@ -141,14 +140,13 @@ test("projector terminal tool bounds the wire schema and enforces draft semantic
 
   // The wire schema guides generation with fixed identity and vocabulary rules.
   // The deterministic parser remains authoritative for dynamic evidence semantics.
-  assert.equal(schema.properties.nodes.maxItems, 24);
-  assert.equal(schema.properties.edges.maxItems, 40);
-  assert.equal(schema.properties.nodes.items?.anyOf?.[0]?.properties?.id?.pattern, "^existing:[1-9][0-9]*$");
-  assert.equal(schema.properties.nodes.items?.anyOf?.[1]?.properties?.id?.pattern, "^new:[1-9][0-9]*$");
-  assert.equal(schema.properties.nodes.items?.anyOf?.[0]?.properties?.graphKind, undefined);
-  assert.equal(schema.properties.nodes.items?.anyOf?.[1]?.properties?.graphKind, undefined);
-  assert.equal(schema.properties.nodes.items?.anyOf?.[0]?.additionalProperties, false);
-  assert.equal(schema.properties.nodes.items?.anyOf?.[1]?.additionalProperties, false);
+  assert.equal(schema.properties.nodes.maxItems, undefined);
+  assert.equal(schema.properties.edges.maxItems, undefined);
+  assert.equal(schema.properties.nodes.items?.properties?.id?.pattern, "^(existing|new):[1-9][0-9]*$");
+  assert.equal(schema.properties.nodes.items?.properties?.graphKind, undefined);
+  assert.ok(schema.properties.nodes.items?.properties?.artifactRef);
+  assert.ok(schema.properties.nodes.items?.properties?.artifactRefs);
+  assert.equal(schema.properties.nodes.items?.additionalProperties, false);
   assert.equal(schema.properties.edges.items?.properties?.from?.pattern, "^(existing|new):[1-9][0-9]*$");
   assert.equal(schema.properties.edges.items?.properties?.to?.pattern, "^(existing|new):[1-9][0-9]*$");
   assert.equal(schema.properties.sourceEventIds, undefined);
@@ -166,7 +164,7 @@ test("projector terminal tool bounds the wire schema and enforces draft semantic
       label: "Repeated identity"
     }],
     edges: []
-  }), false);
+  }), true);
   assert.equal(Check(tool.parameters, {
     nodes: [{
       id: "new:1",
@@ -212,7 +210,7 @@ test("projector terminal tool bounds the wire schema and enforces draft semantic
   assert.equal(Check(tool.parameters, {
     nodes: [{ id: "new:1", label: "Missing type" }],
     edges: []
-  }), false);
+  }), true);
 
   const empty = await tool.execute(
     "call:projector:empty",
@@ -408,31 +406,29 @@ test("projector terminal tool validates existing aliases against only its curren
   );
 });
 
-test("projector rejects unconnected new semantic nodes and accepts an atomic relation", async () => {
+test("projector accepts standalone evidence and atomic relations", async () => {
   const tool = createGraphDeltaSubmitTool({
     existingAliases: new Map([
       ["existing:1", { graphKind: "operation", type: "WebEndpoint" }]
     ])
   });
 
-  await assert.rejects(
-    () => tool.execute(
-      "call:projector:unconnected",
-      {
-        nodes: [{
-          id: "new:1",
-          type: "Evidence",
-          label: "Observed authentication bypass",
-          properties: {}
-        }],
-        edges: []
-      },
-      new AbortController().signal,
-      () => undefined,
-      {} as never
-    ),
-    /unconnected semantic nodes new:1/
+  const standalone = await tool.execute(
+    "call:projector:standalone",
+    {
+      nodes: [{
+        id: "new:1",
+        type: "Evidence",
+        label: "Observed authentication bypass",
+        evidenceRefs: ["o1"]
+      }],
+      edges: []
+    },
+    new AbortController().signal,
+    () => undefined,
+    {} as never
   );
+  assert.equal(standalone.terminate, true);
   const accepted = await tool.execute(
     "call:projector:connected",
     {

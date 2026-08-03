@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -24,6 +24,7 @@ import type { ProjectorGraphRefRegistry } from "../src/projection.js";
 import type { ControlSignal, EpochOutcome, ExecutionEvent, GraphDelta, GraphNode, ObserverProjection, PlannerDecision, PlannerDecisionView, PlannerTaskSpec, SupervisorVerdict, TaskEnvelope, TaskOutcome, TaskResult } from "../src/types.js";
 
 type ControllerHarness = {
+  executorSandbox?: { workspaceDir?: string };
   agents: {
     planner: unknown;
     executor: { abort: () => Promise<void>; clearQueue?: () => unknown; steer?: (text: string) => Promise<void> };
@@ -112,6 +113,7 @@ type ControllerHarness = {
   activePlannerSessions: Set<{ steer?: (text: string) => Promise<void>; abort?: () => Promise<void> }>;
   validatePlannerRuntimeBoundary: (plannerDecision: PlannerDecision) => void;
   normalizePlannerDecisionBoundary: (plannerDecision: PlannerDecision) => PlannerDecision;
+  plannerReferenceCandidates: (prefix: string) => string[];
   taskEnvelopeFromSpec: (taskSpec: PlannerTaskSpec, scopeSummary: string) => TaskEnvelope;
   assertPlannerRuntimeTransitions: (commands: NonNullable<PlannerDecision["commands"]>) => void;
   projectorCoordinator: {
@@ -973,7 +975,7 @@ test("budget checkpoint finalization accepts completed and restores the Executor
   assert.equal(semanticResult?.checkpointReason, undefined);
   assert.deepEqual(finalizerSession.getActiveToolNames(), ["bash", "read", "artifact_write", "task_result_submit"]);
   assert.deepEqual(finalizerSession.activeToolHistory(), [
-    ["artifact_write", "task_result_submit"],
+    ["task_result_submit"],
     ["bash", "read", "artifact_write", "task_result_submit"]
   ]);
   assert.match(finalizerSession.prompts()[0] ?? "", /artifact_write/);
@@ -1028,6 +1030,10 @@ test("completed checkpoint result with unresolved lifecycle fields is normalized
 
 test("checkpoint finalization keeps artifact_write available for multiple existing files", async () => {
   const harness = createControllerHarness();
+  const workspaceDir = mkdtempSync(join(tmpdir(), "luanniao-checkpoint-workspace-"));
+  writeFileSync(join(workspaceDir, "poc.py"), "print('verified')\n");
+  writeFileSync(join(workspaceDir, "evidence.json"), "{}\n");
+  harness.controllerHarness.executorSandbox = { workspaceDir };
   const taskEnvelope = makeTaskEnvelope();
   const state = harness.controllerHarness.beginTaskExecution(taskEnvelope);
   state.executorStopRequested = true;
@@ -1060,7 +1066,9 @@ test("checkpoint finalization keeps artifact_write available for multiple existi
     ["artifact_write", "task_result_submit"],
     ["bash", "read", "artifact_write", "task_result_submit"]
   ]);
-  assert.match(finalizerSession.prompts()[0] ?? "", /可连续归档多个已有文件/);
+  assert.match(finalizerSession.prompts()[0] ?? "", /可连续归档多个文件/);
+  assert.match(finalizerSession.prompts()[0] ?? "", /poc\.py/);
+  assert.match(finalizerSession.prompts()[0] ?? "", /evidence\.json/);
   assert.match(finalizerSession.prompts()[0] ?? "", /不要为结论临时虚构或创建总结文件/);
   harness.controllerHarness.finishTaskExecution(taskEnvelope.taskId, "budget_exhausted");
   await harness.controller.close({ drainProjectionJobs: false });
@@ -4003,6 +4011,25 @@ test("pure provider failure records an EpochOutcome without fabricating TaskOutc
   await reopened.close();
 });
 
+test("Planner reference validation can resolve persisted EpochOutcome refs", async () => {
+  const harness = createControllerHarness();
+  harness.controller.runtimeStore.upsertEpochOutcome({
+    epochRef: "epoch:bf9d37a1-verified",
+    taskRef: "task:recon",
+    status: "provider_error",
+    reason: "retryable provider response",
+    terminalSeq: 12,
+    retryable: true,
+    createdAt: "2026-08-03T00:00:00.000Z"
+  });
+
+  assert.deepEqual(
+    harness.controllerHarness.plannerReferenceCandidates("epoch:bf9d"),
+    ["epoch:bf9d37a1-verified"]
+  );
+  await harness.controller.close({ drainProjectionJobs: false });
+});
+
 test("retryable checkpoint EpochOutcome resumes an open Task with remaining allocation", async () => {
   const harness = createControllerHarness();
   const taskEnvelope = makeTaskEnvelope({
@@ -6586,7 +6613,7 @@ test("maxTurns abort gives the same Executor one unmetered structured finalizati
     && event.payload.reason === "task_end"));
   assert.equal(controller.runtimeStore.getTaskConsumedTurns("task:primary"), MIN_TASK_BUDGET.maxTurns);
   assert.deepEqual(activeToolHistory, [
-    ["artifact_write", "task_result_submit"],
+    ["task_result_submit"],
     ["bash", "read", "artifact_write", "task_result_submit"]
   ]);
   const executorMetrics = events.filter((event) => event.eventType === "invocation_metrics"
