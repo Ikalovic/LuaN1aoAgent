@@ -90,7 +90,7 @@ export function cliHelp(): string {
     "  --proxy <socks5-url>         Transparently route all scoped Agent TCP through SOCKS5",
     "  --runtime-dir <path>         New runtime directory; must be empty",
     "  --resume <session>           Resume one runtime; do not pass --goal",
-    "  --max-cycles <number>        Maximum Planner cycles",
+    "  --max-cycles <number>        Maximum consecutive no-progress Planner cycles",
     "  --max-parallel-tasks <n>     Maximum concurrent tasks",
     "  --max-run-time-ms <number>   Run timeout in milliseconds",
     "  --json                       Disable TUI and print final JSON",

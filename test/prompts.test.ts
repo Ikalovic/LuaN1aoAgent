@@ -35,7 +35,6 @@ test("executor prompt uses bounded experimental method and runtime steering", ()
     operationGraphSlice: emptyGraph,
     reasoningGraphSlice: { ...emptyGraph, view: "reasoning" },
     sessionRefs: [],
-    toolCatalog: ["read", "bash", "grep", "find", "ls", "browser_render", "artifact_read", "artifact_write"],
     executionBrief: "No previous execution events.",
     dependencyOutcomes: "task:recon status=completed\n  result: upload endpoint confirmed",
     runtimeBudgetStatus: "turns: 0/12; remaining: 12"
@@ -52,7 +51,8 @@ test("executor prompt uses bounded experimental method and runtime steering", ()
   assert.match(EXECUTOR_SYSTEM_PROMPT, /使用 browser_render/);
   assert.match(EXECUTOR_SYSTEM_PROMPT, /只改变一个变量/);
   assert.match(EXECUTOR_SYSTEM_PROMPT, /正负对照/);
-  assert.match(EXECUTOR_SYSTEM_PROMPT, /调用 vulnerability_search 检索历史漏洞/);
+  assert.match(EXECUTOR_SYSTEM_PROMPT, /漏洞情报能够明显缩小搜索空间/);
+  assert.match(EXECUTOR_SYSTEM_PROMPT, /使用 vulnerability_search 检索历史漏洞/);
   assert.match(EXECUTOR_SYSTEM_PROMPT, /公网结果只生成待验证 Hypothesis/);
   assert.match(EXECUTOR_SYSTEM_PROMPT, /检索空结果是弱反证/);
   assert.match(EXECUTOR_SYSTEM_PROMPT, /只能标记为 inconclusive/);
@@ -60,19 +60,20 @@ test("executor prompt uses bounded experimental method and runtime steering", ()
   assert.match(EXECUTOR_SYSTEM_PROMPT, /reopenConditions/);
   assert.match(EXECUTOR_SYSTEM_PROMPT, /原始响应写入 artifact/);
   assert.match(EXECUTOR_SYSTEM_PROMPT, /末尾用一句自然语言总结/);
-  assert.match(EXECUTOR_SYSTEM_PROMPT, /首次成为后续步骤依赖或产生可复现正向结果时，立即用 artifact_write 归档/);
-  assert.match(EXECUTOR_SYSTEM_PROMPT, /不要等到 nearTurnLimit、checkpoint 或 task_result_submit/);
-  assert.match(EXECUTOR_SYSTEM_PROMPT, /summary 中提到这些材料时给出精确 artifactRef/);
+  assert.match(EXECUTOR_SYSTEM_PROMPT, /首次成为后续执行依赖时，立即写入当前 Task workspace 并用 artifact_write 归档/);
+  assert.match(EXECUTOR_SYSTEM_PROMPT, /不要等待 nearTurnLimit、checkpoint 或 task_result_submit/);
+  assert.match(EXECUTOR_SYSTEM_PROMPT, /TaskOutcome 本身就是结构化结论/);
+  assert.match(EXECUTOR_SYSTEM_PROMPT, /task_result_submit 只使用实际存在的 artifactRefs/);
   assert.match(EXECUTOR_SYSTEM_PROMPT, /当前工作目录是 Task workspace，跨 epoch 持久/);
-  assert.match(EXECUTOR_SYSTEM_PROMPT, /artifact_write\(\{path:"evidence\.json",kind:"json",mediaType:"application\/json"\}\)/);
+  assert.match(EXECUTOR_SYSTEM_PROMPT, /Runtime 注入授权 Scope，并在 Docker 模式机械执行网络边界/);
   assert.match(EXECUTOR_SYSTEM_PROMPT, /artifact_read\(\{ref:"artifact:\.\.\.",materialize:true\}\)/);
   assert.doesNotMatch(EXECUTOR_SYSTEM_PROMPT, /source=\{type:"(?:file|inline)"/);
-  assert.match(EXECUTOR_SYSTEM_PROMPT, /不得把硬编码命令、固定路径或单个 payload 扩大成通用命令/);
+  assert.match(EXECUTOR_SYSTEM_PROMPT, /没有变量对照时不得把固定调用扩大成通用能力/);
   assert.match(EXECUTOR_SYSTEM_PROMPT, /实际候选清单、每项输入和结果保存为 Artifact/);
   assert.match(EXECUTOR_SYSTEM_PROMPT, /数量达到阈值只表示本轮停止扩大/);
   assert.match(EXECUTOR_SYSTEM_PROMPT, /<example name="discriminating-test">/);
   assert.match(EXECUTOR_SYSTEM_PROMPT, /<example name="causal-boundary-and-oracle">/);
-  assert.match(EXECUTOR_SYSTEM_PROMPT, /<example name="fingerprint-to-vulnerability-research">/);
+  assert.doesNotMatch(EXECUTOR_SYSTEM_PROMPT, /<example name="fingerprint-to-vulnerability-research">/);
   assert.doesNotMatch(input, /budget_status/);
   assert.match(input, /<runtime_budget>/);
   assert.match(input, /turns: 0\/12; remaining: 12/);
@@ -86,7 +87,6 @@ test("executor prompt uses bounded experimental method and runtime steering", ()
   const resumeInput = renderExecutorResumeInput({
     rootGoal: "Obtain flag{uuid}; candidate location /challenge/flag.txt",
     taskEnvelope: { ...taskEnvelope, budget: { maxTurns: 16 } },
-    plannerHint: "Use the confirmed file-read capability to close the remaining goal gap.",
     operationGraphSlice: emptyGraph,
     reasoningGraphSlice: { ...emptyGraph, view: "reasoning" },
     sessionRefs: [],
@@ -96,7 +96,7 @@ test("executor prompt uses bounded experimental method and runtime steering", ()
     environmentFacts: "# Executor 环境事实\n- cwd：/workspace；可写、跨 epoch 持久"
   });
   assert.match(resumeInput, /继续执行同一个 Task/);
-  assert.match(resumeInput, /<planner_hint>/);
+  assert.doesNotMatch(resumeInput, /<planner_hint>/);
   assert.match(resumeInput, /<operation_graph format="json">/);
   assert.match(resumeInput, /<dependency_outcomes>/);
   assert.match(resumeInput, /confirmed file-read capability/);
@@ -134,6 +134,7 @@ test("planner prompt teaches evidence-aware planning without an intermediate con
   assert.match(PLANNER_SYSTEM_PROMPT, /无法解析时重新 list，不猜测 UUID/);
   assert.match(PLANNER_SYSTEM_PROMPT, /Root Goal 的“全部”“所有”“每个”按开放集合处理/);
   assert.match(PLANNER_SYSTEM_PROMPT, /EpochOutcome 只说明执行实例为何结束/);
+  assert.match(PLANNER_SYSTEM_PROMPT, /不要把“另写一份结论 Artifact”设为 successCriteria/);
   assert.match(PLANNER_SYSTEM_PROMPT, /<example name="continue-current-task">/);
   assert.match(PLANNER_SYSTEM_PROMPT, /<example name="create-planning-branch">/);
   assert.match(PLANNER_SYSTEM_PROMPT, /<example name="initial-planning">/);
@@ -276,7 +277,6 @@ test("executor input exposes existing basis refs for transitive material reuse",
     operationGraphSlice: {},
     reasoningGraphSlice: {},
     sessionRefs: [],
-    toolCatalog: [],
     executionBrief: "none",
     runtimeBudgetStatus: "ok"
   });
@@ -292,6 +292,7 @@ test("planner prompt explains how to use degraded projection outcomes", () => {
 
 test("projector prompt requests semantic changes instead of one node per observation", () => {
   assert.match(OBSERVER_PROJECTOR_SYSTEM_PROMPT, /Ground claims/);
+  assert.match(OBSERVER_PROJECTOR_SYSTEM_PROMPT, /维护最小、可追溯、非重复的世界状态/);
   assert.match(OBSERVER_PROJECTOR_SYSTEM_PROMPT, /能够直接指向原始 input\/outcome 的最小 claim/);
   assert.match(OBSERVER_PROJECTOR_SYSTEM_PROMPT, /命令中提到的候选、Executor commentary、静态页面文字和模型解释都不是结果/);
   assert.match(OBSERVER_PROJECTOR_SYSTEM_PROMPT, /Project changes/);
@@ -309,18 +310,27 @@ test("projector prompt requests semantic changes instead of one node per observa
   assert.match(OBSERVER_PROJECTOR_SYSTEM_PROMPT, /Vulnerability -exploited_by-> Exploit/);
   assert.match(OBSERVER_PROJECTOR_SYSTEM_PROMPT, /Evidence -contradicts-> Hypothesis/);
   assert.match(OBSERVER_PROJECTOR_SYSTEM_PROMPT, /Task、Milestone、Blocker、Goal、Scope 不得创建、更新或连接/);
-  assert.match(OBSERVER_SUPERVISOR_SYSTEM_PROMPT, /检查近期实验是否真正减少不确定性/);
+  assert.match(OBSERVER_PROJECTOR_SYSTEM_PROMPT, /grounded-endpoint-claim/);
+  assert.match(OBSERVER_PROJECTOR_SYSTEM_PROMPT, /Evidence -observed_on-> WebEndpoint/);
+  assert.match(OBSERVER_PROJECTOR_SYSTEM_PROMPT, /任何校验错误都会拒绝整份草稿/);
+  assert.match(OBSERVER_PROJECTOR_SYSTEM_PROMPT, /重新提交完整 delta/);
+  assert.doesNotMatch(OBSERVER_PROJECTOR_SYSTEM_PROMPT, /最多 24 个节点、40 条边/);
+  assert.doesNotMatch(OBSERVER_PROJECTOR_SYSTEM_PROMPT, /最多调用两次只读图工具/);
+  assert.match(OBSERVER_SUPERVISOR_SYSTEM_PROMPT, /保护 Executor 的有效执行时间/);
+  assert.match(OBSERVER_SUPERVISOR_SYSTEM_PROMPT, /continue：当前实验正在减少/);
+  assert.match(OBSERVER_SUPERVISOR_SYSTEM_PROMPT, /redirect：Task 和当前因果目标不变/);
+  assert.match(OBSERVER_SUPERVISOR_SYSTEM_PROMPT, /handoff：successCriteria 已出现完整结果/);
+  assert.match(OBSERVER_SUPERVISOR_SYSTEM_PROMPT, /stop_executor：输入显示明确的 Scope 风险/);
   assert.match(OBSERVER_SUPERVISOR_SYSTEM_PROMPT, /同时改变多个独立条件后统一失败/);
-  assert.match(OBSERVER_SUPERVISOR_SYSTEM_PROMPT, /新的 URL、payload、字段名、工具输出或不同 stdout 指纹本身不等于进展/);
-  assert.match(OBSERVER_SUPERVISOR_SYSTEM_PROMPT, /页面静态说明、全局关键词、请求脚本自己打印的标签不能证明/);
-  assert.match(OBSERVER_SUPERVISOR_SYSTEM_PROMPT, /只评价当前因果边界最近窗口的进展/);
-  assert.match(OBSERVER_SUPERVISOR_SYSTEM_PROMPT, /任务阶段是否完成以及下一阶段做什么仍由 Planner 决定/);
-  assert.match(OBSERVER_SUPERVISOR_SYSTEM_PROMPT, /成功条件尚未满足且当前路径仍在有效减少不确定性时，应继续或 redirect/);
-  assert.match(OBSERVER_SUPERVISOR_SYSTEM_PROMPT, /PRIOR_RELEVANT_KNOWLEDGE 来自当前 GraphStore 切片/);
-  assert.match(OBSERVER_SUPERVISOR_SYSTEM_PROMPT, /任一项不同就是尚未被该负面知识覆盖的新分支/);
-  assert.match(OBSERVER_SUPERVISOR_SYSTEM_PROMPT, /reason 必须说明哪些条件等价并引用对应 Hypothesis、contradicts Evidence 的 evidenceRefs/);
-  assert.match(OBSERVER_SUPERVISOR_SYSTEM_PROMPT, /Executor 仍可基于更新鲜证据自主继续/);
-  assert.match(OBSERVER_SUPERVISOR_SYSTEM_PROMPT, /不得仅因枚举数量达到阈值或有限候选均失败就建议 handoff/);
+  assert.match(OBSERVER_SUPERVISOR_SYSTEM_PROMPT, /新的 URL、payload、字段名、工具输出或不同 stdout 文本本身不等于进展/);
+  assert.match(OBSERVER_SUPERVISOR_SYSTEM_PROMPT, /静态页面说明、请求脚本标签和全局关键词不能证明/);
+  assert.match(OBSERVER_SUPERVISOR_SYSTEM_PROMPT, /只评价当前因果边界的最近窗口/);
+  assert.match(OBSERVER_SUPERVISOR_SYSTEM_PROMPT, /Runtime 独立处理预算边界/);
+  assert.match(OBSERVER_SUPERVISOR_SYSTEM_PROMPT, /只有 refuted\/superseded Hypothesis 可支持“重复已知死路”/);
+  assert.match(OBSERVER_SUPERVISOR_SYSTEM_PROMPT, /target、method、preconditions、observedResult 和判定信号必须等价/);
+  assert.match(OBSERVER_SUPERVISOR_SYSTEM_PROMPT, /证据不足且没有明确 Scope 风险或 Runtime stopRequested，选择 continue/);
+  assert.match(OBSERVER_SUPERVISOR_SYSTEM_PROMPT, /similar-output-with-new-variable/);
+  assert.match(OBSERVER_SUPERVISOR_SYSTEM_PROMPT, /repeated-causal-boundary/);
   assert.doesNotMatch(OBSERVER_SUPERVISOR_SYSTEM_PROMPT, /高价值状态变化已经足够交回 Planner/);
 });
 
@@ -337,7 +347,14 @@ test("supervisor input includes persisted relevant graph knowledge", () => {
     actionTraceText: "repeated equivalent path probes",
     loopSignalsText: "same response oracle",
     supervisionState: {},
-    budgetState: {},
+    budgetState: {
+      budget: { maxTurns: 40 },
+      usedTurns: 17,
+      remainingTurns: 23,
+      epochUsedTurns: 5,
+      epochMaxTurns: 8,
+      epochRemainingTurns: 3
+    },
     taskStatus: {},
     priorRelevantKnowledge: {
       nodes: [{
@@ -360,4 +377,6 @@ test("supervisor input includes persisted relevant graph knowledge", () => {
   assert.match(input, /hypothesis:session-file/);
   assert.match(input, /event:negative/);
   assert.match(input, /a valid session identifier is observed/);
+  assert.match(input, /Task allocation：已用 17\/40，剩余 23 turns/);
+  assert.match(input, /Epoch slice：已用 5\/8，剩余 3 turns/);
 });

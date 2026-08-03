@@ -45,7 +45,6 @@ type ControllerHarness = {
     rootGoal: string;
     taskEnvelope: TaskEnvelope;
     taskStatus?: Record<string, unknown>;
-    plannerHint?: string;
     runtimeBudgetStatus: string;
   }) => Promise<string>;
   beginTaskExecution: (taskEnvelope: TaskEnvelope) => {
@@ -225,7 +224,7 @@ test("dependent task gets its own executor session file", async () => {
   await controller.close({ drainProjectionJobs: false });
 });
 
-test("resume input re-injects task, graph, dependency outcomes and planner hint", async () => {
+test("resume input re-injects canonical task, graph and dependency outcomes", async () => {
   const runtimeDir = mkdtempSync(join(tmpdir(), "luanniao-session-boundary-"));
   const { controller, harness } = createHarness(runtimeDir);
   await controller.initialize();
@@ -243,7 +242,6 @@ test("resume input re-injects task, graph, dependency outcomes and planner hint"
     rootGoal: "Obtain flag",
     taskEnvelope,
     taskStatus: { plannerReason: "Continue with admin session" },
-    plannerHint: "Continue with admin session",
     runtimeBudgetStatus: "turns: 0/12; remaining: 12"
   });
 
@@ -251,9 +249,8 @@ test("resume input re-injects task, graph, dependency outcomes and planner hint"
   assert.match(resumeInput, /<updated_task>/);
   assert.match(resumeInput, /<operation_graph format="json">/);
   assert.match(resumeInput, /<reasoning_graph format="json">/);
-  assert.match(resumeInput, /<planner_hint>/);
+  assert.doesNotMatch(resumeInput, /<planner_hint>/);
   assert.match(resumeInput, /<dependency_outcomes>/);
-  assert.match(resumeInput, /Continue with admin session/);
   assert.match(resumeInput, /Use confirmed admin session to read target file/);
 
   await controller.close({ drainProjectionJobs: false });

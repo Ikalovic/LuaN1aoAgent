@@ -340,7 +340,7 @@ npm start -- --resume 20260720-080000Z-a1b2c3d4
 --proxy <socks5-url>         Transparently route all scoped Agent TCP through SOCKS5
 --runtime-dir <path>         Empty directory for a new runtime
 --resume <session>           Resume one runtime; restores Goal and Scope
---max-cycles <number>        Maximum Planner cycles
+--max-cycles <number>        Maximum consecutive no-progress Planner cycles
 --max-parallel-tasks <n>     Maximum concurrent tasks
 --max-run-time-ms <number>   Global run timeout in milliseconds
 --json                       Disable TUI and print final JSON

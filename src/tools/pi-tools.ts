@@ -179,7 +179,7 @@ export function createTaskResultSubmitTool() {
   return defineTool({
     name: "task_result_submit",
     label: "Submit Task Result",
-    description: "Submit the final Executor epoch result and terminate this Executor invocation.",
+    description: "Submit the final Executor epoch result and terminate this Executor invocation. A completed result must omit blockerReason and checkpointReason and must not set retryable=true.",
     parameters: Type.Object({
       taskId: Type.String(),
       status: Type.Union([
@@ -235,7 +235,7 @@ export function createGraphDeltaSubmitTool(options: ProjectionDraftValidationOpt
   return defineTool({
     name: "graph_delta_submit",
     label: "Submit Graph Delta",
-    description: "Submit the final Projector GraphDelta and terminate this Projector invocation.",
+    description: "Submit one complete final Projector GraphDelta and terminate this invocation. Validation rejects the entire draft; correct errors and resubmit the complete delta.",
     parameters: Type.Object({
       nodes: Type.Optional(Type.Array(ProjectorGraphNodeSchema, { maxItems: PROJECTOR_MAX_DELTA_NODES })),
       edges: Type.Optional(Type.Array(ProjectorGraphEdgeSchema, { maxItems: PROJECTOR_MAX_DELTA_EDGES }))

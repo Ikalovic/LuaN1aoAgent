@@ -120,6 +120,7 @@ type ActivePlannerDeliveryState = {
   queuedRevision: number;
   queuedView: PlannerDecisionView;
   queuedSeq: number;
+  requiresControlUpdateConsumption: boolean;
 };
 
 class ActiveTaskMutationError extends GraphValidationError {
@@ -394,7 +395,7 @@ export class SecurityAgentController {
   private activeSupervisorSessions = new Set<SecurityAgentSession>();
   private activePlannerSessions = new Set<SecurityAgentSession>();
   private activePlannerDelivery = new Map<SecurityAgentSession, ActivePlannerDeliveryState>();
-  private plannerStateRevision = 0;
+  private plannerControlRevision = 0;
   private ownedPlannerSession?: SecurityAgentSession;
   private ownedPlannerLogging?: ReturnType<typeof attachExecutionLogging>;
   private lastPlannerDecisionView?: PlannerDecisionView;
@@ -863,7 +864,8 @@ export class SecurityAgentController {
     try {
       let cycleIndex = 0;
       let deferredPlannerFailures = 0;
-      while (cycleIndex < maxPlannerCycles) {
+      let consecutiveNoProgressPlannerCycles = 0;
+      while (consecutiveNoProgressPlannerCycles < maxPlannerCycles) {
         if (this.stopRequestedReason) {
           return await decideRun({ cycles, completed: false, stoppedReason: this.stopRequestedReason });
         }
@@ -921,6 +923,11 @@ export class SecurityAgentController {
         deferredPlannerFailures = 0;
         cycles.push(cycleResult);
         cycleIndex += 1;
+        const plannerCycleMadeProgress = (cycleResult.plannerDecision.commands?.length ?? 0) > 0
+          || (cycleResult.taskResults?.length ?? 0) > 0;
+        consecutiveNoProgressPlannerCycles = plannerCycleMadeProgress
+          ? 0
+          : consecutiveNoProgressPlannerCycles + 1;
         if (this.stopRequestedReason) {
           return await decideRun({ cycles, completed: false, stoppedReason: this.stopRequestedReason });
         }
@@ -952,7 +959,7 @@ export class SecurityAgentController {
       return await decideRun({
         cycles,
         completed: false,
-        stoppedReason: `Reached max planner cycles: ${maxPlannerCycles}`
+        stoppedReason: `Reached max consecutive no-progress planner cycles: ${maxPlannerCycles}`
       });
     } catch (error) {
       if (this.stopRequestedReason) {
@@ -1983,7 +1990,6 @@ export class SecurityAgentController {
             rootGoal,
             taskEnvelope,
             taskStatus,
-            plannerHint: stringProperty(taskStatus?.plannerReason),
             runtimeBudgetStatus
           })
           : await this.renderInitialExecutorInput({
@@ -2603,11 +2609,6 @@ export class SecurityAgentController {
       sessionRefs: this.withSessionMaterialRefs(
         operationGraphSlice.nodes.filter((node) => ["AgentSession", "ShellSession", "Session", "Credential"].includes(node.type))
       ),
-      toolCatalog: [
-        "read", "bash", "grep", "find", "ls", "browser_render", "artifact_read", "artifact_write", "evidence_list", "evidence_read",
-        ...(this.connectivityRuntime ? ["route_open", "route_status", "route_stop", "route_reconnect"] : []),
-        "task_result_submit"
-      ],
       executionBrief: createExecutionBrief(input.taskEnvelope, (await this.executionLog.window({
         taskId: input.taskEnvelope.taskId,
         limit: 5,
@@ -2623,7 +2624,6 @@ export class SecurityAgentController {
     rootGoal: string;
     taskEnvelope: TaskEnvelope;
     taskStatus?: Record<string, unknown>;
-    plannerHint?: string;
     runtimeBudgetStatus: string;
   }): Promise<string> {
     const executionGraphContext = this.graphStore.projectionClosure({
@@ -2642,7 +2642,6 @@ export class SecurityAgentController {
     return renderExecutorResumeInput({
       rootGoal: input.rootGoal,
       taskEnvelope: input.taskEnvelope,
-      plannerHint: input.plannerHint,
       operationGraphSlice,
       reasoningGraphSlice: compactExecutorGraphClosure(executionGraphContext, "reasoning", 12),
       sessionRefs: this.withSessionMaterialRefs(
@@ -2695,9 +2694,13 @@ export class SecurityAgentController {
     reason: string;
     taskId?: string;
     message?: string;
+    invalidateSubmission?: boolean;
   }): boolean {
-    this.plannerStateRevision += 1;
-    const revision = this.plannerStateRevision;
+    const invalidateSubmission = input.invalidateSubmission !== false;
+    if (invalidateSubmission) {
+      this.plannerControlRevision += 1;
+    }
+    const revision = this.plannerControlRevision;
     const currentView = this.buildPlannerDecisionView();
     const deliverySeq = this.executionLog.latestSeq();
     let queuedCount = 0;
@@ -2720,10 +2723,13 @@ export class SecurityAgentController {
       if (delivery) {
         delivery.queuedView = currentView;
         delivery.queuedSeq = deliverySeq;
+        if (invalidateSubmission) {
+          delivery.requiresControlUpdateConsumption = true;
+        }
       }
       queuedCount += 1;
       void steer.call(plannerSession, message).then(() => {
-        if (delivery) {
+        if (delivery && invalidateSubmission) {
           delivery.queuedRevision = Math.max(delivery.queuedRevision, revision);
         }
       }).catch((error: unknown) => {
@@ -2732,7 +2738,7 @@ export class SecurityAgentController {
           role: "runtime",
           eventType: "planner_state_update_steer_failed",
           summary: `Failed to steer Planner state update: ${error instanceof Error ? error.message : String(error)}`,
-          payload: { reason: input.reason, revision, taskId: input.taskId }
+          payload: { reason: input.reason, revision, taskId: input.taskId, submissionInvalidated: invalidateSubmission }
         });
       });
     }
@@ -2742,7 +2748,13 @@ export class SecurityAgentController {
         role: "runtime",
         eventType: "planner_state_update_queued",
         summary: input.reason,
-        payload: { revision, deliverySeq, queuedCount, taskId: input.taskId }
+        payload: {
+          revision,
+          deliverySeq,
+          queuedCount,
+          taskId: input.taskId,
+          submissionInvalidated: invalidateSubmission
+        }
       });
     }
     return queuedCount > 0;
@@ -2753,9 +2765,18 @@ export class SecurityAgentController {
     if (!delivery) {
       return true;
     }
+    if (delivery.queuedRevision !== this.plannerControlRevision) {
+      return false;
+    }
+    if (!delivery.requiresControlUpdateConsumption) {
+      return true;
+    }
     const pendingMessageCount = (session as { pendingMessageCount?: unknown }).pendingMessageCount;
-    return delivery.queuedRevision === this.plannerStateRevision
-      && (typeof pendingMessageCount !== "number" || pendingMessageCount === 0);
+    if (typeof pendingMessageCount === "number" && pendingMessageCount > 0) {
+      return false;
+    }
+    delivery.requiresControlUpdateConsumption = false;
+    return true;
   }
 
   private async invokePlannerCycle(input: {
@@ -2827,9 +2848,10 @@ export class SecurityAgentController {
         const plannerSession = plannerSessionResult.session;
         this.activePlannerSessions.add(plannerSession);
         this.activePlannerDelivery.set(plannerSession, {
-          queuedRevision: this.plannerStateRevision,
+          queuedRevision: this.plannerControlRevision,
           queuedView: plannerDecisionView,
-          queuedSeq: deliverySeq
+          queuedSeq: deliverySeq,
+          requiresControlUpdateConsumption: false
         });
         plannerStatsBefore = readPiSessionStats(plannerSession);
         plannerLogging = plannerSessionResult.isolated
@@ -3486,9 +3508,7 @@ export class SecurityAgentController {
           ),
           budgetState: {
             ...budgetStatusSnapshot(input.taskEnvelope, state),
-            toolExecutionEndCount: state?.toolExecutionEndCount ?? 0,
-            epochTurnCount: state?.epochTurnCount ?? 0,
-            taskTurnCount: state?.taskTurnCount ?? this.runtimeStore.getTaskConsumedTurns(input.taskEnvelope.taskId),
+            toolExecutionEndCount: state?.toolExecutionEndCount ?? 0
           },
           taskStatus: this.getTaskStatusSnapshot(input.taskEnvelope.taskId),
           lastControlSignal: state?.supervisionState.lastVerdict ?? state?.controlSignal,
@@ -4676,8 +4696,8 @@ export class SecurityAgentController {
       "RUNTIME_BUDGET_CHECKPOINT_FINALIZATION",
       input.state.abortContext.reason,
       "探索预算已经耗尽。不得调用 bash、read、搜索、图查询或继续探索。",
-      "若本次已生成且明确知道路径的可复用材料尚未归档，可在第一个工具批次用现有的 artifact_write 原样归档；不得创建、修改、检查或搜索文件。",
-      "该归档批次结束后 Runtime 会只保留 task_result_submit。随后调用一次 task_result_submit，并根据任务成功条件如实选择 completed、partial、blocked 或 failed。",
+      "若本次已生成且明确知道路径的可复用材料尚未归档，可用 artifact_write 原样归档；需要时可连续归档多个已有文件，但不得创建、修改、检查或搜索文件。",
+      "TaskOutcome 本身就是结构化结论，不要为结论临时虚构或创建总结文件。已有材料归档完成后调用一次 task_result_submit，并根据任务成功条件如实选择 completed、partial、blocked 或 failed。",
       "summary 写明本次已经验证的能力、最新失效条件和仍未解决的问题；",
       "evidenceRefs 和 artifactRefs 只填写本会话中真实存在的引用；",
       "不要继续探索，也不要输出自由文本 JSON。"
@@ -4699,7 +4719,6 @@ export class SecurityAgentController {
     const inputBytes = Buffer.byteLength(prompt);
     let invocationStatus = "failed";
     let originalToolNames: string[] | undefined;
-    let unsubscribeFinalizationPhase: (() => void) | undefined;
     try {
       originalToolNames = session.getActiveToolNames();
       const finalizationToolNames = ["artifact_write", "task_result_submit"]
@@ -4713,15 +4732,6 @@ export class SecurityAgentController {
         throw new Error("Executor checkpoint finalization must expose task_result_submit and may expose artifact_write only");
       }
       input.state.checkpointFinalizationActive = true;
-      unsubscribeFinalizationPhase = session.subscribe((event) => {
-        if (!isRecord(event)
-          || event.type !== "tool_execution_end"
-          || event.toolName !== "artifact_write"
-          || event.isError === true) {
-          return;
-        }
-        session.setActiveToolsByName(["task_result_submit"]);
-      });
       const taskResult = await invokeStructured(session, prompt, {
         toolName: "task_result_submit",
         maxTruncationSteers: 0,
@@ -4767,7 +4777,6 @@ export class SecurityAgentController {
     } finally {
       clearTimeout(globalDeadlineTimer);
       input.state.checkpointFinalizationActive = false;
-      unsubscribeFinalizationPhase?.();
       if (originalToolNames) {
         session.setActiveToolsByName(originalToolNames);
       }
@@ -4900,7 +4909,8 @@ export class SecurityAgentController {
     const plannerUpdateQueued = this.queuePlannerStateUpdate({
       taskId,
       reason: `Projector graph commit persisted for ${taskId}`,
-      message: `作战图已提交增量。提交 planner_submit 前请自主判断是否需要查询：${updateManifest}`
+      message: `作战图已提交增量。提交 planner_submit 前请自主判断是否需要查询：${updateManifest}`,
+      invalidateSubmission: false
     });
     await this.executionLog.append({
       taskId,
@@ -5638,21 +5648,30 @@ function runtimeAbortKindForControlSignal(controlSignal: ControlSignal): Runtime
 
 function normalizeTaskResult(result: Partial<TaskResult>, taskEnvelope: TaskEnvelope): TaskResult {
   const submittedStatus = isTaskResultStatus(result.status) ? result.status : "partial";
+  const blockerReason = typeof result.blockerReason === "string" && result.blockerReason.trim().length > 0
+    ? result.blockerReason
+    : undefined;
+  const checkpointReason = typeof result.checkpointReason === "string" && result.checkpointReason.trim().length > 0
+    ? result.checkpointReason
+    : undefined;
+  const retryable = typeof result.retryable === "boolean" ? result.retryable : undefined;
+  const status = submittedStatus === "completed"
+    && (blockerReason !== undefined || checkpointReason !== undefined || retryable === true)
+    ? "partial"
+    : submittedStatus;
   return {
     taskId: taskEnvelope.taskId,
-    status: submittedStatus,
+    status,
     summary: typeof result.summary === "string" && result.summary.trim().length > 0
       ? result.summary
       : "Executor returned a TaskResult without summary",
     evidenceRefs: Array.isArray(result.evidenceRefs) ? result.evidenceRefs.filter((ref): ref is string => typeof ref === "string") : [],
     artifactRefs: Array.isArray(result.artifactRefs) ? result.artifactRefs.filter((ref): ref is string => typeof ref === "string") : [],
     capabilityRefs: Array.isArray(result.capabilityRefs) ? result.capabilityRefs.filter((ref): ref is string => typeof ref === "string") : [],
-    blockerReason: typeof result.blockerReason === "string" ? result.blockerReason : undefined,
+    blockerReason,
     suggestedNextGoal: typeof result.suggestedNextGoal === "string" ? result.suggestedNextGoal : undefined,
-    checkpointReason: typeof result.checkpointReason === "string"
-      ? result.checkpointReason
-      : undefined,
-    retryable: typeof result.retryable === "boolean" ? result.retryable : undefined,
+    checkpointReason,
+    retryable,
     attempt: typeof result.attempt === "number" && Number.isFinite(result.attempt) ? Math.floor(result.attempt) : undefined,
     resumeCursor: typeof result.resumeCursor === "string" ? result.resumeCursor : undefined,
     lastEventId: typeof result.lastEventId === "string" ? result.lastEventId : undefined
