@@ -4070,6 +4070,63 @@ test("retryable checkpoint EpochOutcome resumes an open Task with remaining allo
   await harness.controller.close({ drainProjectionJobs: false });
 });
 
+test("Planner empty decision resumes an open Task after a blocked outcome", async () => {
+  const harness = createControllerHarness();
+  const taskEnvelope = makeTaskEnvelope({
+    taskId: "task:blocked-resume",
+    budget: { maxTurns: 60 }
+  });
+  harness.controller.graphStore.createTask({ ...taskEnvelope, priority: 1 });
+  harness.controller.graphStore.markTaskStatus({
+    taskId: taskEnvelope.taskId,
+    status: "open"
+  });
+  for (let turn = 1; turn <= 36; turn += 1) {
+    harness.controller.runtimeStore.recordTaskTurn({
+      taskId: taskEnvelope.taskId,
+      eventId: `event:blocked-resume:${turn}`
+    });
+  }
+  harness.controller.runtimeStore.upsertTaskOutcome({
+    taskRef: taskEnvelope.taskId,
+    epochRef: "epoch:blocked-resume",
+    status: "blocked",
+    summary: "The previous epoch reached a temporary external blocker",
+    evidenceRefs: [],
+    artifactRefs: [],
+    capabilityRefs: [],
+    terminalSeq: 40,
+    createdAt: new Date().toISOString()
+  });
+  harness.controller.runtimeStore.upsertEpochOutcome({
+    epochRef: "epoch:blocked-resume",
+    taskRef: taskEnvelope.taskId,
+    status: "submitted",
+    reason: "Executor reported a blocked outcome",
+    taskOutcomeRef: taskEnvelope.taskId,
+    terminalSeq: 40,
+    retryable: false,
+    createdAt: new Date().toISOString()
+  });
+  const schedulerState = harness.controller as unknown as { awaitingPlannerTaskIds: Set<string> };
+  schedulerState.awaitingPlannerTaskIds.add(taskEnvelope.taskId);
+
+  const released = await harness.controllerHarness.releasePlannerWaitingTasks({
+    commands: [],
+    reason: "Keep the open Task and continue with its remaining allocation"
+  }, new Set([taskEnvelope.taskId]));
+  const events = await harness.controller.executionLog.readAll();
+
+  assert.deepEqual(released, [taskEnvelope.taskId]);
+  assert.equal(schedulerState.awaitingPlannerTaskIds.has(taskEnvelope.taskId), false);
+  assert.ok(events.some((event) => event.eventType === "planner_handoff_resolved"
+    && event.taskId === taskEnvelope.taskId
+    && event.payload.resolution === "resume_open_task"
+    && event.payload.taskOutcomeRef === taskEnvelope.taskId
+    && event.payload.remainingTurns === 24));
+  await harness.controller.close({ drainProjectionJobs: false });
+});
+
 test("initialize preserves a persisted partial handoff resolution", async () => {
   const runtimeDir = mkdtempSync(join(tmpdir(), "luanniao-controller-"));
   const first = createControllerWithTestLlmEnv(runtimeDir);

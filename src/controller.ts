@@ -1856,10 +1856,13 @@ export class SecurityAgentController {
       const resumableEpoch = epochOutcome?.retryable
         && epochOutcome.taskOutcomeRef === undefined
         && epochOutcome.terminalSeq > (taskOutcome?.terminalSeq ?? 0);
-      if (consumedTurns < maxTurns && (resumablePartial || resumableEpoch)) {
+      const resumableOpenOutcome = taskOutcome?.status === "blocked" || taskOutcome?.status === "failed";
+      if (consumedTurns < maxTurns && (resumablePartial || resumableEpoch || resumableOpenOutcome)) {
         const resolution = resumablePartial
           ? "resume_partial"
-          : "resume_retryable_epoch";
+          : resumableEpoch
+            ? "resume_retryable_epoch"
+            : "resume_open_task";
         await this.executionLog.append({
           taskId,
           role: "runtime",

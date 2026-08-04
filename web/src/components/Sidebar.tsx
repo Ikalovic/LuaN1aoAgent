@@ -58,7 +58,7 @@ export function Sidebar(props: SidebarProps) {
   return (
     <div className="sidebar-content">
       <div className="sidebar-brand">
-        <div className="brand-mark"><img src="/brand/luanniao-mark.svg" alt="" /></div>
+        <div className="brand-mark">鸾</div>
         <div className="brand-copy"><strong>{t("auth.brand")}</strong><span>Agent Workbench</span></div>
         {props.onClose ? <Tooltip title={t("nav.close")}><Button type="text" icon={<PanelLeftClose size={18} />} onClick={props.onClose} aria-label={t("nav.close")} /></Tooltip> : null}
       </div>
