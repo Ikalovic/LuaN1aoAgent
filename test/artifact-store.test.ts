@@ -273,6 +273,44 @@ test("artifact_write imports a complete workspace file without exposing its host
   artifactStore.close();
 });
 
+test("artifact_write persists an explicit report Artifact with a Markdown extension", async () => {
+  const runtimeDir = mkdtempSync(join(tmpdir(), "luanniao-report-artifact-"));
+  const workspaceDir = join(runtimeDir, "workspace");
+  mkdirSync(workspaceDir);
+  writeFileSync(join(workspaceDir, "final-report"), "# Final report\n\nVerified result.");
+  const artifactStore = new ArtifactStore(join(runtimeDir, "artifacts"));
+  const tool = createArtifactWriteTool(artifactStore, {
+    workspace: { hostDir: workspaceDir, visibleRoot: "/workspace" }
+  });
+
+  assert.equal(Check(tool.parameters, {
+    path: "/workspace/final-report",
+    kind: "report",
+    mediaType: "text/markdown"
+  }), true);
+  const result = await tool.execute(
+    "call:report-write",
+    {
+      path: "/workspace/final-report",
+      kind: "report",
+      mediaType: "text/markdown"
+    },
+    new AbortController().signal,
+    () => undefined,
+    {} as never
+  );
+  const publicRecord = JSON.parse(
+    result.content[0]?.type === "text" ? result.content[0].text : "{}"
+  ) as { artifactRef: string };
+  const stored = await artifactStore.get(publicRecord.artifactRef);
+
+  assert.equal(stored?.kind, "report");
+  assert.equal(stored?.mediaType, "text/markdown");
+  assert.match(stored?.path ?? "", /\.md$/);
+  assert.equal(await artifactStore.read(publicRecord.artifactRef), "# Final report\n\nVerified result.");
+  artifactStore.close();
+});
+
 test("artifact tools expose one strict canonical schema without argument shims", async () => {
   const runtimeDir = mkdtempSync(join(tmpdir(), "luanniao-artifact-schema-"));
   const workspaceDir = join(runtimeDir, "workspace");

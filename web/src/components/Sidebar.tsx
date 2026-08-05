@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { Badge, Button, Empty, Menu, Tooltip } from "antd";
-import { Activity, BrainCircuit, Cable, ChevronRight, Folder, FolderOpen, GitBranch, ListTree, Network, PanelLeftClose } from "lucide-react";
+import { Activity, BrainCircuit, Cable, ChevronRight, FileText, Folder, FolderOpen, GitBranch, ListTree, Network, PanelLeftClose } from "lucide-react";
 import { useLanguage } from "../language";
 import { buildSessionTree, sessionRelativePath, type SessionFolderNode } from "../sessions";
 import type { AgentEvent, RuntimeSession, ViewKey } from "../types";
@@ -22,6 +22,7 @@ export function Sidebar(props: SidebarProps) {
   const [expandedFolders, setExpandedFolders] = useState<Set<string>>(new Set());
   const viewItems = [
     { key: "trace", icon: <Activity size={17} />, label: t("nav.trace") },
+    { key: "reports", icon: <FileText size={17} />, label: t("nav.reports") },
     { key: "traffic", icon: <Network size={17} />, label: t("nav.traffic") },
     { key: "connections", icon: <Cable size={17} />, label: t("nav.connections") },
     { key: "reasoning", icon: <BrainCircuit size={17} />, label: t("nav.reasoning") },

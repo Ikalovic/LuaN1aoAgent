@@ -14,6 +14,8 @@ import {
   createAgentTrafficProxyRegistry,
   type AgentRuntimeLifecycle
 } from "./agent-runtime-bootstrap.js";
+import { reapStaleManagedDockerResources } from "./docker-resource-reaper.js";
+import { defaultDockerRunner } from "./executor-sandbox-docker.js";
 import {
   TrafficProxyClient,
   TrafficProxyControlError,
@@ -80,6 +82,8 @@ type WebEdge = {
 
 type WebEvent = {
   id: string;
+  seq?: number;
+  epochId?: string;
   taskId?: string;
   role: string;
   eventType: string;
@@ -92,6 +96,8 @@ type WebEvent = {
 type TraceItem = {
   id: string;
   eventId: string;
+  seq?: number;
+  epochId?: string;
   timestamp: string;
   taskId?: string;
   role: string;
@@ -159,6 +165,65 @@ type RuntimeSession = {
   running?: boolean;
 };
 
+type WebTaskOutcome = {
+  taskRef: string;
+  epochRef: string;
+  objectiveRevision?: number;
+  status: string;
+  summary: string;
+  evidenceRefs: string[];
+  artifactRefs: string[];
+  capabilityRefs: string[];
+  blockerReason?: string;
+  suggestedNextGoal?: string;
+  checkpoint?: JsonRecord;
+  terminalSeq: number;
+  createdAt: string;
+};
+
+type WebEpochOutcome = {
+  epochRef: string;
+  taskRef: string;
+  status: string;
+  reason: string;
+  terminalSeq: number;
+  taskOutcomeRef?: string;
+  retryable: boolean;
+  createdAt: string;
+};
+
+type RunFinalResult = {
+  summary: string;
+  createdAt: string;
+  sourceEventId: string;
+};
+
+type WebFinalReport = {
+  taskRef: string;
+  summary: string;
+  createdAt: string;
+  artifactRefs: string[];
+  artifacts: ArtifactRecord[];
+};
+
+type PlannerCheckpoint = {
+  id: string;
+  index: number;
+  kind: "initial" | "update" | "terminal";
+  startSeq: number;
+  endSeq?: number;
+  startedAt: string;
+  completedAt?: string;
+  status: "completed";
+  reason?: string;
+  inputTaskRefs: string[];
+  createdTaskRefs: string[];
+  updatedTaskRefs: string[];
+  executionTaskRefs: string[];
+  taskRefs: string[];
+  traceItemIds: string[];
+};
+
 type ActiveRun = {
   runtimeDir: string;
   runtimeInput: string;
@@ -179,6 +244,10 @@ const staticRoot = resolve(cwd, "web", "dist");
 const defaultRuntimeDir = args["runtime-dir"] ?? ".agent-runtime";
 const authService = new WebAuthService(resolve(cwd, args["auth-db"] ?? ".agent-runtime/web-auth.sqlite"));
 const runtimePathPolicy = await RuntimePathPolicy.create(defaultRuntimeDir, { baseDir: cwd });
+await reapStaleManagedDockerResources({
+  roots: [cwd, runtimePathPolicy.rootDir],
+  runner: defaultDockerRunner
+});
 const sessionCookieName = "luanniao_session";
 const MAX_CONCURRENT_TRAFFIC_REPLAYS = 4;
 let activeTrafficReplays = 0;
@@ -1570,11 +1639,28 @@ async function readRuntimeState(runtimeDirInput: string): Promise<JsonRecord> {
   ]);
   const graph = readGraph(runtimeDir, graphDeltas);
   const traceItems = buildTraceItems(events);
+  const outcomes = readRuntimeOutcomes(runtimeDir);
+  const planningRounds = derivePlannerCheckpoints(
+    events,
+    traceItems,
+    outcomes.taskOutcomes,
+    outcomes.epochOutcomes
+  );
+  const finalResult = deriveRunFinalResult(events);
+  const finalReport = deriveWebFinalReport(outcomes.taskOutcomes, artifacts);
   return {
     runtimeDir,
     loadedAt: new Date().toISOString(),
     overview: summarizeRuntime(events, graph.nodes, graph.edges, artifacts),
     traceItems,
+    reports: {
+      taskOutcomes: outcomes.taskOutcomes,
+      epochOutcomes: outcomes.epochOutcomes,
+      latestTaskOutcome: outcomes.taskOutcomes[0],
+      finalResult,
+      finalReport,
+      planningRounds
+    },
     graph,
     events: events.map(compactExecutionEvent),
     artifacts: {
@@ -1585,6 +1671,245 @@ async function readRuntimeState(runtimeDirInput: string): Promise<JsonRecord> {
       }
     }
   };
+}
+
+function deriveWebFinalReport(
+  taskOutcomes: WebTaskOutcome[],
+  artifacts: ArtifactRecord[]
+): WebFinalReport | undefined {
+  const reportArtifactByRef = new Map(
+    artifacts
+      .filter((artifact) => artifact.kind === "report")
+      .map((artifact) => [artifact.artifactRef, artifact])
+  );
+  const outcome = [...taskOutcomes]
+    .sort((left, right) => right.terminalSeq - left.terminalSeq)
+    .find((candidate) => candidate.status === "completed"
+      && candidate.artifactRefs.some((ref) => reportArtifactByRef.has(ref)));
+  if (!outcome) return undefined;
+  const reportArtifacts = outcome.artifactRefs.flatMap((ref) => {
+    const artifact = reportArtifactByRef.get(ref);
+    return artifact ? [artifact] : [];
+  });
+  return {
+    taskRef: outcome.taskRef,
+    summary: normalizeReportText(outcome.summary),
+    createdAt: outcome.createdAt,
+    artifactRefs: reportArtifacts.map((artifact) => artifact.artifactRef),
+    artifacts: reportArtifacts
+  };
+}
+
+function deriveRunFinalResult(events: WebEvent[]): RunFinalResult | undefined {
+  const orderedEvents = [...events].sort((left, right) => eventSeq(left) - eventSeq(right));
+  const terminalEvent = [...orderedEvents].reverse().find((event) =>
+    event.eventType === "run_completed" || event.eventType === "run_result_decided");
+  if (!terminalEvent) return undefined;
+  const terminalSeq = eventSeq(terminalEvent);
+  const finalDecision = [...orderedEvents].reverse().find((event) => {
+    if (event.eventType !== "planner_apply_commands" || eventSeq(event) > terminalSeq) return false;
+    const decision = firstRecord(event.payload.plannerDecision);
+    return Boolean(decision && arrayValue(decision.commands).length === 0 && optionalText(decision.reason));
+  });
+  const decision = finalDecision ? firstRecord(finalDecision.payload.plannerDecision) : undefined;
+  const summary = optionalText(decision?.reason);
+  if (!finalDecision || !summary) return undefined;
+  return {
+    summary: normalizeReportText(summary),
+    createdAt: terminalEvent.timestamp || finalDecision.timestamp,
+    sourceEventId: finalDecision.id
+  };
+}
+
+function normalizeReportText(value: string): string {
+  return value
+    .replace(/\\r\\n/g, "\n")
+    .replace(/\\n/g, "\n")
+    .replace(/\\r/g, "\n")
+    .replace(/\\"/g, "\"");
+}
+
+function readRuntimeOutcomes(runtimeDir: string): {
+  taskOutcomes: WebTaskOutcome[];
+  epochOutcomes: WebEpochOutcome[];
+} {
+  const databasePath = join(runtimeDir, "state.sqlite");
+  if (!existsSync(databasePath)) return { taskOutcomes: [], epochOutcomes: [] };
+  const database = new DatabaseSync(databasePath);
+  try {
+    const taskOutcomes = databaseTableExists(database, "task_outcomes")
+      ? database.prepare(`
+          SELECT outcome_json
+          FROM task_outcomes
+          ORDER BY terminal_seq DESC
+          LIMIT 500
+        `).all().flatMap((row) => normalizeTaskOutcome(asRecord(row).outcome_json))
+      : [];
+    const epochOutcomes = databaseTableExists(database, "epoch_outcomes")
+      ? database.prepare(`
+          SELECT outcome_json
+          FROM epoch_outcomes
+          ORDER BY terminal_seq DESC
+          LIMIT 1000
+        `).all().flatMap((row) => normalizeEpochOutcome(asRecord(row).outcome_json))
+      : [];
+    return { taskOutcomes, epochOutcomes };
+  } catch {
+    return { taskOutcomes: [], epochOutcomes: [] };
+  } finally {
+    database.close();
+  }
+}
+
+function databaseTableExists(database: DatabaseSync, table: string): boolean {
+  return Boolean(database.prepare(`
+    SELECT 1
+    FROM sqlite_master
+    WHERE type = 'table' AND name = ?
+    LIMIT 1
+  `).get(table));
+}
+
+function normalizeTaskOutcome(value: unknown): WebTaskOutcome[] {
+  const outcome = parseJsonObject(value);
+  const taskRef = stringValue(outcome.taskRef, "");
+  const epochRef = stringValue(outcome.epochRef, "");
+  if (!taskRef || !epochRef) return [];
+  const checkpoint = isRecord(outcome.checkpoint) ? outcome.checkpoint : undefined;
+  return [{
+    taskRef,
+    epochRef,
+    objectiveRevision: optionalNumber(outcome.objectiveRevision),
+    status: stringValue(outcome.status, "partial"),
+    summary: stringValue(outcome.summary, ""),
+    evidenceRefs: stringArray(outcome.evidenceRefs),
+    artifactRefs: stringArray(outcome.artifactRefs),
+    capabilityRefs: stringArray(outcome.capabilityRefs),
+    blockerReason: optionalText(outcome.blockerReason),
+    suggestedNextGoal: optionalText(outcome.suggestedNextGoal),
+    checkpoint,
+    terminalSeq: numberValue(outcome.terminalSeq),
+    createdAt: stringValue(outcome.createdAt, "")
+  }];
+}
+
+function normalizeEpochOutcome(value: unknown): WebEpochOutcome[] {
+  const outcome = parseJsonObject(value);
+  const epochRef = stringValue(outcome.epochRef, "");
+  const taskRef = stringValue(outcome.taskRef, "");
+  if (!epochRef || !taskRef) return [];
+  return [{
+    epochRef,
+    taskRef,
+    status: stringValue(outcome.status, "failed"),
+    reason: stringValue(outcome.reason, ""),
+    terminalSeq: numberValue(outcome.terminalSeq),
+    taskOutcomeRef: optionalText(outcome.taskOutcomeRef),
+    retryable: outcome.retryable === true,
+    createdAt: stringValue(outcome.createdAt, "")
+  }];
+}
+
+function derivePlannerCheckpoints(
+  events: WebEvent[],
+  traceItems: TraceItem[],
+  taskOutcomes: WebTaskOutcome[],
+  epochOutcomes: WebEpochOutcome[]
+): PlannerCheckpoint[] {
+  const orderedEvents = [...events].sort((left, right) => eventSeq(left) - eventSeq(right));
+  const decisions = orderedEvents.filter((event) => event.eventType === "planner_apply_commands");
+  return decisions.map((decisionEvent, index): PlannerCheckpoint => {
+    const previousDecisionSeq = index > 0 ? eventSeq(decisions[index - 1]!) : Number.NEGATIVE_INFINITY;
+    const nextDecision = decisions[index + 1];
+    const startSeq = eventSeq(decisionEvent);
+    const endSeq = nextDecision ? eventSeq(nextDecision) - 1 : undefined;
+    const executionEvents = orderedEvents.filter((event) => {
+      const seq = eventSeq(event);
+      return seq >= startSeq && (endSeq === undefined || seq <= endSeq);
+    });
+    const decision = firstRecord(decisionEvent.payload.plannerDecision);
+    const commandRefs = plannerCommandTaskRefs(decisionEvent.payload);
+    const inputTaskRefs = uniqueStrings([
+      ...taskOutcomes,
+      ...epochOutcomes
+    ].filter((outcome) =>
+      outcome.terminalSeq > previousDecisionSeq && outcome.terminalSeq <= startSeq
+    ).map((outcome) => outcome.taskRef));
+    const checkpointItems = traceItems.filter((item) => {
+      const seq = item.seq ?? 0;
+      return seq >= startSeq && (endSeq === undefined || seq <= endSeq);
+    });
+    const executionTaskRefs = uniqueStrings(checkpointItems.flatMap((item) =>
+      item.role !== "planner" && item.taskId ? [item.taskId] : []
+    ));
+    const terminal = plannerDecisionTerminatesRoot(decisionEvent.payload)
+      || executionEvents.some((event) => event.eventType === "run_completed" || event.eventType === "run_failed");
+    return {
+      id: decisionEvent.id || `planner-checkpoint:${index + 1}:${startSeq}`,
+      index: index + 1,
+      kind: terminal ? "terminal" : index === 0 ? "initial" : "update",
+      startSeq,
+      endSeq,
+      startedAt: decisionEvent.timestamp,
+      completedAt: decisionEvent.timestamp,
+      status: "completed",
+      reason: normalizeReportText(firstText(decision?.reason, decisionEvent.summary)),
+      inputTaskRefs,
+      createdTaskRefs: commandRefs.created,
+      updatedTaskRefs: commandRefs.updated,
+      executionTaskRefs,
+      taskRefs: uniqueStrings([
+        ...inputTaskRefs,
+        ...commandRefs.created,
+        ...commandRefs.updated,
+        ...executionTaskRefs
+      ]),
+      traceItemIds: checkpointItems.map((item) => item.id)
+    };
+  });
+}
+
+function plannerCommandTaskRefs(payload: JsonRecord): { created: string[]; updated: string[] } {
+  const decision = firstRecord(payload.plannerDecision);
+  const created: string[] = [];
+  const updated: string[] = [];
+  for (const command of arrayValue(decision?.commands)) {
+    if (!isRecord(command)) continue;
+    if (command.kind === "create_tasks") {
+      created.push(...arrayValue(command.tasks).flatMap((task) =>
+        isRecord(task) ? [stringValue(task.id, "")] : []
+      ));
+      continue;
+    }
+    const taskId = stringValue(command.taskId, "");
+    if (taskId) updated.push(taskId);
+  }
+  return {
+    created: uniqueStrings(created.filter(Boolean)),
+    updated: uniqueStrings(updated.filter(Boolean))
+  };
+}
+
+function plannerDecisionTerminatesRoot(payload: JsonRecord): boolean {
+  const decision = firstRecord(payload.plannerDecision);
+  return arrayValue(decision?.commands).some((command) => {
+    if (!isRecord(command) || command.kind !== "set_node_status") return false;
+    const nodeId = stringValue(command.nodeId, "");
+    const status = stringValue(command.status, "").toLowerCase();
+    return nodeId === "goal:root" && (status === "completed" || status === "blocked");
+  });
+}
+
+function eventSeq(event: WebEvent): number {
+  return Number.isFinite(event.seq) ? Number(event.seq) : timestampMs(event.timestamp);
+}
+
+function optionalNumber(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
+function optionalText(value: unknown): string | undefined {
+  return typeof value === "string" && value ? value : undefined;
 }
 
 const MAX_ARTIFACT_TEXT_BYTES = 512 * 1024;
@@ -1615,6 +1940,8 @@ async function readArtifactContent(runtimeDirInput: string, artifactRef: string)
     throw new HttpError(404, "artifact_not_found", "Artifact 内容文件已丢失");
   }
   const isImage = stringValue(record.mediaType, "").startsWith("image/");
+  const mediaType = stringValue(record.mediaType, "");
+  const isText = isTextMediaType(mediaType);
   const limit = isImage ? MAX_ARTIFACT_IMAGE_BYTES : MAX_ARTIFACT_TEXT_BYTES;
   const truncated = info.size > limit;
   const buffer = Buffer.alloc(Math.min(info.size, limit));
@@ -1631,9 +1958,14 @@ async function readArtifactContent(runtimeDirInput: string, artifactRef: string)
     mediaType: record.mediaType,
     byteLength: info.size,
     truncated,
-    encoding: isImage ? "base64" : "utf8",
-    content: isImage ? buffer.toString("base64") : buffer.toString("utf8")
+    encoding: isImage || !isText ? "base64" : "utf8",
+    content: isImage || !isText ? buffer.toString("base64") : buffer.toString("utf8")
   };
+}
+
+function isTextMediaType(mediaType: string): boolean {
+  return mediaType.startsWith("text/")
+    || /(?:json|xml|yaml|javascript|typescript|markdown|sql|graphql)/i.test(mediaType);
 }
 
 async function readRuntimeSessions(rootDirInput: string): Promise<JsonRecord> {
@@ -2005,6 +2337,9 @@ function toAgentActionTraceItem(intent: WebEvent, actionEvents: WebEvent[], tool
       ...relatedPayloads.map((payload) => firstRecord(payload.controlSignal)?.reason)
     ]
   });
+  const displayedIntent = role === "planner"
+    ? normalizeReportText(intentPresentation.text)
+    : intentPresentation.text;
   const action = summarizeTraceAction(firstCall) || toolItem?.action;
   const heading = traceActionHeading(role, firstCall);
   const commandDetails = firstCall?.name === "planner_submit"
@@ -2020,6 +2355,8 @@ function toAgentActionTraceItem(intent: WebEvent, actionEvents: WebEvent[], tool
   return {
     id: `trace:action:${intent.id}`,
     eventId: intent.id,
+    seq: lastEvent.seq ?? intent.seq,
+    epochId: firstText(lastEvent.epochId, intent.epochId),
     timestamp: lastEvent.timestamp,
     taskId,
     role,
@@ -2027,7 +2364,7 @@ function toAgentActionTraceItem(intent: WebEvent, actionEvents: WebEvent[], tool
     eventLabel: heading.eventLabel,
     stage: toolItem?.tool?.isError ? "动作失败" : toolItem?.tool?.status === "running" ? "执行中" : "思考与行动",
     title: heading.title,
-    summary: intentPresentation.text,
+    summary: displayedIntent,
     intentSource: intentPresentation.source,
     detail: actionEvents.map((event) => eventTypeLabel(event.role, event.eventType)).join(" → "),
     decision: firstText(callArgs.decision, ...relatedPayloads.map((payload) => firstRecord(payload.plannerDecision)?.decision), ...relatedPayloads.map((payload) => firstRecord(payload.controlSignal)?.decision)),
@@ -2047,7 +2384,7 @@ function toAgentActionTraceItem(intent: WebEvent, actionEvents: WebEvent[], tool
       eventType: "agent_action",
       timestamp: lastEvent.timestamp,
       intentSource: intentPresentation.source,
-      intent: intentPresentation.text,
+      intent: displayedIntent,
       action,
       sourceEvents: actionEvents.map(compactExecutionEvent)
     }
@@ -2105,6 +2442,8 @@ function toToolTraceItem(events: WebEvent[]): TraceItem {
   return {
     id: `trace:tool:${toolCallId}`,
     eventId: toolCallId,
+    seq: lastEvent.seq,
+    epochId: firstText(...sortedEvents.map((event) => event.epochId)),
     timestamp: lastEvent.timestamp,
     taskId,
     role,
@@ -2194,6 +2533,8 @@ function toTraceItem(event: WebEvent): TraceItem {
   return {
     id: `trace:${event.id}`,
     eventId: event.id,
+    seq: event.seq,
+    epochId: event.epochId,
     timestamp: event.timestamp,
     taskId: event.taskId,
     role,
@@ -2539,6 +2880,8 @@ function findLatestControlSignal(events: WebEvent[]): JsonRecord | undefined {
 function compactExecutionEvent(event: WebEvent): JsonRecord {
   return {
     id: event.id,
+    seq: event.seq,
+    epochId: event.epochId,
     taskId: event.taskId,
     role: event.role,
     eventType: event.eventType,

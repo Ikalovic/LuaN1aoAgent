@@ -3,9 +3,11 @@ import { SecurityAgentController } from "./controller.js";
 import { TrafficProxyManager } from "./connectivity/traffic-proxy-manager.js";
 import { TrafficProxyManagerRegistry } from "./connectivity/traffic-proxy-manager-registry.js";
 import {
+  defaultDockerRunner,
   shouldUseDockerSandbox,
   type DockerRunner
 } from "./executor-sandbox-docker.js";
+import { reapStaleManagedDockerResources } from "./docker-resource-reaper.js";
 import {
   executorSandboxModeFromEnv,
   type ExecutorSandboxRequestedMode
@@ -52,6 +54,12 @@ export async function bootstrapAgentRuntime(input: AgentRuntimeBootstrapOptions)
   const requestedMode = input.executorSandboxMode ?? executorSandboxModeFromEnv();
   const dockerBackend = await shouldUseDockerSandbox(requestedMode, input.dockerRunner);
   const executorSandboxMode: ExecutorSandboxRequestedMode = dockerBackend ? "docker" : requestedMode;
+  if (dockerBackend) {
+    await reapStaleManagedDockerResources({
+      roots: [input.cwd, input.runtimeDir],
+      runner: input.dockerRunner ?? defaultDockerRunner
+    });
+  }
   const registry = dockerBackend
     ? undefined
     : input.trafficProxyRegistry ?? createAgentTrafficProxyRegistry();

@@ -3,7 +3,7 @@ export type JsonRecord = Record<string, JsonValue | undefined>;
 
 export type Role = "planner" | "executor" | "observer" | "runtime" | string;
 export type GraphKind = "reasoning" | "operation" | "task";
-export type ViewKey = "trace" | GraphKind | "traffic" | "connections";
+export type ViewKey = "trace" | "reports" | GraphKind | "traffic" | "connections";
 
 export interface AuthUser {
   id: string;
@@ -56,6 +56,8 @@ export interface ToolTrace {
 export interface TraceItem {
   id: string;
   eventId: string;
+  seq?: number;
+  epochId?: string;
   timestamp: string;
   taskId?: string;
   role: Role;
@@ -155,6 +157,65 @@ export interface ArtifactContent {
   content: string;
 }
 
+export interface TaskOutcome {
+  taskRef: string;
+  epochRef: string;
+  objectiveRevision?: number;
+  status: string;
+  summary: string;
+  evidenceRefs: string[];
+  artifactRefs: string[];
+  capabilityRefs: string[];
+  blockerReason?: string;
+  suggestedNextGoal?: string;
+  checkpoint?: JsonRecord;
+  terminalSeq: number;
+  createdAt: string;
+}
+
+export interface EpochOutcome {
+  epochRef: string;
+  taskRef: string;
+  status: string;
+  reason: string;
+  terminalSeq: number;
+  taskOutcomeRef?: string;
+  retryable: boolean;
+  createdAt: string;
+}
+
+export interface RunFinalResult {
+  summary: string;
+  createdAt: string;
+  sourceEventId: string;
+}
+
+export interface FinalReport {
+  taskRef: string;
+  summary: string;
+  createdAt: string;
+  artifactRefs: string[];
+  artifacts: ArtifactRecord[];
+}
+
+export interface PlannerCheckpoint {
+  id: string;
+  index: number;
+  kind: "initial" | "update" | "terminal";
+  startSeq: number;
+  endSeq?: number;
+  startedAt: string;
+  completedAt?: string;
+  status: "completed";
+  reason?: string;
+  inputTaskRefs: string[];
+  createdTaskRefs: string[];
+  updatedTaskRefs: string[];
+  executionTaskRefs: string[];
+  taskRefs: string[];
+  traceItemIds: string[];
+}
+
 export interface RuntimeState {
   runtimeDir: string;
   loadedAt: string;
@@ -174,6 +235,14 @@ export interface RuntimeState {
     latestControlSignal?: JsonRecord;
   };
   traceItems: TraceItem[];
+  reports: {
+    taskOutcomes: TaskOutcome[];
+    epochOutcomes: EpochOutcome[];
+    latestTaskOutcome?: TaskOutcome;
+    finalResult?: RunFinalResult;
+    finalReport?: FinalReport;
+    planningRounds: PlannerCheckpoint[];
+  };
   graph: {
     nodes: GraphNode[];
     edges: GraphEdge[];

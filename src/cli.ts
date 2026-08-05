@@ -4,6 +4,7 @@ import { resolveCliRunContext } from "./cli-runtime.js";
 import { loadLocalEnvFile } from "./llm-config.js";
 import { normalizeScope } from "./scope.js";
 import { parseTransparentProxy } from "./proxy-config.js";
+import { deriveFinalReport } from "./run-report.js";
 import { AgentCliApp } from "./tui/app.js";
 
 try {
@@ -101,12 +102,24 @@ async function run(options: ReturnType<typeof parseCliOptions>): Promise<void> {
       maxParallelTasks: options.maxParallelTasks,
       maxRunTimeMs: options.maxRunTimeMs
     });
+    const finalReport = deriveFinalReport(
+      controller.runtimeStore.listTaskOutcomes(Number.MAX_SAFE_INTEGER),
+      await controller.artifactStore.list()
+    );
+    const displayedResult = finalReport ? { ...result, finalReport } : result;
     if (app) {
-      app.setStatus(receivedSignal ? "interrupting" : "completed", receivedSignal ? "运行已中断" : "运行结果已生成");
+      app.setStatus(
+        receivedSignal ? "interrupting" : "completed",
+        receivedSignal
+          ? "运行已中断"
+          : finalReport
+            ? `最终报告：${finalReport.artifacts[0]?.path ?? finalReport.artifactRefs[0]}`
+            : "运行结果已生成"
+      );
     } else if (options.jsonl) {
-      jsonlResult = result;
+      jsonlResult = displayedResult;
     } else if (!receivedSignal) {
-      console.log(JSON.stringify(result, null, 2));
+      console.log(JSON.stringify(displayedResult, null, 2));
     }
   } catch (error) {
     app?.setStatus("failed", errorMessage(error));

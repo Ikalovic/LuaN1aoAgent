@@ -7,6 +7,7 @@ import test from "node:test";
 import { ensureTrafficProxySocketDir, trafficProxyRuntimeIdentity } from "../src/connectivity/traffic-proxy-runtime.js";
 import { WebAuthService } from "../src/web-auth.js";
 import { hasCapability } from "../src/web-security.js";
+import { RuntimeStore } from "../src/stores/runtime-store.js";
 
 type ControlRequest = {
   version: number;
@@ -125,6 +126,41 @@ test("analyst reaches metadata and sensitive-read GET routes but lacks export an
   assert.equal(body.status, 200);
   const ca = await analystGet("/api/traffic/ca?runtimeDir=runtime-a");
   assert.equal(ca.status, 200);
+});
+
+test("state projects persisted outcomes and accepted Planner decisions as display checkpoints", async () => {
+  const response = await analystGet("/api/state?runtimeDir=runtime-a");
+  assert.equal(response.status, 200);
+  const state = await json(response);
+  assert.equal(state.reports.latestTaskOutcome.taskRef, "task:web-report");
+  assert.equal(state.reports.latestTaskOutcome.summary, "== RESULT ==\nStatus: completed");
+  assert.deepEqual(state.reports.finalResult, {
+    summary: "All report tasks completed\n- verified",
+    createdAt: "2026-08-05T01:00:11.000Z",
+    sourceEventId: "event:planner-final"
+  });
+  assert.deepEqual(state.reports.finalReport, {
+    taskRef: "task:web-report",
+    summary: "== RESULT ==\nStatus: completed",
+    createdAt: "2026-08-05T01:00:09.000Z",
+    artifactRefs: ["artifact:public"],
+    artifacts: [{
+      artifactRef: "artifact:public",
+      kind: "report",
+      path: join(fixture.root, "runtime-a", "artifacts", "public.md"),
+      mediaType: "text/markdown",
+      byteLength: 16
+    }]
+  });
+  assert.deepEqual(state.reports.epochOutcomes.map((item: Record<string, unknown>) => item.status), ["submitted"]);
+  assert.equal(state.events.filter((event: Record<string, unknown>) => event.eventType === "planner_prompt_started").length, 3);
+  assert.equal(state.reports.planningRounds.length, 2);
+  assert.equal(state.reports.planningRounds[0].kind, "initial");
+  assert.deepEqual(state.reports.planningRounds[0].taskRefs, ["task:web-report"]);
+  assert.deepEqual(state.reports.planningRounds[0].createdTaskRefs, ["task:web-report"]);
+  assert.equal(state.reports.planningRounds[0].status, "completed");
+  assert.equal(state.reports.planningRounds[1].kind, "terminal");
+  assert.deepEqual(state.reports.planningRounds[1].inputTaskRefs, ["task:web-report"]);
 });
 
 test("runtime query parameters enforce canonical containment including traversal and symlinks", async () => {
@@ -261,14 +297,124 @@ async function createFixture(): Promise<Fixture & { process: ChildProcess; contr
     mkdir(join(runtimeB, "artifacts"), { recursive: true }),
     writeFile(join(outside, "secret.txt"), "BREAKOUT_SECRET")
   ]);
-  await writeFile(join(runtimeA, "execution.jsonl"), "");
+  await writeFile(join(runtimeA, "execution.jsonl"), [
+    JSON.stringify({
+      id: "event:planner-start",
+      seq: 1,
+      role: "runtime",
+      eventType: "planner_prompt_started",
+      timestamp: "2026-08-05T01:00:00.000Z",
+      payload: { plannerPromptId: "planner:web-report" }
+    }),
+    JSON.stringify({
+      id: "event:planner-apply",
+      seq: 2,
+      role: "planner",
+      eventType: "planner_apply_commands",
+      timestamp: "2026-08-05T01:00:01.000Z",
+      summary: "Create report task",
+      payload: {
+        plannerDecision: {
+          reason: "Create report task",
+          commands: [{ kind: "create_tasks", tasks: [{ id: "task:web-report" }] }]
+        }
+      }
+    }),
+    JSON.stringify({
+      id: "event:planner-complete",
+      seq: 3,
+      role: "runtime",
+      eventType: "planner_prompt_completed",
+      timestamp: "2026-08-05T01:00:02.000Z",
+      payload: { plannerPromptId: "planner:web-report", reason: "Create report task" }
+    }),
+    JSON.stringify({
+      id: "event:planner-retry-start",
+      seq: 4,
+      role: "runtime",
+      eventType: "planner_prompt_started",
+      timestamp: "2026-08-05T01:00:04.000Z",
+      payload: { plannerPromptId: "planner:retry" }
+    }),
+    JSON.stringify({
+      id: "event:planner-retry-failed",
+      seq: 5,
+      role: "runtime",
+      eventType: "planner_prompt_failed",
+      timestamp: "2026-08-05T01:00:05.000Z",
+      summary: "provider retry",
+      payload: { plannerPromptId: "planner:retry", retryable: true }
+    }),
+    JSON.stringify({
+      id: "event:planner-final-start",
+      seq: 6,
+      role: "runtime",
+      eventType: "planner_prompt_started",
+      timestamp: "2026-08-05T01:00:06.000Z",
+      payload: { plannerPromptId: "planner:final" }
+    }),
+    JSON.stringify({
+      id: "event:planner-final-complete",
+      seq: 7,
+      role: "runtime",
+      eventType: "planner_prompt_completed",
+      timestamp: "2026-08-05T01:00:07.000Z",
+      payload: { plannerPromptId: "planner:final", reason: "All report tasks completed" }
+    }),
+    JSON.stringify({
+      id: "event:planner-final",
+      seq: 10,
+      role: "planner",
+      eventType: "planner_apply_commands",
+      timestamp: "2026-08-05T01:00:10.000Z",
+      summary: "All report tasks completed",
+      payload: {
+        plannerDecision: {
+          reason: "All report tasks completed\\n- verified",
+          commands: []
+        }
+      }
+    }),
+    JSON.stringify({
+      id: "event:run-completed",
+      seq: 11,
+      role: "runtime",
+      eventType: "run_completed",
+      timestamp: "2026-08-05T01:00:11.000Z",
+      summary: "Runtime quiescent after Planner decision",
+      payload: { stoppedReason: "All report tasks completed" }
+    })
+  ].join("\n") + "\n");
   await writeFile(join(runtimeA, "graph-deltas.jsonl"), "");
-  await writeFile(join(runtimeA, "artifacts", "public.txt"), "analyst-readable");
+  await writeFile(join(runtimeA, "artifacts", "public.md"), "analyst-readable");
   await writeFile(join(runtimeB, "artifacts", "secret.txt"), "RUNTIME_B_SECRET");
   await writeFile(join(runtimeA, "artifacts", "index.jsonl"), [
-    JSON.stringify({ artifactRef: "artifact:public", path: join(runtimeA, "artifacts", "public.txt"), mediaType: "text/plain", byteLength: 16 }),
+    JSON.stringify({ artifactRef: "artifact:public", kind: "report", path: join(runtimeA, "artifacts", "public.md"), mediaType: "text/markdown", byteLength: 16 }),
     JSON.stringify({ artifactRef: "artifact:cross-runtime", path: join(runtimeB, "artifacts", "secret.txt"), mediaType: "text/plain", byteLength: 16 })
   ].join("\n") + "\n");
+  const runtimeStore = new RuntimeStore(join(runtimeA, "state.sqlite"));
+  runtimeStore.upsertTaskOutcome({
+    taskRef: "task:web-report",
+    epochRef: "epoch:web-report:1",
+    status: "completed",
+    summary: "== RESULT ==\nStatus: completed",
+    evidenceRefs: ["evidence:web-report"],
+    artifactRefs: ["artifact:public"],
+    capabilityRefs: [],
+    terminalSeq: 9,
+    createdAt: "2026-08-05T01:00:09.000Z"
+  });
+  runtimeStore.upsertEpochOutcome({
+    epochRef: "epoch:web-report:1",
+    taskRef: "task:web-report",
+    status: "submitted",
+    reason: "Task result submitted",
+    terminalSeq: 9,
+    taskOutcomeRef: "task:web-report",
+    retryable: false,
+    createdAt: "2026-08-05T01:00:09.000Z"
+  });
+  runtimeStore.close();
   await writeFile(join(runtimeA, "traffic-proxy", "data", "ca", runtimeIdentity.runtimeRef, "ca.crt"), publicCertificate);
   await symlink(outside, join(root, "runtime-a-link"));
 

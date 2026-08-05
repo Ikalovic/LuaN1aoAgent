@@ -70,6 +70,9 @@ test("executor prompt uses bounded experimental method and runtime steering", ()
   assert.match(EXECUTOR_SYSTEM_PROMPT, /必须保持原文、精确字节或可执行状态/);
   assert.match(EXECUTOR_SYSTEM_PROMPT, /TaskOutcome 本身就是结构化结论/);
   assert.match(EXECUTOR_SYSTEM_PROMPT, /artifactRefs 只填写 artifact_write 返回的真实引用/);
+  assert.match(EXECUTOR_SYSTEM_PROMPT, /successCriteria 明确要求最终报告、文档或可下载交付物/);
+  assert.match(EXECUTOR_SYSTEM_PROMPT, /artifact_write\(kind="report"\)/);
+  assert.match(EXECUTOR_SYSTEM_PROMPT, /completed TaskOutcome\.artifactRefs 引用该报告 Artifact/);
   assert.match(EXECUTOR_SYSTEM_PROMPT, /当前工作目录是 Task workspace，跨命令、checkpoint 和同一 Task 的 epoch 持久/);
   assert.match(EXECUTOR_SYSTEM_PROMPT, /Runtime 注入授权 Scope，并在 Docker 模式机械执行网络边界/);
   assert.match(EXECUTOR_SYSTEM_PROMPT, /artifact_read\(\{ref:"artifact:\.\.\.",materialize:true\}\)/);
@@ -143,6 +146,13 @@ test("planner prompt teaches evidence-aware planning without an intermediate con
   assert.match(PLANNER_SYSTEM_PROMPT, /EpochOutcome 只说明执行实例为何结束/);
   assert.match(PLANNER_SYSTEM_PROMPT, /工具事件和 evidenceRefs 已经持久化/);
   assert.match(PLANNER_SYSTEM_PROMPT, /默认由 summary \+ evidenceRefs 满足，不要求 Artifact/);
+  assert.match(PLANNER_SYSTEM_PROMPT, /Root Goal 明确要求“报告”“文档”“可下载文件”或指定文件格式/);
+  assert.match(PLANNER_SYSTEM_PROMPT, /创建一个依赖全部相关结果 Task 的最终报告 Task/);
+  assert.match(PLANNER_SYSTEM_PROMPT, /artifact_write\(kind="report"\)/);
+  assert.match(PLANNER_SYSTEM_PROMPT, /报告 Artifact 产生前不得判定 Root Goal 完成/);
+  assert.match(PLANNER_SYSTEM_PROMPT, /set_node_status 将 goal:root 设置为 completed/);
+  assert.match(PLANNER_SYSTEM_PROMPT, /不得只在 reason 中声明完成/);
+  assert.match(PLANNER_SYSTEM_PROMPT, /Runtime 已无可继续工作时不得提交空 commands/);
   assert.match(PLANNER_SYSTEM_PROMPT, /<example name="continue-current-task">/);
   assert.match(PLANNER_SYSTEM_PROMPT, /<example name="append-same-workstream-objective">/);
   assert.match(PLANNER_SYSTEM_PROMPT, /<example name="new-goal-with-continuous-context">/);

@@ -122,6 +122,7 @@ export function dockerSandboxNames(
 }
 
 export function createDockerRunArgs(input: {
+  runtimeDir?: string;
   containerName: string;
   workspaceDir: string;
   image: string;
@@ -138,6 +139,7 @@ export function createDockerRunArgs(input: {
     "--name", input.containerName,
     "--label", "luanniao.managed=true",
     "--label", "luanniao.role=executor",
+    ...(input.runtimeDir ? ["--label", `luanniao.runtime_dir=${resolve(input.runtimeDir)}`] : []),
     ...(input.runRef ? ["--label", `luanniao.run_ref=${input.runRef}`] : []),
     ...(input.taskRef ? ["--label", `luanniao.task_ref=${input.taskRef}`] : []),
     "--user", "1000:1000",
@@ -257,6 +259,7 @@ export async function createDockerTaskSandbox(input: DockerTaskSandboxInput): Pr
     ...(input.additionalReadRoots ?? [])
   ].filter((candidate) => existsSync(candidate));
   const runArgs = createDockerRunArgs({
+    runtimeDir: input.runtimeDir,
     containerName,
     workspaceDir,
     image,
@@ -629,7 +632,7 @@ export async function createDockerTaskSandbox(input: DockerTaskSandboxInput): Pr
   return sandbox;
 }
 
-async function defaultDockerRunner(
+export async function defaultDockerRunner(
   args: string[],
   options: { timeoutMs?: number; signal?: AbortSignal; onKill?: () => void; onData?: (chunk: Buffer, stream: "stdout" | "stderr") => void } = {}
 ): Promise<DockerExecResult> {

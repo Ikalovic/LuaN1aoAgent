@@ -3280,6 +3280,123 @@ test("repairs an invalid planner submit in the same session and executes the cre
   await controller.close({ drainProjectionJobs: false });
 });
 
+test("repairs an empty Planner terminal decision by explicitly completing the Root Goal", async () => {
+  const harness = createControllerHarness();
+  const plannerSession = createPromptAwareStructuredToolSession("planner_submit", (_prompt, index) => (
+    index === 0
+      ? {
+          commands: [],
+          reason: "All requested work and the final report are complete"
+        }
+      : {
+          commands: [{
+            kind: "set_node_status",
+            nodeId: "goal:root",
+            status: "completed",
+            basedOnRefs: ["goal:root"]
+          }],
+          reason: "Persist the completed Root Goal state"
+        }
+  ));
+  harness.controllerHarness.structuredInvocationsEnabled = true;
+  harness.controllerHarness.createPlannerSessionForCycle = async () => ({
+    session: plannerSession,
+    isolated: true
+  });
+
+  const result = await harness.controller.runOnce({
+    userGoal: "Produce the requested final report",
+    scopeSummary: "Authorized target only"
+  });
+  const events = await harness.controller.executionLog.readAll();
+
+  assert.equal(plannerSession.promptCount(), 2);
+  assert.match(plannerSession.prompts()[1] ?? "", /<previous_decision_rejection>/);
+  assert.match(plannerSession.prompts()[1] ?? "", /goal:root 设置为 completed 或 blocked/);
+  assert.equal(result.plannerDecision.commands?.[0]?.kind, "set_node_status");
+  assert.equal(
+    harness.controller.graphStore.query("task", ["goal:root"], 1).nodes[0]?.properties.status,
+    "completed"
+  );
+  assert.ok(events.some((event) => event.eventType === "planner_decision_rejected"
+    && /Root Goal remains open/.test(event.summary ?? "")));
+  await harness.controller.close({ drainProjectionJobs: false });
+});
+
+test("keeps an empty Planner decision valid while a ready Task can run", async () => {
+  const harness = createControllerHarness();
+  const controllerHarness = harness.controllerHarness as ControllerHarness & {
+    runExecutorTask: (taskEnvelope: TaskEnvelope) => Promise<{
+      taskEnvelope: TaskEnvelope;
+      taskResult: TaskResult;
+      terminalSeq: number;
+      controlSignal: ControlSignal;
+    }>;
+  };
+  await controllerHarness.ensureRootGraph({
+    userGoal: "Run the ready task",
+    scopeSummary: "Authorized target only"
+  });
+  harness.controller.graphStore.createTask({
+    taskId: "task:ready-after-empty-plan",
+    goal: "Complete the ready work",
+    targetRefs: ["goal:root"],
+    scopeRef: "scope:root",
+    constraints: ["authorized target only"],
+    successCriteria: ["ready work completed"],
+    priority: 1
+  });
+  const plannerSession = createStructuredToolSession("planner_submit", {
+    commands: [],
+    reason: "The existing ready Task should run"
+  });
+  controllerHarness.structuredInvocationsEnabled = true;
+  controllerHarness.createPlannerSessionForCycle = async () => ({
+    session: plannerSession,
+    isolated: true
+  });
+  controllerHarness.runExecutorTask = async (taskEnvelope) => {
+    const taskResult: TaskResult = {
+      taskId: taskEnvelope.taskId,
+      status: "completed",
+      summary: "Ready work completed",
+      evidenceRefs: [],
+      artifactRefs: []
+    };
+    harness.controller.graphStore.markTaskStatus({
+      taskId: taskEnvelope.taskId,
+      status: "completed",
+      properties: { resultSummary: taskResult.summary }
+    });
+    return {
+      taskEnvelope,
+      taskResult,
+      terminalSeq: 1,
+      controlSignal: {
+        decision: "continue",
+        reason: taskResult.summary,
+        evidenceRefs: []
+      }
+    };
+  };
+
+  const result = await harness.controller.runOnce({
+    userGoal: "Run the ready task",
+    scopeSummary: "Authorized target only",
+    maxParallelTasks: 1
+  });
+
+  assert.equal(plannerSession.promptCount(), 1);
+  assert.equal(result.taskResult?.status, "completed");
+  assert.equal(result.quiescent, false);
+  assert.equal(
+    (await harness.controller.executionLog.readAll())
+      .some((event) => event.eventType === "planner_decision_rejected"),
+    false
+  );
+  await harness.controller.close({ drainProjectionJobs: false });
+});
+
 test("retries an unrepaired invalid Planner submit with a fresh session", async () => {
   const harness = createControllerHarness();
   await harness.controllerHarness.ensureRootGraph({ userGoal: "Get the flag", scopeSummary: "Authorized target only" });
@@ -5113,6 +5230,23 @@ test("provider failure after execution evidence preserves and resumes the same E
         commands: [],
         reason: "The retryable provider failure left the Task open with remaining turns; continue it without changing the graph.",
         basedOnRefs: ["task:provider-resume"]
+      }),
+      JSON.stringify({
+        decision: "apply_commands",
+        commands: [{
+          kind: "set_task_status",
+          taskId: "task:provider-resume",
+          status: "completed",
+          reason: "Accept the completed resumed Task outcome.",
+          basedOnRefs: ["task:provider-resume"]
+        }, {
+          kind: "set_node_status",
+          nodeId: "goal:root",
+          status: "completed",
+          basedOnRefs: ["task:provider-resume"]
+        }],
+        reason: "The resumed Task recovered the requested artifact and satisfies the Root Goal.",
+        basedOnRefs: ["task:provider-resume"]
       })
     ]),
     executor: createAbortableMockTextSession("{}"),
@@ -5144,6 +5278,11 @@ test("provider failure after execution evidence preserves and resumes the same E
   ));
 
   assert.equal(result.cycles[1]?.taskResult?.status, "completed");
+  assert.equal(result.completed, true);
+  assert.equal(
+    result.stoppedReason,
+    "The resumed Task recovered the requested artifact and satisfies the Root Goal."
+  );
   assert.equal(executorFactoryCount, 2);
   assert.equal(promptCount, 2);
   assert.match(prompts[1] ?? "", /继续执行同一个 Task/);
@@ -5157,7 +5296,7 @@ test("provider failure after execution evidence preserves and resumes the same E
   assert.equal(events.some((event) => event.eventType === "task_failed"
     && event.taskId === "task:provider-resume"), false);
   assert.equal(disposeCount, 2);
-  assert.equal(controller.graphStore.getTaskNode("task:provider-resume")?.properties.status, "open");
+  assert.equal(controller.graphStore.getTaskNode("task:provider-resume")?.properties.status, "completed");
   assert.equal(controller.runtimeStore.getTaskOutcome("task:provider-resume")?.status, "completed");
   await controller.close({ drainProjectionJobs: false, projectionCancelGraceMs: 100 });
 });
@@ -5379,10 +5518,13 @@ test("close keeps stores open when cancelled projector work misses the grace per
     await originalCloseExecutorResources();
   };
 
-  await assert.rejects(
+  const closePromise = assert.rejects(
     harness.controller.close({ drainProjectionJobs: false, projectionCancelGraceMs: 5 }),
     /stores remain open/
   );
+  await waitFor(() => executorResourcesClosed);
+  assert.equal(await harness.controllerHarness.projectorCoordinator.waitForSettled(0), false);
+  await closePromise;
   assert.equal(graphStoreClosed, false);
   assert.equal(executorResourcesClosed, true);
   assert.equal(await harness.controllerHarness.projectorCoordinator.waitForSettled(0), false);
@@ -7105,7 +7247,12 @@ test("Planner repairs active Task mutation while still creating a dependent Task
     }),
     JSON.stringify({
       decision: "apply_commands",
-      commands: [],
+      commands: [{
+        kind: "set_node_status",
+        nodeId: "goal:root",
+        status: "completed",
+        basedOnRefs: ["task:after-slow"]
+      }],
       reason: "All admitted tasks are settled.",
       basedOnRefs: ["task:after-slow"]
     })
@@ -7149,7 +7296,8 @@ test("Planner repairs active Task mutation while still creating a dependent Task
   const result = await runPromise;
   const events = await controller.executionLog.readAll();
 
-  assert.match(result.stoppedReason, /Runtime quiescent after Planner decision/);
+  assert.equal(result.completed, true);
+  assert.equal(result.stoppedReason, "All admitted tasks are settled.");
   assert.equal(plannerSession.promptCount(), 6);
   assert.equal(controller.graphStore.getTaskNode("task:slow-owned")?.properties.status, "completed");
   assert.equal(controller.graphStore.getTaskNode("task:after-slow")?.properties.status, "completed");
@@ -7245,7 +7393,12 @@ test("Planner exhausting active Task mutation repairs keeps active Executors run
     }),
     JSON.stringify({
       decision: "apply_commands",
-      commands: [],
+      commands: [{
+        kind: "set_node_status",
+        nodeId: "goal:root",
+        status: "completed",
+        basedOnRefs: ["task:slow-owned"]
+      }],
       reason: "All admitted tasks are settled.",
       basedOnRefs: ["task:slow-owned"]
     })
@@ -7290,7 +7443,8 @@ test("Planner exhausting active Task mutation repairs keeps active Executors run
   const result = await runPromise;
   const events = await controller.executionLog.readAll();
 
-  assert.match(result.stoppedReason, /Runtime quiescent after Planner decision/);
+  assert.equal(result.completed, true);
+  assert.equal(result.stoppedReason, "All admitted tasks are settled.");
   assert.equal(plannerSession.promptCount(), 6);
   assert.equal(controller.graphStore.getTaskNode("task:slow-owned")?.properties.status, "completed");
   assert.equal(controller.runtimeStore.getTaskOutcome("task:slow-owned")?.status, "completed");
@@ -7355,7 +7509,7 @@ test("empty apply_commands schedules existing open tasks", async () => {
   controller.close();
 });
 
-test("empty Planner decision becomes quiescent after completed work instead of cycling", async () => {
+test("empty Planner terminal decision is repaired into explicit Root Goal completion", async () => {
   const runtimeDir = mkdtempSync(join(tmpdir(), "luanniao-controller-"));
   const controller = createControllerWithTestLlmEnv(runtimeDir);
   const controllerHarness = controller as unknown as ControllerHarness;
@@ -7370,12 +7524,25 @@ test("empty Planner decision becomes quiescent after completed work instead of c
     budget: { maxTurns: 1 },
     priority: 1
   }]);
-  const plannerSession = createMockTextSession(JSON.stringify({
-    decision: "apply_commands",
-    commands: [],
-    reason: "No graph change",
-    basedOnRefs: ["task:completed-awaiting-planner"]
-  }));
+  const plannerSession = createMockTextSessionSequence([
+    JSON.stringify({
+      decision: "apply_commands",
+      commands: [],
+      reason: "No graph change",
+      basedOnRefs: ["task:completed-awaiting-planner"]
+    }),
+    JSON.stringify({
+      decision: "apply_commands",
+      commands: [{
+        kind: "set_node_status",
+        nodeId: "goal:root",
+        status: "completed",
+        basedOnRefs: ["task:completed-awaiting-planner"]
+      }],
+      reason: "The bounded task satisfies the Root Goal.",
+      basedOnRefs: ["task:completed-awaiting-planner"]
+    })
+  ]);
   controllerHarness.agents = {
     planner: plannerSession,
     executor: createAbortableMockTextSession(JSON.stringify({
@@ -7395,11 +7562,46 @@ test("empty Planner decision becomes quiescent after completed work instead of c
     maxParallelTasks: 1
   });
 
-  assert.match(result.stoppedReason, /Runtime quiescent after Planner decision/);
+  assert.equal(result.completed, true);
+  assert.equal(result.stoppedReason, "The bounded task satisfies the Root Goal.");
   assert.equal(result.cycles.length, 1);
-  assert.equal(plannerSession.promptCount(), 1);
-  assert.equal((await controller.executionLog.readAll())
-    .filter((event) => event.eventType === "planner_cycle_deferred").length, 0);
+  assert.equal(plannerSession.promptCount(), 2);
+  const events = await controller.executionLog.readAll();
+  assert.equal(events.filter((event) => event.eventType === "planner_cycle_deferred").length, 0);
+  assert.equal(events.filter((event) => event.eventType === "planner_decision_rejected").length, 1);
+  await controller.close({ drainProjectionJobs: false });
+});
+
+test("does not defer retry after an incomplete Planner terminal decision exhausts repair", async () => {
+  const runtimeDir = mkdtempSync(join(tmpdir(), "luanniao-controller-"));
+  const controller = createControllerWithTestLlmEnv(runtimeDir);
+  const controllerHarness = controller as unknown as ControllerHarness;
+  const plannerSession = createMockTextSession(JSON.stringify({
+    decision: "apply_commands",
+    commands: [],
+    reason: "Finished",
+    basedOnRefs: ["goal:root"]
+  }));
+  controllerHarness.agents = {
+    planner: plannerSession,
+    executor: createAbortableMockTextSession("{}"),
+    observer: createMockTextSession(observerProjectionJson())
+  };
+
+  await assert.rejects(
+    controller.runUntilDone({
+      userGoal: "Require an explicit terminal state",
+      scopeSummary: "Authorized target only",
+      maxPlannerCycles: 1
+    }),
+    /Planner decision repair exhausted: Root Goal remains open/
+  );
+
+  const events = await controller.executionLog.readAll();
+  assert.equal(plannerSession.promptCount(), 2);
+  assert.equal(events.filter((event) => event.eventType === "planner_cycle_deferred").length, 0);
+  assert.equal(events.filter((event) => event.eventType === "planner_decision_rejected").length, 2);
+  assert.equal(events.filter((event) => event.eventType === "run_failed").length, 1);
   await controller.close({ drainProjectionJobs: false });
 });
 
@@ -7452,6 +7654,16 @@ test("progressing Planner cycles are not stopped by the no-progress limit", asyn
       commands: [],
       reason: "Wait for admitted tasks to settle",
       basedOnRefs: ["task:fast-drain", "task:slow-drain"]
+    }), JSON.stringify({
+      decision: "apply_commands",
+      commands: [{
+        kind: "set_node_status",
+        nodeId: "goal:root",
+        status: "completed",
+        basedOnRefs: ["task:fast-drain", "task:slow-drain"]
+      }],
+      reason: "Both admitted branches satisfy the Root Goal.",
+      basedOnRefs: ["task:fast-drain", "task:slow-drain"]
     })]),
     executor: createAbortableMockTextSession("{}"),
     observer: createAbortableMockTextSession(observerProjectionJson())
@@ -7495,8 +7707,8 @@ test("progressing Planner cycles are not stopped by the no-progress limit", asyn
   });
   clearTimeout(releaseTimer);
 
-  assert.equal(result.completed, false);
-  assert.match(result.stoppedReason, /Runtime quiescent after Planner decision/);
+  assert.equal(result.completed, true);
+  assert.equal(result.stoppedReason, "Both admitted branches satisfy the Root Goal.");
   assert.ok(result.cycles.length > 1);
   assert.equal(slowSettled, true);
   assert.equal(controllerHarness.activeTaskRuns.size, 0);
@@ -7573,7 +7785,12 @@ test("runUntilDone continues planning after task graph command cycles", async ()
       }),
       JSON.stringify({
         decision: "apply_commands",
-        commands: [],
+        commands: [{
+          kind: "set_node_status",
+          nodeId: "goal:root",
+          status: "completed",
+          basedOnRefs: ["task:second-wave"]
+        }],
         reason: "No further graph change after the second checkpoint.",
         basedOnRefs: ["task:second-wave"]
       })
@@ -7593,8 +7810,8 @@ test("runUntilDone continues planning after task graph command cycles", async ()
     maxPlannerCycles: 2
   });
 
-  assert.equal(result.completed, false);
-  assert.match(result.stoppedReason, /Runtime quiescent after Planner decision/);
+  assert.equal(result.completed, true);
+  assert.equal(result.stoppedReason, "No further graph change after the second checkpoint.");
   assert.equal(result.cycles.length, 4);
   assert.equal(result.cycles[0].plannerDecision.decision, undefined);
   assert.equal(result.cycles[1].plannerDecision.decision, undefined);
@@ -7611,8 +7828,8 @@ test("runUntilDone continues planning after task graph command cycles", async ()
   assert.ok(auditEvents.some((event) => event.eventType === "run_result_decided"));
   const runCompleted = auditEvents.find((event) => event.eventType === "run_completed");
   assert.ok(runCompleted);
-  assert.equal(runCompleted.payload.completed, false);
-  assert.match(String(runCompleted.payload.stoppedReason), /Runtime quiescent after Planner decision/);
+  assert.equal(runCompleted.payload.completed, true);
+  assert.equal(runCompleted.payload.stoppedReason, "No further graph change after the second checkpoint.");
 });
 
 function createControllerHarness(): {

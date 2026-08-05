@@ -141,6 +141,15 @@ class PlannerDecisionRepairExhaustedError extends Error {
   }
 }
 
+class IncompletePlannerTerminalDecisionError extends GraphValidationError {
+  constructor() {
+    super(
+      "Root Goal remains open, but Planner submitted no commands and the runtime has no active, pending, or runnable Task work"
+    );
+    this.name = "IncompletePlannerTerminalDecisionError";
+  }
+}
+
 export const DEFAULT_TASK_BUDGET: Required<TaskBudget> = {
   maxTurns: 12
 };
@@ -717,13 +726,16 @@ export class SecurityAgentController {
           invocation.versionSnapshot
         );
         releasedTaskIds = await this.releasePlannerWaitingTasks(plannerDecision, plannerVisibleWaitingTaskIds);
+        this.assertPlannerIdleDecisionCanContinue(plannerDecision, releasedTaskIds);
         break;
       } catch (error) {
         if (!(error instanceof GraphValidationError)) {
           throw error;
         }
         const repairAttemptsExhausted = decisionAttempt >= PLANNER_DECISION_REPAIR_ATTEMPTS;
-        repairFeedback = error instanceof PlannerDecisionConflict
+        repairFeedback = error instanceof IncompletePlannerTerminalDecisionError
+          ? "上一版 Planner 决策留下了不明确终态：Root Goal 仍为 open，commands 为空，并且当前没有 active、pending 或 runnable Task。请明确选择一种结果：用 set_node_status 将 goal:root 设置为 completed 或 blocked；或者创建、恢复能继续推进 Root Goal 的 Task。不得只在 reason 中声明目标已经完成。"
+          : error instanceof PlannerDecisionConflict
           ? `上一版 Planner 决策因任务版本冲突被拒绝：${error.message}。请基于刷新后的任务状态重新规划。`
           : `上一版 Planner 决策未修改任务图，因图语义校验失败被拒绝：${error.message}。请修正命令；若新证据来自当前 Task 的后继 Task，不要反转依赖，应创建同时依赖相关前驱的新后继 Task。`;
         await this.executionLog.append({
@@ -1020,9 +1032,9 @@ export class SecurityAgentController {
       void session.abort();
     }
     await Promise.allSettled(executorTerminations);
-    await this.projectorCoordinator.close({ drain: false });
     await Promise.allSettled([...this.activeTaskRuns.values()].map((run) => run.promise));
     await this.closeExecutorResources();
+    await this.projectorCoordinator.close({ drain: false });
   }
 
   private async finalizeRunMetrics(): Promise<void> {
@@ -1147,6 +1159,7 @@ export class SecurityAgentController {
       this.finishTaskExecution(state.taskEnvelope.taskId, "shutdown");
     }
     await Promise.allSettled([...(this.networkFinalizations?.values() ?? [])]);
+    await this.closeExecutorResources();
     for (const pending of [...this.pendingSupervisorRequests.values()]) {
       void this.discardSupervisorCheck(
         pending.request,
@@ -1196,7 +1209,6 @@ export class SecurityAgentController {
       });
     }
     const projectorSettled = await this.projectorCoordinator.waitForSettled(0);
-    await this.closeExecutorResources();
     if (!projectorSettled) {
       await this.executionLog.drain();
       throw new Error(
@@ -1809,6 +1821,38 @@ export class SecurityAgentController {
     return executions;
   }
 
+  private assertPlannerIdleDecisionCanContinue(
+    plannerDecision: PlannerDecision,
+    releasedTaskIds: string[]
+  ): void {
+    if (!this.isRootGoalStatus("open")
+      || (plannerDecision.commands?.length ?? 0) > 0
+      || releasedTaskIds.length > 0
+      || this.activeTaskRuns.size > 0
+      || this.taskCompletionQueue.length > 0
+      || this.listRunnableTaskCandidates().length > 0) {
+      return;
+    }
+    throw new IncompletePlannerTerminalDecisionError();
+  }
+
+  private listRunnableTaskCandidates(): TaskEnvelope[] {
+    const statusByTaskId = new Map(
+      this.graphStore.plannerDecisionView().taskLedger
+        .map((task) => [task.taskId, task.status])
+    );
+    return this.graphStore
+      .listOpenTasks(Number.MAX_SAFE_INTEGER)
+      .filter((task) => deriveTaskDefinitionReadiness(
+        task.dependsOnTaskRefs,
+        statusByTaskId
+      ).blockedByTaskRefs.length === 0)
+      .filter((task) => this.runtimeStore.getTaskConsumedTurns(task.taskId)
+        < normalizeTaskBudget(task.budget).maxTurns)
+      .filter((task) => !this.activeTaskRuns.has(task.taskId))
+      .filter((task) => !this.awaitingPlannerTaskIds.has(task.taskId));
+  }
+
   private async drainReadyTaskGraph(input: {
     maxParallelTasks: number;
     deadlineAt: number;
@@ -1860,20 +1904,7 @@ export class SecurityAgentController {
       if (capacity === 0 || this.stopRequestedReason || this.invocationAbortController.signal.aborted) {
         return;
       }
-      const statusByTaskId = new Map(
-        this.graphStore.plannerDecisionView().taskLedger
-          .map((task) => [task.taskId, task.status])
-      );
-      const candidates = this.graphStore
-        .listOpenTasks(Number.MAX_SAFE_INTEGER)
-        .filter((task) => deriveTaskDefinitionReadiness(
-          task.dependsOnTaskRefs,
-          statusByTaskId
-        ).blockedByTaskRefs.length === 0)
-        .filter((task) => this.runtimeStore.getTaskConsumedTurns(task.taskId)
-          < normalizeTaskBudget(task.budget).maxTurns)
-        .filter((task) => !this.activeTaskRuns.has(task.taskId))
-        .filter((task) => !this.awaitingPlannerTaskIds.has(task.taskId));
+      const candidates = this.listRunnableTaskCandidates();
       const occupiedSessionRefs = new Set(
         [...this.activeTaskRuns.values()].flatMap((run) => run.taskEnvelope.availableSessionRefs ?? [])
       );
@@ -4870,7 +4901,7 @@ export class SecurityAgentController {
         "先形成本次 TaskOutcome 的 summary 和 evidenceRefs。若提交 partial 且同一 Task 仍可继续，workspace 已跨 epoch 持久，不得仅因 checkpoint 提升文件。",
         "只有 Task 将结束或真实跨 Task 交接，并且结果仍依赖无法由持久 evidenceRefs 重建、必须保持原文、精确字节或可执行状态的现有文件时，才用 artifact_write 提升缺失的最小材料。不要逐项归档普通响应；不得创建、修改、检查或搜索文件。"
       ] : []),
-      "TaskOutcome 本身就是结构化结论，不要为结论临时虚构或创建总结文件。已有材料归档完成后调用一次 task_result_submit，并根据任务成功条件如实选择 completed、partial、blocked 或 failed。",
+      "TaskOutcome 本身就是结构化结论，不要为结论临时虚构或创建总结文件；但若当前 Task successCriteria 明确要求报告交付物，必须引用已经存在并以 kind=report 持久化的报告 Artifact。已有材料归档完成后调用一次 task_result_submit，并根据任务成功条件如实选择 completed、partial、blocked 或 failed。",
       "summary 写明本次已经验证的能力、最新失效条件和仍未解决的问题；",
       "evidenceRefs 和 artifactRefs 只填写本会话中真实存在的引用；",
       "不要继续探索，也不要输出自由文本 JSON。"
@@ -5792,7 +5823,9 @@ export function classifyPlannerProviderFailure(error: unknown): RetryableProvide
 }
 
 function isRetryablePlannerInvocationError(error: unknown): boolean {
-  if (error instanceof PlannerDecisionRepairExhaustedError) return true;
+  if (error instanceof PlannerDecisionRepairExhaustedError) {
+    return !(error.cause instanceof IncompletePlannerTerminalDecisionError);
+  }
   return classifyPlannerProviderFailure(error).retryable;
 }
 

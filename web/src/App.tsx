@@ -4,6 +4,7 @@ import { Activity, ChevronDown, Database, FileBox, LogOut, Menu, PanelRight, Pla
 import { stopRun } from "./api";
 import { Inspector } from "./components/Inspector";
 import { ConnectionsView } from "./components/ConnectionsView";
+import { ArtifactsView } from "./components/ArtifactsView";
 import { ResizableWorkspace } from "./components/ResizableWorkspace";
 import { Sidebar } from "./components/Sidebar";
 import { StartRunModal } from "./components/StartRunModal";
@@ -53,7 +54,7 @@ export default function App({ user, onLogout }: { user: AuthUser; onLogout: () =
   }, [data?.traceItems, selectedTraceId]);
 
   useEffect(() => {
-    if (activeView === "trace" || activeView === "traffic" || activeView === "connections") setSelectedNodeId(undefined);
+    if (activeView === "trace" || activeView === "reports" || activeView === "traffic" || activeView === "connections") setSelectedNodeId(undefined);
     if (activeView !== "traffic") {
       setSelectedExchangeId(undefined);
       setSelectedExchange(undefined);
@@ -149,6 +150,11 @@ export default function App({ user, onLogout }: { user: AuthUser; onLogout: () =
       <Typography.Title level={5}>{t("app.connectionsInspectorTitle")}</Typography.Title>
       <p>{t("app.connectionsInspectorDescription")}</p>
     </div>
+  ) : activeView === "reports" ? (
+    <div className="connections-inspector">
+      <Typography.Title level={5}>{locale === "zh-CN" ? "产物与报告" : "Artifacts & reports"}</Typography.Title>
+      <p>{locale === "zh-CN" ? "TaskOutcome 是任务的最新结构化结论；EpochOutcome 保留每次执行轮次结果；独立文件仅在 Artifact 列表中出现。" : "TaskOutcome is the latest structured task conclusion; EpochOutcome preserves each execution result; standalone files appear only in Artifacts."}</p>
+    </div>
   ) : (
     <Inspector
       view={activeView}
@@ -162,7 +168,7 @@ export default function App({ user, onLogout }: { user: AuthUser; onLogout: () =
     />
   );
 
-  const viewEyebrow = activeView === "trace" ? "LIVE TRACE" : activeView === "traffic" ? "WEB TRAFFIC" : activeView === "connections" ? "CONNECTIVITY" : "TRI-GRAPH";
+  const viewEyebrow = activeView === "trace" ? "LIVE TRACE" : activeView === "reports" ? "RUN OUTPUT" : activeView === "traffic" ? "WEB TRAFFIC" : activeView === "connections" ? "CONNECTIVITY" : "TRI-GRAPH";
 
   return (
     <>
@@ -264,9 +270,24 @@ export default function App({ user, onLogout }: { user: AuthUser; onLogout: () =
                 />
               ) : dashboard.loading && !data ? <Skeleton active paragraph={{ rows: 10 }} /> : initializing ? (
                 <RunInitializing goal={dataMatchesDir ? data?.overview.goal?.label : undefined} />
+              ) : activeView === "reports" ? (
+                <ArtifactsView
+                  runtimeDir={runtimeDir}
+                  artifacts={data?.artifacts.records || []}
+                  taskOutcomes={data?.reports?.taskOutcomes || []}
+                  epochOutcomes={data?.reports?.epochOutcomes || []}
+                  latestTaskOutcome={data?.reports?.latestTaskOutcome}
+                  finalResult={data?.reports?.finalResult}
+                  finalReport={data?.reports?.finalReport}
+                  tasks={data?.overview.tasks.items || []}
+                />
               ) : activeView === "trace" ? (
                 <TraceView
                   items={data?.traceItems || []}
+                  planningCheckpoints={data?.reports?.planningRounds || []}
+                  taskOutcomes={data?.reports?.taskOutcomes || []}
+                  epochOutcomes={data?.reports?.epochOutcomes || []}
+                  tasks={data?.overview.tasks.items || []}
                   selectedTraceId={selectedTraceId}
                   roleFilter={roleFilter}
                   newestFirst={newestFirst}
@@ -332,6 +353,7 @@ type Translate = (key: TranslationKey, variables?: Record<string, string | numbe
 
 function viewTitle(view: ViewKey, locale: Locale, t: Translate): string {
   if (view === "trace") return t("app.traceTitle");
+  if (view === "reports") return locale === "zh-CN" ? "产物与报告" : "Artifacts & Reports";
   if (view === "traffic") return "Web Traffic";
   if (view === "connections") return "Connections";
   return graphLabel(view, locale);
@@ -339,6 +361,7 @@ function viewTitle(view: ViewKey, locale: Locale, t: Translate): string {
 
 function viewStageTitle(view: ViewKey, locale: Locale, t: Translate): string {
   if (view === "trace") return t("app.traceStageTitle");
+  if (view === "reports") return locale === "zh-CN" ? "查看任务结论、最终结果与运行产物" : "Review task conclusions, final results, and run artifacts";
   if (view === "traffic") return t("app.trafficStageTitle");
   if (view === "connections") return t("app.connectionsStageTitle");
   return graphLabel(view, locale);
@@ -346,6 +369,7 @@ function viewStageTitle(view: ViewKey, locale: Locale, t: Translate): string {
 
 function viewStageSubtitle(view: ViewKey, t: Translate): string {
   if (view === "trace") return t("app.traceStageSubtitle");
+  if (view === "reports") return "TaskOutcome / EpochOutcome / Artifact";
   if (view === "traffic") return t("app.trafficStageSubtitle");
   if (view === "connections") return t("app.connectionsStageSubtitle");
   if (view === "reasoning") return t("graph.reasoningSubtitle");
@@ -357,7 +381,7 @@ function readInitialState(): { runtimeDir: string; view: ViewKey } {
   const params = new URLSearchParams(window.location.search);
   const runtimeDir = params.get("runtimeDir") || localStorage.getItem("luanniao-runtime-dir") || DEFAULT_RUNTIME;
   const candidate = params.get("view");
-  const view = candidate && ["trace", "reasoning", "operation", "task", "traffic", "connections"].includes(candidate) ? candidate as ViewKey : "trace";
+  const view = candidate && ["trace", "reports", "reasoning", "operation", "task", "traffic", "connections"].includes(candidate) ? candidate as ViewKey : "trace";
   return { runtimeDir, view };
 }
 

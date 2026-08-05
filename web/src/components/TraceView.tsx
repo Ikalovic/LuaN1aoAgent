@@ -1,12 +1,17 @@
+import { useState } from "react";
 import { Alert, Button, Collapse, Empty, Segmented, Tag, Typography } from "antd";
-import { ArrowDownUp, BrainCircuit, CheckCircle2, Clock3, PlayCircle, TerminalSquare, XCircle } from "lucide-react";
+import { Activity, ArrowDownUp, BrainCircuit, Check, CheckCircle2, ChevronDown, Clock3, ListChecks, ListTree, LoaderCircle, PlayCircle, Rows3, TerminalSquare, XCircle } from "lucide-react";
 import { Virtuoso } from "react-virtuoso";
 import { useLanguage, type Locale } from "../language";
-import type { Role, TraceItem } from "../types";
+import type { EpochOutcome, PlannerCheckpoint, Role, TaskOutcome, TaskSummary, TraceItem } from "../types";
 import { formatRelative, formatTime, roleLabel, shortRef } from "../utils";
 
 interface TraceViewProps {
   items: TraceItem[];
+  planningCheckpoints: PlannerCheckpoint[];
+  taskOutcomes: TaskOutcome[];
+  epochOutcomes: EpochOutcome[];
+  tasks: TaskSummary[];
   selectedTraceId?: string;
   roleFilter: string;
   newestFirst: boolean;
@@ -17,6 +22,7 @@ interface TraceViewProps {
 
 export function TraceView(props: TraceViewProps) {
   const { t } = useLanguage();
+  const [mode, setMode] = useState<"plan" | "timeline">("plan");
   const roleOptions = [
     { label: t("trace.all"), value: "all" },
     { label: "Planner", value: "planner" },
@@ -34,13 +40,28 @@ export function TraceView(props: TraceViewProps) {
   return (
     <div className="trace-view">
       <div className="trace-toolbar">
-        <Segmented options={roleOptions} value={props.roleFilter} onChange={(value) => props.onRoleFilterChange(String(value))} />
-        <Button icon={<ArrowDownUp size={16} />} onClick={props.onOrderChange}>
-          {t(props.newestFirst ? "trace.newestFirst" : "trace.chronological")}
-        </Button>
+        <Segmented
+          value={mode}
+          onChange={(value) => setMode(value as "plan" | "timeline")}
+          options={[
+            { value: "plan", label: "规划视图", icon: <ListTree size={15} /> },
+            { value: "timeline", label: "时间线", icon: <Rows3 size={15} /> }
+          ]}
+        />
+        <div className="trace-toolbar-actions">
+          <Segmented options={roleOptions} value={props.roleFilter} onChange={(value) => props.onRoleFilterChange(String(value))} />
+          {mode === "timeline" ? <Button icon={<ArrowDownUp size={16} />} onClick={props.onOrderChange}>
+            {t(props.newestFirst ? "trace.newestFirst" : "trace.chronological")}
+          </Button> : null}
+        </div>
       </div>
       <div className="trace-list-wrap">
-        {filtered.length ? (
+        {mode === "plan" ? (
+          <PlanningTrace
+            {...props}
+            filtered={filtered}
+          />
+        ) : filtered.length ? (
           <Virtuoso
             data={filtered}
             increaseViewportBy={500}
@@ -55,6 +76,293 @@ export function TraceView(props: TraceViewProps) {
         ) : <Empty description={t("trace.empty")} />}
       </div>
     </div>
+  );
+}
+
+function PlanningTrace(props: TraceViewProps & { filtered: TraceItem[] }) {
+  const { locale } = useLanguage();
+  const zh = locale === "zh-CN";
+  const [selectedCheckpointId, setSelectedCheckpointId] = useState<string | null>(null);
+  if (!props.planningCheckpoints.length) {
+    return <Empty description={zh ? "Planner 尚未提交可展示的决策，可切换到时间线查看当前活动。" : "Planner has not submitted a decision yet; switch to Timeline to inspect current activity."} />;
+  }
+  const visibleIds = new Set(props.filtered.map((item) => item.id));
+  const itemMap = new Map(props.items.map((item) => [item.id, item]));
+  const taskMap = new Map(props.tasks.map((task) => [task.id, task]));
+  const outcomeMap = new Map(props.taskOutcomes.map((outcome) => [outcome.taskRef, outcome]));
+  const selectedCheckpoint = props.planningCheckpoints.find((checkpoint) => checkpoint.id === selectedCheckpointId)
+    || props.planningCheckpoints[props.planningCheckpoints.length - 1];
+  const checkpointItems = selectedCheckpoint.traceItemIds.flatMap((id) => {
+    const item = itemMap.get(id);
+    return item && visibleIds.has(id) ? [item] : [];
+  });
+  const taskRefs = selectedCheckpoint.taskRefs.filter((taskRef) => (
+    props.roleFilter === "all"
+    || checkpointItems.some((item) => item.taskId === taskRef)
+  ));
+  const title = checkpointTitle(selectedCheckpoint, zh);
+  const selectedCheckpointPosition = props.planningCheckpoints.findIndex((checkpoint) => checkpoint.id === selectedCheckpoint.id);
+
+  return (
+    <div className="planning-workbench">
+      <nav className="planning-decision-index" aria-label={zh ? "Planner 决策索引" : "Planner decision index"}>
+        <header>
+          <div>
+            <span>{zh ? "Planner 日志" : "Planner journal"}</span>
+            <strong>{zh ? "决策索引" : "Decision index"}</strong>
+          </div>
+          <b>{props.planningCheckpoints.length}</b>
+        </header>
+        <div className="planning-decision-index-list">
+        {props.planningCheckpoints.map((checkpoint, index) => {
+          const selected = checkpoint.id === selectedCheckpoint.id;
+          return (
+            <button
+              type="button"
+              className={`planning-decision-index-item${selected ? " selected" : ""}`}
+              key={checkpoint.id}
+              onClick={() => setSelectedCheckpointId(checkpoint.id)}
+              aria-pressed={selected}
+            >
+              <span className="planning-decision-marker">
+                <i>{String(checkpoint.index).padStart(2, "0")}</i>
+                {index < props.planningCheckpoints.length - 1 ? <b aria-hidden /> : null}
+              </span>
+              <span className="planning-decision-index-copy">
+                <span>
+                  <em>{checkpointKindLabel(checkpoint.kind, zh)}</em>
+                  <time>{formatTime(checkpoint.startedAt)}</time>
+                </span>
+                <strong>{checkpointTitle(checkpoint, zh)}</strong>
+                <small>{checkpoint.reason || (zh ? "任务图状态检查" : "Task graph state check")}</small>
+                <span className="planning-decision-delta">
+                  {checkpoint.inputTaskRefs.length ? <i>{zh ? `输入 ${checkpoint.inputTaskRefs.length}` : `${checkpoint.inputTaskRefs.length} inputs`}</i> : null}
+                  {checkpoint.createdTaskRefs.length ? <i>{zh ? `新建 ${checkpoint.createdTaskRefs.length}` : `${checkpoint.createdTaskRefs.length} created`}</i> : null}
+                  {checkpoint.updatedTaskRefs.length ? <i>{zh ? `更新 ${checkpoint.updatedTaskRefs.length}` : `${checkpoint.updatedTaskRefs.length} updated`}</i> : null}
+                </span>
+              </span>
+            </button>
+          );
+        })}
+        </div>
+      </nav>
+
+      <section className="planning-decision-canvas">
+        <header className="planning-decision-hero">
+          <div className="planning-decision-hero-copy">
+            <span className="planning-decision-eyebrow">
+              {zh ? `Planner 检查点 ${selectedCheckpointPosition + 1} / ${props.planningCheckpoints.length}` : `Planner checkpoint ${selectedCheckpointPosition + 1} / ${props.planningCheckpoints.length}`}
+            </span>
+            <div>
+              <span className="planning-decision-seal">{String(selectedCheckpoint.index).padStart(2, "0")}</span>
+              <div>
+                <h2>{title}</h2>
+                <p>{selectedCheckpoint.reason || (zh ? "Planner 已完成本次任务图状态检查。" : "Planner completed this task-graph state check.")}</p>
+              </div>
+            </div>
+          </div>
+          <div className="planning-decision-hero-meta">
+            <Tag color={selectedCheckpoint.kind === "terminal" ? "success" : "blue"}>
+              {checkpointKindLabel(selectedCheckpoint.kind, zh)}
+            </Tag>
+            <span>
+              <time>{formatTime(selectedCheckpoint.startedAt)}</time>
+              <small>{selectedCheckpoint.status}</small>
+            </span>
+          </div>
+        </header>
+
+        <div className="planning-decision-facts">
+          <DecisionMetric label={zh ? "结果输入" : "Outcome inputs"} value={selectedCheckpoint.inputTaskRefs.length} />
+          <DecisionMetric label={zh ? "新建任务" : "Created"} value={selectedCheckpoint.createdTaskRefs.length} />
+          <DecisionMetric label={zh ? "状态更新" : "Updated"} value={selectedCheckpoint.updatedTaskRefs.length} />
+          <DecisionMetric label={zh ? "活跃任务" : "Active tasks"} value={selectedCheckpoint.executionTaskRefs.length} />
+        </div>
+
+        <div className="planning-decision-body">
+          <div className="planning-tasks-pane">
+            <section className="planning-input-note">
+              <span>{zh ? "本次决策依据" : "Decision inputs"}</span>
+              {selectedCheckpoint.inputTaskRefs.length ? (
+                <div>
+                  {selectedCheckpoint.inputTaskRefs.map((taskRef) => (
+                    <span key={taskRef}>
+                      <b>{taskMap.get(taskRef)?.label || shortRef(taskRef, 36)}</b>
+                      <small>{checkpointOutcome(outcomeMap.get(taskRef), selectedCheckpoint)?.summary || (zh ? "该任务结果被本次 Planner 决策消费" : "This task result was consumed by the Planner decision")}</small>
+                    </span>
+                  ))}
+                </div>
+              ) : (
+                <p>{selectedCheckpoint.kind === "initial"
+                  ? (zh ? "首次规划，没有前序 TaskOutcome；依据 Root Goal 与 Scope 创建入口任务。" : "Initial planning has no prior TaskOutcome; entry tasks are derived from the Root Goal and Scope.")
+                  : (zh ? "没有新增 TaskOutcome 输入；Planner 基于当前任务图与运行状态完成本次检查。" : "No new TaskOutcome was consumed; Planner checked the current task graph and runtime state.")}</p>
+              )}
+            </section>
+
+            <header className="planning-section-heading">
+              <div>
+                <ListChecks size={14} />
+                <span>
+                  <strong>{zh ? "任务状态" : "Task state"}</strong>
+                  <small>{zh ? "本次决策涉及的任务及其最新结论" : "Tasks touched by this decision and their latest outcomes"}</small>
+                </span>
+              </div>
+              <b>{taskRefs.length}</b>
+            </header>
+            <div className="planning-task-list">
+              {taskRefs.length ? taskRefs.map((taskRef) => (
+                <PlanningTaskRow
+                  key={taskRef}
+                  taskRef={taskRef}
+                  label={taskMap.get(taskRef)?.label}
+                  contextLabels={taskContextLabels(selectedCheckpoint, taskRef, zh)}
+                  outcome={checkpointOutcome(outcomeMap.get(taskRef), selectedCheckpoint)}
+                  epochs={props.epochOutcomes
+                    .filter((item) => item.taskRef === taskRef && (selectedCheckpoint.endSeq === undefined || item.terminalSeq <= selectedCheckpoint.endSeq))
+                    .sort((a, b) => a.terminalSeq - b.terminalSeq)}
+                  zh={zh}
+                />
+              )) : (
+                <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description={zh ? "该决策没有匹配当前筛选条件的任务" : "No tasks in this decision match the current filter"} />
+              )}
+            </div>
+          </div>
+
+          <aside className="planning-activity-pane">
+            <header className="planning-section-heading">
+              <div>
+                <Activity size={14} />
+                <span>
+                  <strong>{zh ? "执行流" : "Execution stream"}</strong>
+                  <small>{zh ? "决策提交后的 Agent 活动" : "Agent activity after this decision"}</small>
+                </span>
+              </div>
+              <b>{checkpointItems.length}</b>
+            </header>
+            <div className="planning-activity-list">
+              {checkpointItems.length ? [...checkpointItems].reverse().map((item, index, items) => (
+                <button
+                  type="button"
+                  className={`planning-activity-item role-${roleToken(item.role)}${item.id === props.selectedTraceId ? " selected" : ""}`}
+                  key={item.id}
+                  onClick={() => props.onSelectTrace(item.id)}
+                >
+                  <span className="planning-activity-track">
+                    <i />
+                    {index < items.length - 1 ? <b /> : null}
+                  </span>
+                  <span className="planning-activity-copy">
+                    <span><time>{formatTime(item.timestamp)}</time><em>{roleLabel(item.role)} · {item.stage}</em></span>
+                    <strong>{localizeTracePresentation(item.title, locale)}</strong>
+                    <small>{localizeTracePresentation(item.summary, locale) || item.eventLabel}</small>
+                  </span>
+                </button>
+              )) : (
+                <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description={zh ? "该筛选条件下无活动记录" : "No activity for this filter"} />
+              )}
+            </div>
+          </aside>
+        </div>
+      </section>
+    </div>
+  );
+}
+
+function DecisionMetric({ label, value }: { label: string; value: number }) {
+  return <span><small>{label}</small><b>{String(value).padStart(2, "0")}</b></span>;
+}
+
+function checkpointTitle(checkpoint: PlannerCheckpoint, zh: boolean): string {
+  if (checkpoint.kind === "initial") return zh ? "初始规划" : "Initial plan";
+  if (checkpoint.kind === "terminal") return zh ? "最终决策" : "Final decision";
+  return zh ? `决策 ${checkpoint.index}` : `Decision ${checkpoint.index}`;
+}
+
+function checkpointKindLabel(kind: PlannerCheckpoint["kind"], zh: boolean): string {
+  if (kind === "initial") return zh ? "初始" : "initial";
+  if (kind === "terminal") return zh ? "终态" : "terminal";
+  return zh ? "更新" : "update";
+}
+
+function checkpointOutcome(outcome: TaskOutcome | undefined, checkpoint: PlannerCheckpoint): TaskOutcome | undefined {
+  if (!outcome) return undefined;
+  return checkpoint.endSeq === undefined || outcome.terminalSeq <= checkpoint.endSeq ? outcome : undefined;
+}
+
+function taskContextLabels(checkpoint: PlannerCheckpoint, taskRef: string, zh: boolean): string[] {
+  return [
+    checkpoint.inputTaskRefs.includes(taskRef) ? (zh ? "结果输入" : "outcome input") : undefined,
+    checkpoint.createdTaskRefs.includes(taskRef) ? (zh ? "新建" : "created") : undefined,
+    checkpoint.updatedTaskRefs.includes(taskRef) ? (zh ? "状态更新" : "updated") : undefined,
+    checkpoint.executionTaskRefs.includes(taskRef) ? (zh ? "活跃任务" : "active task") : undefined
+  ].filter((label): label is string => Boolean(label));
+}
+
+function PlanningTaskRow({
+  taskRef,
+  label,
+  contextLabels,
+  outcome,
+  epochs,
+  zh
+}: {
+  taskRef: string;
+  label?: string;
+  contextLabels: string[];
+  outcome?: TaskOutcome;
+  epochs: EpochOutcome[];
+  zh: boolean;
+}) {
+  const [expanded, setExpanded] = useState(!outcome);
+  const hasDetails = Boolean(outcome || epochs.length);
+  const completed = outcome?.status === "completed";
+  return (
+    <article className={`planning-task-row${expanded ? " expanded" : ""}`}>
+      <button
+        type="button"
+        className="planning-task-summary"
+        disabled={!hasDetails}
+        onClick={() => hasDetails && setExpanded((value) => !value)}
+        aria-expanded={expanded}
+      >
+        <span className={`planning-task-status${completed ? " completed" : outcome ? " ended" : " running"}`}>
+          {completed ? <Check size={14} /> : outcome ? <span>!</span> : <LoaderCircle size={14} />}
+        </span>
+        <span className="planning-task-copy">
+          <span>
+            <strong>{label || shortRef(taskRef, 48)}</strong>
+            {contextLabels.map((context) => <Tag className="planning-context-tag" key={context}>{context}</Tag>)}
+            <Tag color={completed ? "success" : outcome?.status === "partial" ? "processing" : outcome ? "warning" : "default"}>
+              {outcome?.status || (zh ? "执行中" : "in progress")}
+            </Tag>
+          </span>
+          <small>{outcome?.summary || (zh ? "等待 TaskOutcome" : "Waiting for TaskOutcome")}</small>
+        </span>
+        {hasDetails ? <ChevronDown className="planning-task-chevron" size={14} /> : null}
+      </button>
+      {expanded && hasDetails ? (
+        <div className="planning-task-details">
+          <section>
+            <span>{outcome ? "TaskOutcome" : (zh ? "当前状态" : "Current status")}</span>
+            <p>{outcome?.summary || (zh ? "任务仍在执行，终态结论尚未提交。" : "The task is still running; no terminal outcome has been submitted.")}</p>
+          </section>
+          {epochs.length ? (
+            <section className="planning-attempts">
+              <span>{zh ? "执行尝试" : "Execution attempts"}</span>
+              <div>
+                {epochs.map((epoch, index) => (
+                  <div key={epoch.epochRef}>
+                    <b>{zh ? `第 ${index + 1} 次` : `Attempt ${index + 1}`}</b>
+                    <em>{epoch.status}</em>
+                    <small>{epoch.reason}</small>
+                  </div>
+                ))}
+              </div>
+            </section>
+          ) : null}
+        </div>
+      ) : null}
+    </article>
   );
 }
 

@@ -16,3 +16,4 @@ AGENTS.md
 .playwright-cli/
 output/
 benchmarks/
+.runtime/

@@ -458,6 +458,8 @@ function extensionForKind(kind: ArtifactRecord["kind"]): string {
       return "png";
     case "poc":
       return "txt";
+    case "report":
+      return "md";
     default:
       return "txt";
   }

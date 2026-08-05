@@ -78,6 +78,7 @@ function stateFixture(runtimeDir: string): RuntimeState {
       agents: {}
     },
     traceItems: [],
+    reports: { taskOutcomes: [], epochOutcomes: [], planningRounds: [] },
     graph: { nodes: [], edges: [], source: "sqlite", summary: {} },
     events: [],
     artifacts: { records: [], summary: { count: 0, totalBytes: 0 } }

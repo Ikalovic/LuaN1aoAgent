@@ -278,6 +278,7 @@ async function startIndex(
     const started = await runner([
       "run", "-d", "--name", containerName,
       "--label", "luanniao.managed=true", "--label", "luanniao.role=history-index", "--label", `luanniao.config=${configDigest}`,
+      "--label", `luanniao.runtime_dir=${resolve(runtimeDir)}`,
       "--read-only", "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
       "--pids-limit", "128", "--memory", "512m",
       "--publish", "127.0.0.1::8788",

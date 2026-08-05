@@ -370,7 +370,7 @@ export type ProjectionClaim = {
 export type ArtifactRecord = {
   artifactRef: string;
   taskId?: string;
-  kind: "http_body" | "screenshot" | "stdout" | "stderr" | "poc" | "json" | "text" | "credential" | "other";
+  kind: "http_body" | "screenshot" | "stdout" | "stderr" | "poc" | "json" | "text" | "report" | "credential" | "other";
   mediaType: string;
   path: string;
   byteLength: number;

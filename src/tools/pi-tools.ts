@@ -1188,6 +1188,7 @@ export function createArtifactWriteTool(
       Type.Literal("poc"),
       Type.Literal("json"),
       Type.Literal("text"),
+      Type.Literal("report"),
       Type.Literal("other")
     ]),
     mediaType: Type.String(),
@@ -1197,7 +1198,7 @@ export function createArtifactWriteTool(
   return defineTool({
     name: "artifact_write",
     label: "Artifact Write",
-    description: "Promote the minimum existing file whose exact content is required across the Task boundary from the persistent workspace into Artifact storage. Same-Task epoch resume and reconstructible persisted evidence do not require promotion; temporary files under /tmp are not a durable handoff boundary.",
+    description: "Promote the minimum existing file whose exact content is required across the Task boundary from the persistent workspace into Artifact storage. Use kind=report only for a Root Goal explicitly requiring a report, document, or downloadable deliverable. Same-Task epoch resume and reconstructible persisted evidence do not require promotion; temporary files under /tmp are not a durable handoff boundary.",
     parameters,
     execute: async (_toolCallId, params) => {
       const record: ArtifactRecord = options.readExecutorFile
