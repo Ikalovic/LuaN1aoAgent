@@ -37,6 +37,7 @@ export class HostEgressBroker {
           port: address.port,
           token: this.token.toString("hex")
         };
+        this.log(`listening on 0.0.0.0:${address.port}`);
         server.unref();
         resolve(this.endpoint);
       });
@@ -62,8 +63,12 @@ export class HostEgressBroker {
 
   private accept(client: Socket): void {
     this.trackSocket(client);
+    const peer = `${client.remoteAddress ?? "unknown"}:${client.remotePort ?? 0}`;
     let pending = Buffer.alloc(0);
-    client.setTimeout(BROKER_HANDSHAKE_TIMEOUT_MS, () => client.destroy());
+    client.setTimeout(BROKER_HANDSHAKE_TIMEOUT_MS, () => {
+      this.log(`handshake from ${peer} timed out; destroying connection`);
+      client.destroy();
+    });
     const onData = (chunk: Buffer) => {
       pending = Buffer.concat([pending, chunk]);
       if (pending.length < BROKER_REQUEST_BYTES) return;
@@ -71,6 +76,7 @@ export class HostEgressBroker {
       if (pending.length !== BROKER_REQUEST_BYTES
         || !pending.subarray(0, BROKER_MAGIC.length).equals(BROKER_MAGIC)
         || !timingSafeEqual(pending.subarray(BROKER_MAGIC.length, BROKER_MAGIC.length + 32), this.token)) {
+        this.log(`rejected handshake from ${peer}: bad magic or token`);
         client.destroy();
         return;
       }
@@ -78,6 +84,7 @@ export class HostEgressBroker {
       const host = [...pending.subarray(offset, offset + 4)].join(".");
       const port = pending.readUInt16BE(offset + 4);
       if (!isIPv4(host) || port === 0 || deniedHostTarget(host)) {
+        this.log(`denied target ${host}:${port} requested by ${peer}`);
         client.end(Buffer.from([1]));
         return;
       }
@@ -92,7 +99,10 @@ export class HostEgressBroker {
     this.trackSocket(upstream);
     let connected = false;
     upstream.setTimeout(BROKER_CONNECT_TIMEOUT_MS, () => {
-      if (!connected) client.end(Buffer.from([2]));
+      if (!connected) {
+        this.log(`connect to ${host}:${port} timed out after ${BROKER_CONNECT_TIMEOUT_MS}ms`);
+        client.end(Buffer.from([2]));
+      }
       upstream.destroy();
     });
     upstream.once("connect", () => {
@@ -103,18 +113,29 @@ export class HostEgressBroker {
       client.pipe(upstream);
       upstream.pipe(client);
     });
-    upstream.once("error", () => {
-      if (!connected) client.end(Buffer.from([1]));
-      else client.destroy();
+    upstream.once("error", (error: Error) => {
+      if (!connected) {
+        this.log(`connect to ${host}:${port} failed: ${error.message}`);
+        client.end(Buffer.from([1]));
+      } else client.destroy();
     });
     client.once("close", () => upstream.destroy());
     upstream.connect({ host, port });
+  }
+
+  private log(message: string): void {
+    if (!luanniaoDebugEnabled()) return;
+    console.error(`[host-egress-broker] ${message}`);
   }
 
   private trackSocket(socket: Socket): void {
     this.sockets.add(socket);
     socket.once("close", () => this.sockets.delete(socket));
   }
+}
+
+export function luanniaoDebugEnabled(): boolean {
+  return /^(1|true|yes)$/i.test(process.env.LUANNIAO_DEBUG ?? "");
 }
 
 function deniedHostTarget(host: string): boolean {

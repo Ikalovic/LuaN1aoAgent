@@ -51,6 +51,7 @@ func main() {
 	caKey := flag.String("ca-key", "/traffic/ca/luanniao-ca-key.pem", "private MITM CA key")
 	runRef := flag.String("run-ref", "", "run reference attached to captured flows")
 	taskRef := flag.String("task-ref", "", "task reference attached to captured flows")
+	debug := flag.Bool("debug", false, "log dial failures and other diagnostics")
 	flag.Parse()
 
 	if *tunName == "" || *readyFile == "" || *directBroker == "" || *directBrokerToken == "" {
@@ -137,6 +138,7 @@ func main() {
 	gateway := &protocolGateway{
 		dialer: routeDialer, authority: authority, capture: capture,
 		runRef: *runRef, taskRef: *taskRef, bodyLimit: int(bodyLimit), replayContextPath: replayContextPath,
+		debug: *debug,
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()

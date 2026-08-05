@@ -2,7 +2,7 @@ import { spawn } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
 import { chmod, mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
-import { HostEgressBroker, type HostEgressBrokerEndpoint } from "./host-egress-broker.js";
+import { HostEgressBroker, luanniaoDebugEnabled, type HostEgressBrokerEndpoint } from "./host-egress-broker.js";
 import { normalizeScope, parseAuthorizedScope } from "../scope.js";
 
 export const DEFAULT_NETWORK_IMAGE = "luanniao-network:latest";
@@ -397,6 +397,8 @@ export class NetworkSandboxManager {
       "--sysctl", "net.ipv6.conf.default.disable_ipv6=1",
       "--sysctl", "net.netfilter.nf_conntrack_acct=1",
       "--sysctl", "net.ipv4.ip_forward=1",
+      "--sysctl", "net.ipv4.conf.all.rp_filter=0",
+      "--sysctl", "net.ipv4.conf.default.rp_filter=0",
       "--read-only", "--cap-drop", "ALL",
       "--cap-add", "NET_ADMIN", "--cap-add", "SETUID", "--cap-add", "SETGID",
       "--group-add", "101",
@@ -418,6 +420,7 @@ export class NetworkSandboxManager {
       "--env", `LUANNIAO_DIRECT_BROKER=${hostEgress.host}:${hostEgress.port}`,
       "--env", `LUANNIAO_DIRECT_BROKER_TOKEN=${hostEgress.token}`,
       "--env", `LUANNIAO_LOCAL_DIRECT_DENY_PORTS=${protectedHostPorts.join(",")}`,
+      ...(luanniaoDebugEnabled() ? ["--env", "LUANNIAO_DEBUG=1"] : []),
       ...this.captureEnvironment,
       this.image, "gateway"
     ];
@@ -837,6 +840,7 @@ export class NetworkSandboxManager {
       "network", "create", "--driver", "bridge",
       "--label", "luanniao.managed=true", "--label", "luanniao.role=run-network",
       "--label", `luanniao.run_ref=${this.runRef}`,
+      "--label", `luanniao.runtime_dir=${this.runtimeDir}`,
       this.networkName
     ]);
     if (created.code !== 0) throw new Error(`Failed to create network ${this.networkName}: ${created.stderr}`);
@@ -866,6 +870,7 @@ export class NetworkSandboxManager {
       "--label", "luanniao.managed=true", "--label", "luanniao.role=task-network",
       "--label", `luanniao.run_ref=${this.runRef}`,
       "--label", `luanniao.task_ref=${taskId}`,
+      "--label", `luanniao.runtime_dir=${this.runtimeDir}`,
       name
     ]);
     if (created.code !== 0) throw new Error(`Failed to create task network ${name}: ${created.stderr}`);
@@ -1061,6 +1066,7 @@ export class NetworkSandboxManager {
       "--label", `luanniao.role=${role}`,
       "--label", `luanniao.config=${configDigest}`,
       "--label", `luanniao.run_ref=${identity.runRef}`,
+      "--label", `luanniao.runtime_dir=${this.runtimeDir}`,
       ...(identity.taskRef ? ["--label", `luanniao.task_ref=${identity.taskRef}`] : []),
       ...args
     ]);

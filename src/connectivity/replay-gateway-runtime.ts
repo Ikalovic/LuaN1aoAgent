@@ -184,6 +184,8 @@ export class ReplayGatewayRuntime {
       "--sysctl", "net.ipv6.conf.all.disable_ipv6=1",
       "--sysctl", "net.ipv6.conf.default.disable_ipv6=1",
       "--sysctl", "net.netfilter.nf_conntrack_acct=1",
+      "--sysctl", "net.ipv4.conf.all.rp_filter=0",
+      "--sysctl", "net.ipv4.conf.default.rp_filter=0",
       "--read-only", "--cap-drop", "ALL",
       "--cap-add", "NET_ADMIN", "--cap-add", "SETUID", "--cap-add", "SETGID",
       "--cap-add", "CHOWN", "--cap-add", "FOWNER", "--cap-add", "SETPCAP",
@@ -222,6 +224,7 @@ export class ReplayGatewayRuntime {
         "run", "-d", "--name", this.containerName,
         "--label", "luanniao.managed=true", "--label", "luanniao.role=replay-gateway",
         "--label", `luanniao.config=${configDigest}`,
+        "--label", `luanniao.runtime_dir=${this.runtimeDir}`,
         ...containerArgs
       ]);
       if (started.code !== 0) throw new Error(`Failed to start replay gateway: ${started.stderr}`);
@@ -251,6 +254,7 @@ export class ReplayGatewayRuntime {
       "network", "create", "--internal",
       "--label", "luanniao.managed=true",
       "--label", "luanniao.role=replay-task-network",
+      "--label", `luanniao.runtime_dir=${this.runtimeDir}`,
       this.taskNetworkName
     ]);
     if (created.code !== 0) throw new Error(`Failed to create replay task network: ${created.stderr || created.stdout}`);

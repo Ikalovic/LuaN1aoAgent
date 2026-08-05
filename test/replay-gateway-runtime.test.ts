@@ -109,6 +109,8 @@ test("replay gateway sends HTTP through uid 1000 and captures replay metadata in
   const gatewayRun = commands.find((entry) => entry.args[0] === "run" && entry.args.includes("--name"))?.args ?? [];
   assert.ok(gatewayRun.includes("/dev/net/tun:/dev/net/tun"));
   assert.ok(gatewayRun.includes("net.netfilter.nf_conntrack_acct=1"));
+  assert.ok(gatewayRun.includes("net.ipv4.conf.all.rp_filter=0"));
+  assert.ok(gatewayRun.includes("net.ipv4.conf.default.rp_filter=0"));
   for (const capability of ["NET_ADMIN", "SETUID", "SETGID", "CHOWN", "FOWNER", "SETPCAP"]) {
     const capabilityIndex = gatewayRun.indexOf(capability);
     assert.ok(capabilityIndex > 0);

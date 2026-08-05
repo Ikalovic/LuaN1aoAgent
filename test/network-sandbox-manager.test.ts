@@ -225,6 +225,8 @@ test("network sandbox gives only the gateway network capability and reconciles l
     assert.ok(gatewayRun.includes("SETGID"));
     assert.ok(gatewayRun.includes("/dev/net/tun:/dev/net/tun"));
     assert.ok(gatewayRun.includes("net.netfilter.nf_conntrack_acct=1"));
+    assert.ok(gatewayRun.includes("net.ipv4.conf.all.rp_filter=0"));
+    assert.ok(gatewayRun.includes("net.ipv4.conf.default.rp_filter=0"));
     assert.equal(connector.includes("/dev/net/tun:/dev/net/tun"), false);
     assert.equal(index.includes("/dev/net/tun:/dev/net/tun"), false);
     assert.ok(gatewayRun.includes("net.ipv6.conf.all.disable_ipv6=1"));

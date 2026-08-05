@@ -46,6 +46,7 @@ type protocolGateway struct {
 	taskRef           string
 	bodyLimit         int
 	replayContextPath string
+	debug             bool
 	sequence          atomic.Uint64
 }
 
@@ -86,7 +87,11 @@ func (gateway *protocolGateway) handleTCP(ctx context.Context, request *tcp.Forw
 	destination := net.JoinHostPort(endpointID.LocalAddress.String(), fmt.Sprint(endpointID.LocalPort))
 	upstream, err := gateway.dial(ctx, destination)
 	if err != nil {
-		request.Complete(shouldResetTCP(err))
+		reset := shouldResetTCP(err)
+		if gateway.debug {
+			log.Printf("gateway dial %s failed (reset=%v): %v", destination, reset, err)
+		}
+		request.Complete(reset)
 		return
 	}
 	if gateway.replayContextPath != "" {

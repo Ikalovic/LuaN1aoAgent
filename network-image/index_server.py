@@ -373,6 +373,8 @@ def gateway_tun_command() -> list[str]:
     ]
     if _authorized_domains():
         command.append("--allow-domain-resolved")
+    if os.environ.get("LUANNIAO_DEBUG", "").lower() in ("1", "true", "yes"):
+        command.append("--debug")
     return command
 
 

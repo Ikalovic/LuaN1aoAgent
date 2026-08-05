@@ -42,6 +42,59 @@ test("host egress broker rejects invalid authentication", async (context) => {
   assert.equal(result.code, -1);
 });
 
+test("host egress broker logs rejections without leaking the token in debug mode", async (context) => {
+  const broker = new HostEgressBroker();
+  const endpoint = await broker.start();
+  context.after(() => broker.close());
+  const previousDebug = process.env.LUANNIAO_DEBUG;
+  process.env.LUANNIAO_DEBUG = "1";
+  context.after(() => {
+    if (previousDebug === undefined) delete process.env.LUANNIAO_DEBUG;
+    else process.env.LUANNIAO_DEBUG = previousDebug;
+  });
+  const messages: string[] = [];
+  const originalError = console.error;
+  console.error = (...args: unknown[]) => { messages.push(args.map(String).join(" ")); };
+  context.after(() => { console.error = originalError; });
+
+  const rejected = await brokerDial("127.0.0.1", endpoint.port, "00".repeat(32), "1.1.1.1", 80);
+  assert.equal(rejected.code, -1);
+  const denied = await brokerDial("127.0.0.1", endpoint.port, endpoint.token, "127.0.0.1", 80);
+  assert.equal(denied.code, 1);
+
+  assert.ok(
+    messages.some((message) => message.includes("bad magic or token")),
+    `missing handshake rejection log: ${messages}`
+  );
+  assert.ok(
+    messages.some((message) => message.includes("denied target 127.0.0.1:80")),
+    `missing denied target log: ${messages}`
+  );
+  assert.ok(
+    messages.every((message) => !message.includes(endpoint.token)),
+    "logs must never contain the broker token"
+  );
+});
+
+test("host egress broker stays silent when debug mode is off", async (context) => {
+  const broker = new HostEgressBroker();
+  const endpoint = await broker.start();
+  context.after(() => broker.close());
+  const previousDebug = process.env.LUANNIAO_DEBUG;
+  delete process.env.LUANNIAO_DEBUG;
+  context.after(() => {
+    if (previousDebug !== undefined) process.env.LUANNIAO_DEBUG = previousDebug;
+  });
+  const messages: string[] = [];
+  const originalError = console.error;
+  console.error = (...args: unknown[]) => { messages.push(args.map(String).join(" ")); };
+  context.after(() => { console.error = originalError; });
+
+  const rejected = await brokerDial("127.0.0.1", endpoint.port, "00".repeat(32), "1.1.1.1", 80);
+  assert.equal(rejected.code, -1);
+  assert.deepEqual(messages, []);
+});
+
 test("host egress broker close terminates established relay connections", async (context) => {
   const interfaceAddress = Object.values(networkInterfaces()).flat()
     .find((value) => value?.family === "IPv4" && !value.internal)?.address;
