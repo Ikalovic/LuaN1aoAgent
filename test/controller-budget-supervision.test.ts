@@ -1028,7 +1028,7 @@ test("completed checkpoint result with unresolved lifecycle fields is normalized
   await harness.controller.close({ drainProjectionJobs: false });
 });
 
-test("checkpoint finalization keeps artifact_write available for multiple existing files", async () => {
+test("checkpoint finalization keeps artifact_write available for selected handoff files", async () => {
   const harness = createControllerHarness();
   const workspaceDir = mkdtempSync(join(tmpdir(), "luanniao-checkpoint-workspace-"));
   writeFileSync(join(workspaceDir, "poc.py"), "print('verified')\n");
@@ -1066,10 +1066,52 @@ test("checkpoint finalization keeps artifact_write available for multiple existi
     ["artifact_write", "task_result_submit"],
     ["bash", "read", "artifact_write", "task_result_submit"]
   ]);
-  assert.match(finalizerSession.prompts()[0] ?? "", /可连续归档多个文件/);
+  assert.match(finalizerSession.prompts()[0] ?? "", /提升缺失的最小材料/);
+  assert.match(finalizerSession.prompts()[0] ?? "", /不得仅因 checkpoint 提升文件/);
   assert.match(finalizerSession.prompts()[0] ?? "", /poc\.py/);
   assert.match(finalizerSession.prompts()[0] ?? "", /evidence\.json/);
   assert.match(finalizerSession.prompts()[0] ?? "", /不要为结论临时虚构或创建总结文件/);
+  harness.controllerHarness.finishTaskExecution(taskEnvelope.taskId, "budget_exhausted");
+  await harness.controller.close({ drainProjectionJobs: false });
+});
+
+test("partial checkpoint may keep workspace files without promoting artifacts", async () => {
+  const harness = createControllerHarness();
+  const workspaceDir = mkdtempSync(join(tmpdir(), "luanniao-checkpoint-workspace-"));
+  writeFileSync(join(workspaceDir, "working-response.html"), "<html>working</html>\n");
+  harness.controllerHarness.executorSandbox = { workspaceDir };
+  const taskEnvelope = makeTaskEnvelope();
+  const state = harness.controllerHarness.beginTaskExecution(taskEnvelope);
+  state.executorStopRequested = true;
+  state.abortContext = {
+    kind: "budget_abort",
+    reason: "Epoch slice reached",
+    controlSignal: { decision: "handoff", reason: "Epoch slice reached", evidenceRefs: [] }
+  };
+  const finalizerSession = createCheckpointSubmissionSession({
+    taskId: taskEnvelope.taskId,
+    status: "partial",
+    summary: "The same Task can continue from its persistent workspace.",
+    evidenceRefs: [],
+    artifactRefs: []
+  });
+
+  const semanticResult = await harness.controllerHarness.collectBudgetCheckpointTaskResult({
+    taskEnvelope,
+    state,
+    executorSession: {
+      session: finalizerSession,
+      dynamicExecutor: true,
+      resumed: false,
+      resumeCount: 0
+    }
+  });
+
+  assert.equal(semanticResult?.status, "partial");
+  assert.deepEqual(semanticResult?.artifactRefs, []);
+  assert.match(finalizerSession.prompts()[0] ?? "", /workspace 已跨 epoch 持久/);
+  assert.match(finalizerSession.prompts()[0] ?? "", /不得仅因 checkpoint 提升文件/);
+  assert.deepEqual(finalizerSession.getActiveToolNames(), ["bash", "read", "artifact_write", "task_result_submit"]);
   harness.controllerHarness.finishTaskExecution(taskEnvelope.taskId, "budget_exhausted");
   await harness.controller.close({ drainProjectionJobs: false });
 });
@@ -5658,6 +5700,17 @@ test("planner commands update explicit task and milestone without ending root go
       { from: "task:recon", to: "milestone:recon", type: "produces_milestone" }
     ]
   });
+  controller.runtimeStore.upsertTaskOutcome({
+    taskRef: "task:recon",
+    epochRef: "epoch:recon-completed",
+    status: "completed",
+    summary: "Recon success criteria are complete",
+    evidenceRefs: [],
+    artifactRefs: [],
+    capabilityRefs: [],
+    terminalSeq: 1,
+    createdAt: new Date(0).toISOString()
+  });
   const controllerHarness = controller as unknown as ControllerHarness;
   controllerHarness.agents = {
     planner: createMockTextSessionSequence([
@@ -5769,6 +5822,17 @@ test("planner commands patch explicit task and continue scheduling", async () =>
         type: "produces_milestone"
       }
     ]
+  });
+  controller.runtimeStore.upsertTaskOutcome({
+    taskRef: "task:26ca066d-bbf7-40f6-9e82-897cd8f72367",
+    epochRef: "epoch:recon-completed",
+    status: "completed",
+    summary: "Recon success criteria are complete",
+    evidenceRefs: [],
+    artifactRefs: [],
+    capabilityRefs: [],
+    terminalSeq: 1,
+    createdAt: new Date(0).toISOString()
   });
   const controllerHarness = controller as unknown as ControllerHarness;
   controllerHarness.agents = {
@@ -6309,7 +6373,7 @@ test("same partial task resumes without a redundant open status write", async ()
   assert.match(prompts[1] ?? "", /<execution_brief>[\s\S]*Confirmed arbitrary file read/);
   assert.match(prompts[1] ?? "", /The confirmed primitive has not yet been applied to \/challenge\/flag\.txt/);
   assert.match(prompts[1] ?? "", /taskAllocation: 0\/16; remaining: 16/);
-  assert.match(prompts[1] ?? "", /epochSlice: 0\/12; remaining: 12/);
+  assert.match(prompts[1] ?? "", /epochSlice: 0\/16; remaining: 16/);
   assert.equal(executorDisposeCount, 2);
   const firstPartialIndex = events.findIndex((event) => event.eventType === "task_partial" && event.taskId === "task:primary");
   const resumeDecisionIndex = events.findIndex((event) => event.eventType === "planner_task_patched"
@@ -6709,6 +6773,17 @@ test("planner command targets ignore basedOnRefs and reason task mentions", asyn
   ]);
   controller.graphStore.markTaskStatus({ taskId: "task:intended", status: "partial" });
   controller.graphStore.markTaskStatus({ taskId: "task:referenced-only", status: "partial" });
+  controller.runtimeStore.upsertTaskOutcome({
+    taskRef: "task:intended",
+    epochRef: "epoch:intended-completed",
+    status: "completed",
+    summary: "The intended Task is complete",
+    evidenceRefs: [],
+    artifactRefs: [],
+    capabilityRefs: [],
+    terminalSeq: 1,
+    createdAt: new Date(0).toISOString()
+  });
   const controllerHarness = controller as unknown as ControllerHarness;
   const cleanedTaskIds: string[] = [];
   controller.runtimeStore.upsertExecutorSession({ taskId: "task:intended", sessionFile: "/tmp/task-intended.jsonl" });
@@ -6786,8 +6861,7 @@ test("wakes Planner on the first completion while independent work and dependenc
             successCriteria: ["A done"],
             budget: { maxTurns: 1 },
             priority: 1,
-            parentTaskId: "goal:root",
-            parallelGroup: "recon"
+            parentTaskId: "goal:root"
           },
           {
             id: "task:recon-b",
@@ -6798,8 +6872,7 @@ test("wakes Planner on the first completion while independent work and dependenc
             successCriteria: ["B done"],
             budget: { maxTurns: 1 },
             priority: 1,
-            parentTaskId: "goal:root",
-            parallelGroup: "recon"
+            parentTaskId: "goal:root"
           },
           {
             id: "task:exploit",

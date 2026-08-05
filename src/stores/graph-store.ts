@@ -19,6 +19,7 @@ import type {
   PlannerTaskPatch,
   TaskBudget,
   TaskEnvelope,
+  TaskGoalAddition,
   TaskGraphStatus,
   TaskResult
 } from "../types.js";
@@ -52,8 +53,9 @@ export type TaskCreateInput = {
   scopeRef: string;
   constraints: string[];
   successCriteria: string[];
+  goalAdditions?: TaskGoalAddition[];
   dependsOnTaskRefs?: string[];
-  parallelGroup?: string;
+  continueFromTaskRef?: string;
   budget?: TaskBudget;
   priority: number;
 };
@@ -892,6 +894,7 @@ export class SQLiteGraphStore {
           throw new GraphValidationError(`Dependency task ${dependencyTaskId} does not exist`);
         }
       }
+      assertTaskContextContinuation(input, dependencyTaskIds, newTaskIds);
       dependencyOverrides.set(input.taskId, dependencyTaskIds);
     }
     this.assertDependencyGraphAcyclic(dependencyOverrides);
@@ -903,13 +906,15 @@ export class SQLiteGraphStore {
       properties: {
         status: "open",
         version: 1,
+        objectiveRevision: 1,
         targetRefs: input.targetRefs,
         basisRefs: input.basisRefs,
         scopeRef: input.scopeRef,
         constraints: input.constraints,
         successCriteria: input.successCriteria,
+        goalAdditions: input.goalAdditions,
         parentTaskId: input.parentTaskId,
-        parallelGroup: input.parallelGroup,
+        continueFromTaskRef: input.continueFromTaskRef,
         budget: input.budget,
         priority: input.priority
       }
@@ -997,6 +1002,14 @@ export class SQLiteGraphStore {
         if (!availableTaskIds.has(dependencyTaskId)) {
           throw new GraphValidationError(`Dependency task ${dependencyTaskId} does not exist`);
         }
+      }
+      const createdTask = commands.flatMap((command) =>
+        command.kind === "create_tasks" ? command.tasks : []).find((task) => task.id === taskId);
+      if (createdTask) {
+        assertTaskContextContinuation({
+          taskId: createdTask.id,
+          continueFromTaskRef: createdTask.continueFromTaskRef
+        }, dependencies, newTaskIds);
       }
     }
     this.assertDependencyGraphAcyclic(dependencyOverrides);
@@ -1098,13 +1111,15 @@ export class SQLiteGraphStore {
       properties: {
         status: "open",
         version: 1,
+        objectiveRevision: 1,
         targetRefs: task.targetRefs,
         basisRefs: task.basisRefs,
         scopeRef: task.scopeRef,
         constraints: task.constraints,
         successCriteria: task.successCriteria,
+        goalAdditions: task.goalAdditions,
         parentTaskId: task.parentTaskId,
-        parallelGroup: task.parallelGroup,
+        continueFromTaskRef: task.continueFromTaskRef,
         budget: task.budget,
         priority: task.priority
       },
@@ -1181,6 +1196,10 @@ export class SQLiteGraphStore {
         if (!availableTaskIds.has(dependencyTaskId)) {
           throw new GraphValidationError(`Dependency task ${dependencyTaskId} does not exist`);
         }
+      }
+      const createdTask = input.createTasks.find((task) => task.taskId === taskId);
+      if (createdTask) {
+        assertTaskContextContinuation(createdTask, dependencies, newTaskIds);
       }
     }
     this.assertDependencyGraphAcyclic(dependencyOverrides);
@@ -2341,6 +2360,23 @@ function dedupeStringValues(values: string[]): string[] {
   return [...new Set(values.filter((value) => value.trim().length > 0))];
 }
 
+function assertTaskContextContinuation(
+  task: Pick<TaskCreateInput, "taskId" | "continueFromTaskRef">,
+  dependencyTaskIds: string[],
+  newTaskIds: ReadonlySet<string>
+): void {
+  const sourceTaskId = task.continueFromTaskRef;
+  if (!sourceTaskId) return;
+  if (!dependencyTaskIds.includes(sourceTaskId)) {
+    throw new GraphValidationError(
+      `Task ${task.taskId} can continue Executor context only from a direct dependency: ${sourceTaskId}`
+    );
+  }
+  if (newTaskIds.has(sourceTaskId)) {
+    throw new GraphValidationError(`Task ${task.taskId} cannot continue from newly created Task ${sourceTaskId}`);
+  }
+}
+
 function dedupeConflictItems(conflicts: PlannerDecisionConflictItem[]): PlannerDecisionConflictItem[] {
   return [...new Map(conflicts.map((conflict) => [conflict.nodeId, conflict])).values()];
 }
@@ -2363,10 +2399,13 @@ function taskNodeToEnvelope(
     scopeRef: typeof node.properties.scopeRef === "string" ? node.properties.scopeRef : "scope:root",
     constraints,
     successCriteria: stringArray(node.properties.successCriteria),
+    goalAdditions: taskGoalAdditions(node.properties.goalAdditions),
     availableSessionRefs: stringArray(node.properties.availableSessionRefs),
     dependsOnTaskRefs: dependencyTaskIds,
     parentTaskId: typeof node.properties.parentTaskId === "string" ? node.properties.parentTaskId : undefined,
-    parallelGroup: typeof node.properties.parallelGroup === "string" ? node.properties.parallelGroup : undefined,
+    continueFromTaskRef: typeof node.properties.continueFromTaskRef === "string"
+      ? node.properties.continueFromTaskRef
+      : undefined,
     budget: isRecord(node.properties.budget) ? node.properties.budget as TaskBudget : undefined
   };
 }
@@ -2398,16 +2437,30 @@ function withoutTaskDependencyProperty(properties: Record<string, unknown>): Rec
 }
 
 function applyPlannerTaskPatch(task: GraphNode, patch: PlannerTaskPatch, reason: string | undefined): GraphNode {
+  const appendedObjectives = patch.appendObjectives?.length ?? 0;
   return {
     ...task,
     properties: {
       ...withoutTaskDependencyProperty(task.properties),
       ...(patch.budget ? { budget: patch.budget } : {}),
       ...(typeof patch.priority === "number" ? { priority: patch.priority } : {}),
-      ...(typeof patch.parallelGroup === "string" ? { parallelGroup: patch.parallelGroup } : {}),
+      ...(patch.appendObjectives ? {
+        goalAdditions: [
+          ...taskGoalAdditions(task.properties.goalAdditions),
+          ...patch.appendObjectives
+        ],
+        objectiveRevision: taskObjectiveRevision(task) + (appendedObjectives > 0 ? 1 : 0)
+      } : {}),
       ...(reason ? { plannerReason: reason } : {})
     }
   };
+}
+
+function taskObjectiveRevision(task: GraphNode): number {
+  const revision = task.properties.objectiveRevision;
+  return typeof revision === "number" && Number.isFinite(revision) && revision >= 1
+    ? Math.floor(revision)
+    : 1;
 }
 
 function nodeVersion(node: GraphNode): number {
@@ -2454,6 +2507,15 @@ function stringArray(value: unknown, fallback: string[] = []): string[] {
   return Array.isArray(value)
     ? value.filter((item): item is string => typeof item === "string")
     : fallback;
+}
+
+function taskGoalAdditions(value: unknown): TaskGoalAddition[] {
+  if (!Array.isArray(value)) return [];
+  return value.flatMap((item) => {
+    if (!isRecord(item) || typeof item.goal !== "string" || !item.goal.trim()) return [];
+    const successCriteria = stringArray(item.successCriteria);
+    return successCriteria.length > 0 ? [{ goal: item.goal, successCriteria }] : [];
+  });
 }
 
 function isRunnableTaskStatus(status: unknown): boolean {

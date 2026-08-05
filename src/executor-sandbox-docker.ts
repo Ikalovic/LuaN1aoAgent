@@ -84,6 +84,7 @@ export type DockerTaskSandboxInput = {
   runtimeDir: string;
   runRef: string;
   taskId: string;
+  workspaceKey?: string;
   image?: string;
   environment?: NodeJS.ProcessEnv;
   network: DockerTaskNetworkAttachment;
@@ -104,12 +105,18 @@ export function executorDockerImage(): string {
   return process.env.LUANNIAO_EXECUTOR_IMAGE?.trim() || "luanniao-executor:latest";
 }
 
-export function dockerSandboxNames(runtimeDir: string, taskId: string): { containerName: string; workspaceDir: string; hostDir: string } {
+export function dockerSandboxNames(
+  runtimeDir: string,
+  taskId: string,
+  workspaceKey = taskId
+): { containerName: string; workspaceDir: string; hostDir: string } {
   const digest = createHash("sha256").update(`${resolve(runtimeDir)}${taskId}`).digest("hex").slice(0, 20);
+  const workspaceDigest = createHash("sha256").update(`${resolve(runtimeDir)}${workspaceKey}`).digest("hex").slice(0, 8);
   const slug = taskId.replace(/[^A-Za-z0-9._-]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 48) || "task";
+  const workspaceSlug = workspaceKey.replace(/[^A-Za-z0-9._-]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 48) || "task";
   return {
     containerName: `luanniao-exec-${digest}`,
-    workspaceDir: join(resolve(runtimeDir), "sandboxes", `${slug}-${digest.slice(0, 8)}`),
+    workspaceDir: join(resolve(runtimeDir), "sandboxes", `${workspaceSlug}-${workspaceDigest}`),
     hostDir: join(resolve(runtimeDir), "sandboxes", ".host", `${slug}-${digest.slice(0, 8)}`)
   };
 }
@@ -224,7 +231,11 @@ export async function shouldUseDockerSandbox(requestedMode: string, runner: Dock
 export async function createDockerTaskSandbox(input: DockerTaskSandboxInput): Promise<DockerTaskSandbox> {
   const runner = input.runner ?? defaultDockerRunner;
   const image = input.image ?? executorDockerImage();
-  const { containerName, workspaceDir, hostDir } = dockerSandboxNames(input.runtimeDir, input.taskId);
+  const { containerName, workspaceDir, hostDir } = dockerSandboxNames(
+    input.runtimeDir,
+    input.taskId,
+    input.workspaceKey
+  );
   // workspaceDir is bind-mounted into the container (host-visible data only; host
   // code must never load or execute from it). hostRoot is host-only and backs the
   // Pi prompt loader and session headers — the container never sees it.

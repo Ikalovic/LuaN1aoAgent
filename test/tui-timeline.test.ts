@@ -229,8 +229,8 @@ test("distinguishes parallel executors and filters the timeline by task", async 
   });
   await app.start();
 
-  await appendTaskStart(executionLog, "task:auth", "验证认证边界", "recon");
-  await appendTaskStart(executionLog, "task:upload", "检查上传处理", "recon");
+  await appendTaskStart(executionLog, "task:auth", "验证认证边界");
+  await appendTaskStart(executionLog, "task:upload", "检查上传处理");
   await executionLog.append({
     taskId: "task:auth",
     role: "executor",
@@ -344,8 +344,7 @@ function stripAnsi(value: string): string {
 async function appendTaskStart(
   executionLog: ExecutionLog,
   taskId: string,
-  goal: string,
-  parallelGroup: string
+  goal: string
 ): Promise<void> {
   await executionLog.append({
     taskId,
@@ -362,8 +361,7 @@ async function appendTaskStart(
         targetRefs: [],
         scopeRef: "scope:root",
         constraints: [],
-        successCriteria: [],
-        parallelGroup
+        successCriteria: []
       }
     }
   });

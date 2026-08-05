@@ -50,6 +50,52 @@ test("preserves incremental task budget extensions", () => {
   assert.deepEqual(command?.kind === "patch_task" ? command.patch : undefined, { additionalTurns: 6 });
 });
 
+test("preserves append-only Task objectives with their observable criteria", () => {
+  const decision = normalizePlannerDecision({
+    commands: [{
+      kind: "patch_task",
+      taskId: "task:foothold",
+      patch: {
+        appendObjectives: [{
+          goal: "Use the foothold to obtain the remaining internal result",
+          successCriteria: ["the remaining result is persisted"]
+        }]
+      }
+    }],
+    reason: "New evidence extends the same causal workstream"
+  });
+
+  const command = decision.commands?.[0];
+  assert.deepEqual(command?.kind === "patch_task" ? command.patch.appendObjectives : undefined, [{
+    goal: "Use the foothold to obtain the remaining internal result",
+    successCriteria: ["the remaining result is persisted"]
+  }]);
+});
+
+test("preserves explicit sequential Executor context continuation", () => {
+  const decision = normalizePlannerDecision({
+    commands: [{
+      kind: "create_tasks",
+      tasks: [{
+        id: "task:successor",
+        goal: "Use the established session to obtain the final result",
+        targetRefs: ["goal:root"],
+        scopeRef: "scope:root",
+        successCriteria: ["Final result is persisted"],
+        priority: 1,
+        dependsOnTaskRefs: ["task:foothold"],
+        continueFromTaskRef: "task:foothold"
+      }]
+    }],
+    reason: "The predecessor goal is complete and the next goal needs its live working context"
+  });
+
+  const command = decision.commands?.[0];
+  assert.equal(command?.kind, "create_tasks");
+  assert.equal(command?.kind === "create_tasks" ? command.tasks[0]?.continueFromTaskRef : undefined,
+    "task:foothold");
+});
+
 test("drops legacy Planner-authored constraints from task definitions", () => {
   const decision = normalizePlannerDecision({
     decision: "apply_commands",

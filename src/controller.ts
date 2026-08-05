@@ -154,7 +154,7 @@ export const MAX_TASK_BUDGET: Required<TaskBudget> = {
   maxTurns: 40
 };
 
-export const DEFAULT_EPOCH_TURN_SLICE = 12;
+export const DEFAULT_EPOCH_TURN_SLICE = 20;
 export const DEFAULT_RUN_TIME_BUDGET_MS = 900_000;
 export const TASK_EPOCH_RUN_TIME_SHARE = 0.5;
 
@@ -331,6 +331,7 @@ type ExecutorSessionLease = {
   dynamicExecutor: boolean;
   resumed: boolean;
   resumeCount: number;
+  continuedFromTaskRef?: string;
 };
 
 export type RetryableProviderFailure = {
@@ -1255,6 +1256,7 @@ export class SecurityAgentController {
           basisRefs: taskEnvelope.basisRefs,
           scopeRef: taskEnvelope.scopeRef,
           successCriteria: taskEnvelope.successCriteria,
+          goalAdditions: taskEnvelope.goalAdditions,
           parentTaskId: taskEnvelope.parentTaskId,
           dependsOnTaskRefs: taskEnvelope.dependsOnTaskRefs
         } : {}),
@@ -1353,9 +1355,10 @@ export class SecurityAgentController {
       scopeRef: taskSpec.scopeRef,
       constraints,
       successCriteria: taskSpec.successCriteria,
+      goalAdditions: [],
       dependsOnTaskRefs,
+      continueFromTaskRef: taskSpec.continueFromTaskRef,
       parentTaskId,
-      parallelGroup: taskSpec.parallelGroup,
       budget
     };
   }
@@ -1433,8 +1436,9 @@ export class SecurityAgentController {
           scopeRef: taskEnvelope.scopeRef,
           constraints: taskEnvelope.constraints,
           successCriteria: taskEnvelope.successCriteria,
+          goalAdditions: taskEnvelope.goalAdditions,
           dependsOnTaskRefs: taskEnvelope.dependsOnTaskRefs,
-          parallelGroup: taskEnvelope.parallelGroup,
+          continueFromTaskRef: taskEnvelope.continueFromTaskRef,
           budget: taskEnvelope.budget,
           priority
         })),
@@ -1547,7 +1551,15 @@ export class SecurityAgentController {
             payload: { command, status: command.status, nodeVersion: appliedCommand?.node.properties.version }
           });
           if (["completed", "blocked", "failed", "archived"].includes(command.status)) {
-            this.runtimeStore.deleteExecutorSession(command.taskId);
+            const transfersContext = taskCreateInputs.some(({ taskEnvelope }) =>
+              taskEnvelope.continueFromTaskRef === command.taskId);
+            if (!transfersContext) {
+              this.runtimeStore.deleteExecutorSession(command.taskId);
+              const continuedFromTaskRef = this.graphStore.getTaskEnvelope(command.taskId)?.continueFromTaskRef;
+              if (continuedFromTaskRef) {
+                this.runtimeStore.deleteExecutorSession(continuedFromTaskRef);
+              }
+            }
             await this.disposeTaskExecutorResources(command.taskId);
           }
         }
@@ -1638,6 +1650,17 @@ export class SecurityAgentController {
     commands: PlannerCommand[],
     budgetPatchByCommandIndex = this.resolvePlannerBudgetPatches(commands)
   ): void {
+    this.assertExecutorContextTransfers(commands);
+    for (const command of commands) {
+      if (command.kind !== "set_task_status" || command.status !== "completed") continue;
+      const outcome = this.runtimeStore.getTaskOutcome(command.taskId);
+      if (!this.taskOutcomeCompletesCurrentObjectives(command.taskId, outcome, commands)) {
+        throw new GraphValidationError(
+          `Task ${command.taskId} requires a completed TaskOutcome for its current objective definition `
+          + "before Planner can set completed"
+        );
+      }
+    }
     const maxTurnsByTaskId = new Map<string, number>();
     for (const resolution of budgetPatchByCommandIndex.values()) {
       maxTurnsByTaskId.set(resolution.taskId, resolution.newMaxTurns);
@@ -1662,6 +1685,93 @@ export class SecurityAgentController {
         + "or archive this Task and create a genuinely distinct successor."
       );
     }
+  }
+
+  private assertExecutorContextTransfers(commands: PlannerCommand[]): void {
+    const createdTaskIds = new Set(commands.flatMap((command) =>
+      command.kind === "create_tasks" ? command.tasks.map((task) => task.id) : []));
+    const completedTaskIds = new Set(commands.flatMap((command) =>
+      command.kind === "set_task_status" && command.status === "completed" ? [command.taskId] : []));
+    const claimedSourceTaskIds = new Set<string>();
+    for (const command of commands) {
+      if (command.kind !== "create_tasks") continue;
+      for (const task of command.tasks) {
+        const sourceTaskId = task.continueFromTaskRef;
+        if (!sourceTaskId) continue;
+        if (!(task.dependsOnTaskRefs ?? []).includes(sourceTaskId)) {
+          throw new GraphValidationError(
+            `Task ${task.id} can continue Executor context only from a direct dependency: ${sourceTaskId}`
+          );
+        }
+        if (createdTaskIds.has(sourceTaskId)) {
+          throw new GraphValidationError(`Task ${task.id} cannot continue from newly created Task ${sourceTaskId}`);
+        }
+        if (claimedSourceTaskIds.has(sourceTaskId)) {
+          throw new GraphValidationError(`Executor context for ${sourceTaskId} can have only one successor`);
+        }
+        const reservedSuccessor = this.graphStore.listOpenTasks(5_000)
+          .find((candidate) => candidate.continueFromTaskRef === sourceTaskId);
+        if (reservedSuccessor) {
+          throw new GraphValidationError(
+            `Executor context for ${sourceTaskId} is already reserved by ${reservedSuccessor.taskId}`
+          );
+        }
+        if (this.activeTaskRuns.has(sourceTaskId) || this.activeEpochIdByTask.has(sourceTaskId)) {
+          throw new GraphValidationError(`Cannot transfer active Executor context from ${sourceTaskId}`);
+        }
+        const sourceNode = this.graphStore.getTaskNode(sourceTaskId);
+        if (!sourceNode) {
+          throw new GraphValidationError(`Executor context source Task ${sourceTaskId} does not exist`);
+        }
+        if (sourceNode.properties.status !== "completed" && !completedTaskIds.has(sourceTaskId)) {
+          throw new GraphValidationError(
+            `Executor context source ${sourceTaskId} must be completed before its successor starts`
+          );
+        }
+        const sourceOutcome = this.runtimeStore.getTaskOutcome(sourceTaskId);
+        if (!this.taskOutcomeCompletesCurrentObjectives(sourceTaskId, sourceOutcome, commands)) {
+          throw new GraphValidationError(
+            `Executor context source ${sourceTaskId} requires a completed TaskOutcome for its current objective definition`
+          );
+        }
+        if (!this.runtimeStore.getExecutorSession(sourceTaskId)) {
+          throw new GraphValidationError(`Executor context source ${sourceTaskId} has no persisted Executor session`);
+        }
+        if (this.runtimeStore.getExecutorSession(task.id)) {
+          throw new GraphValidationError(`Executor context target ${task.id} already owns an Executor session`);
+        }
+        claimedSourceTaskIds.add(sourceTaskId);
+      }
+    }
+  }
+
+  private taskOutcomeCompletesCurrentObjectives(
+    taskId: string,
+    outcome: TaskOutcome | undefined,
+    pendingCommands: PlannerCommand[] = []
+  ): boolean {
+    if (outcome?.status !== "completed") {
+      return false;
+    }
+    const task = this.graphStore.getTaskNode(taskId);
+    if (!task) {
+      return false;
+    }
+    const appendsObjectives = pendingCommands.some((command) => command.kind === "patch_task"
+      && command.taskId === taskId
+      && (command.patch.appendObjectives?.length ?? 0) > 0);
+    if (appendsObjectives) {
+      return false;
+    }
+    const revision = task.properties.objectiveRevision;
+    const currentRevision = typeof revision === "number" && Number.isFinite(revision) && revision >= 1
+      ? Math.floor(revision)
+      : 1;
+    if (outcome.objectiveRevision !== undefined) {
+      return outcome.objectiveRevision === currentRevision;
+    }
+    return currentRevision === 1 && (task.properties.goalAdditions === undefined
+      || (Array.isArray(task.properties.goalAdditions) && task.properties.goalAdditions.length === 0));
   }
 
   private async runReadyTaskGraph(input: { maxParallelTasks: number }): Promise<TaskExecution[]> {
@@ -1930,7 +2040,8 @@ export class SecurityAgentController {
       }
       let executorSession: ExecutorSessionLease;
       try {
-        await this.prepareExecutorSandboxForEpoch(state);
+        const executorContext = await this.claimExecutorContextForTask(taskEnvelope);
+        await this.prepareExecutorSandboxForEpoch(state, executorContext.workspaceKey);
         executorSession = await this.createExecutorSessionForTask(taskEnvelope, options.useDynamicExecutor);
       } catch (error) {
         await this.endExecutorNetworkEpoch(state);
@@ -1993,7 +2104,8 @@ export class SecurityAgentController {
             rootGoal,
             taskEnvelope,
             taskStatus,
-            runtimeBudgetStatus
+            runtimeBudgetStatus,
+            continuedFromTaskRef: executorSession.continuedFromTaskRef
           })
           : await this.renderInitialExecutorInput({
             rootGoal,
@@ -2191,6 +2303,7 @@ export class SecurityAgentController {
       const taskOutcome = createTaskOutcome({
         taskResult,
         epochRef: state.epochId,
+        objectiveRevision: taskObjectiveRevision(this.graphStore.getTaskNode(taskEnvelope.taskId)),
         terminalSeq
       });
       const epochOutcome = (await this.persistEpochOutcome(state, {
@@ -2250,7 +2363,37 @@ export class SecurityAgentController {
     throw new Error(`Executor retry loop exhausted without result for ${taskEnvelope.taskId}`);
   }
 
-  private async prepareExecutorSandboxForEpoch(state: ActiveTaskState): Promise<void> {
+  private async claimExecutorContextForTask(
+    taskEnvelope: TaskEnvelope
+  ): Promise<{ workspaceKey: string }> {
+    const owned = this.runtimeStore.getExecutorSession(taskEnvelope.taskId);
+    if (owned) {
+      return { workspaceKey: owned.workspaceKey };
+    }
+    const sourceTaskId = taskEnvelope.continueFromTaskRef;
+    if (!sourceTaskId) {
+      return { workspaceKey: taskEnvelope.taskId };
+    }
+    const transferred = this.runtimeStore.transferExecutorSession(sourceTaskId, taskEnvelope.taskId);
+    await this.executionLog.append({
+      taskId: taskEnvelope.taskId,
+      role: "runtime",
+      eventType: "executor_context_transferred",
+      summary: `Transferred Executor context ${sourceTaskId} -> ${taskEnvelope.taskId}`,
+      payload: {
+        sourceTaskId,
+        targetTaskId: taskEnvelope.taskId,
+        sessionFile: transferred.sessionFile,
+        workspaceKey: transferred.workspaceKey
+      }
+    });
+    return { workspaceKey: transferred.workspaceKey };
+  }
+
+  private async prepareExecutorSandboxForEpoch(
+    state: ActiveTaskState,
+    workspaceKey = state.taskEnvelope.taskId
+  ): Promise<void> {
     if (!this.connectivityRuntime) {
       return;
     }
@@ -2263,6 +2406,7 @@ export class SecurityAgentController {
           runtimeDir: this.runtimeDir,
           runRef: this.runId,
           taskId,
+          workspaceKey,
           environment: this.environment,
           network: {
             networkName: gateway.networkName,
@@ -2531,11 +2675,13 @@ export class SecurityAgentController {
         session: executor.session,
         dynamicExecutor: true,
         resumed: true,
-        resumeCount: persisted.resumeCount + 1
+        resumeCount: persisted.resumeCount + 1,
+        continuedFromTaskRef: taskEnvelope.continueFromTaskRef
       };
       this.runtimeStore.upsertExecutorSession({
         taskId: taskEnvelope.taskId,
         sessionFile: persisted.sessionFile,
+        workspaceKey: persisted.workspaceKey,
         resumeCount: lease.resumeCount
       });
       await this.executionLog.append({
@@ -2628,6 +2774,7 @@ export class SecurityAgentController {
     taskEnvelope: TaskEnvelope;
     taskStatus?: Record<string, unknown>;
     runtimeBudgetStatus: string;
+    continuedFromTaskRef?: string;
   }): Promise<string> {
     const executionGraphContext = this.graphStore.projectionClosure({
       taskId: input.taskEnvelope.taskId,
@@ -2657,6 +2804,7 @@ export class SecurityAgentController {
       })).events, this.runtimeStore.getTaskOutcome(input.taskEnvelope.taskId), input.taskStatus),
       dependencyOutcomes: await this.createDependencyOutcomeBrief(input.taskEnvelope),
       runtimeBudgetStatus: input.runtimeBudgetStatus,
+      continuedFromTaskRef: input.continuedFromTaskRef,
       environmentFacts: await this.executorEnvironmentFacts(input.taskEnvelope.taskId)
     });
   }
@@ -4716,10 +4864,11 @@ export class SecurityAgentController {
         ? `已持久化 Artifact（直接在 TaskOutcome 中引用，不要重复归档）：\n${durableArtifactRefs.map((ref) => `- ${JSON.stringify(ref)}`).join("\n")}`
         : "当前 Task 尚无已持久化 Artifact。",
       workspaceFiles.length > 0
-        ? `workspace 中可归档的真实文件（artifact_write.path 只能从下列 JSON 字符串选择）：\n${workspaceFiles.map((path) => `- ${JSON.stringify(path)}`).join("\n")}`
+        ? `workspace 中可选择提升的现有文件（artifact_write.path 只能从下列 JSON 字符串选择）：\n${workspaceFiles.map((path) => `- ${JSON.stringify(path)}`).join("\n")}`
         : "workspace 中没有可归档文件；直接调用 task_result_submit，不要调用或提及 artifact_write。",
       ...(workspaceFiles.length > 0 ? [
-        "仅当上述文件是后继执行需要的原始证据、脚本或能力状态时，才用 artifact_write 原样归档；可连续归档多个文件，但不得创建、修改、检查或搜索文件。"
+        "先形成本次 TaskOutcome 的 summary 和 evidenceRefs。若提交 partial 且同一 Task 仍可继续，workspace 已跨 epoch 持久，不得仅因 checkpoint 提升文件。",
+        "只有 Task 将结束或真实跨 Task 交接，并且结果仍依赖无法由持久 evidenceRefs 重建、必须保持原文、精确字节或可执行状态的现有文件时，才用 artifact_write 提升缺失的最小材料。不要逐项归档普通响应；不得创建、修改、检查或搜索文件。"
       ] : []),
       "TaskOutcome 本身就是结构化结论，不要为结论临时虚构或创建总结文件。已有材料归档完成后调用一次 task_result_submit，并根据任务成功条件如实选择 completed、partial、blocked 或 failed。",
       "summary 写明本次已经验证的能力、最新失效条件和仍未解决的问题；",
@@ -5708,11 +5857,13 @@ function normalizeTaskResult(result: Partial<TaskResult>, taskEnvelope: TaskEnve
 function createTaskOutcome(input: {
   taskResult: TaskResult;
   epochRef: string;
+  objectiveRevision: number;
   terminalSeq: number;
 }): TaskOutcome {
   return {
     taskRef: input.taskResult.taskId,
     epochRef: input.epochRef,
+    objectiveRevision: input.objectiveRevision,
     status: input.taskResult.status,
     summary: input.taskResult.summary,
     evidenceRefs: [...input.taskResult.evidenceRefs],
@@ -5730,6 +5881,13 @@ function createTaskOutcome(input: {
     terminalSeq: input.terminalSeq,
     createdAt: new Date().toISOString()
   };
+}
+
+function taskObjectiveRevision(task: GraphNode | undefined): number {
+  const revision = task?.properties.objectiveRevision;
+  return typeof revision === "number" && Number.isFinite(revision) && revision >= 1
+    ? Math.floor(revision)
+    : 1;
 }
 
 function taskResultFromOutcome(outcome: TaskOutcome | undefined): TaskResult | undefined {

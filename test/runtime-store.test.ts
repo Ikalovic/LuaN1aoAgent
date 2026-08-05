@@ -30,6 +30,51 @@ test("reads the persistent run reference without recovering active runtime state
   store.close();
 });
 
+test("transfers one Executor session and workspace to a single successor", () => {
+  const runtimeDir = mkdtempSync(join(tmpdir(), "luanniao-runtime-"));
+  const store = new RuntimeStore(join(runtimeDir, "state.sqlite"));
+  store.upsertExecutorSession({
+    taskId: "task:source",
+    sessionFile: "/runtime/executor-sessions/source.jsonl",
+    workspaceKey: "task:workspace-origin",
+    resumeCount: 3
+  });
+
+  const transferred = store.transferExecutorSession("task:source", "task:successor");
+
+  assert.equal(store.getExecutorSession("task:source"), undefined);
+  assert.deepEqual(transferred, store.getExecutorSession("task:successor"));
+  assert.equal(transferred.sessionFile, "/runtime/executor-sessions/source.jsonl");
+  assert.equal(transferred.workspaceKey, "task:workspace-origin");
+  assert.equal(transferred.resumeCount, 3);
+  assert.throws(
+    () => store.transferExecutorSession("task:source", "task:other"),
+    /Executor session transfer failed/
+  );
+  store.close();
+});
+
+test("migrates legacy Executor sessions with their original task workspace key", () => {
+  const runtimeDir = mkdtempSync(join(tmpdir(), "luanniao-runtime-"));
+  const databasePath = join(runtimeDir, "state.sqlite");
+  const database = new DatabaseSync(databasePath);
+  database.exec(`
+    CREATE TABLE executor_sessions (
+      task_id TEXT PRIMARY KEY,
+      session_file TEXT NOT NULL,
+      resume_count INTEGER NOT NULL DEFAULT 0,
+      updated_at TEXT NOT NULL
+    );
+    INSERT INTO executor_sessions (task_id, session_file, resume_count, updated_at)
+    VALUES ('task:legacy', '/runtime/legacy.jsonl', 2, '2026-08-04T00:00:00.000Z');
+  `);
+  database.close();
+
+  const store = new RuntimeStore(databasePath);
+  assert.equal(store.getExecutorSession("task:legacy")?.workspaceKey, "task:legacy");
+  store.close();
+});
+
 test("tracks multiple epochs for one task without shared lifecycle state", () => {
   const runtimeDir = mkdtempSync(join(tmpdir(), "luanniao-runtime-"));
   const store = new RuntimeStore(join(runtimeDir, "state.sqlite"));

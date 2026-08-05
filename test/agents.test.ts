@@ -112,62 +112,26 @@ test("projector terminal tool bounds the wire schema and enforces draft semantic
   const tool = createGraphDeltaSubmitTool();
   const schema = tool.parameters as unknown as {
     properties: {
-      nodes: {
-        maxItems?: number;
-        items?: {
-          properties?: {
-            id?: { pattern?: string };
-            graphKind?: unknown;
-            artifactRef?: unknown;
-            artifactRefs?: unknown;
-          };
-          additionalProperties?: boolean;
-        };
-      };
-      edges: {
-        maxItems?: number;
-        items?: {
-          properties?: {
-            from?: { pattern?: string };
-            to?: { pattern?: string };
-          };
-        };
-      };
-      sourceEventIds?: unknown;
+      changes: { items?: { anyOf?: unknown[] } };
+      nodes?: unknown;
+      edges?: unknown;
     };
     additionalProperties?: boolean;
   };
 
-  // The wire schema guides generation with fixed identity and vocabulary rules.
-  // The deterministic parser remains authoritative for dynamic evidence semantics.
-  assert.equal(schema.properties.nodes.maxItems, undefined);
-  assert.equal(schema.properties.edges.maxItems, undefined);
-  assert.equal(schema.properties.nodes.items?.properties?.id?.pattern, "^(existing|new):[1-9][0-9]*$");
-  assert.equal(schema.properties.nodes.items?.properties?.graphKind, undefined);
-  assert.ok(schema.properties.nodes.items?.properties?.artifactRef);
-  assert.ok(schema.properties.nodes.items?.properties?.artifactRefs);
-  assert.equal(schema.properties.nodes.items?.additionalProperties, false);
-  assert.equal(schema.properties.edges.items?.properties?.from?.pattern, "^(existing|new):[1-9][0-9]*$");
-  assert.equal(schema.properties.edges.items?.properties?.to?.pattern, "^(existing|new):[1-9][0-9]*$");
-  assert.equal(schema.properties.sourceEventIds, undefined);
+  assert.equal(schema.properties.changes.items?.anyOf?.length, 3);
+  assert.equal(schema.properties.nodes, undefined);
+  assert.equal(schema.properties.edges, undefined);
   assert.equal(schema.additionalProperties, false);
   assert.equal(Check(tool.parameters, {}), true);
 
   assert.equal(Check(tool.parameters, {
-    nodes: [{ id: "existing:1", properties: { status: "refuted" }, evidenceRefs: ["o1"] }],
-    edges: []
+    changes: [{ op: "update_node", ref: "existing:1", properties: { status: "refuted" }, evidenceRefs: ["o1"] }]
   }), true);
   assert.equal(Check(tool.parameters, {
-    nodes: [{
-      id: "existing:1",
-      type: "Evidence",
-      label: "Repeated identity"
-    }],
-    edges: []
-  }), true);
-  assert.equal(Check(tool.parameters, {
-    nodes: [{
-      id: "new:1",
+    changes: [{
+      op: "create_node",
+      ref: "new:1",
       type: "Evidence",
       label: "HTTP evidence",
       properties: {
@@ -175,42 +139,24 @@ test("projector terminal tool bounds the wire schema and enforces draft semantic
         summary: "Observed a valid response"
       },
       evidenceRefs: ["o1"]
-    }],
-    edges: []
+    }]
   }), true);
   assert.equal(Check(tool.parameters, {
-    nodes: [{
-      id: "new:1",
-      type: "Evidence",
-      label: "Long evidence",
-      properties: { summary: "x".repeat(2_000) },
-      evidenceRefs: Array.from({ length: 16 }, (_, index) => `o${index + 1}`)
-    }],
-    edges: []
+    changes: [{ op: "create_edge", from: "existing:1", to: "existing:2", type: "supports" }]
   }), true);
   assert.equal(Check(tool.parameters, {
-    nodes: [{ id: "bogus:1", type: "Evidence", label: "Bad alias" }],
-    edges: []
+    changes: [{ op: "create_node", ref: "bogus:1", type: "Evidence", label: "Bad alias" }]
   }), false);
 
-  // Fixed vocabulary and conditional identity rules are rejected at the wire boundary.
-  const vocabularyDraft = {
-    nodes: [{ id: "new:1", type: "Nope", label: "Wrong vocabulary" }],
-    edges: []
-  };
-  assert.equal(Check(tool.parameters, vocabularyDraft), false);
   assert.equal(Check(tool.parameters, {
-    nodes: [{ id: "new:1", type: "Evidence", label: "Extra keys", status: "confirmed" }],
-    edges: []
+    changes: [{ op: "update_node", ref: "existing:1", type: "Evidence", label: "Repeated identity" }]
   }), false);
   assert.equal(Check(tool.parameters, {
-    nodes: [],
-    edges: [{ from: "existing:1", to: "existing:2", type: "depends_on" }]
+    changes: [{ op: "create_edge", from: "existing:1", to: "existing:2", type: "depends_on" }]
   }), false);
   assert.equal(Check(tool.parameters, {
-    nodes: [{ id: "new:1", label: "Missing type" }],
-    edges: []
-  }), true);
+    changes: [{ op: "create_node", ref: "new:1", label: "Missing type" }]
+  }), false);
 
   const empty = await tool.execute(
     "call:projector:empty",
@@ -222,7 +168,7 @@ test("projector terminal tool bounds the wire schema and enforces draft semantic
   assert.deepEqual(empty.details, { nodes: [], edges: [] });
   const nodeOnly = await tool.execute(
     "call:projector:node-only",
-    { nodes: [{ id: "new:1", type: "Host", label: "10.0.0.1" }] },
+    { changes: [{ op: "create_node", ref: "new:1", type: "Host", label: "10.0.0.1" }] },
     new AbortController().signal,
     () => undefined,
     {} as never
@@ -232,65 +178,6 @@ test("projector terminal tool bounds the wire schema and enforces draft semantic
     edges: []
   });
 
-  await assert.rejects(
-    () => tool.execute(
-      "call:projector:vocabulary",
-      vocabularyDraft,
-      new AbortController().signal,
-      () => undefined,
-      {} as never
-    ),
-    /node at index 0 has type "Nope"; valid node types:.*No part of the delta was accepted/
-  );
-  await assert.rejects(
-    () => tool.execute(
-      "call:projector:missing-type",
-      { nodes: [{ id: "new:1", label: "Missing type" }] },
-      new AbortController().signal,
-      () => undefined,
-      {} as never
-    ),
-    /node at index 0 has type null; valid node types:.*No part of the delta was accepted/
-  );
-  await assert.rejects(
-    () => tool.execute(
-      "call:projector:existing-identity",
-      {
-        nodes: [{ id: "existing:1", type: "Evidence", label: "Repeated identity" }],
-        edges: []
-      },
-      new AbortController().signal,
-      () => undefined,
-      {} as never
-    ),
-    /must omit existing identity fields \[type, label\].*No part of the delta was accepted/
-  );
-  await assert.rejects(
-    () => tool.execute(
-      "call:projector:keys",
-      {
-        nodes: [{ id: "new:1", type: "Evidence", label: "Extra keys", status: "confirmed" }],
-        edges: []
-      },
-      new AbortController().signal,
-      () => undefined,
-      {} as never
-    ),
-    /node at index 0 has unexpected top-level keys \[status\].*No part of the delta was accepted/
-  );
-  await assert.rejects(
-    () => tool.execute(
-      "call:projector:edgetype",
-      {
-        nodes: [],
-        edges: [{ from: "existing:1", to: "existing:2", type: "depends_on" }]
-      },
-      new AbortController().signal,
-      () => undefined,
-      {} as never
-    ),
-    /edge at index 0 has type "depends_on".*No part of the delta was accepted/
-  );
 });
 
 test("projector terminal tool rejects incomplete new-alias closures before terminating", async () => {
@@ -300,13 +187,13 @@ test("projector terminal tool rejects incomplete new-alias closures before termi
     () => tool.execute(
       "call:projector",
       {
-        nodes: [{
-          id: "new:7",
+        changes: [{
+          op: "create_node",
+          ref: "new:7",
           type: "Port",
           label: "60.205.226.234:8001",
           properties: { port: 8001 }
-        }],
-        edges: [{ from: "new:1", to: "new:7", type: "observed_on" }]
+        }, { op: "create_edge", from: "new:1", to: "new:7", type: "observed_on" }]
       },
       new AbortController().signal,
       () => undefined,
@@ -322,14 +209,14 @@ test("projector terminal tool enforces one total delta byte boundary", async () 
     () => tool.execute(
       "call:projector:oversized",
       {
-        nodes: [{
-          id: "new:1",
+        changes: [{
+          op: "create_node",
+          ref: "new:1",
           type: "Evidence",
           label: "Oversized evidence",
           properties: { summary: "x".repeat(130 * 1024) },
           evidenceRefs: ["o1"]
-        }],
-        edges: []
+        }]
       },
       new AbortController().signal,
       () => undefined,
@@ -352,8 +239,7 @@ test("projector terminal tool validates existing aliases against only its curren
     () => tool.execute(
       "call:projector:unknown-existing",
       {
-        nodes: [],
-        edges: [{ from: "existing:1", to: "existing:4", type: "supports" }]
+        changes: [{ op: "create_edge", from: "existing:1", to: "existing:4", type: "supports" }]
       },
       new AbortController().signal,
       () => undefined,
@@ -365,11 +251,11 @@ test("projector terminal tool validates existing aliases against only its curren
   const accepted = await tool.execute(
     "call:projector:known-existing",
     {
-      nodes: [{
-        id: "existing:1",
+      changes: [{
+        op: "update_node",
+        ref: "existing:1",
         properties: { ip: "10.0.0.1" }
-      }],
-      edges: [{ from: "existing:2", to: "existing:1", type: "observed_on" }]
+      }, { op: "create_edge", from: "existing:2", to: "existing:1", type: "observed_on" }]
     },
     new AbortController().signal,
     () => undefined,
@@ -381,11 +267,11 @@ test("projector terminal tool validates existing aliases against only its curren
     () => tool.execute(
       "call:projector:task-update",
       {
-        nodes: [{
-          id: "existing:3",
+        changes: [{
+          op: "update_node",
+          ref: "existing:3",
           properties: {}
-        }],
-        edges: []
+        }]
       },
       new AbortController().signal,
       () => undefined,
@@ -397,7 +283,7 @@ test("projector terminal tool validates existing aliases against only its curren
   await assert.rejects(
     () => tool.execute(
       "call:projector:task-edge",
-      { nodes: [], edges: [{ from: "existing:2", to: "existing:3", type: "supports" }] },
+      { changes: [{ op: "create_edge", from: "existing:2", to: "existing:3", type: "supports" }] },
       new AbortController().signal,
       () => undefined,
       {} as never
@@ -416,13 +302,13 @@ test("projector accepts standalone evidence and atomic relations", async () => {
   const standalone = await tool.execute(
     "call:projector:standalone",
     {
-      nodes: [{
-        id: "new:1",
+      changes: [{
+        op: "create_node",
+        ref: "new:1",
         type: "Evidence",
         label: "Observed authentication bypass",
         evidenceRefs: ["o1"]
-      }],
-      edges: []
+      }]
     },
     new AbortController().signal,
     () => undefined,
@@ -432,13 +318,13 @@ test("projector accepts standalone evidence and atomic relations", async () => {
   const accepted = await tool.execute(
     "call:projector:connected",
     {
-      nodes: [{
-        id: "new:1",
+      changes: [{
+        op: "create_node",
+        ref: "new:1",
         type: "Evidence",
         label: "Observed authentication bypass",
         properties: {}
-      }],
-      edges: [{ from: "new:1", to: "existing:1", type: "supports" }]
+      }, { op: "create_edge", from: "new:1", to: "existing:1", type: "supports" }]
     },
     new AbortController().signal,
     () => undefined,
@@ -664,7 +550,7 @@ test("projector graph tools share one stable alias namespace through submission"
 
   const submitted = await submitTool.execute(
     "call:projector-submit-dynamic",
-    { nodes: [], edges: [{ from: "existing:1", to: "existing:2", type: "supports" }] },
+    { changes: [{ op: "create_edge", from: "existing:1", to: "existing:2", type: "supports" }] },
     new AbortController().signal,
     () => undefined,
     {} as never

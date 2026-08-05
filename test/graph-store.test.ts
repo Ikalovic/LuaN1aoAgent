@@ -993,8 +993,7 @@ test("lists open task definitions without inferring dependency outcomes from gra
     constraints: [],
     successCriteria: ["A done"],
     priority: 1,
-    parentTaskId: "goal:root",
-    parallelGroup: "recon"
+    parentTaskId: "goal:root"
   });
   graphStore.createTask({
     taskId: "task:recon-b",
@@ -1004,8 +1003,7 @@ test("lists open task definitions without inferring dependency outcomes from gra
     constraints: [],
     successCriteria: ["B done"],
     priority: 1,
-    parentTaskId: "goal:root",
-    parallelGroup: "recon"
+    parentTaskId: "goal:root"
   });
   graphStore.createTask({
     taskId: "task:exploit",
@@ -1239,6 +1237,46 @@ test("archived dependency summaries do not alter structural open-task listing", 
   graphStore.close();
 });
 
+test("persists explicit Executor context continuation in the successor Task envelope", () => {
+  const runtimeDir = mkdtempSync(join(tmpdir(), "luanniao-graph-"));
+  const graphStore = new SQLiteGraphStore(join(runtimeDir, "state.sqlite"), join(runtimeDir, "deltas.jsonl"));
+  graphStore.createTask({
+    taskId: "task:source",
+    goal: "Establish an authenticated foothold",
+    targetRefs: ["goal:root"],
+    scopeRef: "scope:root",
+    constraints: [],
+    successCriteria: ["authenticated foothold established"],
+    priority: 1
+  });
+  graphStore.createTask({
+    taskId: "task:successor",
+    goal: "Use the foothold for a distinct final result",
+    targetRefs: ["goal:root"],
+    scopeRef: "scope:root",
+    constraints: [],
+    successCriteria: ["final result persisted"],
+    priority: 1,
+    dependsOnTaskRefs: ["task:source"],
+    continueFromTaskRef: "task:source"
+  });
+
+  const successor = graphStore.getTaskEnvelope("task:successor");
+  assert.equal(successor?.continueFromTaskRef, "task:source");
+  assert.deepEqual(successor?.dependsOnTaskRefs, ["task:source"]);
+  assert.throws(() => graphStore.createTask({
+    taskId: "task:invalid-successor",
+    goal: "Invalid continuation",
+    targetRefs: ["goal:root"],
+    scopeRef: "scope:root",
+    constraints: [],
+    successCriteria: ["result"],
+    priority: 1,
+    continueFromTaskRef: "task:source"
+  }), /only from a direct dependency/);
+  graphStore.close();
+});
+
 test("rejects scheduler dependency edges outside Task to Task", () => {
   const runtimeDir = mkdtempSync(join(tmpdir(), "luanniao-graph-"));
   const graphStore = new SQLiteGraphStore(join(runtimeDir, "state.sqlite"), join(runtimeDir, "deltas.jsonl"));
@@ -1424,7 +1462,24 @@ test("runtime task result preserves planner version for later expectedVersion pa
     patch: { priority: 1 }
   });
   assert.equal(nextPatch.properties.version, 3);
+  assert.equal(nextPatch.properties.objectiveRevision, 1);
   assert.equal(nextPatch.label, "Extract flag");
+  const withAddedObjective = graphStore.patchTask({
+    taskId: "task:extract-flag",
+    expectedVersion: 3,
+    patch: {
+      appendObjectives: [{
+        goal: "Use the authenticated foothold to obtain the remaining result",
+        successCriteria: ["remaining result is persisted"]
+      }]
+    }
+  });
+  assert.equal(withAddedObjective.label, "Extract flag");
+  assert.equal(withAddedObjective.properties.objectiveRevision, 2);
+  assert.deepEqual(graphStore.getTaskEnvelope("task:extract-flag")?.goalAdditions, [{
+    goal: "Use the authenticated foothold to obtain the remaining result",
+    successCriteria: ["remaining result is persisted"]
+  }]);
   graphStore.close();
 });
 

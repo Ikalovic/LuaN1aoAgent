@@ -44,8 +44,12 @@ test("executor prompt uses bounded experimental method and runtime steering", ()
   assert.match(EXECUTOR_SYSTEM_PROMPT, /先输出一句不超过 80 个汉字的可公开行动理由/);
   assert.match(EXECUTOR_SYSTEM_PROMPT, /缩小当前竞争解释或直接推进成功条件/);
   assert.match(EXECUTOR_SYSTEM_PROMPT, /先锁定当前因果边界/);
-  assert.match(EXECUTOR_SYSTEM_PROMPT, /探索实验用于尚无正向基线的未知边界/);
+  assert.match(EXECUTOR_SYSTEM_PROMPT, /根据当前不确定性的结构选择行动粒度/);
+  assert.match(EXECUTOR_SYSTEM_PROMPT, /候选彼此独立时，使用批量脚本或并行工具调用/);
+  assert.match(EXECUTOR_SYSTEM_PROMPT, /探索实验用于尚无正向基线且存在多个竞争解释的边界/);
   assert.match(EXECUTOR_SYSTEM_PROMPT, /确认实验用于已有可复现基线的机制/);
+  assert.match(EXECUTOR_SYSTEM_PROMPT, /已有验证能力时直接复用它推进 successCriteria/);
+  assert.match(EXECUTOR_SYSTEM_PROMPT, /材料足以判定时立即提交结果/);
   assert.match(EXECUTOR_SYSTEM_PROMPT, /页面本来就存在的说明文字/);
   assert.match(EXECUTOR_SYSTEM_PROMPT, /请求脚本自己打印的标签不能证明/);
   assert.match(EXECUTOR_SYSTEM_PROMPT, /使用 browser_render/);
@@ -58,18 +62,21 @@ test("executor prompt uses bounded experimental method and runtime steering", ()
   assert.match(EXECUTOR_SYSTEM_PROMPT, /只能标记为 inconclusive/);
   assert.match(EXECUTOR_SYSTEM_PROMPT, /status=refuted\/superseded/);
   assert.match(EXECUTOR_SYSTEM_PROMPT, /reopenConditions/);
-  assert.match(EXECUTOR_SYSTEM_PROMPT, /原始响应写入 artifact/);
+  assert.match(EXECUTOR_SYSTEM_PROMPT, /原始响应和批量结果写入当前 workspace/);
   assert.match(EXECUTOR_SYSTEM_PROMPT, /末尾用一句自然语言总结/);
-  assert.match(EXECUTOR_SYSTEM_PROMPT, /首次成为后续执行依赖时，立即写入当前 Task workspace 并用 artifact_write 归档/);
-  assert.match(EXECUTOR_SYSTEM_PROMPT, /不要等待 nearTurnLimit、checkpoint 或 task_result_submit/);
+  assert.match(EXECUTOR_SYSTEM_PROMPT, /不要因为 checkpoint 或“以后可能有用”逐项调用 artifact_write/);
+  assert.match(EXECUTOR_SYSTEM_PROMPT, /准备 task_result_submit 时，先形成 summary 和 evidenceRefs/);
+  assert.match(EXECUTOR_SYSTEM_PROMPT, /不要为使 nmap、HTTP 响应或枚举输出变得“持久”而重复提升文件/);
+  assert.match(EXECUTOR_SYSTEM_PROMPT, /必须保持原文、精确字节或可执行状态/);
   assert.match(EXECUTOR_SYSTEM_PROMPT, /TaskOutcome 本身就是结构化结论/);
-  assert.match(EXECUTOR_SYSTEM_PROMPT, /task_result_submit 只使用实际存在的 artifactRefs/);
-  assert.match(EXECUTOR_SYSTEM_PROMPT, /当前工作目录是 Task workspace，跨 epoch 持久/);
+  assert.match(EXECUTOR_SYSTEM_PROMPT, /artifactRefs 只填写 artifact_write 返回的真实引用/);
+  assert.match(EXECUTOR_SYSTEM_PROMPT, /当前工作目录是 Task workspace，跨命令、checkpoint 和同一 Task 的 epoch 持久/);
   assert.match(EXECUTOR_SYSTEM_PROMPT, /Runtime 注入授权 Scope，并在 Docker 模式机械执行网络边界/);
   assert.match(EXECUTOR_SYSTEM_PROMPT, /artifact_read\(\{ref:"artifact:\.\.\.",materialize:true\}\)/);
   assert.doesNotMatch(EXECUTOR_SYSTEM_PROMPT, /source=\{type:"(?:file|inline)"/);
   assert.match(EXECUTOR_SYSTEM_PROMPT, /没有变量对照时不得把固定调用扩大成通用能力/);
-  assert.match(EXECUTOR_SYSTEM_PROMPT, /实际候选清单、每项输入和结果保存为 Artifact/);
+  assert.match(EXECUTOR_SYSTEM_PROMPT, /实际候选、每项输入和结果写成当前 workspace 中的一个 manifest/);
+  assert.doesNotMatch(EXECUTOR_SYSTEM_PROMPT, /立即写入当前 Task workspace 并用 artifact_write 归档/);
   assert.match(EXECUTOR_SYSTEM_PROMPT, /数量达到阈值只表示本轮停止扩大/);
   assert.match(EXECUTOR_SYSTEM_PROMPT, /<example name="discriminating-test">/);
   assert.match(EXECUTOR_SYSTEM_PROMPT, /<example name="causal-boundary-and-oracle">/);
@@ -134,12 +141,20 @@ test("planner prompt teaches evidence-aware planning without an intermediate con
   assert.match(PLANNER_SYSTEM_PROMPT, /无法解析时重新 list，不猜测 UUID/);
   assert.match(PLANNER_SYSTEM_PROMPT, /Root Goal 的“全部”“所有”“每个”按开放集合处理/);
   assert.match(PLANNER_SYSTEM_PROMPT, /EpochOutcome 只说明执行实例为何结束/);
-  assert.match(PLANNER_SYSTEM_PROMPT, /不要把“另写一份结论 Artifact”设为 successCriteria/);
+  assert.match(PLANNER_SYSTEM_PROMPT, /工具事件和 evidenceRefs 已经持久化/);
+  assert.match(PLANNER_SYSTEM_PROMPT, /默认由 summary \+ evidenceRefs 满足，不要求 Artifact/);
   assert.match(PLANNER_SYSTEM_PROMPT, /<example name="continue-current-task">/);
-  assert.match(PLANNER_SYSTEM_PROMPT, /<example name="create-planning-branch">/);
+  assert.match(PLANNER_SYSTEM_PROMPT, /<example name="append-same-workstream-objective">/);
+  assert.match(PLANNER_SYSTEM_PROMPT, /<example name="new-goal-with-continuous-context">/);
+  assert.match(PLANNER_SYSTEM_PROMPT, /<example name="parallel-independent-results">/);
   assert.match(PLANNER_SYSTEM_PROMPT, /<example name="initial-planning">/);
-  assert.equal((PLANNER_SYSTEM_PROMPT.match(/<example name=/g) ?? []).length, 3);
-  assert.match(EXECUTOR_SYSTEM_PROMPT, /只有全部 successCriteria 满足时提交 completed/);
+  assert.equal((PLANNER_SYSTEM_PROMPT.match(/<example name=/g) ?? []).length, 5);
+  assert.match(PLANNER_SYSTEM_PROMPT, /Task 是一条由同一个 Executor 持续拥有的因果工作流/);
+  assert.match(PLANNER_SYSTEM_PROMPT, /appendObjectives 追加目标及其 successCriteria/);
+  assert.match(PLANNER_SYSTEM_PROMPT, /并行不需要分组标签/);
+  assert.match(PLANNER_SYSTEM_PROMPT, /continueFromTaskRef=旧 Task/);
+  assert.match(PLANNER_SYSTEM_PROMPT, /set_node_status 只用于非 Task 规划节点/);
+  assert.match(EXECUTOR_SYSTEM_PROMPT, /只有原始成功条件和 TaskEnvelope 中全部累计新增目标的成功条件都满足时提交 completed/);
   assert.match(EXECUTOR_SYSTEM_PROMPT, /成功条件满足后立即调用 task_result_submit/);
 });
 
@@ -285,6 +300,32 @@ test("executor input exposes existing basis refs for transitive material reuse",
   assert.match(input, /event:proof/);
 });
 
+test("executor input re-injects cumulative Task goal additions", () => {
+  const input = renderExecutorInput({
+    rootGoal: "Obtain all authorized results",
+    taskEnvelope: {
+      taskId: "task:foothold",
+      goal: "Establish an entry foothold",
+      targetRefs: ["goal:root"],
+      scopeRef: "scope:root",
+      constraints: ["authorized target only"],
+      successCriteria: ["entry foothold is established"],
+      goalAdditions: [{
+        goal: "Use the foothold to obtain the internal result",
+        successCriteria: ["internal result is persisted"]
+      }]
+    },
+    operationGraphSlice: {},
+    reasoningGraphSlice: {},
+    sessionRefs: [],
+    executionBrief: "Resume from the current state",
+    runtimeBudgetStatus: "turns remain"
+  });
+  assert.match(input, /目标：Establish an entry foothold/);
+  assert.match(input, /Use the foothold to obtain the internal result/);
+  assert.match(input, /internal result is persisted/);
+});
+
 test("planner prompt explains how to use degraded projection outcomes", () => {
   assert.match(PLANNER_SYSTEM_PROMPT, /projectionDegradations 表示语义图未追平/);
   assert.match(PLANNER_SYSTEM_PROMPT, /优先使用最新 TaskOutcome 决策/);
@@ -297,6 +338,7 @@ test("projector prompt requests semantic changes instead of one node per observa
   assert.match(OBSERVER_PROJECTOR_SYSTEM_PROMPT, /命令中提到的候选、Executor commentary、静态页面文字和模型解释都不是结果/);
   assert.match(OBSERVER_PROJECTOR_SYSTEM_PROMPT, /Project changes/);
   assert.match(OBSERVER_PROJECTOR_SYSTEM_PROMPT, /相同事实合并 evidenceRefs/);
+  assert.match(OBSERVER_PROJECTOR_SYSTEM_PROMPT, /必须在节点顶层 evidenceRefs 中直接引用至少一个本批 observation/);
   assert.match(OBSERVER_PROJECTOR_SYSTEM_PROMPT, /已有事实没有变化就提交空 delta/);
   assert.match(OBSERVER_PROJECTOR_SYSTEM_PROMPT, /不存在 contradicted 状态/);
   assert.match(OBSERVER_PROJECTOR_SYSTEM_PROMPT, /Evidence 只写 ground claim/);

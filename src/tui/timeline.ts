@@ -41,7 +41,6 @@ type TaskPresentation = {
   taskId: string;
   label: string;
   goal?: string;
-  parallelGroup?: string;
   attempt?: number;
   status: TaskStatus;
   color: string;
@@ -292,7 +291,6 @@ export function projectExecutionEvents(
       if (task) {
         const detail = [
           task.taskId,
-          task.parallelGroup ? `并行组 ${task.parallelGroup}` : undefined,
           task.attempt ? `第 ${task.attempt} 轮` : undefined
         ].filter((value): value is string => Boolean(value)).join(" · ");
         items.push({
@@ -537,7 +535,6 @@ export function buildTaskPresentation(
       if (event.eventType === "epoch_transition" && stringValue(event.payload.state) === "running") {
         const envelope = recordValue(event.payload.taskEnvelope);
         task.goal = stringValue(envelope?.goal) ?? task.goal;
-        task.parallelGroup = stringValue(envelope?.parallelGroup) ?? task.parallelGroup;
         task.attempt = numberValue(event.payload.attempt) ?? task.attempt;
         task.status = "running";
       }

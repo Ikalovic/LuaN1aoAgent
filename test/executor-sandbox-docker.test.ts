@@ -93,6 +93,15 @@ test("container and workspace names are deterministic per runtimeDir + taskId", 
   assert.ok(first.workspaceDir.includes("sandboxes/task-one-"));
 });
 
+test("a successor keeps its own container identity while mounting the predecessor workspace", () => {
+  const source = dockerSandboxNames("/runtime/a", "task:source");
+  const successor = dockerSandboxNames("/runtime/a", "task:successor", "task:source");
+
+  assert.notEqual(successor.containerName, source.containerName);
+  assert.notEqual(successor.hostDir, source.hostDir);
+  assert.equal(successor.workspaceDir, source.workspaceDir);
+});
+
 test("container environment drops proxy and host secrets while mapping the Gateway CA", () => {
   const { environment, caCertHostPath } = buildContainerEnvironment({
     HTTP_PROXY: "http://127.0.0.1:8080",

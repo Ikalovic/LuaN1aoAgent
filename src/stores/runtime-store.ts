@@ -16,6 +16,7 @@ import type { EpochBudgetClockSnapshot } from "../epoch-budget-clock.js";
 export type ExecutorSessionRecord = {
   taskId: string;
   sessionFile: string;
+  workspaceKey: string;
   resumeCount: number;
   updatedAt: string;
 };
@@ -59,6 +60,7 @@ type ProjectionRow = {
 type ExecutorSessionRow = {
   task_id: string;
   session_file: string;
+  workspace_key: string | null;
   resume_count: number;
   updated_at: string;
 };
@@ -365,22 +367,48 @@ export class RuntimeStore {
     return rows.map(projectionRowToState);
   }
 
-  upsertExecutorSession(input: { taskId: string; sessionFile: string; resumeCount?: number }): ExecutorSessionRecord {
+  upsertExecutorSession(input: {
+    taskId: string;
+    sessionFile: string;
+    workspaceKey?: string;
+    resumeCount?: number;
+  }): ExecutorSessionRecord {
     const updatedAt = new Date().toISOString();
+    const workspaceKey = input.workspaceKey ?? input.taskId;
     this.database.prepare(`
-      INSERT INTO executor_sessions (task_id, session_file, resume_count, updated_at)
-      VALUES (?, ?, ?, ?)
+      INSERT INTO executor_sessions (task_id, session_file, workspace_key, resume_count, updated_at)
+      VALUES (?, ?, ?, ?, ?)
       ON CONFLICT(task_id) DO UPDATE SET
         session_file = excluded.session_file,
+        workspace_key = excluded.workspace_key,
         resume_count = excluded.resume_count,
         updated_at = excluded.updated_at
-    `).run(input.taskId, input.sessionFile, input.resumeCount ?? 0, updatedAt);
+    `).run(input.taskId, input.sessionFile, workspaceKey, input.resumeCount ?? 0, updatedAt);
     return {
       taskId: input.taskId,
       sessionFile: input.sessionFile,
+      workspaceKey,
       resumeCount: input.resumeCount ?? 0,
       updatedAt
     };
+  }
+
+  transferExecutorSession(fromTaskId: string, toTaskId: string): ExecutorSessionRecord {
+    const updatedAt = new Date().toISOString();
+    const result = this.database.prepare(`
+      UPDATE executor_sessions
+      SET task_id = ?, updated_at = ?
+      WHERE task_id = ?
+        AND NOT EXISTS (SELECT 1 FROM executor_sessions WHERE task_id = ?)
+    `).run(toTaskId, updatedAt, fromTaskId, toTaskId);
+    if (Number(result.changes) !== 1) {
+      throw new Error(`Executor session transfer failed: ${fromTaskId} -> ${toTaskId}`);
+    }
+    const transferred = this.getExecutorSession(toTaskId);
+    if (!transferred) {
+      throw new Error(`Transferred Executor session is missing for ${toTaskId}`);
+    }
+    return transferred;
   }
 
   getExecutorSession(taskId: string): ExecutorSessionRecord | undefined {
@@ -524,6 +552,7 @@ export class RuntimeStore {
       CREATE TABLE IF NOT EXISTS executor_sessions (
         task_id TEXT PRIMARY KEY,
         session_file TEXT NOT NULL,
+        workspace_key TEXT NOT NULL,
         resume_count INTEGER NOT NULL DEFAULT 0,
         updated_at TEXT NOT NULL
       );
@@ -567,6 +596,8 @@ export class RuntimeStore {
     `);
     ensureColumn(this.database, "projection_states", "pending_since", "TEXT");
     ensureColumn(this.database, "projection_states", "terminal_target_seq", "INTEGER");
+    ensureColumn(this.database, "executor_sessions", "workspace_key", "TEXT");
+    this.database.exec("UPDATE executor_sessions SET workspace_key = task_id WHERE workspace_key IS NULL OR workspace_key = ''");
   }
 
   private recoverInterruptedEpochs(): void {
@@ -659,6 +690,7 @@ function executorSessionRowToRecord(row: ExecutorSessionRow): ExecutorSessionRec
   return {
     taskId: row.task_id,
     sessionFile: row.session_file,
+    workspaceKey: row.workspace_key ?? row.task_id,
     resumeCount: Number(row.resume_count),
     updatedAt: row.updated_at
   };

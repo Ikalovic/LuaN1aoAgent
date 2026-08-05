@@ -123,12 +123,18 @@ export type TaskDefinition = {
   scopeRef: string;
   constraints: string[];
   successCriteria: string[];
+  goalAdditions?: TaskGoalAddition[];
+};
+
+export type TaskGoalAddition = {
+  goal: string;
+  successCriteria: string[];
 };
 
 export type TaskSchedulingPolicy = {
   dependsOnTaskRefs?: string[];
+  continueFromTaskRef?: string;
   parentTaskId?: string;
-  parallelGroup?: string;
   budget?: {
     maxTurns?: number;
   };
@@ -182,7 +188,7 @@ export type PlannerTaskSpec = {
   priority: number;
   parentTaskId?: string;
   dependsOnTaskRefs?: string[];
-  parallelGroup?: string;
+  continueFromTaskRef?: string;
 };
 
 export type PlannerTaskPatch = {
@@ -191,7 +197,7 @@ export type PlannerTaskPatch = {
   /** Historical decisions and Runtime-internal resolved patches only. */
   budget?: TaskBudget;
   priority?: number;
-  parallelGroup?: string;
+  appendObjectives?: TaskGoalAddition[];
 };
 
 type PlannerCommandBasis = {
@@ -252,6 +258,8 @@ export type SupervisorVerdict = ControlSignal & {
 export type TaskOutcome = {
   taskRef: string;
   epochRef: string;
+  /** Task objective definition evaluated by this outcome. */
+  objectiveRevision?: number;
   status: TaskResultStatus;
   summary: string;
   evidenceRefs: string[];
@@ -398,6 +406,7 @@ export type PlannerTaskLedgerItem = {
   basisRefs?: string[];
   scopeRef?: string;
   successCriteria?: string[];
+  goalAdditions?: TaskGoalAddition[];
   parentTaskId?: string;
   executionState?: "running" | "awaiting_planner" | "queued" | "blocked";
   maxTurns?: number;

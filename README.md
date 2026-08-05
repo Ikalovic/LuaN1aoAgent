@@ -90,7 +90,7 @@ v2 replaces the shared-history P-E-R loop with explicit runtime boundaries.
 
 - Reads compact task, reasoning, and operation graph views.
 - Creates or patches goal-level tasks instead of prescribing low-level actions.
-- Controls dependencies, priority, parallel groups, scope, and task budgets.
+- Controls dependencies, priority, independent-task concurrency, scope, and task budgets.
 - Reconciles ready tasks against available capacity after graph changes and task handoffs, without waiting for an entire parallel wave to finish.
 - Submits decisions through the structured `planner_submit` terminating tool.
 

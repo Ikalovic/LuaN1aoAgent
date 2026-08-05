@@ -193,7 +193,9 @@ function normalizePlannerTaskSpec(value: unknown): PlannerTaskSpec {
     priority: typeof value.priority === "number" && Number.isFinite(value.priority) ? value.priority : 1,
     parentTaskId: nonEmptyString(value.parentTaskId),
     dependsOnTaskRefs: stringArray(value.dependsOnTaskRefs).map(requireTaskId),
-    parallelGroup: nonEmptyString(value.parallelGroup)
+    continueFromTaskRef: value.continueFromTaskRef === undefined
+      ? undefined
+      : requireTaskId(value.continueFromTaskRef)
   };
 }
 
@@ -211,7 +213,21 @@ function normalizePlannerTaskPatch(value: unknown): PlannerTaskPatch {
   // structured Planner tool exposes only additionalTurns for budget changes.
   if (isRecord(value.budget)) patch.budget = value.budget;
   if (typeof value.priority === "number" && Number.isFinite(value.priority)) patch.priority = value.priority;
-  if (typeof value.parallelGroup === "string") patch.parallelGroup = value.parallelGroup;
+  if (Array.isArray(value.appendObjectives)) {
+    const additions = value.appendObjectives.map((objective) => {
+      if (!isRecord(objective)) {
+        throw new PlannerProtocolError("appendObjectives entries must be objects");
+      }
+      return {
+        goal: nonEmptyString(objective.goal) ?? fail("An appended objective requires a goal"),
+        successCriteria: nonEmptyStringArray(
+          objective.successCriteria,
+          ["Produce an observable result for the appended objective"]
+        )
+      };
+    });
+    if (additions.length > 0) patch.appendObjectives = additions;
+  }
   if (Object.keys(patch).length === 0) {
     throw new PlannerProtocolError("patch_task patch contains no supported fields");
   }

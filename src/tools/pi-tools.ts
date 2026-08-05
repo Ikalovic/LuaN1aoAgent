@@ -34,23 +34,32 @@ const ProjectorGraphNodeUpdateProperties = {
   artifactRefs: Type.Optional(Type.Array(Type.String({ pattern: "^artifact:.+" })))
 };
 
-const ProjectorGraphNodeSchema = Type.Object({
-  id: Type.String({ pattern: "^(existing|new):[1-9][0-9]*$", maxLength: 32 }),
-  type: Type.Optional(Type.Union(PROJECTION_ALL_NODE_TYPES.map((type) => Type.Literal(type)))),
-  label: Type.Optional(Type.String({ minLength: 1, maxLength: 500 })),
+const ProjectorGraphRefSchema = Type.String({ pattern: "^(existing|new):[1-9][0-9]*$", maxLength: 32 });
+
+const ProjectorCreateNodeOperationSchema = Type.Object({
+  op: Type.Literal("create_node"),
+  ref: Type.String({ pattern: "^new:[1-9][0-9]*$", maxLength: 32 }),
+  type: Type.Union(PROJECTION_ALL_NODE_TYPES.map((type) => Type.Literal(type))),
+  label: Type.String({ minLength: 1, maxLength: 500 }),
   ...ProjectorGraphNodeUpdateProperties
 }, { additionalProperties: false });
 
-const ProjectorGraphEdgeSchema = Type.Object({
-  from: Type.String({ pattern: "^(existing|new):[1-9][0-9]*$", maxLength: 32 }),
-  to: Type.String({ pattern: "^(existing|new):[1-9][0-9]*$", maxLength: 32 }),
+const ProjectorUpdateNodeOperationSchema = Type.Object({
+  op: Type.Literal("update_node"),
+  ref: ProjectorGraphRefSchema,
+  ...ProjectorGraphNodeUpdateProperties
+}, { additionalProperties: false });
+
+const ProjectorCreateEdgeOperationSchema = Type.Object({
+  op: Type.Literal("create_edge"),
+  from: ProjectorGraphRefSchema,
+  to: ProjectorGraphRefSchema,
   type: Type.Union(PROJECTION_EDGE_TYPES.map((type) => Type.Literal(type))),
   properties: Type.Optional(Type.Record(Type.String(), Type.Unknown())),
   evidenceRefs: Type.Optional(Type.Array(Type.String()))
 }, { additionalProperties: false });
 
 const PlannerTaskIdSchema = Type.String({ pattern: "^task:.+", minLength: 6, maxLength: 256 });
-const PlannerNodeIdSchema = Type.String({ minLength: 1, maxLength: 256 });
 const PlannerRefArraySchema = Type.Array(Type.String({ minLength: 1, maxLength: 256 }), { maxItems: 32 });
 const PlannerCommandBasisProperties = {
   basedOnRefs: Type.Optional(Type.Array(Type.String({ minLength: 1, maxLength: 256 }), {
@@ -60,6 +69,13 @@ const PlannerCommandBasisProperties = {
 };
 const PlannerTaskBudgetSchema = Type.Object({
   maxTurns: Type.Optional(Type.Integer({ minimum: 1, maximum: 40 }))
+}, { additionalProperties: false });
+const PlannerTaskGoalAdditionSchema = Type.Object({
+  goal: Type.String({ minLength: 1, maxLength: 2_000 }),
+  successCriteria: Type.Array(Type.String({ minLength: 1, maxLength: 1_000 }), {
+    minItems: 1,
+    maxItems: 32
+  })
 }, { additionalProperties: false });
 const PlannerTaskSpecSchema = Type.Object({
   id: PlannerTaskIdSchema,
@@ -79,7 +95,12 @@ const PlannerTaskSpecSchema = Type.Object({
   priority: Type.Number({ minimum: 1 }),
   parentTaskId: Type.Optional(Type.String({ pattern: "^(goal|task):.+", maxLength: 256 })),
   dependsOnTaskRefs: Type.Optional(Type.Array(PlannerTaskIdSchema, { maxItems: 32 })),
-  parallelGroup: Type.Optional(Type.String({ minLength: 1, maxLength: 256 }))
+  continueFromTaskRef: Type.Optional(Type.String({
+    pattern: "^task:.+",
+    minLength: 6,
+    maxLength: 256,
+    description: "Completed direct dependency whose Executor session and workspace should move to this sequential successor. Omit for independent or parallel work."
+  }))
 }, { additionalProperties: false });
 const PlannerTaskPatchSchema = Type.Object({
   additionalTurns: Type.Optional(Type.Integer({
@@ -88,7 +109,11 @@ const PlannerTaskPatchSchema = Type.Object({
     description: "Turns to add to this Task's cumulative maxTurns. This is an increment, not the new total."
   })),
   priority: Type.Optional(Type.Number({ minimum: 1 })),
-  parallelGroup: Type.Optional(Type.String({ maxLength: 256 }))
+  appendObjectives: Type.Optional(Type.Array(PlannerTaskGoalAdditionSchema, {
+    minItems: 1,
+    maxItems: 16,
+    description: "Append newly discovered results and their observable completion criteria without replacing the original Task goal."
+  }))
 }, { additionalProperties: false });
 const PlannerTaskStatusSchema = Type.Union([
   Type.Literal("open"),
@@ -123,8 +148,16 @@ const PlannerCommandSchema = Type.Union([
   }, { additionalProperties: false }),
   Type.Object({
     kind: Type.Literal("set_node_status"),
-    nodeId: PlannerNodeIdSchema,
-    status: Type.String({ minLength: 1, maxLength: 64 }),
+    nodeId: Type.String({
+      minLength: 1,
+      maxLength: 256,
+      description: "Non-Task planning node id. Never use task:*; Task lifecycle uses set_task_status."
+    }),
+    status: Type.String({
+      minLength: 1,
+      maxLength: 64,
+      description: "Status for a non-Task planning node, not an Executor progress label."
+    }),
     ...PlannerCommandBasisProperties
   }, { additionalProperties: false })
 ]);
@@ -229,13 +262,27 @@ export function createGraphDeltaSubmitTool(options: ProjectionDraftValidationOpt
   return defineTool({
     name: "graph_delta_submit",
     label: "Submit Graph Delta",
-    description: "Submit one complete final Projector GraphDelta and terminate this invocation. Validation rejects the entire draft; correct errors and resubmit the complete delta.",
+    description: "Submit one complete semantic change set and terminate this invocation. Use create_node for new identities, update_node for existing metadata, and create_edge for relations. Validation rejects the entire draft.",
     parameters: Type.Object({
-      nodes: Type.Optional(Type.Array(ProjectorGraphNodeSchema)),
-      edges: Type.Optional(Type.Array(ProjectorGraphEdgeSchema))
+      changes: Type.Optional(Type.Array(Type.Union([
+        ProjectorCreateNodeOperationSchema,
+        ProjectorUpdateNodeOperationSchema,
+        ProjectorCreateEdgeOperationSchema
+      ])))
     }, { additionalProperties: false }),
     execute: async (_toolCallId, params) => {
-      const draft = normalizeProjectionDraft(params, options);
+      const nodes: Array<Record<string, unknown>> = [];
+      const edges: Array<Record<string, unknown>> = [];
+      for (const change of params.changes ?? []) {
+        if (change.op === "create_edge") {
+          const { op: _op, ...edge } = change;
+          edges.push(edge);
+          continue;
+        }
+        const { op: _op, ref, ...node } = change;
+        nodes.push({ id: ref, ...node });
+      }
+      const draft = normalizeProjectionDraft({ nodes, edges }, options);
       return {
         content: [{ type: "text", text: "Graph delta draft accepted; graph transaction commit is pending" }],
         details: draft,
@@ -1150,7 +1197,7 @@ export function createArtifactWriteTool(
   return defineTool({
     name: "artifact_write",
     label: "Artifact Write",
-    description: "Import a complete existing file from the persistent Task workspace (for example evidence.json or poc.py) into Artifact storage. Temporary files under /tmp are not a durable handoff boundary.",
+    description: "Promote the minimum existing file whose exact content is required across the Task boundary from the persistent workspace into Artifact storage. Same-Task epoch resume and reconstructible persisted evidence do not require promotion; temporary files under /tmp are not a durable handoff boundary.",
     parameters,
     execute: async (_toolCallId, params) => {
       const record: ArtifactRecord = options.readExecutorFile
