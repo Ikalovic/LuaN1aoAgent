@@ -4286,6 +4286,176 @@ test("Planner empty decision resumes an open Task after a blocked outcome", asyn
   await harness.controller.close({ drainProjectionJobs: false });
 });
 
+test("Planner empty decision resumes a reopened Task after its completed outcome was superseded by appended objectives", async () => {
+  const harness = createControllerHarness();
+  const taskEnvelope = makeTaskEnvelope({
+    taskId: "task:reopened-completed",
+    budget: { maxTurns: 10 }
+  });
+  harness.controller.graphStore.createTask({ ...taskEnvelope, priority: 1 });
+  harness.controller.graphStore.markTaskStatus({
+    taskId: taskEnvelope.taskId,
+    status: "open"
+  });
+  for (let turn = 1; turn <= 10; turn += 1) {
+    harness.controller.runtimeStore.recordTaskTurn({
+      taskId: taskEnvelope.taskId,
+      eventId: `event:reopened-completed:${turn}`
+    });
+  }
+  harness.controller.runtimeStore.upsertTaskOutcome({
+    taskRef: taskEnvelope.taskId,
+    epochRef: "epoch:reopened-completed",
+    status: "completed",
+    summary: "The original recon objective completed at revision 1",
+    evidenceRefs: [],
+    artifactRefs: [],
+    capabilityRefs: [],
+    objectiveRevision: 1,
+    terminalSeq: 40,
+    createdAt: new Date().toISOString()
+  });
+  harness.controller.runtimeStore.upsertEpochOutcome({
+    epochRef: "epoch:reopened-completed",
+    taskRef: taskEnvelope.taskId,
+    status: "submitted",
+    reason: "Executor reported a completed outcome at revision 1",
+    taskOutcomeRef: taskEnvelope.taskId,
+    terminalSeq: 40,
+    retryable: false,
+    createdAt: new Date().toISOString()
+  });
+  harness.controller.graphStore.patchTask({
+    taskId: taskEnvelope.taskId,
+    patch: {
+      appendObjectives: [{
+        goal: "Exploit the portal to obtain the flag",
+        successCriteria: ["flag obtained"]
+      }],
+      budget: { maxTurns: 22 }
+    },
+    reason: "Append the exploitation objective to the same workstream"
+  });
+  const schedulerState = harness.controller as unknown as { awaitingPlannerTaskIds: Set<string> };
+  schedulerState.awaitingPlannerTaskIds.add(taskEnvelope.taskId);
+
+  const released = await harness.controllerHarness.releasePlannerWaitingTasks({
+    commands: [],
+    reason: "Keep the reopened Task and continue with its remaining allocation"
+  }, new Set([taskEnvelope.taskId]));
+  const events = await harness.controller.executionLog.readAll();
+
+  assert.deepEqual(released, [taskEnvelope.taskId]);
+  assert.equal(schedulerState.awaitingPlannerTaskIds.has(taskEnvelope.taskId), false);
+  assert.ok(events.some((event) => event.eventType === "planner_handoff_resolved"
+    && event.taskId === taskEnvelope.taskId
+    && event.payload.resolution === "resume_open_task"
+    && event.payload.taskOutcomeRef === taskEnvelope.taskId
+    && event.payload.remainingTurns === 12));
+  await harness.controller.close({ drainProjectionJobs: false });
+});
+
+test("runUntilDone resumes a reopened Task with the same Executor after appended objectives", async () => {
+  const runtimeDir = mkdtempSync(join(tmpdir(), "luanniao-controller-"));
+  const controller = createControllerWithTestLlmEnv(runtimeDir);
+  const controllerHarness = controller as unknown as ControllerHarness;
+  const plannerSession = createMockTextSessionSequence([
+    JSON.stringify({
+      decision: "apply_commands",
+      commands: [{
+        kind: "create_tasks",
+        tasks: [{
+          id: "task:reopen-e2e",
+          goal: "Recon the entry target",
+          targetRefs: ["goal:root"],
+          scopeRef: "scope:root",
+          constraints: [],
+          successCriteria: ["entry mapped"],
+          budget: { maxTurns: 10 },
+          priority: 1
+        }],
+        reason: "Start entry recon",
+        basedOnRefs: ["goal:root"]
+      }],
+      reason: "Start entry recon",
+      basedOnRefs: ["goal:root"]
+    }),
+    JSON.stringify({
+      decision: "apply_commands",
+      commands: [{
+        kind: "patch_task",
+        taskId: "task:reopen-e2e",
+        patch: {
+          appendObjectives: [{
+            goal: "Exploit the entry to obtain the flag",
+            successCriteria: ["flag obtained"]
+          }],
+          budget: { maxTurns: 22 }
+        },
+        reason: "Continue the same workstream",
+        basedOnRefs: ["task:reopen-e2e"]
+      }],
+      reason: "Continue the same workstream",
+      basedOnRefs: ["task:reopen-e2e"]
+    }),
+    JSON.stringify({
+      decision: "apply_commands",
+      commands: [],
+      reason: "Resume the reopened Task with its remaining allocation",
+      basedOnRefs: ["task:reopen-e2e"]
+    }),
+    JSON.stringify({
+      decision: "apply_commands",
+      commands: [{
+        kind: "set_node_status",
+        nodeId: "goal:root",
+        status: "completed",
+        basedOnRefs: ["task:reopen-e2e"]
+      }],
+      reason: "All objectives are satisfied",
+      basedOnRefs: ["task:reopen-e2e"]
+    })
+  ]);
+  const observerSession = createAbortableMockTextSession(observerProjectionJson());
+  controllerHarness.agents = {
+    planner: plannerSession,
+    executor: { abort: async () => {}, steer: async () => {} },
+    observer: observerSession
+  };
+  let executorSessionsCreated = 0;
+  controllerHarness.createExecutorSessionForTask = async (taskEnvelope) => {
+    executorSessionsCreated += 1;
+    return {
+      session: createAbortableMockTextSession(JSON.stringify({
+        taskId: taskEnvelope.taskId,
+        status: "completed",
+        summary: `Epoch ${executorSessionsCreated} completed`,
+        evidenceRefs: [],
+        artifactRefs: []
+      })),
+      dynamicExecutor: true,
+      resumed: executorSessionsCreated > 1,
+      resumeCount: executorSessionsCreated - 1
+    };
+  };
+
+  const result = await controller.runUntilDone({
+    userGoal: "Obtain the flag through the entry target",
+    scopeSummary: "Authorized target only",
+    maxParallelTasks: 1,
+    maxRunTimeMs: 60_000
+  });
+
+  assert.equal(result.completed, true);
+  assert.equal(executorSessionsCreated, 2);
+  const events = await controller.executionLog.readAll();
+  assert.ok(events.some((event) => event.eventType === "planner_handoff_resolved"
+    && event.taskId === "task:reopen-e2e"
+    && event.payload.resolution === "resume_open_task"));
+  assert.ok(!events.some((event) => event.eventType === "run_failed"));
+  await controller.close({ drainProjectionJobs: false });
+});
+
 test("initialize preserves a persisted partial handoff resolution", async () => {
   const runtimeDir = mkdtempSync(join(tmpdir(), "luanniao-controller-"));
   const first = createControllerWithTestLlmEnv(runtimeDir);

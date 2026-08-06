@@ -1998,7 +1998,11 @@ export class SecurityAgentController {
         && epochOutcome.taskOutcomeRef === undefined
         && epochOutcome.terminalSeq > (taskOutcome?.terminalSeq ?? 0);
       const resumableOpenOutcome = taskOutcome?.status === "blocked" || taskOutcome?.status === "failed";
-      if (consumedTurns < maxTurns && (resumablePartial || resumableEpoch || resumableOpenOutcome)) {
+      const resumableCompletedRevision = taskOutcome?.status === "completed"
+        && typeof taskOutcome.objectiveRevision === "number"
+        && taskOutcome.objectiveRevision < taskObjectiveRevision(this.graphStore.getTaskNode(taskId));
+      if (consumedTurns < maxTurns
+        && (resumablePartial || resumableEpoch || resumableOpenOutcome || resumableCompletedRevision)) {
         const resolution = resumablePartial
           ? "resume_partial"
           : resumableEpoch
