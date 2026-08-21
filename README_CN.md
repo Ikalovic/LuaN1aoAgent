@@ -294,6 +294,36 @@ LLM_DEFAULT_MODEL=your-model-id
 LLM_API_TYPE=openai-completions
 ```
 
+### 可选 FOFA MCP 资产发现
+
+在宿主机设置 `FOFA_API_KEY` 后，动态 Task Executor 会获得
+`fofa_account_info`、`fofa_search`、`fofa_search_next`、`fofa_stats` 和
+`fofa_host_aggregate` 五项工具。密钥只保存在宿主侧 stdio MCP 子进程，
+不会进入 Executor 沙箱或提示词。未设置密钥时 Agent 仍正常启动，只是不注册
+这五项工具。
+
+默认限制为每次查询 100 条、每个 Task 累计 1,000 条，以及每个 Task 20 次统计或
+主机聚合调用。可通过 `FOFA_MAX_RESULTS_PER_CALL`、
+`FOFA_MAX_RESULTS_PER_TASK`、`FOFA_MAX_AGGREGATIONS_PER_TASK` 调整；
+`FOFA_API_BASE_URL` 默认 `https://fofa.info`，请求超时
+`FOFA_REQUEST_TIMEOUT_MS` 默认 15000 毫秒。
+
+授权根域包含按标签边界匹配的子域。共享基础设施上的无关域名、证书或 ICP 关联、
+格式异常或身份不明确的旁站线索均保持 `candidate_only`，并明确标记
+`active_testing_allowed:false`，不会扩大授权 Scope。完整 FOFA 结果保存为 Task
+JSON Artifact，模型只接收有界摘要。
+
+普通测试不会访问 FOFA。真实的一条结果冒烟测试必须同时显式启用并提供密钥：
+
+```bash
+npm run build
+FOFA_LIVE_TEST=1 FOFA_API_KEY=... npm run test:fofa-live
+```
+
+端点映射参考了采用 MIT 许可证的
+[fofaEX 3.3.1](https://github.com/10cks/fofaEX/releases/tag/3.3.1) 及 FOFA
+官方 SDK 行为；项目没有捆绑 fofaEX 源码。
+
 v2 会读取本地 `.env`。该文件已被 Git 忽略，绝不能提交。
 
 ### 3. 启动 Agent 运行

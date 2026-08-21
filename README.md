@@ -294,6 +294,38 @@ LLM_DEFAULT_MODEL=your-model-id
 LLM_API_TYPE=openai-completions
 ```
 
+### Optional FOFA MCP discovery
+
+Set `FOFA_API_KEY` on the host to enable `fofa_account_info`, `fofa_search`,
+`fofa_search_next`, `fofa_stats`, and `fofa_host_aggregate` for dynamic Task
+Executors. The key remains in the host-side stdio MCP child and is never added
+to an Executor sandbox or prompt. With no key, the agent starts normally and
+the five tools are simply absent.
+
+Defaults are 100 records per call, 1,000 records per Task, and 20 statistics or
+host-aggregation calls per Task. Configure them with
+`FOFA_MAX_RESULTS_PER_CALL`, `FOFA_MAX_RESULTS_PER_TASK`, and
+`FOFA_MAX_AGGREGATIONS_PER_TASK`; `FOFA_API_BASE_URL` defaults to
+`https://fofa.info`, and `FOFA_REQUEST_TIMEOUT_MS` defaults to 15000.
+
+An authorized root domain includes its label-boundary subdomains. Unrelated
+domains found on shared infrastructure, certificate/ICP associations, malformed
+or ambiguous identities, and other旁站 leads remain `candidate_only` with
+`active_testing_allowed:false`; they never widen Scope. Complete FOFA results
+are stored as Task JSON Artifacts while the model receives a bounded preview.
+
+Normal tests never contact FOFA. A one-record real request requires both an
+explicit opt-in and a key:
+
+```bash
+npm run build
+FOFA_LIVE_TEST=1 FOFA_API_KEY=... npm run test:fofa-live
+```
+
+The endpoint mapping was informed by the MIT-licensed
+[fofaEX 3.3.1](https://github.com/10cks/fofaEX/releases/tag/3.3.1) and the
+official FOFA SDK behavior. No fofaEX source code is bundled.
+
 v2 reads `.env` locally. The file is ignored by Git and must never be committed.
 
 ### 3. Start an Agent run
