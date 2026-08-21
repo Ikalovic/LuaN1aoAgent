@@ -82,11 +82,15 @@ import {
   type PlannerTaskBatchCommand
 } from "./stores/graph-store.js";
 import { RuntimeStore } from "./stores/runtime-store.js";
+import { loadFofaConfig, type FofaConfig } from "./fofa/fofa-config.js";
+import { FofaScopePolicy } from "./fofa/fofa-scope-policy.js";
+import { FofaMcpRuntime, type FofaMcpRuntimeOptions } from "./mcp/fofa-runtime.js";
 import {
   createExecutorConnectivityTools,
   type ExecutorConnectivityRuntime
 } from "./tools/connectivity-tools.js";
 import { createEvidenceListTool, createEvidenceReadTool } from "./tools/pi-tools.js";
+import { createExecutorFofaTools } from "./tools/fofa-mcp-tools.js";
 import type {
   AgentRole,
   ControlSignal,
@@ -395,6 +399,12 @@ export class SecurityAgentController {
   private readonly executorSandboxMode?: ExecutorSandboxRequestedMode;
   private executorSandbox?: ExecutorSandbox;
   private connectivityRuntime?: ConnectivityRuntime;
+  private readonly fofaConfig?: FofaConfig;
+  private readonly fofaConfigInvalid: boolean;
+  private readonly fofaRuntimeFactory: (input: FofaMcpRuntimeOptions) => FofaMcpRuntime;
+  private fofaRuntime?: FofaMcpRuntime;
+  private fofaScopeFingerprint?: string;
+  private fofaCapabilityReported = false;
   private connectivityStore?: ConnectivityStore;
   private connectivityRuntimeCleanupComplete = false;
   private taskExecutorSandboxes = new Map<string, DockerTaskSandbox>();
@@ -447,11 +457,22 @@ export class SecurityAgentController {
     runtimeDir?: string;
     environment?: NodeJS.ProcessEnv;
     executorSandboxMode?: ExecutorSandboxRequestedMode;
+    fofaRuntimeFactory?: (input: FofaMcpRuntimeOptions) => FofaMcpRuntime;
   }) {
     this.cwd = input.cwd;
     this.runtimeDir = input.runtimeDir ?? join(input.cwd, ".agent-runtime");
     this.environment = input.environment;
     this.executorSandboxMode = input.executorSandboxMode;
+    this.fofaRuntimeFactory = input.fofaRuntimeFactory ?? ((options) => new FofaMcpRuntime(options));
+    let fofaConfig: FofaConfig | undefined;
+    let fofaConfigInvalid = false;
+    try {
+      fofaConfig = loadFofaConfig(input.environment ?? process.env);
+    } catch {
+      fofaConfigInvalid = true;
+    }
+    this.fofaConfig = fofaConfig;
+    this.fofaConfigInvalid = fofaConfigInvalid;
     this.graphStore = new SQLiteGraphStore(
       join(this.runtimeDir, "state.sqlite"),
       join(this.runtimeDir, "graph-deltas.jsonl")
@@ -793,6 +814,7 @@ export class SecurityAgentController {
     maxRunTimeMs?: number;
   }): Promise<RunResult> {
     await this.connectivityRuntime?.configureAuthorizedScope(input.scopeSummary);
+    await this.configureFofaRuntime(input.scopeSummary);
     const maxPlannerCycles = input.maxPlannerCycles ?? 8;
     const maxParallelTasks = normalizeParallelTaskLimit(input.maxParallelTasks);
     const maxRunTimeMs = normalizeRunTimeBudgetMs(input.maxRunTimeMs);
@@ -998,6 +1020,7 @@ export class SecurityAgentController {
     }
     this.stopRequestedReason = reason;
     this.invocationAbortController.abort(reason);
+    const fofaStop = this.fofaRuntime?.close(reason);
     this.projectionRequestsClosed = true;
     this.projectionCancellationRequested = true;
     this.projectorInvocationAbortController.abort(reason);
@@ -1035,6 +1058,7 @@ export class SecurityAgentController {
     await Promise.allSettled([...this.activeTaskRuns.values()].map((run) => run.promise));
     await this.closeExecutorResources();
     await this.projectorCoordinator.close({ drain: false });
+    await fofaStop;
   }
 
   private async finalizeRunMetrics(): Promise<void> {
@@ -1160,6 +1184,7 @@ export class SecurityAgentController {
     }
     await Promise.allSettled([...(this.networkFinalizations?.values() ?? [])]);
     await this.closeExecutorResources();
+    await this.fofaRuntime?.close("Controller shutdown");
     for (const pending of [...this.pendingSupervisorRequests.values()]) {
       void this.discardSupervisorCheck(
         pending.request,
@@ -1563,6 +1588,7 @@ export class SecurityAgentController {
             payload: { command, status: command.status, nodeVersion: appliedCommand?.node.properties.version }
           });
           if (["completed", "blocked", "failed", "archived"].includes(command.status)) {
+            this.invalidateFofaTaskIfTerminal(command.taskId, command.status);
             const transfersContext = taskCreateInputs.some(({ taskEnvelope }) =>
               taskEnvelope.continueFromTaskRef === command.taskId);
             if (!transfersContext) {
@@ -2383,6 +2409,11 @@ export class SecurityAgentController {
       if (taskResult.status === "completed"
         || taskResult.status === "blocked"
         || (taskResult.status === "failed" && taskResult.retryable !== true)) {
+        this.invalidateFofaTaskIfTerminal(
+          taskEnvelope.taskId,
+          taskResult.status,
+          taskResult.retryable === true
+        );
         const finalization = this.networkFinalizations.get(state.epochId) ?? Promise.resolve();
         void finalization.then(() => this.disposeTaskExecutorResources(taskEnvelope.taskId)).catch(() => undefined);
       }
@@ -2580,9 +2611,83 @@ export class SecurityAgentController {
   private createTaskRuntimeTools(taskEnvelope: TaskEnvelope) {
     return [
       ...this.createTaskConnectivityTools(taskEnvelope.taskId),
+      ...(this.fofaRuntime
+        ? createExecutorFofaTools(this.fofaRuntime, this.artifactStore, taskEnvelope.taskId)
+        : []),
       createEvidenceListTool(this.executionLog),
       createEvidenceReadTool(this.executionLog)
     ];
+  }
+
+  private async configureFofaRuntime(scopeSummary: string): Promise<void> {
+    if (this.fofaRuntime) {
+      const fingerprint = new FofaScopePolicy(parseAuthorizedScope(scopeSummary)).fingerprint();
+      if (fingerprint !== this.fofaScopeFingerprint) {
+        throw new Error("FOFA Runtime Scope cannot change within one Controller Run");
+      }
+      return;
+    }
+    if (this.fofaConfigInvalid) {
+      if (!this.fofaCapabilityReported) {
+        this.fofaCapabilityReported = true;
+        await this.executionLog.append({
+          role: "runtime",
+          eventType: "fofa_mcp_failed",
+          summary: "FOFA MCP configuration is invalid",
+          payload: { enabled: false }
+        });
+      }
+      return;
+    }
+    if (!this.fofaConfig) {
+      if (!this.fofaCapabilityReported) {
+        this.fofaCapabilityReported = true;
+        await this.executionLog.append({
+          role: "runtime",
+          eventType: "fofa_mcp_disabled",
+          summary: "FOFA MCP is not configured",
+          payload: { enabled: false }
+        });
+      }
+      return;
+    }
+    const scope = parseAuthorizedScope(scopeSummary);
+    const policy = new FofaScopePolicy(scope);
+    const runtime = this.fofaRuntimeFactory({
+      runRef: this.runId,
+      scope,
+      config: this.fofaConfig,
+      runtimeStore: this.runtimeStore,
+      executionLog: this.executionLog
+    });
+    try {
+      await runtime.start();
+      this.fofaRuntime = runtime;
+      this.fofaScopeFingerprint = policy.fingerprint();
+      this.fofaCapabilityReported = true;
+      await this.executionLog.append({
+        role: "runtime",
+        eventType: "fofa_mcp_ready",
+        summary: "FOFA MCP is ready for Task Executors",
+        payload: { enabled: true, scopeFingerprint: this.fofaScopeFingerprint }
+      });
+    } catch {
+      await runtime.close("FOFA MCP initialization failed").catch(() => undefined);
+      this.fofaCapabilityReported = true;
+      await this.executionLog.append({
+        role: "runtime",
+        eventType: "fofa_mcp_failed",
+        summary: "FOFA MCP initialization failed",
+        payload: { enabled: false }
+      });
+    }
+  }
+
+  private invalidateFofaTaskIfTerminal(taskRef: string, status: string, retryable = false): void {
+    if (status === "completed" || status === "blocked" || status === "archived"
+      || (status === "failed" && !retryable)) {
+      this.fofaRuntime?.invalidateTask(taskRef);
+    }
   }
 
   private async disposeTaskExecutorResources(
