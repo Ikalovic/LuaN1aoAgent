@@ -47,6 +47,15 @@ test("FOFA rejects insecure remote base URLs but permits test loopback", () => {
     })!.baseUrl,
     "http://127.0.0.1:8080"
   );
+  assert.equal(
+    loadFofaConfig({
+      FOFA_API_KEY: "sentinel-secret",
+      FOFA_API_BASE_URL: "http://localhost:9090/",
+      FOFA_BASE_URL: "http://127.0.0.1:8080/",
+      NODE_ENV: "test"
+    })!.baseUrl,
+    "http://localhost:9090"
+  );
 });
 
 test("the child environment and redacted text do not expose host secrets", () => {

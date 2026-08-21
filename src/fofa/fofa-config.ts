@@ -20,7 +20,7 @@ export function loadFofaConfig(env: NodeJS.ProcessEnv): FofaConfig | undefined {
     return undefined;
   }
 
-  const baseUrl = normalizeBaseUrl(env.FOFA_BASE_URL, env.NODE_ENV);
+  const baseUrl = normalizeBaseUrl(env.FOFA_API_BASE_URL ?? env.FOFA_BASE_URL, env.NODE_ENV);
   const maxResultsPerTask = positiveInteger(
     env.FOFA_MAX_RESULTS_PER_TASK,
     DEFAULT_MAX_RESULTS_PER_TASK
@@ -59,7 +59,7 @@ export function fofaChildEnvironment(
   if (config.email) {
     child.FOFA_EMAIL = config.email;
   }
-  child.FOFA_BASE_URL = config.baseUrl;
+  child.FOFA_API_BASE_URL = config.baseUrl;
   child.FOFA_MAX_RESULTS_PER_CALL = String(config.maxResultsPerCall);
   child.FOFA_MAX_RESULTS_PER_TASK = String(config.maxResultsPerTask);
   child.FOFA_MAX_AGGREGATIONS_PER_TASK = String(config.maxAggregationsPerTask);
