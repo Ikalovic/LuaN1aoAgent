@@ -11,6 +11,36 @@ export type AuthorizedScope = {
   domains: string[];
 };
 
+export function authorizedScopeContainsDomain(scope: AuthorizedScope, input: string): boolean {
+  const candidate = normalizeDomainCandidate(input);
+  if (!candidate) {
+    return false;
+  }
+  return scope.domains.some((pattern) => {
+    if (pattern.startsWith("*.")) {
+      return candidate.endsWith(`.${pattern.slice(2)}`);
+    }
+    return candidate === pattern || candidate.endsWith(`.${pattern}`);
+  });
+}
+
+export function authorizedScopeContainsIp(scope: AuthorizedScope, input: string): boolean {
+  const candidate = parseIpv4Number(input);
+  if (candidate === undefined) {
+    return false;
+  }
+  return scope.cidrs.some((cidr) => {
+    const [networkInput, prefixInput] = cidr.split("/");
+    const network = parseIpv4Number(networkInput);
+    const prefixLength = Number(prefixInput);
+    if (network === undefined || !Number.isInteger(prefixLength) || prefixLength < 0 || prefixLength > 32) {
+      return false;
+    }
+    const mask = prefixLength === 0 ? 0 : (0xffffffff << (32 - prefixLength)) >>> 0;
+    return ((candidate & mask) >>> 0) === ((network & mask) >>> 0);
+  });
+}
+
 export function normalizeScope(values: string | string[]): string {
   const scope = parseAuthorizedScope(values);
   return [...scope.cidrs, ...scope.domains].join(",");
@@ -65,6 +95,22 @@ function normalizeDomainPattern(value: string): string {
     throw new Error(`Invalid domain scope entry: ${value}`);
   }
   return wildcard ? `*.${domain}` : domain;
+}
+
+function normalizeDomainCandidate(value: string): string | undefined {
+  const rawDomain = value.trim().replace(/\.+$/, "").toLowerCase();
+  if (!rawDomain || rawDomain.includes("*") || rawDomain.includes(":") || rawDomain.includes("/") || /\s/.test(rawDomain)) {
+    return undefined;
+  }
+  const domain = domainToASCII(rawDomain).toLowerCase();
+  if (!domain || domain.length > 253 || !domain.includes(".")) {
+    return undefined;
+  }
+  const labels = domain.split(".");
+  if (labels.some((label) => !/^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/.test(label)) || /^\d+$/.test(labels.at(-1)!)) {
+    return undefined;
+  }
+  return domain;
 }
 
 export function normalizeInferredScopeCidrs(goal: string, values: string[]): string {
@@ -124,4 +170,16 @@ function compareCidrs(left: string, right: string): number {
 
 function ipv4Number(value: string): number {
   return value.split(".").reduce((result, octet) => ((result << 8) | Number(octet)) >>> 0, 0);
+}
+
+function parseIpv4Number(value: string): number | undefined {
+  const parts = value.trim().split(".");
+  if (parts.length !== 4 || parts.some((part) => !/^\d{1,3}$/.test(part))) {
+    return undefined;
+  }
+  const octets = parts.map(Number);
+  if (octets.some((octet) => octet > 255)) {
+    return undefined;
+  }
+  return octets.reduce((result, octet) => ((result << 8) | octet) >>> 0, 0);
 }

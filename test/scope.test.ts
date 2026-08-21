@@ -1,12 +1,32 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  authorizedScopeContainsDomain,
+  authorizedScopeContainsIp,
   extractLiteralGoalCidrs,
   normalizeInferredScopeCidrs,
   normalizeScope,
   normalizeScopeCidrs,
   parseAuthorizedScope
 } from "../src/scope.js";
+
+test("authorized Scope includes root subdomains and CIDR addresses", () => {
+  const scope = parseAuthorizedScope("example.com,10.20.0.0/16");
+  assert.equal(authorizedScopeContainsDomain(scope, "example.com"), true);
+  assert.equal(authorizedScopeContainsDomain(scope, "a.b.example.com"), true);
+  assert.equal(authorizedScopeContainsDomain(scope, "notexample.com"), false);
+  assert.equal(authorizedScopeContainsIp(scope, "10.20.4.8"), true);
+  assert.equal(authorizedScopeContainsIp(scope, "10.21.4.8"), false);
+});
+
+test("wildcard Scope excludes its root and malformed candidates fail closed", () => {
+  const scope = parseAuthorizedScope("*.例子.测试,192.0.2.8/31");
+  assert.equal(authorizedScopeContainsDomain(scope, "例子.测试"), false);
+  assert.equal(authorizedScopeContainsDomain(scope, "A.例子.测试."), true);
+  assert.equal(authorizedScopeContainsDomain(scope, "https://a.例子.测试"), false);
+  assert.equal(authorizedScopeContainsIp(scope, "192.0.2.9"), true);
+  assert.equal(authorizedScopeContainsIp(scope, "192.0.2.999"), false);
+});
 
 test("normalizes explicit IPv4 scope into canonical CIDRs", () => {
   assert.equal(normalizeScopeCidrs("11.0.0.9/24,10.0.0.1"), "10.0.0.1/32,11.0.0.0/24");
