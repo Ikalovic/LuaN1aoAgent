@@ -18,6 +18,35 @@ test("FOFA config clamps per-call results to the Task limit", () => {
   })!;
   assert.equal(config.maxResultsPerCall, 10);
   assert.equal(config.maxResultsPerTask, 10);
+  assert.equal(config.provider, "official");
+  assert.equal(config.allowInsecureHttp, false);
+});
+
+test("FOFA config requires an explicit opt-in for the Shenxd HTTP endpoint", () => {
+  const endpoint = "http://map.example/fofa/test_fofa/fofa1_api.php";
+  assert.throws(
+    () => loadFofaConfig({
+      FOFA_API_KEY: "sentinel-secret",
+      FOFA_PROVIDER: "shenxd",
+      FOFA_API_BASE_URL: endpoint
+    }),
+    /FOFA_ALLOW_INSECURE_HTTP/
+  );
+
+  const config = loadFofaConfig({
+    FOFA_API_KEY: "sentinel-secret",
+    FOFA_PROVIDER: "shenxd",
+    FOFA_ALLOW_INSECURE_HTTP: "1",
+    FOFA_API_BASE_URL: endpoint
+  })!;
+  assert.equal(config.provider, "shenxd");
+  assert.equal(config.allowInsecureHttp, true);
+  assert.equal(config.baseUrl, endpoint);
+
+  assert.throws(
+    () => loadFofaConfig({ FOFA_API_KEY: "sentinel-secret", FOFA_PROVIDER: "unknown" }),
+    /FOFA_PROVIDER/
+  );
 });
 
 test("FOFA config uses bounded defaults for invalid positive integers", () => {
@@ -73,6 +102,8 @@ test("the child environment and redacted text do not expose host secrets", () =>
   assert.equal(child.PATH, "/bin");
   assert.equal(child.FOFA_API_KEY, "sentinel-secret");
   assert.equal(child.FOFA_EMAIL, "agent+fofa@example.com");
+  assert.equal(child.FOFA_PROVIDER, "official");
+  assert.equal(child.FOFA_ALLOW_INSECURE_HTTP, undefined);
 
   const redacted = redactFofaSecret(
     "?key=sentinel-secret sentinel-secret email=agent%2Bfofa%40example.com agent+fofa@example.com",

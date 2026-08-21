@@ -7,6 +7,7 @@ import type { ExecutionLog } from "../stores/execution-log.js";
 import type { RuntimeStore } from "../stores/runtime-store.js";
 import { fofaChildEnvironment, redactFofaSecret, type FofaConfig } from "../fofa/fofa-config.js";
 import { FofaScopePolicy } from "../fofa/fofa-scope-policy.js";
+import { assertFofaProviderSupportsTool } from "../fofa/shenxd-adapter.js";
 import {
   FofaError,
   type FofaErrorCode,
@@ -111,6 +112,7 @@ export class FofaMcpRuntime {
     if (signal?.aborted) {
       throw signal.reason;
     }
+    assertFofaProviderSupportsTool(this.options.config, toolName);
     await this.ensureClientForCall();
     if (signal?.aborted) {
       throw signal.reason;

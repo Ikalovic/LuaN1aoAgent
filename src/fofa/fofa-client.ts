@@ -1,5 +1,6 @@
 import type { FofaConfig } from "./fofa-config.js";
 import { redactFofaSecret } from "./fofa-config.js";
+import { buildShenxdSearchRequest } from "./shenxd-adapter.js";
 import {
   FofaError,
   type FofaErrorCode,
@@ -47,7 +48,10 @@ export class FofaClient {
   }
 
   async search(input: FofaSearchInput, signal?: AbortSignal): Promise<FofaRawSearchResult> {
-    const data = await this.request("/api/v1/search/all", searchParameters(input), signal);
+    const target = this.config.provider === "shenxd"
+      ? buildShenxdSearchRequest(this.config, input)
+      : { endpoint: "/api/v1/search/all", parameters: searchParameters(input) };
+    const data = await this.request(target.endpoint, target.parameters, signal);
     return parseSearchResult(data, input.fields.length);
   }
 
@@ -149,7 +153,12 @@ export class FofaClient {
         throw this.error("fofa_response_invalid", "FOFA returned a non-object response");
       }
       if (value.error === true) {
-        throw this.providerError(typeof value.errmsg === "string" ? value.errmsg : "FOFA rejected the request");
+        const message = typeof value.errmsg === "string"
+          ? value.errmsg
+          : typeof value.message === "string"
+            ? value.message
+            : "FOFA rejected the request";
+        throw this.providerError(message);
       }
       return value;
     } catch (error) {
@@ -168,7 +177,7 @@ export class FofaClient {
 
   private providerError(message: string): FofaError {
     const normalized = message.toLowerCase();
-    if (/auth|invalid.{0,20}(?:key|email)|(?:key|email).{0,20}invalid|认证|密钥/.test(normalized)) {
+    if (/auth|invalid.{0,20}(?:key|email)|(?:key|email).{0,20}invalid|认证|密钥|无效|已过期/.test(normalized)) {
       return this.error("fofa_auth_failed", message);
     }
     if (/f-?points?|fpoints?|not enough.{0,20}point|insufficient.{0,20}point|点数|积分/.test(normalized)) {

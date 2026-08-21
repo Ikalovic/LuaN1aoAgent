@@ -5,6 +5,8 @@ import type { FofaConfig } from "../src/fofa/fofa-config.js";
 import { FofaError } from "../src/fofa/fofa-types.js";
 
 const config: FofaConfig = {
+  provider: "official",
+  allowInsecureHttp: false,
   apiKey: "sentinel-secret",
   email: "agent@example.com",
   baseUrl: "https://fofa.example",
@@ -13,6 +15,51 @@ const config: FofaConfig = {
   maxAggregationsPerTask: 20,
   requestTimeoutMs: 50
 };
+
+test("FOFA client routes Shenxd searches directly through the PHP adapter", async () => {
+  let seen: URL | undefined;
+  const client = new FofaClient({
+    ...config,
+    provider: "shenxd",
+    allowInsecureHttp: true,
+    baseUrl: "http://map.example/fofa/test_fofa/fofa1_api.php"
+  }, {
+    fetch: async (input) => {
+      seen = new URL(String(input));
+      return json({ error: false, size: 1, total: 1, results: [["192.0.2.1", 443]] });
+    }
+  });
+
+  await client.search({ query: 'domain="example.com"', fields: ["ip", "port"], size: 1, full: false });
+  assert.ok(seen);
+  assert.equal(seen.pathname, "/fofa/test_fofa/fofa1_api.php");
+  assert.equal(Buffer.from(seen.searchParams.get("qbase64")!, "base64").toString("utf8"), 'domain="example.com"');
+  assert.equal(seen.searchParams.get("key"), "sentinel-secret");
+  assert.equal(seen.searchParams.get("email"), "agent@example.com");
+  assert.equal(seen.searchParams.get("fields"), "ip,port");
+  assert.equal(seen.searchParams.get("size"), "1");
+  assert.equal(seen.searchParams.get("full"), "false");
+});
+
+test("FOFA client normalizes Shenxd expired-card errors without leaking credentials", async () => {
+  const client = new FofaClient({
+    ...config,
+    provider: "shenxd",
+    allowInsecureHttp: true,
+    baseUrl: "http://map.example/fofa/test_fofa/fofa1_api.php"
+  }, {
+    fetch: async () => json({ error: true, message: "API密钥 sentinel-secret 无效或已过期" })
+  });
+
+  await assert.rejects(
+    client.search({ query: 'domain="example.com"', fields: ["host"], size: 1, full: false }),
+    (error: unknown) => {
+      assert.ok(isFofaError(error, "fofa_auth_failed"));
+      assert.doesNotMatch(String(error), /sentinel-secret|agent@example\.com/);
+      return true;
+    }
+  );
+});
 
 test("FOFA client calls all official endpoints with encoded bounded parameters", async () => {
   const seen: URL[] = [];

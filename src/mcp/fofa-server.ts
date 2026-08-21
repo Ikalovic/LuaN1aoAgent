@@ -10,6 +10,7 @@ import {
   type FofaConfig
 } from "../fofa/fofa-config.js";
 import { FofaScopePolicy } from "../fofa/fofa-scope-policy.js";
+import { assertFofaProviderSupportsTool } from "../fofa/shenxd-adapter.js";
 import {
   FOFA_FIELDS,
   FofaError,
@@ -65,6 +66,7 @@ export function createFofaMcpServer(config: FofaConfig): McpServer {
     description: "Return a redacted FOFA account capability and points summary.",
     inputSchema: z.object({ _runtime: trustedContextSchema }).strict()
   }, async ({ _runtime }) => runTool(config, async () => {
+    assertFofaProviderSupportsTool(config, "fofa_account_info");
     validateContext(_runtime);
     const data = await client.accountInfo();
     return { operation: "account_info", data, returned: 0 };
@@ -85,6 +87,7 @@ export function createFofaMcpServer(config: FofaConfig): McpServer {
     description: "Continue a Scope-anchored FOFA search with a provider continuation token.",
     inputSchema: nextSchema
   }, async ({ _runtime, query, fields, size, full, next }) => runTool(config, async () => {
+    assertFofaProviderSupportsTool(config, "fofa_search_next");
     const policy = validateContext(_runtime);
     policy.validateQuery(query, new Set(_runtime.derivedRefs));
     const boundedSize = Math.min(size, config.maxResultsPerCall);
@@ -96,6 +99,7 @@ export function createFofaMcpServer(config: FofaConfig): McpServer {
     description: "Aggregate FOFA statistics for a Scope-anchored query.",
     inputSchema: statsSchema
   }, async ({ _runtime, query, fields, size }) => runTool(config, async () => {
+    assertFofaProviderSupportsTool(config, "fofa_stats");
     const policy = validateContext(_runtime);
     policy.validateQuery(query, new Set(_runtime.derivedRefs));
     const data = await client.stats({
@@ -110,6 +114,7 @@ export function createFofaMcpServer(config: FofaConfig): McpServer {
     description: "Return FOFA host aggregation for an authorized host or trusted derived reference.",
     inputSchema: hostSchema
   }, async ({ _runtime, host, detail }) => runTool(config, async () => {
+    assertFofaProviderSupportsTool(config, "fofa_host_aggregate");
     const policy = validateContext(_runtime);
     policy.validateHost(host, new Set(_runtime.derivedRefs));
     const data = await client.hostAggregate({ host, detail });

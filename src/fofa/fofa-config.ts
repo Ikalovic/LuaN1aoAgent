@@ -1,4 +1,6 @@
 export type FofaConfig = {
+  provider: "official" | "shenxd";
+  allowInsecureHttp: boolean;
   apiKey: string;
   email?: string;
   baseUrl: string;
@@ -20,7 +22,18 @@ export function loadFofaConfig(env: NodeJS.ProcessEnv): FofaConfig | undefined {
     return undefined;
   }
 
-  const baseUrl = normalizeBaseUrl(env.FOFA_API_BASE_URL ?? env.FOFA_BASE_URL, env.NODE_ENV);
+  const provider = normalizeProvider(env.FOFA_PROVIDER);
+  const allowInsecureHttp = env.FOFA_ALLOW_INSECURE_HTTP === "1";
+  const configuredBaseUrl = env.FOFA_API_BASE_URL ?? env.FOFA_BASE_URL;
+  if (provider === "shenxd" && !configuredBaseUrl?.trim()) {
+    throw new Error("FOFA_API_BASE_URL is required when FOFA_PROVIDER=shenxd");
+  }
+  const baseUrl = normalizeBaseUrl(
+    configuredBaseUrl,
+    env.NODE_ENV,
+    provider,
+    allowInsecureHttp
+  );
   const maxResultsPerTask = positiveInteger(
     env.FOFA_MAX_RESULTS_PER_TASK,
     DEFAULT_MAX_RESULTS_PER_TASK
@@ -31,6 +44,8 @@ export function loadFofaConfig(env: NodeJS.ProcessEnv): FofaConfig | undefined {
   );
 
   return {
+    provider,
+    allowInsecureHttp,
     apiKey,
     email: env.FOFA_EMAIL?.trim() || undefined,
     baseUrl,
@@ -56,6 +71,10 @@ export function fofaChildEnvironment(
   }
 
   child.FOFA_API_KEY = config.apiKey;
+  child.FOFA_PROVIDER = config.provider;
+  if (config.allowInsecureHttp) {
+    child.FOFA_ALLOW_INSECURE_HTTP = "1";
+  }
   if (config.email) {
     child.FOFA_EMAIL = config.email;
   }
@@ -82,19 +101,38 @@ export function redactFofaSecret(
   return redacted;
 }
 
-function normalizeBaseUrl(value: string | undefined, nodeEnv: string | undefined): string {
+function normalizeProvider(value: string | undefined): FofaConfig["provider"] {
+  const provider = value?.trim().toLowerCase() || "official";
+  if (provider !== "official" && provider !== "shenxd") {
+    throw new Error("FOFA_PROVIDER must be official or shenxd");
+  }
+  return provider;
+}
+
+function normalizeBaseUrl(
+  value: string | undefined,
+  nodeEnv: string | undefined,
+  provider: FofaConfig["provider"],
+  allowInsecureHttp: boolean
+): string {
   let url: URL;
   try {
     url = new URL(value?.trim() || DEFAULT_BASE_URL);
   } catch {
-    throw new Error("FOFA_BASE_URL must be a valid HTTPS URL");
+    throw new Error("FOFA_API_BASE_URL must be a valid URL");
   }
   const testLoopback = nodeEnv === "test" && url.protocol === "http:" && isLoopback(url.hostname);
-  if (url.protocol !== "https:" && !testLoopback) {
-    throw new Error("FOFA_BASE_URL must use HTTPS except for test loopback URLs");
+  const optedInShenxdHttp = provider === "shenxd"
+    && allowInsecureHttp
+    && url.protocol === "http:";
+  if (url.protocol !== "https:" && !testLoopback && !optedInShenxdHttp) {
+    if (provider === "shenxd" && url.protocol === "http:") {
+      throw new Error("FOFA_ALLOW_INSECURE_HTTP=1 is required for a remote Shenxd HTTP endpoint");
+    }
+    throw new Error("FOFA_API_BASE_URL must use HTTPS except for test loopback URLs");
   }
   if (url.username || url.password || url.search || url.hash) {
-    throw new Error("FOFA_BASE_URL must not contain credentials, query parameters, or fragments");
+    throw new Error("FOFA_API_BASE_URL must not contain credentials, query parameters, or fragments");
   }
   return url.toString().replace(/\/$/, "");
 }

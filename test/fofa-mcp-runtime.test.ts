@@ -14,6 +14,8 @@ import { ExecutionLog } from "../src/stores/execution-log.js";
 import { RuntimeStore } from "../src/stores/runtime-store.js";
 
 const config: FofaConfig = {
+  provider: "official",
+  allowInsecureHttp: false,
   apiKey: "sentinel-secret",
   baseUrl: "https://fofa.example",
   maxResultsPerCall: 100,
@@ -21,6 +23,42 @@ const config: FofaConfig = {
   maxAggregationsPerTask: 3,
   requestTimeoutMs: 1_000
 };
+
+test("FOFA Runtime rejects unsupported Shenxd tools before startup and quota", async () => {
+  const fixture = runtimeFixture();
+  let factoryCalls = 0;
+  const runtime = new FofaMcpRuntime({
+    runRef: "run:1",
+    scope: parseAuthorizedScope("example.com"),
+    config: { ...config, provider: "shenxd", allowInsecureHttp: true },
+    runtimeStore: fixture.store,
+    executionLog: fixture.log,
+    clientFactory: async () => {
+      factoryCalls += 1;
+      return fakeConnection(async () => assert.fail("unsupported tool must not be dispatched"));
+    }
+  });
+
+  for (const [tool, args] of [
+    ["fofa_account_info", {}],
+    ["fofa_search_next", { cursor: "cursor:any", limit: 1 }],
+    ["fofa_stats", { query: 'domain="example.com"', fields: ["host"], limit: 1 }],
+    ["fofa_host_aggregate", { host: "example.com", detail: false }]
+  ] as const) {
+    await assert.rejects(
+      () => runtime.call("task:a", tool, args),
+      (error: unknown) => error instanceof Error && "code" in error
+        && error.code === "fofa_plan_unsupported"
+    );
+  }
+  assert.equal(factoryCalls, 0);
+  assert.deepEqual(fixture.store.getFofaQuota("task:a"), {
+    resultsConsumed: 0,
+    aggregationsConsumed: 0
+  });
+  await runtime.close();
+  await fixture.closeStores();
+});
 
 test("FOFA Runtime injects trusted Task context and owns opaque cursors", async () => {
   const fixture = runtimeFixture();
@@ -246,6 +284,7 @@ test("FOFA Runtime resume keeps SQLite quota and rejects a prior process cursor"
 
 function runtimeFixture(): {
   store: RuntimeStore;
+  log: ExecutionLog;
   create: (factory: FofaMcpClientFactory, now?: () => number) => FofaMcpRuntime;
   close: (runtime: FofaMcpRuntime) => Promise<void>;
   closeStores: () => Promise<void>;
@@ -260,6 +299,7 @@ function runtimeFixture(): {
   };
   return {
     store,
+    log,
     create: (clientFactory, now) => new FofaMcpRuntime({
       runRef: "run:1",
       scope: parseAuthorizedScope("example.com"),
