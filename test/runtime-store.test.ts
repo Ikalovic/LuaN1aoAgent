@@ -298,3 +298,90 @@ test("keeps the latest complete task outcome for dependency handoff", () => {
   assert.deepEqual(store.listTaskOutcomes(1).map((outcome) => outcome.taskRef), ["task:test"]);
   store.close();
 });
+
+test("persists and releases bounded FOFA result quota", () => {
+  const runtimeDir = mkdtempSync(join(tmpdir(), "luanniao-runtime-"));
+  const databasePath = join(runtimeDir, "state.sqlite");
+  const store = new RuntimeStore(databasePath);
+  assert.deepEqual(
+    store.reserveFofaQuota({ taskId: "task:a", kind: "results", amount: 80, limit: 100 }),
+    { consumed: 80, remaining: 20 }
+  );
+  assert.throws(
+    () => store.reserveFofaQuota({ taskId: "task:a", kind: "results", amount: 21, limit: 100 }),
+    /quota exhausted/
+  );
+  assert.deepEqual(
+    store.releaseFofaQuota({ taskId: "task:a", kind: "results", amount: 10 }),
+    { consumed: 70 }
+  );
+  store.close();
+
+  const reopened = new RuntimeStore(databasePath);
+  assert.deepEqual(reopened.getFofaQuota("task:a"), {
+    resultsConsumed: 70,
+    aggregationsConsumed: 0
+  });
+  reopened.close();
+});
+
+test("tracks FOFA aggregation quotas independently for each Task", () => {
+  const runtimeDir = mkdtempSync(join(tmpdir(), "luanniao-runtime-"));
+  const store = new RuntimeStore(join(runtimeDir, "state.sqlite"));
+  assert.deepEqual(
+    store.reserveFofaQuota({ taskId: "task:a", kind: "aggregations", amount: 2, limit: 3 }),
+    { consumed: 2, remaining: 1 }
+  );
+  assert.deepEqual(
+    store.reserveFofaQuota({ taskId: "task:b", kind: "aggregations", amount: 3, limit: 3 }),
+    { consumed: 3, remaining: 0 }
+  );
+  assert.deepEqual(store.getFofaQuota("task:a"), {
+    resultsConsumed: 0,
+    aggregationsConsumed: 2
+  });
+  assert.throws(
+    () => store.reserveFofaQuota({ taskId: "task:b", kind: "aggregations", amount: 1, limit: 3 }),
+    /quota exhausted/
+  );
+  store.close();
+});
+
+test("FOFA quota mutations reject invalid numeric input", () => {
+  const runtimeDir = mkdtempSync(join(tmpdir(), "luanniao-runtime-"));
+  const store = new RuntimeStore(join(runtimeDir, "state.sqlite"));
+  assert.throws(
+    () => store.reserveFofaQuota({ taskId: "task:a", kind: "results", amount: -1, limit: 100 }),
+    /non-negative integer/
+  );
+  assert.throws(
+    () => store.reserveFofaQuota({ taskId: "task:a", kind: "results", amount: 1.5, limit: 100 }),
+    /non-negative integer/
+  );
+  assert.throws(
+    () => store.releaseFofaQuota({ taskId: "task:a", kind: "results", amount: -1 }),
+    /non-negative integer/
+  );
+  store.close();
+});
+
+test("two RuntimeStore instances reserve against one atomic FOFA quota", () => {
+  const runtimeDir = mkdtempSync(join(tmpdir(), "luanniao-runtime-"));
+  const databasePath = join(runtimeDir, "state.sqlite");
+  const first = new RuntimeStore(databasePath);
+  const second = new RuntimeStore(databasePath);
+  assert.deepEqual(
+    first.reserveFofaQuota({ taskId: "task:a", kind: "results", amount: 60, limit: 100 }),
+    { consumed: 60, remaining: 40 }
+  );
+  assert.deepEqual(
+    second.reserveFofaQuota({ taskId: "task:a", kind: "results", amount: 40, limit: 100 }),
+    { consumed: 100, remaining: 0 }
+  );
+  assert.throws(
+    () => first.reserveFofaQuota({ taskId: "task:a", kind: "results", amount: 1, limit: 100 }),
+    /quota exhausted/
+  );
+  first.close();
+  second.close();
+});

@@ -12,6 +12,7 @@ import type {
   TaskOutcome
 } from "../types.js";
 import type { EpochBudgetClockSnapshot } from "../epoch-budget-clock.js";
+import { FofaError } from "../fofa/fofa-types.js";
 
 export type ExecutorSessionRecord = {
   taskId: string;
@@ -521,6 +522,84 @@ export class RuntimeStore {
     return Number(row.count);
   }
 
+  getFofaQuota(taskId: string): { resultsConsumed: number; aggregationsConsumed: number } {
+    const row = this.database.prepare(`
+      SELECT results_consumed, aggregations_consumed
+      FROM fofa_task_quotas
+      WHERE task_id = ?
+    `).get(taskId) as { results_consumed: number; aggregations_consumed: number } | undefined;
+    return {
+      resultsConsumed: Number(row?.results_consumed ?? 0),
+      aggregationsConsumed: Number(row?.aggregations_consumed ?? 0)
+    };
+  }
+
+  reserveFofaQuota(input: {
+    taskId: string;
+    kind: "results" | "aggregations";
+    amount: number;
+    limit: number;
+  }): { consumed: number; remaining: number } {
+    validateFofaQuotaInput(input.taskId, input.amount, input.limit);
+    const column = input.kind === "results" ? "results_consumed" : "aggregations_consumed";
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      this.ensureFofaQuotaRow(input.taskId);
+      const row = this.database.prepare(`
+        SELECT ${column} AS consumed FROM fofa_task_quotas WHERE task_id = ?
+      `).get(input.taskId) as { consumed: number };
+      const consumed = Number(row.consumed);
+      if (consumed + input.amount > input.limit) {
+        throw new FofaError(
+          "fofa_quota_exhausted",
+          `FOFA ${input.kind} quota exhausted for ${input.taskId}`
+        );
+      }
+      const nextConsumed = consumed + input.amount;
+      this.database.prepare(`
+        UPDATE fofa_task_quotas SET ${column} = ?, updated_at = ? WHERE task_id = ?
+      `).run(nextConsumed, new Date().toISOString(), input.taskId);
+      this.database.exec("COMMIT");
+      return { consumed: nextConsumed, remaining: input.limit - nextConsumed };
+    } catch (error) {
+      this.database.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  releaseFofaQuota(input: {
+    taskId: string;
+    kind: "results" | "aggregations";
+    amount: number;
+  }): { consumed: number } {
+    validateFofaQuotaInput(input.taskId, input.amount);
+    const column = input.kind === "results" ? "results_consumed" : "aggregations_consumed";
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      this.ensureFofaQuotaRow(input.taskId);
+      const row = this.database.prepare(`
+        SELECT ${column} AS consumed FROM fofa_task_quotas WHERE task_id = ?
+      `).get(input.taskId) as { consumed: number };
+      const consumed = Math.max(0, Number(row.consumed) - input.amount);
+      this.database.prepare(`
+        UPDATE fofa_task_quotas SET ${column} = ?, updated_at = ? WHERE task_id = ?
+      `).run(consumed, new Date().toISOString(), input.taskId);
+      this.database.exec("COMMIT");
+      return { consumed };
+    } catch (error) {
+      this.database.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  private ensureFofaQuotaRow(taskId: string): void {
+    this.database.prepare(`
+      INSERT OR IGNORE INTO fofa_task_quotas (
+        task_id, results_consumed, aggregations_consumed, updated_at
+      ) VALUES (?, 0, 0, ?)
+    `).run(taskId, new Date().toISOString());
+  }
+
   private initialize(): void {
     this.database.exec(`
       CREATE TABLE IF NOT EXISTS execution_epochs (
@@ -593,6 +672,12 @@ export class RuntimeStore {
         key TEXT PRIMARY KEY,
         value TEXT NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS fofa_task_quotas (
+        task_id TEXT PRIMARY KEY,
+        results_consumed INTEGER NOT NULL DEFAULT 0 CHECK(results_consumed >= 0),
+        aggregations_consumed INTEGER NOT NULL DEFAULT 0 CHECK(aggregations_consumed >= 0),
+        updated_at TEXT NOT NULL
+      );
     `);
     ensureColumn(this.database, "projection_states", "pending_since", "TEXT");
     ensureColumn(this.database, "projection_states", "terminal_target_seq", "INTEGER");
@@ -619,6 +704,18 @@ export class RuntimeStore {
     return Number(result.changes);
   }
 
+}
+
+function validateFofaQuotaInput(taskId: string, amount: number, limit?: number): void {
+  if (!taskId.trim()) {
+    throw new Error("FOFA quota taskId must not be empty");
+  }
+  if (!Number.isSafeInteger(amount) || amount < 0) {
+    throw new Error("FOFA quota amount must be a non-negative integer");
+  }
+  if (limit !== undefined && (!Number.isSafeInteger(limit) || limit < 0)) {
+    throw new Error("FOFA quota limit must be a non-negative integer");
+  }
 }
 
 function ensureRuntimeMetadataTable(database: DatabaseSync): void {
