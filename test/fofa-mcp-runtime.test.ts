@@ -177,6 +177,73 @@ test("FOFA Runtime propagates cancellation and closes idempotently", async () =>
   await fixture.closeStores();
 });
 
+test("FOFA Runtime resume keeps SQLite quota and rejects a prior process cursor", async () => {
+  const runtimeDir = mkdtempSync(join(tmpdir(), "fofa-runtime-resume-"));
+  const databasePath = join(runtimeDir, "state.sqlite");
+  const firstStore = new RuntimeStore(databasePath);
+  const firstLog = new ExecutionLog(join(runtimeDir, "first.jsonl"), join(runtimeDir, "first-events.sqlite"));
+  const firstRuntime = new FofaMcpRuntime({
+    runRef: "run:resume",
+    scope: parseAuthorizedScope("example.com"),
+    config,
+    runtimeStore: firstStore,
+    executionLog: firstLog,
+    clientFactory: async () => fakeConnection(async () => success({
+      operation: "search",
+      query: 'domain="example.com"',
+      fields: ["host"],
+      records: Array.from({ length: 90 }, (_, index) => ({
+        fields: { host: `a${index}.example.com` },
+        classification: "in_scope",
+        active_testing_allowed: true
+      })),
+      returned: 90,
+      nextProviderToken: "provider-token-must-stay-private"
+    }))
+  });
+  const first = await firstRuntime.call("task:a", "fofa_search", {
+    query: 'domain="example.com"', fields: ["host"], limit: 90, full: false
+  });
+  assert.doesNotMatch(first.cursor ?? "", /provider-token/);
+  await firstRuntime.close();
+  await firstLog.drain();
+  firstLog.close();
+  firstStore.close();
+
+  const reopenedStore = new RuntimeStore(databasePath);
+  const secondLog = new ExecutionLog(join(runtimeDir, "second.jsonl"), join(runtimeDir, "second-events.sqlite"));
+  const secondRuntime = new FofaMcpRuntime({
+    runRef: "run:resume",
+    scope: parseAuthorizedScope("example.com"),
+    config,
+    runtimeStore: reopenedStore,
+    executionLog: secondLog,
+    clientFactory: async () => fakeConnection(async () => success({
+      operation: "search_next", records: [], returned: 0
+    }))
+  });
+  assert.deepEqual(reopenedStore.getFofaQuota("task:a"), {
+    resultsConsumed: 90,
+    aggregationsConsumed: 0
+  });
+  await assert.rejects(
+    () => secondRuntime.call("task:a", "fofa_search_next", { cursor: first.cursor, limit: 10 }),
+    /cursor.*unknown/i
+  );
+  assert.deepEqual(
+    reopenedStore.reserveFofaQuota({ taskId: "task:a", kind: "results", amount: 10, limit: 100 }),
+    { consumed: 100, remaining: 0 }
+  );
+  assert.throws(
+    () => reopenedStore.reserveFofaQuota({ taskId: "task:a", kind: "results", amount: 1, limit: 100 }),
+    /quota exhausted/
+  );
+  await secondRuntime.close();
+  await secondLog.drain();
+  secondLog.close();
+  reopenedStore.close();
+});
+
 function runtimeFixture(): {
   store: RuntimeStore;
   create: (factory: FofaMcpClientFactory, now?: () => number) => FofaMcpRuntime;

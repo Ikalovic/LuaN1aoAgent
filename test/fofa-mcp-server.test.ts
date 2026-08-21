@@ -47,9 +47,11 @@ test("FOFA stdio MCP server exposes five Scope-aware tools without leaking crede
   let stderr = "";
   transport.stderr?.on("data", (chunk) => { stderr += String(chunk); });
   const client = new Client({ name: "fofa-test", version: "1.0.0" });
+  let childPid: number | null = null;
 
   try {
     await client.connect(transport);
+    childPid = transport.pid;
     const listed = await client.listTools();
     assert.deepEqual(listed.tools.map((tool) => tool.name).sort(), [
       "fofa_account_info",
@@ -105,4 +107,9 @@ test("FOFA stdio MCP server exposes five Scope-aware tools without leaking crede
     await client.close().catch(() => undefined);
     await new Promise<void>((resolveClose, reject) => mock.close((error) => error ? reject(error) : resolveClose()));
   }
+  assert.ok(childPid);
+  assert.throws(
+    () => process.kill(childPid!, 0),
+    (error: unknown) => (error as NodeJS.ErrnoException).code === "ESRCH"
+  );
 });
