@@ -14,6 +14,8 @@
 
 **Files:**
 - Modify: `test/fofa-config.test.ts`
+- Modify: `test/fofa-client.test.ts`
+- Modify: `test/fofa-mcp-runtime.test.ts`
 - Modify: `src/fofa/fofa-config.ts`
 - Modify: `.env.example`
 
@@ -42,6 +44,8 @@ allowInsecureHttp: boolean;
 
 Normalize `FOFA_PROVIDER`, require the exact `shenxd` value for proxy mode, and allow remote HTTP only when both the selected provider is `shenxd` and `FOFA_ALLOW_INSECURE_HTTP === "1"`. Preserve loopback HTTP under `NODE_ENV=test`. Add `FOFA_PROVIDER` and `FOFA_ALLOW_INSECURE_HTTP` to the child environment generated from the already validated config.
 
+Update the two manually constructed `FofaConfig` fixtures in `test/fofa-client.test.ts` and `test/fofa-mcp-runtime.test.ts` with `provider: "official"` and `allowInsecureHttp: false` so the focused build remains type-correct.
+
 - [ ] **Step 4: Run the focused test and verify GREEN**
 
 Run the Step 2 command. Expected: all FOFA configuration tests pass.
@@ -51,7 +55,7 @@ Run the Step 2 command. Expected: all FOFA configuration tests pass.
 Add commented examples to `.env.example`, then commit:
 
 ```bash
-git add src/fofa/fofa-config.ts test/fofa-config.test.ts .env.example
+git add src/fofa/fofa-config.ts test/fofa-config.test.ts test/fofa-client.test.ts test/fofa-mcp-runtime.test.ts .env.example
 git commit -m "feat: configure Shenxd FOFA provider"
 ```
 
@@ -229,4 +233,3 @@ ps -eo pid=,ppid=,command= | rg '[f]ofa-server\.js' || true
 ```
 
 Expected: clean feature worktree and no FOFA child process.
-
