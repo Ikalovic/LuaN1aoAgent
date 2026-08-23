@@ -82,14 +82,18 @@ import {
   type PlannerTaskBatchCommand
 } from "./stores/graph-store.js";
 import { RuntimeStore } from "./stores/runtime-store.js";
+import { loadBeekeeperConfig, type BeekeeperConfig } from "./beekeeper/beekeeper-config.js";
 import { loadFofaConfig, type FofaConfig } from "./fofa/fofa-config.js";
+import type { ReportingContext, TaskType } from "./reporting/task-reporting.js";
 import { FofaScopePolicy } from "./fofa/fofa-scope-policy.js";
+import { BeekeeperMcpRuntime, type BeekeeperMcpRuntimeOptions } from "./mcp/beekeeper-runtime.js";
 import { FofaMcpRuntime, type FofaMcpRuntimeOptions } from "./mcp/fofa-runtime.js";
 import {
   createExecutorConnectivityTools,
   type ExecutorConnectivityRuntime
 } from "./tools/connectivity-tools.js";
 import { createEvidenceListTool, createEvidenceReadTool } from "./tools/pi-tools.js";
+import { createExecutorBeekeeperTools } from "./tools/beekeeper-mcp-tools.js";
 import { createExecutorFofaTools } from "./tools/fofa-mcp-tools.js";
 import type {
   AgentRole,
@@ -405,6 +409,11 @@ export class SecurityAgentController {
   private fofaRuntime?: FofaMcpRuntime;
   private fofaScopeFingerprint?: string;
   private fofaCapabilityReported = false;
+  private readonly beekeeperConfig?: BeekeeperConfig;
+  private readonly beekeeperConfigInvalid: boolean;
+  private readonly beekeeperRuntimeFactory: (input: BeekeeperMcpRuntimeOptions) => BeekeeperMcpRuntime;
+  private beekeeperRuntime?: BeekeeperMcpRuntime;
+  private beekeeperCapabilityReported = false;
   private connectivityStore?: ConnectivityStore;
   private connectivityRuntimeCleanupComplete = false;
   private taskExecutorSandboxes = new Map<string, DockerTaskSandbox>();
@@ -451,6 +460,7 @@ export class SecurityAgentController {
   private structuredInvocationsEnabled = false;
   private activeRun?: ActiveRunRecord;
   private currentUserGoal?: string;
+  private reportingContext: ReportingContext = { taskType: "pentest" };
 
   constructor(input: {
     cwd: string;
@@ -458,12 +468,15 @@ export class SecurityAgentController {
     environment?: NodeJS.ProcessEnv;
     executorSandboxMode?: ExecutorSandboxRequestedMode;
     fofaRuntimeFactory?: (input: FofaMcpRuntimeOptions) => FofaMcpRuntime;
+    beekeeperRuntimeFactory?: (input: BeekeeperMcpRuntimeOptions) => BeekeeperMcpRuntime;
   }) {
     this.cwd = input.cwd;
     this.runtimeDir = input.runtimeDir ?? join(input.cwd, ".agent-runtime");
     this.environment = input.environment;
     this.executorSandboxMode = input.executorSandboxMode;
     this.fofaRuntimeFactory = input.fofaRuntimeFactory ?? ((options) => new FofaMcpRuntime(options));
+    this.beekeeperRuntimeFactory = input.beekeeperRuntimeFactory
+      ?? ((options) => new BeekeeperMcpRuntime(options));
     let fofaConfig: FofaConfig | undefined;
     let fofaConfigInvalid = false;
     try {
@@ -473,6 +486,15 @@ export class SecurityAgentController {
     }
     this.fofaConfig = fofaConfig;
     this.fofaConfigInvalid = fofaConfigInvalid;
+    let beekeeperConfig: BeekeeperConfig | undefined;
+    let beekeeperConfigInvalid = false;
+    try {
+      beekeeperConfig = loadBeekeeperConfig(input.environment ?? process.env, input.cwd);
+    } catch {
+      beekeeperConfigInvalid = true;
+    }
+    this.beekeeperConfig = beekeeperConfig;
+    this.beekeeperConfigInvalid = beekeeperConfigInvalid;
     this.graphStore = new SQLiteGraphStore(
       join(this.runtimeDir, "state.sqlite"),
       join(this.runtimeDir, "graph-deltas.jsonl")
@@ -719,7 +741,7 @@ export class SecurityAgentController {
     for (let decisionAttempt = 1; decisionAttempt <= PLANNER_DECISION_REPAIR_ATTEMPTS; decisionAttempt += 1) {
       try {
         const invocation = await this.invokePlannerCycle({
-          userGoal: input.userGoal,
+          userGoal: this.reportingGoal(input.userGoal),
           scopeSummary: input.scopeSummary,
           repairFeedback
         });
@@ -809,12 +831,17 @@ export class SecurityAgentController {
   async runUntilDone(input: {
     userGoal: string;
     scopeSummary: string;
+    taskType?: TaskType;
+    reportingContext?: ReportingContext;
     maxPlannerCycles?: number;
     maxParallelTasks?: number;
     maxRunTimeMs?: number;
   }): Promise<RunResult> {
+    this.reportingContext = input.reportingContext ?? { taskType: input.taskType ?? "pentest" };
+    this.reportingContext = { ...this.reportingContext, taskType: input.taskType ?? this.reportingContext.taskType ?? "pentest" };
     await this.connectivityRuntime?.configureAuthorizedScope(input.scopeSummary);
     await this.configureFofaRuntime(input.scopeSummary);
+    await this.configureBeekeeperRuntime();
     const maxPlannerCycles = input.maxPlannerCycles ?? 8;
     const maxParallelTasks = normalizeParallelTaskLimit(input.maxParallelTasks);
     const maxRunTimeMs = normalizeRunTimeBudgetMs(input.maxRunTimeMs);
@@ -831,6 +858,10 @@ export class SecurityAgentController {
         runId: this.runId,
         userGoal: input.userGoal,
         scopeSummary: input.scopeSummary,
+        taskType: this.reportingContext.taskType,
+        templateDigest: this.reportingContext.templateDigest,
+        reportTemplatePath: this.reportingContext.reportTemplatePath,
+        scoringTemplatePath: this.reportingContext.scoringTemplatePath,
         maxPlannerCycles,
         maxParallelTasks,
         maxRunTimeMs,
@@ -1014,6 +1045,18 @@ export class SecurityAgentController {
     }
   }
 
+  private reportingGoal(userGoal: string): string {
+    const context = this.reportingContext;
+    const filename = context.taskType === "ctf" ? "writeup.md" : "pentest-report.md";
+    const requirements = context.taskType === "ctf"
+      ? "完成后必须生成可复现的 writeup.md，包含题目摘要、关键步骤、脚本/命令和最终 Flag。"
+      : `完成后必须生成 ${filename}，只使用已验证证据，并遵循评分标准和报告模板；必须包含攻击路径、成果评分、证据、账号密码来源、代码详情和 AI 使用说明。`;
+    const template = context.taskType === "pentest"
+      ? `评分标准：\n${(context.scoringText ?? "未加载评分标准").slice(0, 12000)}\n报告模板：\n${(context.reportText ?? "未加载报告模板").slice(0, 12000)}`
+      : "";
+    return `${userGoal}\n\n<reporting_context>\n任务类型：${context.taskType}\n${requirements}\n${template}\n</reporting_context>`;
+  }
+
   async requestStop(reason: string): Promise<void> {
     if (this.stopRequestedReason) {
       return;
@@ -1021,6 +1064,7 @@ export class SecurityAgentController {
     this.stopRequestedReason = reason;
     this.invocationAbortController.abort(reason);
     const fofaStop = this.fofaRuntime?.close(reason);
+    const beekeeperStop = this.beekeeperRuntime?.close(reason);
     this.projectionRequestsClosed = true;
     this.projectionCancellationRequested = true;
     this.projectorInvocationAbortController.abort(reason);
@@ -1059,6 +1103,7 @@ export class SecurityAgentController {
     await this.closeExecutorResources();
     await this.projectorCoordinator.close({ drain: false });
     await fofaStop;
+    await beekeeperStop;
   }
 
   private async finalizeRunMetrics(): Promise<void> {
@@ -1185,6 +1230,7 @@ export class SecurityAgentController {
     await Promise.allSettled([...(this.networkFinalizations?.values() ?? [])]);
     await this.closeExecutorResources();
     await this.fofaRuntime?.close("Controller shutdown");
+    await this.beekeeperRuntime?.close("Controller shutdown");
     for (const pending of [...this.pendingSupervisorRequests.values()]) {
       void this.discardSupervisorCheck(
         pending.request,
@@ -2614,9 +2660,66 @@ export class SecurityAgentController {
       ...(this.fofaRuntime
         ? createExecutorFofaTools(this.fofaRuntime, this.artifactStore, taskEnvelope.taskId)
         : []),
+      ...(this.beekeeperRuntime
+        ? createExecutorBeekeeperTools(this.beekeeperRuntime, taskEnvelope.taskId)
+        : []),
       createEvidenceListTool(this.executionLog),
       createEvidenceReadTool(this.executionLog)
     ];
+  }
+
+  private async configureBeekeeperRuntime(): Promise<void> {
+    if (this.beekeeperRuntime) {
+      return;
+    }
+    if (this.beekeeperConfigInvalid) {
+      if (!this.beekeeperCapabilityReported) {
+        this.beekeeperCapabilityReported = true;
+        await this.executionLog.append({
+          role: "runtime",
+          eventType: "beekeeper_mcp_failed",
+          summary: "Beekeeper MCP configuration is invalid",
+          payload: { enabled: false }
+        });
+      }
+      return;
+    }
+    if (!this.beekeeperConfig) {
+      if (!this.beekeeperCapabilityReported) {
+        this.beekeeperCapabilityReported = true;
+        await this.executionLog.append({
+          role: "runtime",
+          eventType: "beekeeper_mcp_disabled",
+          summary: "Beekeeper MCP is not configured",
+          payload: { enabled: false }
+        });
+      }
+      return;
+    }
+    const runtime = this.beekeeperRuntimeFactory({
+      config: this.beekeeperConfig,
+      executionLog: this.executionLog
+    });
+    try {
+      await runtime.start();
+      this.beekeeperRuntime = runtime;
+      this.beekeeperCapabilityReported = true;
+      await this.executionLog.append({
+        role: "runtime",
+        eventType: "beekeeper_mcp_ready",
+        summary: "Beekeeper MCP is ready for Task Executors",
+        payload: { enabled: true }
+      });
+    } catch {
+      await runtime.close("Beekeeper MCP initialization failed").catch(() => undefined);
+      this.beekeeperCapabilityReported = true;
+      await this.executionLog.append({
+        role: "runtime",
+        eventType: "beekeeper_mcp_failed",
+        summary: "Beekeeper MCP initialization failed",
+        payload: { enabled: false }
+      });
+    }
   }
 
   private async configureFofaRuntime(scopeSummary: string): Promise<void> {
@@ -2891,7 +2994,7 @@ export class SecurityAgentController {
     });
     const operationGraphSlice = compactExecutorGraphClosure(executionGraphContext, "operation", 12);
     return renderExecutorInput({
-      rootGoal: input.rootGoal,
+      rootGoal: this.reportingGoal(input.rootGoal),
       taskEnvelope: input.taskEnvelope,
       operationGraphSlice,
       reasoningGraphSlice: compactExecutorGraphClosure(executionGraphContext, "reasoning", 12),
@@ -2930,7 +3033,7 @@ export class SecurityAgentController {
     });
     const operationGraphSlice = compactExecutorGraphClosure(executionGraphContext, "operation", 12);
     return renderExecutorResumeInput({
-      rootGoal: input.rootGoal,
+      rootGoal: this.reportingGoal(input.rootGoal),
       taskEnvelope: input.taskEnvelope,
       operationGraphSlice,
       reasoningGraphSlice: compactExecutorGraphClosure(executionGraphContext, "reasoning", 12),

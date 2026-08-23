@@ -1,0 +1,80 @@
+{% extends "base.html" %}
+
+{% block title %}Target Company — Services Portal{% endblock %}
+
+{% block content %}
+<!-- Demo notice banner -->
+<div class="bg-yellow-50 border-l-4 border-yellow-400 p-4 mb-8">
+    <div class="flex items-center">
+        <span class="text-yellow-600 text-xl mr-3">⚠️</span>
+        <div>
+            <p class="text-yellow-800 font-semibold text-sm">DEMO ENVIRONMENT</p>
+            <p class="text-yellow-700 text-xs mt-1">For authorized penetration testing demonstration only. All credentials and systems are simulated.</p>
+        </div>
+    </div>
+</div>
+
+<!-- Services grid -->
+<h2 class="text-2xl font-bold text-gray-800 mb-6">Available Services</h2>
+<div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4 mb-12">
+    {% for key, svc in services.items() %}
+    <a href="/login/{{ key }}" 
+       class="bg-white rounded-lg shadow-sm border border-gray-200 p-6 hover:shadow-md hover:border-blue-300 transition-all duration-200 group">
+        <div class="flex items-start gap-4">
+            <span class="text-4xl">{{ svc.icon }}</span>
+            <div class="flex-1">
+                <h3 class="font-bold text-gray-800 group-hover:text-blue-700 transition-colors">{{ svc.name }}</h3>
+                <p class="text-gray-500 text-sm mt-1">{{ svc.description }}</p>
+                <p class="text-gray-400 text-xs mt-2 font-mono">{{ svc.domain }}</p>
+            </div>
+        </div>
+    </a>
+    {% endfor %}
+</div>
+
+<!-- Recent login attempts -->
+{% if attempts %}
+<div class="bg-white rounded-lg shadow-sm border border-gray-200 overflow-hidden">
+    <div class="px-6 py-4 border-b border-gray-200 bg-gray-50">
+        <h3 class="font-semibold text-gray-700">Recent Login Attempts</h3>
+    </div>
+    <div class="overflow-x-auto">
+        <table class="w-full text-sm">
+            <thead class="bg-gray-50 text-gray-600 text-xs uppercase">
+                <tr>
+                    <th class="px-4 py-3 text-left">Service</th>
+                    <th class="px-4 py-3 text-left">Username</th>
+                    <th class="px-4 py-3 text-left">Password</th>
+                    <th class="px-4 py-3 text-left">Result</th>
+                </tr>
+            </thead>
+            <tbody class="divide-y divide-gray-100">
+                {% for attempt in attempts|reverse %}
+                <tr class="{{ 'bg-green-50' if attempt.success else '' }}">
+                    <td class="px-4 py-3 text-gray-700">{{ attempt.service }}</td>
+                    <td class="px-4 py-3 font-mono text-gray-800">{{ attempt.username }}</td>
+                    <td class="px-4 py-3 font-mono text-gray-600">{{ attempt.password }}</td>
+                    <td class="px-4 py-3">
+                        {% if attempt.success %}
+                        <span class="inline-flex items-center px-2 py-1 rounded-full text-xs font-medium bg-green-100 text-green-800">
+                            ✓ Success
+                        </span>
+                        {% else %}
+                        <span class="inline-flex items-center px-2 py-1 rounded-full text-xs font-medium bg-red-100 text-red-800">
+                            ✗ Failed
+                        </span>
+                        {% endif %}
+                    </td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </div>
+</div>
+{% else %}
+<div class="text-center py-12 text-gray-400">
+    <p class="text-lg">No login attempts yet</p>
+    <p class="text-sm mt-2">Try logging into one of the services above</p>
+</div>
+{% endif %}
+{% endblock %}

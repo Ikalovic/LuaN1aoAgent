@@ -1,0 +1,65 @@
+{% extends "base.html" %}
+{% block title %}{{ domain }}{% endblock %}
+
+{% block content %}
+<div class="max-w-6xl mx-auto">
+    <!-- Header -->
+    <div class="flex items-center justify-between mb-8">
+        <div>
+            <a href="/browse" class="text-gray-400 hover:text-yellow-400 text-sm mb-2 inline-block">← Back to Browse</a>
+            <h2 class="text-3xl font-bold text-yellow-400 font-mono">{{ domain }}</h2>
+            <p class="text-gray-400 mt-1">{{ total }} credentials</p>
+        </div>
+        <a
+            href="/domain/{{ domain }}/export"
+            class="bg-gray-800 border border-gray-600 hover:border-yellow-400 text-gray-200 hover:text-yellow-400 px-5 py-2.5 rounded-lg transition font-medium"
+        >
+            ⬇ Export CSV
+        </a>
+    </div>
+
+    <!-- Credentials Table -->
+    {% if credentials %}
+    <div class="bg-gray-800 rounded-xl border border-gray-700 overflow-hidden">
+        <table class="w-full">
+            <thead class="bg-gray-750 border-b border-gray-700">
+                <tr>
+                    <th class="text-left px-6 py-4 text-sm font-semibold text-gray-300 uppercase tracking-wide">Account</th>
+                    <th class="text-left px-6 py-4 text-sm font-semibold text-gray-300 uppercase tracking-wide">Password</th>
+                    <th class="text-left px-6 py-4 text-sm font-semibold text-gray-300 uppercase tracking-wide">Source</th>
+                    <th class="text-left px-6 py-4 text-sm font-semibold text-gray-300 uppercase tracking-wide">Created</th>
+                </tr>
+            </thead>
+            <tbody class="divide-y divide-gray-700">
+                {% for cred in credentials %}
+                <tr class="hover:bg-gray-750 transition">
+                    <td class="px-6 py-4 text-white font-mono text-sm">{{ cred.account }}</td>
+                    <td class="px-6 py-4 text-gray-300 font-mono text-sm break-all">{{ cred.password }}</td>
+                    <td class="px-6 py-4 text-gray-400 text-sm">{{ cred.source or '—' }}</td>
+                    <td class="px-6 py-4 text-gray-400 text-sm">
+                        {% if cred.created_at %}{{ cred.created_at.strftime('%Y-%m-%d') }}{% else %}—{% endif %}
+                    </td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </div>
+
+    <!-- Pagination -->
+    {% if total_pages > 1 %}
+    <div class="flex items-center justify-center gap-2 mt-8">
+        {% if page > 1 %}
+        <a href="/domain/{{ domain }}?page={{ page - 1 }}" class="px-4 py-2 bg-gray-800 rounded-lg hover:bg-gray-700 transition">← Prev</a>
+        {% endif %}
+        <span class="px-4 py-2 text-gray-400">Page {{ page }} / {{ total_pages }}</span>
+        {% if page < total_pages %}
+        <a href="/domain/{{ domain }}?page={{ page + 1 }}" class="px-4 py-2 bg-gray-800 rounded-lg hover:bg-gray-700 transition">Next →</a>
+        {% endif %}
+    </div>
+    {% endif %}
+
+    {% else %}
+    <p class="text-gray-500 text-center py-12">No credentials found for this domain.</p>
+    {% endif %}
+</div>
+{% endblock %}

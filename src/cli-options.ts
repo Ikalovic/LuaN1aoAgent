@@ -10,6 +10,7 @@ export type CliOptions = {
   json: boolean;
   jsonl: boolean;
   noTui: boolean;
+  taskType: "ctf" | "pentest";
   help: boolean;
 };
 
@@ -25,7 +26,8 @@ export function parseCliOptions(rawArgs: string[]): CliOptions {
     "resume",
     "max-cycles",
     "max-parallel-tasks",
-    "max-run-time-ms"
+    "max-run-time-ms",
+    "task-type"
   ]);
 
   for (let index = 0; index < rawArgs.length; index += 1) {
@@ -68,6 +70,7 @@ export function parseCliOptions(rawArgs: string[]): CliOptions {
     maxPlannerCycles: optionalNumber(values, "max-cycles"),
     maxParallelTasks: optionalNumber(values, "max-parallel-tasks"),
     maxRunTimeMs: optionalNumber(values, "max-run-time-ms"),
+    taskType: values.get("task-type") === "ctf" ? "ctf" : values.get("task-type") === "pentest" || !values.has("task-type") ? "pentest" : (() => { throw new Error("--task-type must be ctf or pentest"); })(),
     json: flags.has("json"),
     jsonl: flags.has("jsonl"),
     noTui: flags.has("no-tui"),
@@ -91,6 +94,7 @@ export function cliHelp(): string {
     "  --runtime-dir <path>         New runtime directory; must be empty",
     "  --resume <session>           Resume one runtime; do not pass --goal",
     "  --max-cycles <number>        Maximum consecutive no-progress Planner cycles",
+    "  --task-type <ctf|pentest>    Reporting mode (default: pentest)",
     "  --max-parallel-tasks <n>     Maximum concurrent tasks",
     "  --max-run-time-ms <number>   Run timeout in milliseconds",
     "  --json                       Disable TUI and print final JSON",

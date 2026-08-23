@@ -1,0 +1,37 @@
+<!DOCTYPE html>
+<html lang="zh-CN" class="h-full">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Beekeeper - {% block title %}Dashboard{% endblock %}</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://unpkg.com/htmx.org@1.9.10"></script>
+</head>
+<body class="h-full bg-gray-900 text-gray-100">
+    <div class="flex h-full">
+        <!-- Sidebar -->
+        <nav class="w-64 bg-gray-800 border-r border-gray-700 flex flex-col">
+            <div class="p-6">
+                <h1 class="text-2xl font-bold text-yellow-400">🐝 Beekeeper</h1>
+                <p class="text-sm text-gray-400 mt-1">Credential Database</p>
+            </div>
+            <div class="flex-1 px-4">
+                <a href="/" class="block px-4 py-3 rounded-lg hover:bg-gray-700 transition {% if request.url.path == '/' %}bg-gray-700 text-yellow-400{% endif %}">
+                    📊 Dashboard
+                </a>
+                <a href="/browse" class="block px-4 py-3 rounded-lg hover:bg-gray-700 transition {% if '/browse' in request.url.path %}bg-gray-700 text-yellow-400{% endif %}">
+                    🔍 Browse
+                </a>
+                <a href="/manage" class="block px-4 py-3 rounded-lg hover:bg-gray-700 transition {% if '/manage' in request.url.path %}bg-gray-700 text-yellow-400{% endif %}">
+                    ⚙️ Manage
+                </a>
+            </div>
+        </nav>
+        
+        <!-- Main Content -->
+        <main class="flex-1 overflow-auto p-8">
+            {% block content %}{% endblock %}
+        </main>
+    </div>
+</body>
+</html>

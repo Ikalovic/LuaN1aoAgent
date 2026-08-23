@@ -1,4 +1,5 @@
 import type { ArtifactRecord, TaskOutcome } from "./types.js";
+import { basename } from "node:path";
 
 export type FinalReport = {
   taskRef: string;
@@ -6,6 +7,7 @@ export type FinalReport = {
   createdAt: string;
   artifactRefs: string[];
   artifacts: ArtifactRecord[];
+  taskType?: "ctf" | "pentest";
 };
 
 export function deriveFinalReport(
@@ -31,6 +33,7 @@ export function deriveFinalReport(
     summary: outcome.summary,
     createdAt: outcome.createdAt,
     artifactRefs: reportArtifacts.map((artifact) => artifact.artifactRef),
-    artifacts: reportArtifacts
+    artifacts: reportArtifacts,
+    taskType: reportArtifacts.some((artifact) => basename(artifact.path ?? "") === "writeup.md") ? "ctf" : "pentest"
   };
 }

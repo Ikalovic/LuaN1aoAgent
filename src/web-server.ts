@@ -2,7 +2,7 @@ import { createServer, type IncomingMessage, type ServerResponse } from "node:ht
 import { randomUUID } from "node:crypto";
 import { createReadStream, existsSync } from "node:fs";
 import { open, readFile, readdir, stat } from "node:fs/promises";
-import { basename, extname, join, relative, resolve, sep } from "node:path";
+import { basename, dirname, extname, join, relative, resolve, sep } from "node:path";
 import { createInterface } from "node:readline";
 import { DatabaseSync } from "node:sqlite";
 import { WebAuthError, WebAuthService, type WebUser } from "./web-auth.js";
@@ -37,6 +37,7 @@ import { ExecutionLog } from "./stores/execution-log.js";
 import { discoverRuntimeSessionDirs } from "./runtime-session-discovery.js";
 import { RuntimePathPolicy, RuntimePathPolicyError } from "./runtime-path-policy.js";
 import { normalizeScope } from "./scope.js";
+import { loadPentestTemplates, normalizeTaskType, type ReportingContext, type TaskType } from "./reporting/task-reporting.js";
 import {
   clearCsrfCookie,
   createCsrfToken,
@@ -229,6 +230,8 @@ type ActiveRun = {
   runtimeInput: string;
   goal: string;
   scope: string;
+  taskType: TaskType;
+  reportingContext: ReportingContext;
   startedAt: string;
   controller: SecurityAgentController;
   agentRuntime: AgentRuntimeLifecycle;
@@ -1484,6 +1487,13 @@ async function handleStartRun(request: IncomingMessage, response: ServerResponse
   const body = await readJsonBody(request);
   const goal = stringValue(body.goal, "").trim();
   const rawScope = stringValue(body.scope, "").trim();
+  let taskType: TaskType;
+  try {
+    taskType = normalizeTaskType(body.taskType);
+  } catch (error) {
+    await sendJson(response, { error: { code: "invalid_request", message: error instanceof Error ? error.message : String(error) } }, 400);
+    return;
+  }
   if (!goal || !rawScope) {
     await sendJson(response, { error: { code: "invalid_request", message: "goal 和 scope 不能为空" } }, 400);
     return;
@@ -1510,6 +1520,21 @@ async function handleStartRun(request: IncomingMessage, response: ServerResponse
   let agentRuntime: AgentRuntimeLifecycle | undefined;
   let run: ActiveRun | undefined;
   try {
+    let reportingContext: ReportingContext;
+    try {
+      reportingContext = taskType === "pentest"
+        ? await loadPentestTemplates((() => {
+          const scoringPath = process.env.PENTEST_SCORING_TEMPLATE?.trim() || join(cwd, "templates/pentest/default-scoring-standard.md");
+          const reportPath = process.env.PENTEST_REPORT_TEMPLATE?.trim() || join(cwd, "templates/pentest/default-report-template.md");
+          return { scoringPath, reportPath, allowedRoots: [cwd, dirname(scoringPath), dirname(reportPath)] };
+        })())
+        : { taskType: "ctf" as const };
+    } catch (error) {
+      if (error && typeof error === "object" && "code" in error && (error as { code?: string }).code === "template_unavailable") {
+        throw new HttpError(400, "template_unavailable", error instanceof Error ? error.message : "渗透测试模板不可用");
+      }
+      throw error;
+    }
     agentRuntime = await bootstrapAgentRuntime({
       cwd,
       runtimeDir,
@@ -1523,13 +1548,15 @@ async function handleStartRun(request: IncomingMessage, response: ServerResponse
       runtimeInput: toRuntimeInput(runtimeDir),
       goal,
       scope,
+      taskType,
+      reportingContext,
       startedAt: new Date().toISOString(),
       controller,
       agentRuntime
     };
     activeRuns.set(runtimeDir, run);
 
-    const options: Parameters<SecurityAgentController["runUntilDone"]>[0] = { userGoal: goal, scopeSummary: scope };
+    const options: Parameters<SecurityAgentController["runUntilDone"]>[0] = { userGoal: goal, scopeSummary: scope, taskType, reportingContext };
     const maxRunTimeMs = optionalPositiveNumber(body.maxRunTimeMs);
     const maxParallelTasks = optionalPositiveNumber(body.maxParallelTasks);
     const maxPlannerCycles = optionalPositiveNumber(body.maxPlannerCycles);
@@ -1552,6 +1579,8 @@ async function handleStartRun(request: IncomingMessage, response: ServerResponse
       name: basename(runtimeDir),
       goal,
       scope,
+      taskType,
+      templateDigest: reportingContext.templateDigest,
       startedAt: activeRun.startedAt,
       running: true
     }, 201);
@@ -1571,6 +1600,8 @@ function listActiveRuns(): JsonRecord {
       name: basename(run.runtimeDir),
       goal: run.goal,
       scope: run.scope,
+      taskType: run.taskType,
+      templateDigest: run.reportingContext.templateDigest,
       startedAt: run.startedAt,
       running: true
     }))

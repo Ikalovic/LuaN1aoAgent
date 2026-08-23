@@ -5,6 +5,8 @@ import { loadLocalEnvFile } from "./llm-config.js";
 import { normalizeScope } from "./scope.js";
 import { parseTransparentProxy } from "./proxy-config.js";
 import { deriveFinalReport } from "./run-report.js";
+import { loadPentestTemplates } from "./reporting/task-reporting.js";
+import { dirname, join } from "node:path";
 import { AgentCliApp } from "./tui/app.js";
 
 try {
@@ -82,6 +84,13 @@ async function run(options: ReturnType<typeof parseCliOptions>): Promise<void> {
     if (transparentProxy) {
       await controller.configureTransparentProxy(transparentProxy, scopeSummary);
     }
+    const reportingContext = options.taskType === "pentest"
+      ? await loadPentestTemplates((() => {
+        const scoringPath = process.env.PENTEST_SCORING_TEMPLATE?.trim() || join(cwd, "templates/pentest/default-scoring-standard.md");
+        const reportPath = process.env.PENTEST_REPORT_TEMPLATE?.trim() || join(cwd, "templates/pentest/default-report-template.md");
+        return { scoringPath, reportPath, allowedRoots: [cwd, dirname(scoringPath), dirname(reportPath)] };
+      })())
+      : { taskType: "ctf" as const };
     if (options.jsonl) {
       process.stdout.write(`${JSON.stringify({
         type: "run",
@@ -98,6 +107,8 @@ async function run(options: ReturnType<typeof parseCliOptions>): Promise<void> {
     const result = await controller.runUntilDone({
       userGoal: runContext.userGoal,
       scopeSummary,
+      taskType: options.taskType,
+      reportingContext,
       maxPlannerCycles: options.maxPlannerCycles,
       maxParallelTasks: options.maxParallelTasks,
       maxRunTimeMs: options.maxRunTimeMs

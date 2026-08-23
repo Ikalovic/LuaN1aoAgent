@@ -1,0 +1,41 @@
+{% extends "base.html" %}
+{% block title %}Browse{% endblock %}
+
+{% block content %}
+<div class="max-w-5xl mx-auto">
+    <h2 class="text-3xl font-bold text-yellow-400 mb-8">Browse Domains</h2>
+
+    <!-- Search Input -->
+    <div class="mb-6">
+        <input
+            type="text"
+            id="search-input"
+            name="q"
+            value="{{ query }}"
+            placeholder="Filter domains..."
+            hx-get="/browse/search"
+            hx-trigger="input changed delay:300ms"
+            hx-target="#domain-list"
+            class="w-full bg-gray-800 border border-gray-600 rounded-lg px-4 py-3 text-white placeholder-gray-400 focus:outline-none focus:border-yellow-400 transition"
+        >
+    </div>
+
+    <!-- Domain List -->
+    <div id="domain-list">
+        {% include "_domain_list.html" %}
+    </div>
+
+    <!-- Pagination -->
+    {% if total_pages > 1 %}
+    <div class="flex items-center justify-center gap-2 mt-8">
+        {% if page > 1 %}
+        <a href="?q={{ query }}&page={{ page - 1 }}" class="px-4 py-2 bg-gray-800 rounded-lg hover:bg-gray-700 transition">← Prev</a>
+        {% endif %}
+        <span class="px-4 py-2 text-gray-400">Page {{ page }} / {{ total_pages }}</span>
+        {% if page < total_pages %}
+        <a href="?q={{ query }}&page={{ page + 1 }}" class="px-4 py-2 bg-gray-800 rounded-lg hover:bg-gray-700 transition">Next →</a>
+        {% endif %}
+    </div>
+    {% endif %}
+</div>
+{% endblock %}

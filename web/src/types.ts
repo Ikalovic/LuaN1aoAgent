@@ -112,6 +112,7 @@ export interface RuntimeSession {
 export interface StartRunInput {
   goal: string;
   scope: string;
+  taskType?: "ctf" | "pentest";
   maxRunTimeMs?: number;
   maxParallelTasks?: number;
   maxPlannerCycles?: number;
@@ -122,6 +123,8 @@ export interface StartRunResponse {
   name: string;
   goal: string;
   scope: string;
+  taskType: "ctf" | "pentest";
+  templateDigest?: string;
   startedAt: string;
   running: boolean;
 }
@@ -131,6 +134,8 @@ export interface ActiveRun {
   name: string;
   goal: string;
   scope: string;
+  taskType: "ctf" | "pentest";
+  templateDigest?: string;
   startedAt: string;
   running: boolean;
 }
@@ -196,6 +201,7 @@ export interface FinalReport {
   createdAt: string;
   artifactRefs: string[];
   artifacts: ArtifactRecord[];
+  taskType?: "ctf" | "pentest";
 }
 
 export interface PlannerCheckpoint {

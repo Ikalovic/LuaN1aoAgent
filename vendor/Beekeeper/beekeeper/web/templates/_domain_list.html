@@ -1,0 +1,10 @@
+<div class="space-y-2">
+    {% for domain, count in domains %}
+    <a href="/domain/{{ domain }}" class="block p-4 bg-gray-800 rounded-lg hover:bg-gray-700 transition">
+        <span class="text-yellow-400 font-mono">{{ domain }}</span>
+        <span class="text-gray-400 text-sm ml-2">{{ count }} credentials</span>
+    </a>
+    {% else %}
+    <p class="text-gray-500">No domains found{% if query %} for "{{ query }}"{% endif %}</p>
+    {% endfor %}
+</div>

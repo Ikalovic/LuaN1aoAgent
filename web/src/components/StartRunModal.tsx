@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { Alert, Form, Input, InputNumber, Modal } from "antd";
+import { Alert, Form, Input, InputNumber, Modal, Select, Typography } from "antd";
 import { startRun } from "../api";
 import { useLanguage } from "../language";
 
@@ -23,6 +23,7 @@ export function StartRunModal({ open, onClose, onStarted }: StartRunModalProps) 
       const result = await startRun({
         goal: String(values.goal).trim(),
         scope: String(values.scope).trim(),
+        taskType: values.taskType ?? "pentest",
         maxRunTimeMs: values.maxRunTimeMin ? Math.round(values.maxRunTimeMin * 60_000) : undefined,
         maxParallelTasks: values.maxParallelTasks ?? undefined,
         maxPlannerCycles: values.maxPlannerCycles ?? undefined
@@ -56,8 +57,15 @@ export function StartRunModal({ open, onClose, onStarted }: StartRunModalProps) 
       <Form
         form={form}
         layout="vertical"
-        initialValues={{ maxRunTimeMin: 15, maxParallelTasks: 2, maxPlannerCycles: 8 }}
+        initialValues={{ taskType: "pentest", maxRunTimeMin: 15, maxParallelTasks: 2, maxPlannerCycles: 8 }}
       >
+        <Form.Item name="taskType" label={t("startRun.taskType")}>
+          <Select options={[
+            { value: "pentest", label: t("startRun.pentest") },
+            { value: "ctf", label: t("startRun.ctf") }
+          ]} />
+        </Form.Item>
+        <Typography.Text type="secondary">{t("startRun.taskTypeHint")}</Typography.Text>
         <Form.Item name="goal" label={t("startRun.goal")} rules={[{ required: true, whitespace: true, message: t("startRun.goalRequired") }]}>
           <Input.TextArea rows={4} maxLength={4000} placeholder={t("startRun.goalPlaceholder")} />
         </Form.Item>

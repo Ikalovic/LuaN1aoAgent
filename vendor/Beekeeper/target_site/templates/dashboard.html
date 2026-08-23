@@ -1,0 +1,169 @@
+{% extends "base.html" %}
+
+{% block title %}{{ svc.name }} — Dashboard{% endblock %}
+
+{% block content %}
+<div class="max-w-2xl mx-auto mt-8">
+    <!-- Success banner -->
+    <div class="bg-green-50 border-l-4 border-green-500 p-4 mb-8">
+        <div class="flex items-center">
+            <span class="text-green-500 text-xl mr-3">✓</span>
+            <div>
+                <p class="text-green-800 font-semibold">Login Successful</p>
+                <p class="text-green-700 text-sm mt-1">Welcome, <strong>{{ username }}</strong>! You are now authenticated.</p>
+            </div>
+        </div>
+    </div>
+
+    <!-- Service dashboard content -->
+    <div class="bg-white rounded-lg shadow-sm border border-gray-200 p-8 mb-6">
+        <div class="flex items-center gap-4 mb-6">
+            <span class="text-5xl">{{ svc.icon }}</span>
+            <div>
+                <h2 class="text-2xl font-bold text-gray-800">{{ svc.name }}</h2>
+                <p class="text-gray-500 text-sm">{{ svc.domain }}</p>
+            </div>
+        </div>
+
+        <!-- Service-specific mock content -->
+        <div class="border-t border-gray-100 pt-6">
+            {% if service == "vpn" %}
+            <div class="space-y-4">
+                <h3 class="font-semibold text-gray-700">VPN Connection Status</h3>
+                <div class="bg-gray-50 rounded-lg p-4">
+                    <div class="flex items-center justify-between mb-2">
+                        <span class="text-sm text-gray-600">Status</span>
+                        <span class="inline-flex items-center px-2 py-1 rounded-full text-xs font-medium bg-green-100 text-green-800">Connected</span>
+                    </div>
+                    <div class="flex items-center justify-between mb-2">
+                        <span class="text-sm text-gray-600">Session Duration</span>
+                        <span class="text-sm font-mono text-gray-800">00:14:32</span>
+                    </div>
+                    <div class="flex items-center justify-between">
+                        <span class="text-sm text-gray-600">Assigned IP</span>
+                        <span class="text-sm font-mono text-gray-800">10.0.1.{{ range(2, 254)|random }}</span>
+                    </div>
+                </div>
+            </div>
+
+            {% elif service == "mail" %}
+            <div class="space-y-4">
+                <h3 class="font-semibold text-gray-700">Mailbox Overview</h3>
+                <div class="grid grid-cols-3 gap-4">
+                    <div class="bg-blue-50 rounded-lg p-4 text-center">
+                        <p class="text-2xl font-bold text-blue-700">3</p>
+                        <p class="text-xs text-blue-600 mt-1">Unread</p>
+                    </div>
+                    <div class="bg-gray-50 rounded-lg p-4 text-center">
+                        <p class="text-2xl font-bold text-gray-700">147</p>
+                        <p class="text-xs text-gray-600 mt-1">Total</p>
+                    </div>
+                    <div class="bg-gray-50 rounded-lg p-4 text-center">
+                        <p class="text-2xl font-bold text-gray-700">12</p>
+                        <p class="text-xs text-gray-600 mt-1">Drafts</p>
+                    </div>
+                </div>
+                <div class="bg-gray-50 rounded-lg p-4 mt-4">
+                    <p class="text-sm text-gray-600 mb-2">Latest email from <strong>IT Department</strong>:</p>
+                    <p class="text-sm text-gray-800">"Password policy update: All passwords must be rotated by end of month."</p>
+                </div>
+            </div>
+
+            {% elif service == "jira" %}
+            <div class="space-y-4">
+                <h3 class="font-semibold text-gray-700">Sprint Overview</h3>
+                <div class="grid grid-cols-4 gap-3">
+                    <div class="bg-blue-50 rounded-lg p-3 text-center">
+                        <p class="text-xl font-bold text-blue-700">2</p>
+                        <p class="text-xs text-blue-600 mt-1">Open</p>
+                    </div>
+                    <div class="bg-yellow-50 rounded-lg p-3 text-center">
+                        <p class="text-xl font-bold text-yellow-700">5</p>
+                        <p class="text-xs text-yellow-600 mt-1">In Progress</p>
+                    </div>
+                    <div class="bg-purple-50 rounded-lg p-3 text-center">
+                        <p class="text-xl font-bold text-purple-700">3</p>
+                        <p class="text-xs text-purple-600 mt-1">Review</p>
+                    </div>
+                    <div class="bg-green-50 rounded-lg p-3 text-center">
+                        <p class="text-xl font-bold text-green-700">18</p>
+                        <p class="text-xs text-green-600 mt-1">Done</p>
+                    </div>
+                </div>
+                <p class="text-sm text-gray-500 mt-2">Sprint 24 ends in 6 days • Velocity: 42 points</p>
+            </div>
+
+            {% elif service == "gitlab" %}
+            <div class="space-y-4">
+                <h3 class="font-semibold text-gray-700">Repository Activity</h3>
+                <div class="bg-gray-50 rounded-lg p-4 space-y-3">
+                    <div class="flex items-center justify-between">
+                        <span class="text-sm text-gray-600">Open Merge Requests</span>
+                        <span class="font-bold text-gray-800">7</span>
+                    </div>
+                    <div class="flex items-center justify-between">
+                        <span class="text-sm text-gray-600">Open Issues</span>
+                        <span class="font-bold text-gray-800">23</span>
+                    </div>
+                    <div class="flex items-center justify-between">
+                        <span class="text-sm text-gray-600">Pipelines (24h)</span>
+                        <span class="font-bold text-green-700">14 passed</span>
+                    </div>
+                    <div class="flex items-center justify-between">
+                        <span class="text-sm text-gray-600">Last Deploy</span>
+                        <span class="text-sm text-gray-800">2 hours ago</span>
+                    </div>
+                </div>
+            </div>
+
+            {% elif service == "admin" %}
+            <div class="space-y-4">
+                <h3 class="font-semibold text-gray-700">System Administration</h3>
+                <div class="grid grid-cols-2 gap-4">
+                    <div class="bg-gray-50 rounded-lg p-4">
+                        <p class="text-xs text-gray-500 uppercase mb-1">CPU Usage</p>
+                        <p class="text-2xl font-bold text-gray-800">34%</p>
+                        <div class="w-full bg-gray-200 rounded-full h-2 mt-2">
+                            <div class="bg-blue-600 h-2 rounded-full" style="width: 34%"></div>
+                        </div>
+                    </div>
+                    <div class="bg-gray-50 rounded-lg p-4">
+                        <p class="text-xs text-gray-500 uppercase mb-1">Memory</p>
+                        <p class="text-2xl font-bold text-gray-800">6.2 GB</p>
+                        <div class="w-full bg-gray-200 rounded-full h-2 mt-2">
+                            <div class="bg-yellow-500 h-2 rounded-full" style="width: 62%"></div>
+                        </div>
+                    </div>
+                    <div class="bg-gray-50 rounded-lg p-4">
+                        <p class="text-xs text-gray-500 uppercase mb-1">Disk</p>
+                        <p class="text-2xl font-bold text-gray-800">128 GB</p>
+                        <div class="w-full bg-gray-200 rounded-full h-2 mt-2">
+                            <div class="bg-green-500 h-2 rounded-full" style="width: 45%"></div>
+                        </div>
+                    </div>
+                    <div class="bg-gray-50 rounded-lg p-4">
+                        <p class="text-xs text-gray-500 uppercase mb-1">Uptime</p>
+                        <p class="text-2xl font-bold text-gray-800">47 days</p>
+                        <p class="text-xs text-gray-500 mt-2">Last reboot: Jan 4, 2024</p>
+                    </div>
+                </div>
+            </div>
+            {% endif %}
+        </div>
+    </div>
+
+    <!-- Demo notice -->
+    <div class="bg-blue-50 border border-blue-200 rounded-lg p-4 text-center mb-6">
+        <p class="text-blue-700 text-sm">
+            <strong>Demo Environment</strong> — This is a simulated system for penetration testing demonstration.
+        </p>
+    </div>
+
+    <!-- Navigation -->
+    <div class="text-center">
+        <a href="/" class="inline-flex items-center px-6 py-3 bg-blue-700 hover:bg-blue-800 text-white font-medium rounded-lg transition-colors">
+            ← Try Another Service
+        </a>
+    </div>
+</div>
+{% endblock %}

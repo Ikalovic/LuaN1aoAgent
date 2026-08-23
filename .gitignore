@@ -18,3 +18,8 @@ output/
 benchmarks/
 .runtime/
 .worktrees/
+.beekeeper-mcp-venv/
+vendor/Beekeeper/beekeeper.egg-info/
+vendor/Beekeeper/**/__pycache__/
+vendor/Beekeeper/**/*.pyc
+vendor/Beekeeper/.pytest_cache/

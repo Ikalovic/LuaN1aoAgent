@@ -103,6 +103,7 @@ function FinalResult({ report, finalResult, outcome, artifacts, taskLabel, onOpe
           />
           <StructuredReport text={report.summary} />
           <dl className="outcome-details">
+            <div><dt>{zh ? "任务类型" : "Task type"}</dt><dd>{report.taskType === "ctf" ? (zh ? "CTF WP" : "CTF writeup") : (zh ? "渗透测试" : "Pentest")}</dd></div>
             <div><dt>{zh ? "报告任务" : "Report task"}</dt><dd>{report.taskRef}</dd></div>
             <div><dt>{zh ? "完成时间" : "Completed at"}</dt><dd>{report.createdAt}</dd></div>
             <div><dt>{zh ? "报告文件" : "Report files"}</dt><dd>{report.artifactRefs.length}</dd></div>
