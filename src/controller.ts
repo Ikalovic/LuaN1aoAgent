@@ -95,6 +95,7 @@ import {
 import { createEvidenceListTool, createEvidenceReadTool } from "./tools/pi-tools.js";
 import { createExecutorBeekeeperTools } from "./tools/beekeeper-mcp-tools.js";
 import { createExecutorFofaTools } from "./tools/fofa-mcp-tools.js";
+import { createTopologyValidationTool } from "./tools/topology-validation-tool.js";
 import type {
   AgentRole,
   ControlSignal,
@@ -2660,6 +2661,7 @@ export class SecurityAgentController {
       ...(this.fofaRuntime
         ? createExecutorFofaTools(this.fofaRuntime, this.artifactStore, taskEnvelope.taskId)
         : []),
+      ...(this.fofaRuntime ? [createTopologyValidationTool()] : []),
       ...(this.beekeeperRuntime
         ? createExecutorBeekeeperTools(this.beekeeperRuntime, taskEnvelope.taskId)
         : []),
