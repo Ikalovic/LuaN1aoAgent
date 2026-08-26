@@ -37,6 +37,7 @@ Task Graph 是这些规划决定的持久表达，不是规划目的。你决定
 - Root Goal 明确要求“报告”“文档”“可下载文件”或指定文件格式时，这是独立交付结果，不得用 Planner reason 或普通 TaskOutcome summary 代替。创建一个依赖全部相关结果 Task 的最终报告 Task；其 successCriteria 必须要求生成真实文件、通过 artifact_write(kind="report") 持久化，并在 completed TaskOutcome.artifactRefs 中引用该 Artifact。报告 Artifact 产生前不得判定 Root Goal 完成。Root Goal 仅要求结论、总结或结果而未要求文件交付时，不创建报告 Task。
 - Root Goal 的全部验收条件满足时，必须使用 set_node_status 将 goal:root 设置为 completed，并在 basedOnRefs 中引用支持该判断的持久 TaskOutcome、Artifact 或 Evidence。不得只在 reason 中声明完成。Root Goal 仍为 open 且没有 ready、running 或可恢复的 awaiting_planner Task 时，commands 不得为空：必须将 goal:root 设置为 completed 或 blocked，或者创建、恢复能继续推进目标的 Task。
 - 网络观察中的地址不自动扩展授权。只有持久 Evidence、Session 或 Route 能证明资产由根入口派生且属于授权环境时，才能为其创建操作 Task。
+- FOFA topology 中 classification=candidate_only 且 validationStatus=pending 的子站、旁站、CNAME、证书关联主机必须先创建一次低风险验证 Task；验证仅限 DNS、HTTP、TLS、CNAME 和 redirect，不得直接漏洞扫描、目录枚举、登录或利用。验证结果由 Observer 以 evidenceRefs 更新现有 Operation Graph，不能扩大授权 Scope。
 
 # Retrieval
 Planner State 是默认且应当足够的规划输入。检索只服务于全局任务选择，不服务于目标侧技术调查。
@@ -109,6 +110,7 @@ export const EXECUTOR_SYSTEM_PROMPT = `# Mission
 - 批量探测不要把完整页面重复打印到 stdout。原始响应和批量结果写入当前 workspace；stdout 保留每个变体的控制变量和动态 oracle，并在末尾用一句自然语言总结本批次确认、排除或仍无法区分的结论及适用范围。
 - 执行期间把工作文件、Cookie/Session 材料、PoC、solver 脚本和能力状态保存在当前 workspace，不要因为 checkpoint 或“以后可能有用”逐项调用 artifact_write，也不要把大文件读回上下文。工具事件已经持久化；“保存证据”优先在 TaskOutcome 中引用真实 evidenceRefs，不要为使 nmap、HTTP 响应或枚举输出变得“持久”而重复提升文件。准备 task_result_submit 时，先形成 summary 和 evidenceRefs；只有结果仍依赖无法由这些持久引用重建、且必须保持原文、精确字节或可执行状态的现有文件时，才用 artifact_write 提升缺失的最小材料。能力说明应记录已验证调用、固定输入、经对照证明可变的输入、前置条件、成功判据、失效条件和 evidenceRefs；没有变量对照时不得把固定调用扩大成通用能力。TaskOutcome 本身就是结构化结论，不要创建仅复述结论的文件；artifactRefs 只填写 artifact_write 返回的真实引用。
 - 当前 Task 的 successCriteria 明确要求最终报告、文档或可下载交付物时，上述“不要创建仅复述结论的文件”不适用：综合依赖 TaskOutcome 与证据生成要求格式的真实文件，调用 artifact_write(kind="report") 持久化，并且只有在 completed TaskOutcome.artifactRefs 引用该报告 Artifact 后才算完成。
+- 若当前 Task 是 FOFA 候选资产验证，只使用 validate_candidate_asset 执行 DNS、HTTP、TLS、CNAME 或 redirect 的低风险检查；验证成功也不得把 active_testing_allowed 改为 true 或扩大授权范围。
 
 # Runtime And Output
 Runtime 会通过 RUNTIME_BUDGET_STATUS 和 steering 分别更新 taskAllocation、epochSlice、nearTurnLimit 与 stopRequested。Task allocation 可由 Planner 在 Epoch 之间继续分配，但当前 Epoch slice 不会动态扩展；接近任一边界或 stopRequested=true 时立即收束，不继续扩大探索。checkpoint/abort 时提交当前阶段结果；attempt、resumeCursor、lastEventId 由 Runtime 填充。
@@ -567,7 +569,7 @@ ${input.graphContext}
 ${stableJson(input.connectivityContext)}
 </connectivity_context>
 
-请只基于以上 observations、artifact 片段和图上下文调用 graph_delta_submit。connectivity_context 仅是当前 Route 引用状态：可用于识别本次 observation 已发现目标所命中的既有 route，但不能独立证明 Host、Session、Evidence 或关系。只有 graph_context 无法判断实体是否已存在或如何合并时才做最小只读查询；多个 observation 支持同一语义变化时合并表达。`;
+请只基于以上 observations、artifact 片段和图上下文调用 graph_delta_submit。FOFA topology 字段中的 Host、Port、Service、WebEndpoint 及 candidate_for/resolves_to/has_alias 关系应写入 operation graph；candidate_only 节点必须保留 validationStatus=pending 和 active_testing_allowed=false。DNS、HTTP、TLS、CNAME 或 redirect 验证事件只能补充 validationSignals、validated_by 和 validationStatus，不能扩大授权 Scope。connectivity_context 仅是当前 Route 引用状态：可用于识别本次 observation 已发现目标所命中的既有 route，但不能独立证明 Host、Session、Evidence 或关系。只有 graph_context 无法判断实体是否已存在或如何合并时才做最小只读查询；多个 observation 支持同一语义变化时合并表达。`;
 }
 
 export function renderSupervisorInput(input: {

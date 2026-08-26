@@ -46,7 +46,7 @@ export const PROJECTION_EDGE_TYPES = [
   "supports", "contradicts", "confirms", "promoted_to", "exploited_by", "produces_evidence",
   "observed_on", "affects", "has_port", "runs_service", "exposes_endpoint", "has_parameter",
   "authenticates_to", "creates_session", "session_on", "tunnels_to", "proxy_route",
-  "contains_file", "spawns_process"
+  "contains_file", "spawns_process", "discovered_by", "candidate_for", "resolves_to", "has_alias", "validated_by"
 ] as const;
 
 export type ProjectionObservation = {
@@ -1055,6 +1055,7 @@ function projectionEdgeTypeForEndpoints(
   to: { graphKind: GraphNode["graphKind"]; type: string }
 ): string | undefined {
   if (from.type === "Host" && to.type === "Port") return "has_port";
+  if (from.type === "Host" && to.type === "Host") return "resolves_to";
   if (from.type === "Port" && to.type === "Service") return "runs_service";
   if (from.type === "Service" && to.type === "WebEndpoint") return "exposes_endpoint";
   if (from.type === "WebEndpoint" && to.type === "Parameter") return "has_parameter";

@@ -3,6 +3,7 @@ import { Type } from "typebox";
 import { FOFA_FIELDS, type FofaRecord, type FofaToolName } from "../fofa/fofa-types.js";
 import type { FofaMcpCallResult, FofaMcpRuntime } from "../mcp/fofa-runtime.js";
 import type { ArtifactStore } from "../stores/artifact-store.js";
+import { normalizeFofaTopology } from "../fofa/fofa-topology.js";
 
 const MAX_MODEL_BYTES = 12_000;
 const fieldSchema = Type.Union(FOFA_FIELDS.map((field) => Type.Literal(field)));
@@ -104,6 +105,7 @@ async function presentResult(
     data: JSON.stringify(artifactPayload, null, 2)
   });
   const records = result.full.records ?? [];
+  const topology = normalizeFofaTopology({ records, evidenceRef: artifact.artifactRef });
   const inScopePreview = records.filter((record) => record.classification === "in_scope").slice(0, 25);
   const candidatePreview = records.filter((record) => record.classification === "candidate_only").slice(0, 10);
   const summary: Record<string, unknown> = {
@@ -124,6 +126,10 @@ async function presentResult(
     candidatePreview,
     candidatePolicy: { classification: "candidate_only", active_testing_allowed: false },
     warning: "candidate_only records are discovery leads; active_testing_allowed:false and they do not expand Scope"
+  };
+  summary.topology = {
+    nodes: topology.nodes.map((node) => ({ id: node.id, type: node.type, label: node.label, properties: node.properties, evidenceRefs: node.evidenceRefs })),
+    edges: topology.edges
   };
   if (result.full.data !== undefined) {
     summary.dataPreview = boundedDataPreview(result.full.data);
@@ -148,6 +154,8 @@ function boundPreview(
       inScopePreview.pop();
     } else if (summary.dataPreview !== undefined) {
       delete summary.dataPreview;
+    } else if (summary.topology !== undefined) {
+      delete summary.topology;
     } else {
       throw new Error("FOFA model summary exceeded its fixed byte budget");
     }
