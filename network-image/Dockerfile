@@ -33,8 +33,8 @@ RUN sed -i 's|http://deb.debian.org/debian|https://deb.debian.org/debian|g; s|ht
     && arch="${TARGETARCH:-amd64}" \
     && case "${arch}" in amd64|arm64) ;; *) echo "unsupported architecture: ${arch}" >&2; exit 65 ;; esac \
     && mkdir -p /opt/luanniao/chisel \
-    && curl -fsSL "https://github.com/jpillora/chisel/releases/download/v${CHISEL_VERSION}/chisel_${CHISEL_VERSION}_linux_amd64.gz" -o "/opt/luanniao/chisel/chisel_${CHISEL_VERSION}_linux_amd64.gz" \
-    && curl -fsSL "https://github.com/jpillora/chisel/releases/download/v${CHISEL_VERSION}/chisel_${CHISEL_VERSION}_linux_arm64.gz" -o "/opt/luanniao/chisel/chisel_${CHISEL_VERSION}_linux_arm64.gz" \
+    && curl --retry 5 --retry-all-errors --retry-delay 2 -fsSL "https://github.com/jpillora/chisel/releases/download/v${CHISEL_VERSION}/chisel_${CHISEL_VERSION}_linux_amd64.gz" -o "/opt/luanniao/chisel/chisel_${CHISEL_VERSION}_linux_amd64.gz" \
+    && curl --retry 5 --retry-all-errors --retry-delay 2 -fsSL "https://github.com/jpillora/chisel/releases/download/v${CHISEL_VERSION}/chisel_${CHISEL_VERSION}_linux_arm64.gz" -o "/opt/luanniao/chisel/chisel_${CHISEL_VERSION}_linux_arm64.gz" \
     && printf '%s  %s\n%s  %s\n' \
       "0525aa3c5d457f2a4075e66221d5125d434bedf15006d3271c213f5cd6ff2230" "/opt/luanniao/chisel/chisel_${CHISEL_VERSION}_linux_amd64.gz" \
       "f55beb68fb99b69903df1adcff4197fbfdb82cb0ee596848c0f055dc219da983" "/opt/luanniao/chisel/chisel_${CHISEL_VERSION}_linux_arm64.gz" \
