@@ -458,3 +458,31 @@ export type PlannerDecisionView = {
   blockers: PlannerDigestItem[];
   graphSummary: JsonObject;
 };
+
+export type CredentialKind = "cookie" | "token" | "api_key" | "password" | "certificate" | "ssh_key" | "other";
+export type CredentialSource = "auto_traffic" | "auto_output" | "traffic_proxy" | "manual" | "beekeeper";
+
+export interface CredentialIndexRecord {
+  artifactRef: string;
+  scopeRef: string;
+  kind: CredentialKind;
+  hostRef?: string;
+  label: string;
+  username?: string;
+  role?: string;
+  source: CredentialSource;
+  valid: boolean;
+  graphNodeId?: string;
+  createdAt: string;
+  lastUsedAt?: string;
+}
+
+export interface CredentialAccessLogRecord {
+  id: string;
+  credentialRef: string;
+  taskId?: string;
+  action: "read" | "use" | "inject" | "invalidate" | "store";
+  actor: string;
+  details?: string;
+  createdAt: string;
+}

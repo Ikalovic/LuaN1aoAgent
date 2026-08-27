@@ -98,6 +98,12 @@ function directOperationIdentityKey(node: GraphNode): string | undefined {
       ? `endpoint:${protocol}://host:${host}:${port}:${method}:${path}`
       : undefined;
   }
+  if (node.type === "Credential") {
+    const kind = node.properties?.kind ?? "unknown";
+    const host = node.properties?.hostRef ?? node.properties?.host ?? "";
+    const username = node.properties?.username ?? "";
+    return `credential:${kind}:${host}:${username}`;
+  }
   if (node.type === "Parameter") {
     const endpoint = normalizedUrl(node.properties.endpoint ?? node.properties.url);
     const host = endpoint?.hostname ?? normalizedHost(node.properties.host ?? node.properties.hostname);

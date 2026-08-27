@@ -90,6 +90,7 @@ export type DockerTaskSandboxInput = {
   network: DockerTaskNetworkAttachment;
   transparentCaPath: string;
   additionalReadRoots?: string[];
+  credentialFileContent?: string;
   runner?: DockerRunner;
 };
 
@@ -175,7 +176,7 @@ export function createDockerRunArgs(input: {
   return args;
 }
 
-export function buildContainerEnvironment(input: NodeJS.ProcessEnv | undefined, options: { caHostPath: string }): {
+export function buildContainerEnvironment(input: NodeJS.ProcessEnv | undefined, options: { caHostPath: string; credentialFilePath?: string }): {
   environment: NodeJS.ProcessEnv;
   caCertHostPath: string;
 } {
@@ -190,6 +191,9 @@ export function buildContainerEnvironment(input: NodeJS.ProcessEnv | undefined, 
   environment.REQUESTS_CA_BUNDLE = DOCKER_CA_PATH;
   environment.CURL_CA_BUNDLE = DOCKER_CA_PATH;
   environment.NODE_EXTRA_CA_CERTS = DOCKER_CA_PATH;
+  if (options.credentialFilePath) {
+    environment.CREDENTIAL_FILE = options.credentialFilePath;
+  }
   return { environment, caCertHostPath: options.caHostPath };
 }
 
@@ -249,8 +253,15 @@ export async function createDockerTaskSandbox(input: DockerTaskSandboxInput): Pr
   await chmod(resolverHostPath, 0o444);
   await prepareContainerWritableDirectory(workspaceDir);
   await prepareContainerWritableDirectory(join(workspaceDir, "home"));
+  let credentialFilePath: string | undefined;
+  if (input.credentialFileContent !== undefined) {
+    const credentialHostPath = join(workspaceDir, ".credentials.json");
+    await writeFile(credentialHostPath, input.credentialFileContent, { mode: 0o600 });
+    credentialFilePath = posix.join(DOCKER_SANDBOX_WORKDIR, ".credentials.json");
+  }
   const { environment, caCertHostPath } = buildContainerEnvironment(input.environment, {
-    caHostPath: input.transparentCaPath
+    caHostPath: input.transparentCaPath,
+    credentialFilePath
   });
   const skillsRoots = [
     join(homedir(), ".agents", "skills"),

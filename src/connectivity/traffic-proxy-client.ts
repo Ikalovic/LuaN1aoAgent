@@ -95,6 +95,15 @@ export type TrafficExchange<FlowRef extends string | number = TrafficFlowRef> = 
   request_headers?: TrafficHeaderEntry[];
   response_headers?: TrafficHeaderEntry[];
 };
+export type TrafficCredentialHint = {
+  id: number;
+  exchange_id: number;
+  kind: string;
+  name: string;
+  value_hash: string;
+  host: string;
+  extracted_at: string;
+};
 export type TrafficHistoryPage<FlowRef extends string | number = TrafficFlowRef> = { items: TrafficExchange<FlowRef>[]; has_more: boolean; next_cursor?: string };
 export type TrafficHistoryBody<FlowRef extends string | number = TrafficFlowRef> = { exchange_id: FlowRef; side: "request" | "response"; body_ref: string; encoding: "base64"; data: string; bytes: number; truncated: boolean };
 type ControlResponse<T> = { version: number; id?: string; ok: boolean; result?: T; error?: string; error_code?: string };
@@ -139,6 +148,9 @@ export class TrafficProxyClient {
   }
   replay(input: TrafficReplayInput): Promise<TrafficReplayResult<number>> {
     return this.request("replay", input, this.replayTimeoutMs);
+  }
+  credentialHints(host: string, since?: string): Promise<{ hints: TrafficCredentialHint[] }> {
+    return this.request("credential_hints", { host, ...(since !== undefined ? { since } : {}) });
   }
 
   async configureManagedHttpScope(scope: ManagedHttpTrafficScope): Promise<void> {
