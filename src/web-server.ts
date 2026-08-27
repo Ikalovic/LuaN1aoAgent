@@ -1572,7 +1572,12 @@ async function handleStartRun(request: IncomingMessage, response: ServerResponse
       .catch((error: unknown) => {
         console.error(`[web run failed] ${activeRun.runtimeInput}:`, error instanceof Error ? error.message : error);
       })
-      .finally(() => cleanupRun(activeRun));
+      // Cleanup is best-effort. A slow Docker/Gateway teardown must not turn
+      // an otherwise completed run into an unhandled rejection that crashes
+      // the Web process.
+      .finally(() => cleanupRun(activeRun).catch((error: unknown) => {
+        console.error(`[web run cleanup failed] ${activeRun.runtimeInput}:`, error instanceof Error ? error.message : error);
+      }));
 
     await sendJson(response, {
       runtimeDir: activeRun.runtimeInput,
