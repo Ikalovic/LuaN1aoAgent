@@ -15,8 +15,11 @@ case "$role" in
     ;;
   storage-init)
     [ "$#" -gt 0 ] || { echo "storage-init requires at least one path" >&2; exit 64; }
-    chown -R 101:101 "$@"
-    find "$@" -type d -exec chmod 2770 {} +
+    # Docker Desktop/WSL bind mounts can reject chown even for container
+    # root. The gateway only needs access to these isolated directories;
+    # grant recursive read/write/traverse permissions instead of changing
+    # host ownership.
+    chmod -R u+rwX,g+rwX,o+rwX "$@"
     ;;
   index)
     exec python3 /opt/luanniao/index_server.py index "$@"

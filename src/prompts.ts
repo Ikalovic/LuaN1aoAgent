@@ -569,7 +569,7 @@ ${input.graphContext}
 ${stableJson(input.connectivityContext)}
 </connectivity_context>
 
-请只基于以上 observations、artifact 片段和图上下文调用 graph_delta_submit。FOFA topology 字段中的 Host、Port、Service、WebEndpoint 及 candidate_for/resolves_to/has_alias 关系应写入 operation graph；candidate_only 节点必须保留 validationStatus=pending 和 active_testing_allowed=false。DNS、HTTP、TLS、CNAME 或 redirect 验证事件只能补充 validationSignals、validated_by 和 validationStatus，不能扩大授权 Scope。connectivity_context 仅是当前 Route 引用状态：可用于识别本次 observation 已发现目标所命中的既有 route，但不能独立证明 Host、Session、Evidence 或关系。只有 graph_context 无法判断实体是否已存在或如何合并时才做最小只读查询；多个 observation 支持同一语义变化时合并表达。`;
+请只基于以上 observations、artifact 片段和图上下文调用 graph_delta_submit。FOFA topology 字段中的 Host、Port、Service、WebEndpoint 及 candidate_for/resolves_to/has_alias 关系应写入 operation graph；candidate_only 节点必须保留 validationStatus=pending 和 active_testing_allowed=false。提交前确保每个新建的 Evidence、Hypothesis、Vulnerability 或 Exploit 都至少通过一条语义边连接到同一批次的其他语义节点或已有 operation 节点；不要提交孤立语义节点，否则整批增量会被拒绝。DNS、HTTP、TLS、CNAME 或 redirect 验证事件只能补充 validationSignals、validated_by 和 validationStatus，不能扩大授权 Scope。connectivity_context 仅是当前 Route 引用状态：可用于识别本次 observation 已发现目标所命中的既有 route，但不能独立证明 Host、Session、Evidence 或关系。只有 graph_context 无法判断实体是否已存在或如何合并时才做最小只读查询；多个 observation 支持同一语义变化时合并表达。`;
 }
 
 export function renderSupervisorInput(input: {
