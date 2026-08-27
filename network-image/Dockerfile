@@ -25,7 +25,8 @@ ARG MITMPROXY_VERSION=12.2.1
 ARG CHISEL_VERSION=1.10.1
 ARG TARGETARCH
 
-RUN apt-get update \
+RUN sed -i 's|http://deb.debian.org/debian|https://deb.debian.org/debian|g; s|http://deb.debian.org/debian-security|https://deb.debian.org/debian-security|g' /etc/apt/sources.list.d/debian.sources \
+    && apt-get update \
     && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
       ca-certificates conntrack curl iproute2 iptables jq netcat-openbsd nftables openssh-client procps sshpass util-linux \
     && pip install --no-cache-dir "mitmproxy==${MITMPROXY_VERSION}" "httpx==0.28.1" \
