@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/tls"
 	"encoding/hex"
 	"errors"
@@ -174,8 +175,12 @@ func (p *Proxy) forward(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		a.Completed = time.Now()
-		if err := p.Store.Record(a); err != nil {
+		exchangeID, err := p.Store.RecordWithID(a)
+		if err != nil {
 			log.Printf("audit storage error: %v", err)
+		} else {
+			extractCredentialHints(a.RequestHeaders, "request", a.Host, p.Store, exchangeID)
+			extractCredentialHints(a.ResponseHeaders, "response", a.Host, p.Store, exchangeID)
 		}
 	}()
 	if err := p.validate(r); err != nil {
@@ -347,8 +352,12 @@ func (p *Proxy) connect(w http.ResponseWriter, r *http.Request) {
 	a.ConnectRef = hex.EncodeToString(refBytes)
 	defer func() {
 		a.Completed = time.Now()
-		if err := p.Store.Record(a); err != nil {
+		exchangeID, err := p.Store.RecordWithID(a)
+		if err != nil {
 			log.Printf("audit storage error: %v", err)
+		} else {
+			extractCredentialHints(a.RequestHeaders, "request", a.Host, p.Store, exchangeID)
+			extractCredentialHints(a.ResponseHeaders, "response", a.Host, p.Store, exchangeID)
 		}
 	}()
 	host, port, err := p.validateConnectTarget(r.Host)
@@ -539,3 +548,53 @@ func normalizeListen(addr string) ([]string, error) {
 	return []string{addr, "localhost:" + port, "127.0.0.1:" + port, "[::1]:" + port}, nil
 }
 func targetURL(raw string) (*url.URL, error) { return url.Parse(raw) }
+
+func extractCredentialHints(headers http.Header, side string, host string, store *Store, exchangeID int64) {
+	if host == "" {
+		return
+	}
+	if side == "request" {
+		for _, cookie := range headers["Cookie"] {
+			for _, pair := range strings.Split(cookie, ";") {
+				pair = strings.TrimSpace(pair)
+				eq := strings.IndexByte(pair, '=')
+				if eq <= 0 {
+					continue
+				}
+				name := pair[:eq]
+				value := pair[eq+1:]
+				h := sha256.Sum256([]byte(value))
+				_ = store.StoreCredentialHint(exchangeID, "cookie", name, hex.EncodeToString(h[:]), host)
+			}
+		}
+		if auth := headers.Get("Authorization"); auth != "" {
+			parts := strings.SplitN(auth, " ", 2)
+			scheme := parts[0]
+			token := ""
+			if len(parts) == 2 {
+				token = parts[1]
+			}
+			if token != "" {
+				h := sha256.Sum256([]byte(token))
+				_ = store.StoreCredentialHint(exchangeID, "token", scheme, hex.EncodeToString(h[:]), host)
+			}
+		}
+	}
+	if side == "response" {
+		for _, cookie := range headers["Set-Cookie"] {
+			semi := strings.IndexByte(cookie, ';')
+			raw := cookie
+			if semi >= 0 {
+				raw = cookie[:semi]
+			}
+			eq := strings.IndexByte(raw, '=')
+			if eq <= 0 {
+				continue
+			}
+			name := raw[:eq]
+			value := raw[eq+1:]
+			h := sha256.Sum256([]byte(value))
+			_ = store.StoreCredentialHint(exchangeID, "cookie", name, hex.EncodeToString(h[:]), host)
+		}
+	}
+}

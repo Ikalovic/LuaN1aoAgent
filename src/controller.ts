@@ -95,6 +95,8 @@ import {
 import { createEvidenceListTool, createEvidenceReadTool } from "./tools/pi-tools.js";
 import { createExecutorBeekeeperTools } from "./tools/beekeeper-mcp-tools.js";
 import { createExecutorFofaTools } from "./tools/fofa-mcp-tools.js";
+import { createExecutorCredentialTools } from "./tools/credential-tools.js";
+import { CredentialMcpRuntime } from "./mcp/credential-runtime.js";
 import { createTopologyValidationTool } from "./tools/topology-validation-tool.js";
 import type {
   AgentRole,
@@ -415,6 +417,7 @@ export class SecurityAgentController {
   private readonly beekeeperRuntimeFactory: (input: BeekeeperMcpRuntimeOptions) => BeekeeperMcpRuntime;
   private beekeeperRuntime?: BeekeeperMcpRuntime;
   private beekeeperCapabilityReported = false;
+  private credentialMcpRuntime?: CredentialMcpRuntime;
   private connectivityStore?: ConnectivityStore;
   private connectivityRuntimeCleanupComplete = false;
   private taskExecutorSandboxes = new Map<string, DockerTaskSandbox>();
@@ -622,6 +625,18 @@ export class SecurityAgentController {
       });
     }
     this.projectorCoordinator.start();
+    this.credentialMcpRuntime = new CredentialMcpRuntime({
+      artifactStoreRoot: this.artifactStore.rootDir,
+      artifactStoreDb: this.artifactStore.databasePath,
+      executionLog: this.executionLog
+    });
+    await this.credentialMcpRuntime.configure();
+    await this.executionLog.append({
+      role: "runtime",
+      eventType: "credential_mcp_ready",
+      summary: "Credential MCP Runtime ready",
+      payload: { enabled: true }
+    });
   }
 
   hasConnectivityRuntime(): boolean {
@@ -684,7 +699,13 @@ export class SecurityAgentController {
     const runtime = this.requireConnectivityRuntime();
     await runtime.configureAuthorizedScope(scopeSummary);
     const authorizedScope = parseAuthorizedScope(scopeSummary);
-    const credential = await this.artifactStore.writeCredential({ data: proxy.password });
+    const credential = await this.artifactStore.writeCredential({
+      data: proxy.password,
+      scopeRef: this.runId,
+      kind: "password",
+      label: "transparent_proxy_password",
+      source: "auto_output"
+    });
     const route = await runtime.replaceTransparentProxy({
       connector: "socks5",
       pivotHostRef: proxy.host,
@@ -741,9 +762,11 @@ export class SecurityAgentController {
     let repairFeedback: string | undefined;
     for (let decisionAttempt = 1; decisionAttempt <= PLANNER_DECISION_REPAIR_ATTEMPTS; decisionAttempt += 1) {
       try {
+        const credentialSummary = await this.buildCredentialSummary(input.scopeSummary);
+        const enrichedScopeSummary = input.scopeSummary + credentialSummary;
         const invocation = await this.invokePlannerCycle({
           userGoal: this.reportingGoal(input.userGoal),
-          scopeSummary: input.scopeSummary,
+          scopeSummary: enrichedScopeSummary,
           repairFeedback
         });
         plannerDecision = invocation.plannerDecision;
@@ -1066,6 +1089,7 @@ export class SecurityAgentController {
     this.invocationAbortController.abort(reason);
     const fofaStop = this.fofaRuntime?.close(reason);
     const beekeeperStop = this.beekeeperRuntime?.close(reason);
+    const credentialStop = this.credentialMcpRuntime?.close(reason);
     this.projectionRequestsClosed = true;
     this.projectionCancellationRequested = true;
     this.projectorInvocationAbortController.abort(reason);
@@ -1105,6 +1129,7 @@ export class SecurityAgentController {
     await this.projectorCoordinator.close({ drain: false });
     await fofaStop;
     await beekeeperStop;
+    await credentialStop;
   }
 
   private async finalizeRunMetrics(): Promise<void> {
@@ -1232,6 +1257,7 @@ export class SecurityAgentController {
     await this.closeExecutorResources();
     await this.fofaRuntime?.close("Controller shutdown");
     await this.beekeeperRuntime?.close("Controller shutdown");
+    await this.credentialMcpRuntime?.close("Controller shutdown");
     for (const pending of [...this.pendingSupervisorRequests.values()]) {
       void this.discardSupervisorCheck(
         pending.request,
@@ -2665,9 +2691,33 @@ export class SecurityAgentController {
       ...(this.beekeeperRuntime
         ? createExecutorBeekeeperTools(this.beekeeperRuntime, taskEnvelope.taskId)
         : []),
+      ...createExecutorCredentialTools(this.credentialMcpRuntime!, taskEnvelope.taskId),
       createEvidenceListTool(this.executionLog),
       createEvidenceReadTool(this.executionLog)
     ];
+  }
+
+  private async buildCredentialSummary(scopeSummary: string): Promise<string> {
+    if (!this.credentialMcpRuntime) return "";
+    try {
+      const result = await this.credentialMcpRuntime.call(
+        "planner",
+        "credential_query",
+        { scopeRef: this.runId, includeInvalid: false }
+      ) as { records?: Array<{ role?: string; kind: string; hostRef?: string; valid: boolean; lastUsedAt?: string }> };
+      const records = result?.records;
+      if (!records || records.length === 0) return "";
+      const lines = records.map((record) => {
+        const roleTag = record.role ? `[${record.role}]` : "[unknown]";
+        const hostInfo = record.hostRef ? ` on ${record.hostRef}` : "";
+        const validity = record.valid ? "valid" : "invalid";
+        const lastUsed = record.lastUsedAt ? `, last used: ${record.lastUsedAt}` : "";
+        return `- ${roleTag} ${record.kind}${hostInfo} (${validity}${lastUsed})`;
+      });
+      return `\n\n<credential_summary scope="${scopeSummary}">\nAvailable credentials:\n${lines.join("\n")}\n</credential_summary>`;
+    } catch {
+      return "";
+    }
   }
 
   private async configureBeekeeperRuntime(): Promise<void> {

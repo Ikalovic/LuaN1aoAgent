@@ -6,7 +6,7 @@ import { DatabaseSync } from "node:sqlite";
 import { Transform } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import { toJsonLine } from "../json.js";
-import type { ArtifactRecord } from "../types.js";
+import type { ArtifactRecord, CredentialIndexRecord, CredentialAccessLogRecord } from "../types.js";
 
 type ArtifactRow = {
   artifact_ref: string;
@@ -91,7 +91,16 @@ export class ArtifactStore {
     return record;
   }
 
-  async writeCredential(input: { data: string | Buffer }): Promise<ArtifactRecord> {
+  async writeCredential(input: {
+    data: string | Buffer;
+    scopeRef?: string;
+    kind?: string;
+    hostRef?: string;
+    label?: string;
+    username?: string;
+    role?: string;
+    source?: string;
+  }): Promise<ArtifactRecord> {
     const dataBuffer = Buffer.isBuffer(input.data) ? input.data : Buffer.from(input.data);
     if (dataBuffer.byteLength === 0 || dataBuffer.byteLength > 1 << 20) {
       throw new Error("Credential is empty or too large");
@@ -118,7 +127,118 @@ export class ArtifactStore {
       throw new Error("Failed to persist credential artifact");
     }
     await this.appendRecord(record);
+    if (input.scopeRef) {
+      this.database.exec("BEGIN IMMEDIATE");
+      try {
+        this.database.prepare(`
+          INSERT OR REPLACE INTO credential_index
+            (artifact_ref, scope_ref, kind, host_ref, label, username, role, source, valid, created_at)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
+        `).run(
+          record.artifactRef,
+          input.scopeRef,
+          input.kind ?? "other",
+          input.hostRef ?? null,
+          input.label ?? "",
+          input.username ?? null,
+          input.role ?? null,
+          input.source ?? "auto_output",
+          record.createdAt
+        );
+        this.database.exec("COMMIT");
+      } catch (error) {
+        this.database.exec("ROLLBACK");
+        throw error;
+      }
+    }
     return record;
+  }
+
+  async listCredentials(scopeRef: string, options?: {
+    hostRef?: string;
+    kind?: string;
+    role?: string;
+    validOnly?: boolean;
+  }): Promise<CredentialIndexRecord[]> {
+    const conditions: string[] = ["scope_ref = ?"];
+    const params: string[] = [scopeRef];
+    if (options?.hostRef) {
+      conditions.push("host_ref = ?");
+      params.push(options.hostRef);
+    }
+    if (options?.kind) {
+      conditions.push("kind = ?");
+      params.push(options.kind);
+    }
+    if (options?.role) {
+      conditions.push("role = ?");
+      params.push(options.role);
+    }
+    if (options?.validOnly) {
+      conditions.push("valid = 1");
+    }
+    const sql = `SELECT * FROM credential_index WHERE ${conditions.join(" AND ")} ORDER BY created_at ASC`;
+    const rows = this.database.prepare(sql).all(...params) as CredentialIndexRow[];
+    return rows.map(credentialRowToRecord);
+  }
+
+  async readCredential(artifactRef: string): Promise<string> {
+    return this.read(artifactRef);
+  }
+
+  async invalidateCredential(artifactRef: string): Promise<void> {
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      this.database.prepare("UPDATE credential_index SET valid = 0 WHERE artifact_ref = ?").run(artifactRef);
+      this.database.exec("COMMIT");
+    } catch (error) {
+      this.database.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  async touchCredential(artifactRef: string): Promise<void> {
+    const now = new Date().toISOString();
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      this.database.prepare("UPDATE credential_index SET last_used_at = ? WHERE artifact_ref = ?").run(now, artifactRef);
+      this.database.exec("COMMIT");
+    } catch (error) {
+      this.database.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  async logCredentialAccess(input: {
+    credentialRef: string;
+    taskId?: string;
+    action: string;
+    actor: string;
+    details?: string;
+  }): Promise<void> {
+    const id = `credlog:${randomUUID()}`;
+    const createdAt = new Date().toISOString();
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      this.database.prepare(`
+        INSERT INTO credential_access_log (id, credential_ref, task_id, action, actor, details, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+      `).run(id, input.credentialRef, input.taskId ?? null, input.action, input.actor, input.details ?? null, createdAt);
+      this.database.exec("COMMIT");
+    } catch (error) {
+      this.database.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  async listCredentialAccessLog(credentialRef?: string): Promise<CredentialAccessLogRecord[]> {
+    const sql = credentialRef
+      ? "SELECT * FROM credential_access_log WHERE credential_ref = ? ORDER BY created_at ASC"
+      : "SELECT * FROM credential_access_log ORDER BY created_at ASC";
+    const rows = credentialRef
+      ? this.database.prepare(sql).all(credentialRef) as CredentialAccessLogRow[]
+      : this.database.prepare(sql).all() as CredentialAccessLogRow[];
+    return rows.map(accessLogRowToRecord);
   }
 
   async importFile(input: {
@@ -391,6 +511,33 @@ export class ArtifactStore {
         chunk_index UNINDEXED,
         content
       );
+      CREATE TABLE IF NOT EXISTS credential_index (
+        artifact_ref TEXT PRIMARY KEY REFERENCES artifacts(artifact_ref),
+        scope_ref TEXT NOT NULL,
+        kind TEXT NOT NULL,
+        host_ref TEXT,
+        label TEXT NOT NULL DEFAULT '',
+        username TEXT,
+        role TEXT,
+        source TEXT NOT NULL DEFAULT 'auto',
+        valid INTEGER NOT NULL DEFAULT 1,
+        graph_node_id TEXT,
+        created_at TEXT NOT NULL,
+        last_used_at TEXT
+      );
+      CREATE INDEX IF NOT EXISTS idx_cred_scope ON credential_index(scope_ref, valid);
+      CREATE INDEX IF NOT EXISTS idx_cred_host ON credential_index(host_ref);
+      CREATE INDEX IF NOT EXISTS idx_cred_role ON credential_index(role);
+      CREATE TABLE IF NOT EXISTS credential_access_log (
+        id TEXT PRIMARY KEY,
+        credential_ref TEXT NOT NULL,
+        task_id TEXT,
+        action TEXT NOT NULL,
+        actor TEXT NOT NULL,
+        details TEXT,
+        created_at TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_cred_access_ref ON credential_access_log(credential_ref);
     `);
   }
 
@@ -474,6 +621,60 @@ function normalizeExtension(value: string): string {
     throw new Error(`Invalid artifact extension: ${value}`);
   }
   return normalized;
+}
+
+type CredentialIndexRow = {
+  artifact_ref: string;
+  scope_ref: string;
+  kind: string;
+  host_ref: string | null;
+  label: string;
+  username: string | null;
+  role: string | null;
+  source: string;
+  valid: number;
+  graph_node_id: string | null;
+  created_at: string;
+  last_used_at: string | null;
+};
+
+type CredentialAccessLogRow = {
+  id: string;
+  credential_ref: string;
+  task_id: string | null;
+  action: string;
+  actor: string;
+  details: string | null;
+  created_at: string;
+};
+
+function credentialRowToRecord(row: CredentialIndexRow): CredentialIndexRecord {
+  return {
+    artifactRef: row.artifact_ref,
+    scopeRef: row.scope_ref,
+    kind: row.kind as CredentialIndexRecord["kind"],
+    hostRef: row.host_ref ?? undefined,
+    label: row.label,
+    username: row.username ?? undefined,
+    role: row.role ?? undefined,
+    source: row.source as CredentialIndexRecord["source"],
+    valid: Boolean(row.valid),
+    graphNodeId: row.graph_node_id ?? undefined,
+    createdAt: row.created_at,
+    lastUsedAt: row.last_used_at ?? undefined
+  };
+}
+
+function accessLogRowToRecord(row: CredentialAccessLogRow): CredentialAccessLogRecord {
+  return {
+    id: row.id,
+    credentialRef: row.credential_ref,
+    taskId: row.task_id ?? undefined,
+    action: row.action as CredentialAccessLogRecord["action"],
+    actor: row.actor,
+    details: row.details ?? undefined,
+    createdAt: row.created_at
+  };
 }
 
 function isAlreadyExistsError(error: unknown): boolean {

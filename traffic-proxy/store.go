@@ -15,7 +15,17 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-const schemaVersion = 4
+const schemaVersion = 5
+
+type CredentialHint struct {
+	ID          int64  `json:"id"`
+	ExchangeID  int64  `json:"exchange_id"`
+	Kind        string `json:"kind"`
+	Name        string `json:"name"`
+	ValueHash   string `json:"value_hash"`
+	Host        string `json:"host"`
+	ExtractedAt string `json:"extracted_at"`
+}
 
 type Store struct {
 	db          *sql.DB
@@ -161,7 +171,14 @@ request_bytes,response_bytes,0,0,request_blob,response_blob,CASE WHEN request_bl
 	}
 	if _, err = tx.Exec(`CREATE INDEX IF NOT EXISTS exchanges_connect_ref ON exchanges(connect_ref);
 CREATE INDEX IF NOT EXISTS exchanges_replay_of ON exchanges(replay_of);
-PRAGMA user_version=4`); err != nil {
+CREATE TABLE IF NOT EXISTS credential_hints(
+ id INTEGER PRIMARY KEY AUTOINCREMENT,
+ exchange_id INTEGER NOT NULL REFERENCES exchanges(id) ON DELETE CASCADE,
+ kind TEXT NOT NULL, name TEXT, value_hash TEXT, host TEXT NOT NULL,
+ extracted_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS credential_hints_host ON credential_hints(host, extracted_at);
+PRAGMA user_version=5`); err != nil {
 		return err
 	}
 	return tx.Commit()
@@ -272,6 +289,34 @@ func (s *Store) RecordWithID(a Audit) (int64, error) {
 		_, err = s.db.Exec(`UPDATE exchanges SET quota_pressure=?,evicted_exchanges=? WHERE id=?`, boolInt(pressure), evicted, id)
 	}
 	return id, err
+}
+
+func (s *Store) StoreCredentialHint(exchangeID int64, kind, name, valueHash, host string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, err := s.db.Exec(`INSERT INTO credential_hints(exchange_id, kind, name, value_hash, host, extracted_at) VALUES(?,?,?,?,?,?)`,
+		exchangeID, kind, name, valueHash, host, time.Now().UTC().Format(time.RFC3339Nano))
+	return err
+}
+
+func (s *Store) GetCredentialHints(host string, since time.Time) ([]CredentialHint, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	rows, err := s.db.Query(`SELECT id, exchange_id, kind, name, value_hash, host, extracted_at FROM credential_hints WHERE host=? AND extracted_at>=? ORDER BY extracted_at ASC`,
+		host, since.UTC().Format(time.RFC3339Nano))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var hints []CredentialHint
+	for rows.Next() {
+		var h CredentialHint
+		if err = rows.Scan(&h.ID, &h.ExchangeID, &h.Kind, &h.Name, &h.ValueHash, &h.Host, &h.ExtractedAt); err != nil {
+			return nil, err
+		}
+		hints = append(hints, h)
+	}
+	return hints, rows.Err()
 }
 
 func (s *Store) rotate(current int64) (int64, bool, error) {

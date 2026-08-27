@@ -85,6 +85,8 @@ type controlRequest struct {
 	Body       *ReplayBody    `json:"body,omitempty"`
 	RouteRef   string         `json:"route_ref,omitempty"`
 	SessionRef string         `json:"session_ref,omitempty"`
+	Host       string         `json:"host,omitempty"`
+	Since      string         `json:"since,omitempty"`
 	Context    *Context       `json:"context,omitempty"`
 }
 type controlResponse struct {
@@ -244,6 +246,21 @@ func handleControl(c net.Conn, state *State, shutdown func(), store *Store, prox
 				err = replayError("replay_unavailable", "replay unavailable")
 			} else {
 				resp.Result, err = proxy.Replay(context.Background(), ReplayRequest{ExchangeID: req.ExchangeID, Method: req.Method, URL: req.URL, Headers: req.Headers, Body: req.Body, RouteRef: req.RouteRef, SessionRef: req.SessionRef, Context: req.Context})
+			}
+		case "credential_hints":
+			if store == nil {
+				err = errors.New("credential hints unavailable")
+			} else {
+				since := time.Time{}
+				if req.Since != "" {
+					since, _ = time.Parse(time.RFC3339Nano, req.Since)
+				}
+				hints, queryErr := store.GetCredentialHints(req.Host, since)
+				if queryErr != nil {
+					err = queryErr
+				} else {
+					resp.Result = map[string]any{"hints": hints}
+				}
 			}
 		case "shutdown":
 			resp.OK = true

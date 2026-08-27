@@ -412,6 +412,7 @@ function sandboxEnvironment(input: NodeJS.ProcessEnv | undefined, root: string):
     SSL_CERT_DIR: source.SSL_CERT_DIR,
     CURL_CA_BUNDLE: source.CURL_CA_BUNDLE,
     NODE_EXTRA_CA_CERTS: source.NODE_EXTRA_CA_CERTS,
+    CREDENTIAL_FILE: source.CREDENTIAL_FILE,
     PYTHONDONTWRITEBYTECODE: "1"
   };
   return Object.fromEntries(Object.entries(output).filter((entry): entry is [string, string] => typeof entry[1] === "string"));
