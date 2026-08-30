@@ -3,12 +3,16 @@ export type ScopeTextFragment = {
   page?: number;
   paragraph?: number;
   line?: number;
+  sheet?: string;
+  cell?: string;
 };
 
 export type ScopeCandidateEvidence = {
   page?: number;
   paragraph?: number;
   line?: number;
+  sheet?: string;
+  cell?: string;
   excerpt: string;
 };
 

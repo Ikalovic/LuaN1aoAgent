@@ -1,5 +1,5 @@
 import { createRequire } from "node:module";
-import { dirname, extname, join } from "node:path";
+import { dirname, extname, join, posix } from "node:path";
 import { unzipSync } from "fflate";
 import type { ScopeTextFragment } from "./scope-document-types.js";
 
@@ -39,6 +39,9 @@ export async function extractScopeText(fileName: string, data: Buffer): Promise<
       break;
     case ".docx":
       fragments = docxParagraphs(data);
+      break;
+    case ".xlsx":
+      fragments = xlsxCells(data);
       break;
     case ".pdf":
       fragments = await pdfPages(data);
@@ -153,6 +156,127 @@ function docxParagraphs(data: Buffer): ScopeTextFragment[] {
     if (text) paragraphs.push({ text, paragraph: paragraphs.length + 1 });
   }
   return paragraphs;
+}
+
+function xlsxCells(data: Buffer): ScopeTextFragment[] {
+  if (data[0] !== 0x50 || data[1] !== 0x4b) {
+    throw new ScopeDocumentError("invalid_xlsx", "XLSX 文件签名无效");
+  }
+  let entries: Record<string, Uint8Array>;
+  try {
+    entries = unzipSync(new Uint8Array(data));
+  } catch {
+    throw new ScopeDocumentError("invalid_xlsx", "XLSX 压缩包无法解析");
+  }
+  const expandedBytes = Object.values(entries).reduce((sum, entry) => sum + entry.byteLength, 0);
+  if (expandedBytes > SCOPE_DOCUMENT_LIMITS.expandedBytes) {
+    throw new ScopeDocumentError("document_too_large", "XLSX 解压后内容超过 20 MiB");
+  }
+  const workbook = xlsxXml(entries, "xl/workbook.xml");
+  const relationships = xlsxXml(entries, "xl/_rels/workbook.xml.rels");
+  const sharedStrings = parseSharedStrings(entries["xl/sharedStrings.xml"]);
+  const relationshipPaths = new Map<string, string>();
+  for (const match of relationships.matchAll(/<Relationship\b([^>]*)\/?\s*>/gi)) {
+    const attributes = match[1];
+    const id = xmlAttribute(attributes, "Id");
+    const type = xmlAttribute(attributes, "Type");
+    const target = xmlAttribute(attributes, "Target");
+    const targetMode = xmlAttribute(attributes, "TargetMode");
+    if (!id || !type?.endsWith("/worksheet") || !target || targetMode?.toLowerCase() === "external") continue;
+    const path = xlsxRelationshipPath(target);
+    if (!path || relationshipPaths.has(id)) {
+      throw new ScopeDocumentError("invalid_xlsx", "XLSX 工作表关系无效");
+    }
+    relationshipPaths.set(id, path);
+  }
+  const sheets: Array<{ name: string; path: string }> = [];
+  for (const match of workbook.matchAll(/<sheet\b([^>]*)\/?\s*>/gi)) {
+    const name = xmlAttribute(match[1], "name");
+    const relationshipId = xmlAttribute(match[1], "r:id");
+    const path = relationshipId ? relationshipPaths.get(relationshipId) : undefined;
+    if (!name || !path) {
+      throw new ScopeDocumentError("invalid_xlsx", "XLSX 工作表元数据无效");
+    }
+    sheets.push({ name: decodeXml(name), path });
+  }
+  if (sheets.length === 0) {
+    throw new ScopeDocumentError("invalid_xlsx", "XLSX 不包含工作表");
+  }
+  return sheets.flatMap(({ name, path }) => parseWorksheet(xlsxXml(entries, path), name, sharedStrings));
+}
+
+function xlsxXml(entries: Record<string, Uint8Array>, path: string): string {
+  const entry = entries[path];
+  if (!entry) throw new ScopeDocumentError("invalid_xlsx", "XLSX 缺少必要的工作簿内容");
+  try {
+    return decodeUtf8(Buffer.from(entry));
+  } catch {
+    throw new ScopeDocumentError("invalid_xlsx", "XLSX XML 编码无效");
+  }
+}
+
+function xlsxRelationshipPath(value: string): string | undefined {
+  const target = decodeXml(value).replace(/\\/g, "/");
+  const resolved = target.startsWith("/")
+    ? posix.normalize(target.slice(1))
+    : posix.normalize(posix.join("xl", target));
+  return resolved.startsWith("xl/") && resolved !== "xl/" ? resolved : undefined;
+}
+
+function parseSharedStrings(entry: Uint8Array | undefined): string[] {
+  if (!entry) return [];
+  let xml: string;
+  try {
+    xml = decodeUtf8(Buffer.from(entry));
+  } catch {
+    throw new ScopeDocumentError("invalid_xlsx", "XLSX 共享字符串编码无效");
+  }
+  return [...xml.matchAll(/<si(?:\s[^>]*)?>([\s\S]*?)<\/si>/gi)]
+    .map((match) => xlsxTextNodes(match[1]));
+}
+
+function parseWorksheet(xml: string, sheet: string, sharedStrings: string[]): ScopeTextFragment[] {
+  const fragments: ScopeTextFragment[] = [];
+  for (const match of xml.matchAll(/<c\b([^>]*)>([\s\S]*?)<\/c>/gi)) {
+    const cell = xmlAttribute(match[1], "r")?.toUpperCase();
+    const type = xmlAttribute(match[1], "t")?.toLowerCase();
+    const body = match[2];
+    let text = "";
+    if (type === "inlinestr") {
+      text = xlsxTextNodes(body);
+    } else {
+      const rawValue = /<v(?:\s[^>]*)?>([\s\S]*?)<\/v>/i.exec(body)?.[1];
+      if (rawValue === undefined || type === "e") continue;
+      if (type === "s") {
+        const index = Number(rawValue.trim());
+        if (!Number.isSafeInteger(index) || index < 0 || sharedStrings[index] === undefined) {
+          throw new ScopeDocumentError("invalid_xlsx", "XLSX 共享字符串索引无效");
+        }
+        text = sharedStrings[index];
+      } else {
+        text = decodeXml(rawValue);
+      }
+    }
+    text = text.trim();
+    if (!text) continue;
+    if (!cell || !/^[A-Z]{1,3}[1-9]\d*$/.test(cell)) {
+      throw new ScopeDocumentError("invalid_xlsx", "XLSX 单元格地址无效");
+    }
+    fragments.push({ text, sheet, cell });
+  }
+  return fragments;
+}
+
+function xlsxTextNodes(xml: string): string {
+  return [...xml.matchAll(/<t(?:\s[^>]*)?>([\s\S]*?)<\/t>/gi)]
+    .map((match) => decodeXml(match[1]))
+    .join("");
+}
+
+function xmlAttribute(attributes: string, name: string): string | undefined {
+  const escapedName = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return new RegExp(`(?:^|\\s)${escapedName}\\s*=\\s*(["'])([\\s\\S]*?)\\1`, "i")
+    .exec(attributes)?.[2];
 }
 
 async function pdfPages(data: Buffer): Promise<ScopeTextFragment[]> {

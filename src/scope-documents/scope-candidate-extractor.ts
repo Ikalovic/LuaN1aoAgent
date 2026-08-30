@@ -43,6 +43,8 @@ function addCandidate(
         ...(fragment.page !== undefined ? { page: fragment.page } : {}),
         ...(fragment.paragraph !== undefined ? { paragraph: fragment.paragraph } : {}),
         ...(fragment.line !== undefined ? { line: fragment.line } : {}),
+        ...(fragment.sheet !== undefined ? { sheet: fragment.sheet } : {}),
+        ...(fragment.cell !== undefined ? { cell: fragment.cell } : {}),
         excerpt: boundedExcerpt(fragment.text)
       }
     });

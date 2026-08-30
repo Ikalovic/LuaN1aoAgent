@@ -44,6 +44,22 @@ test("extracts DOCX paragraphs without reading unrelated zip entries", async () 
   ]);
 });
 
+test("extracts every XLSX worksheet with cell evidence", async () => {
+  assert.deepEqual(await extractScopeText("scope.xlsx", createXlsx()), [
+    { text: "api.example", sheet: "External", cell: "A1" },
+    { text: "10.0.0.0/24", sheet: "External", cell: "B2" },
+    { text: "admin.example", sheet: "Internal", cell: "C3" },
+    { text: "192.0.2.8", sheet: "Internal", cell: "D4" }
+  ]);
+});
+
+test("rejects malformed XLSX packages", async () => {
+  await assert.rejects(
+    () => extractScopeText("scope.xlsx", Buffer.from("not-a-zip")),
+    (error: unknown) => error instanceof ScopeDocumentError && error.code === "invalid_xlsx"
+  );
+});
+
 test("extracts text-layer PDF by page", async () => {
   const fragments = await extractScopeText("scope.pdf", createPdf("api.example 10.0.0.1"));
   assert.deepEqual(fragments, [{ text: "api.example 10.0.0.1", page: 1 }]);
@@ -86,4 +102,33 @@ function createPdf(text?: string): Buffer {
   body += offsets.slice(1).map((offset) => `${String(offset).padStart(10, "0")} 00000 n \n`).join("");
   body += `trailer\n<< /Size ${objects.length + 1} /Root 1 0 R >>\nstartxref\n${xrefOffset}\n%%EOF\n`;
   return Buffer.from(body);
+}
+
+function createXlsx(): Buffer {
+  const workbook = `<?xml version="1.0"?><workbook xmlns:r="urn:rels"><sheets>`
+    + `<sheet name="External" sheetId="1" r:id="rId1"/>`
+    + `<sheet name="Internal" sheetId="2" r:id="rId2"/>`
+    + `</sheets></workbook>`;
+  const relationships = `<?xml version="1.0"?><Relationships>`
+    + `<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>`
+    + `<Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet2.xml"/>`
+    + `</Relationships>`;
+  const sharedStrings = `<?xml version="1.0"?><sst><si><t>api.example</t></si></sst>`;
+  const externalSheet = `<?xml version="1.0"?><worksheet><sheetData>`
+    + `<row r="1"><c r="A1" t="s"><v>0</v></c></row>`
+    + `<row r="2"><c r="B2" t="inlineStr"><is><t>10.0.0.0/24</t></is></c></row>`
+    + `</sheetData></worksheet>`;
+  const internalSheet = `<?xml version="1.0"?><worksheet><sheetData>`
+    + `<row r="3"><c r="C3" t="str"><v>admin.example</v></c></row>`
+    + `<row r="4"><c r="D4" t="str"><f>TEXT(A1,"0")</f><v>192.0.2.8</v></c></row>`
+    + `</sheetData></worksheet>`;
+  return Buffer.from(zipSync({
+    "[Content_Types].xml": strToU8("<Types/>"),
+    "xl/workbook.xml": strToU8(workbook),
+    "xl/_rels/workbook.xml.rels": strToU8(relationships),
+    "xl/sharedStrings.xml": strToU8(sharedStrings),
+    "xl/worksheets/sheet1.xml": strToU8(externalSheet),
+    "xl/worksheets/sheet2.xml": strToU8(internalSheet),
+    "xl/ignored.xml": strToU8("ignored.example")
+  }));
 }

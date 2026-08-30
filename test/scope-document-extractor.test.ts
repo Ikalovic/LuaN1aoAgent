@@ -49,3 +49,21 @@ test("deduplicates candidates while retaining the first evidence location", () =
     evidence: { line: 2, excerpt: "a.example" }
   }]);
 });
+
+test("preserves XLSX worksheet and cell evidence", () => {
+  const result = extractScopeCandidates([{
+    text: "api.example 10.0.0.1",
+    sheet: "Targets",
+    cell: "B7"
+  }]);
+  assert.deepEqual(result.domains[0]?.evidence, {
+    sheet: "Targets",
+    cell: "B7",
+    excerpt: "api.example 10.0.0.1"
+  });
+  assert.deepEqual(result.ipv4Cidrs[0]?.evidence, {
+    sheet: "Targets",
+    cell: "B7",
+    excerpt: "api.example 10.0.0.1"
+  });
+});
