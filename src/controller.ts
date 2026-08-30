@@ -3,6 +3,8 @@ import { mkdir } from "node:fs/promises";
 import { join } from "node:path";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
 import { createExecutorAgentSession, createObserverAgentSession, createPlannerAgentSession, createScopeResolverAgentSession, projectSkillsDirs, type SecurityAgentRuntime, type SecurityAgentSession } from "./agents.js";
+import { SkillRegistry, type SkillRegistrySnapshot } from "./skills/skill-registry.js";
+import { selectSkillsForTask, type SkillSelectionResult } from "./skills/skill-selector.js";
 import { extractJsonObject } from "./json.js";
 import { normalizeInferredScopeCidrs, parseAuthorizedScope, type ScopeResolution } from "./scope.js";
 import {
@@ -415,6 +417,12 @@ export class SecurityAgentController {
   private readonly beekeeperConfig?: BeekeeperConfig;
   private readonly beekeeperConfigInvalid: boolean;
   private readonly beekeeperRuntimeFactory: (input: BeekeeperMcpRuntimeOptions) => BeekeeperMcpRuntime;
+  private readonly skillRegistry: { scan(): SkillRegistrySnapshot };
+  private readonly skillSelector: (input: {
+    taskGoal: string;
+    snapshot: SkillRegistrySnapshot;
+  }) => Promise<SkillSelectionResult>;
+  private skillSnapshot?: SkillRegistrySnapshot;
   private beekeeperRuntime?: BeekeeperMcpRuntime;
   private beekeeperCapabilityReported = false;
   private credentialMcpRuntime?: CredentialMcpRuntime;
@@ -473,6 +481,8 @@ export class SecurityAgentController {
     executorSandboxMode?: ExecutorSandboxRequestedMode;
     fofaRuntimeFactory?: (input: FofaMcpRuntimeOptions) => FofaMcpRuntime;
     beekeeperRuntimeFactory?: (input: BeekeeperMcpRuntimeOptions) => BeekeeperMcpRuntime;
+    skillRegistry?: { scan(): SkillRegistrySnapshot };
+    skillSelector?: (input: { taskGoal: string; snapshot: SkillRegistrySnapshot }) => Promise<SkillSelectionResult>;
   }) {
     this.cwd = input.cwd;
     this.runtimeDir = input.runtimeDir ?? join(input.cwd, ".agent-runtime");
@@ -481,6 +491,13 @@ export class SecurityAgentController {
     this.fofaRuntimeFactory = input.fofaRuntimeFactory ?? ((options) => new FofaMcpRuntime(options));
     this.beekeeperRuntimeFactory = input.beekeeperRuntimeFactory
       ?? ((options) => new BeekeeperMcpRuntime(options));
+    this.skillRegistry = input.skillRegistry ?? new SkillRegistry(join(input.cwd, ".agents", "skills"));
+    this.skillSelector = input.skillSelector ?? ((selectionInput) => selectSkillsForTask({
+      ...selectionInput,
+      cwd: this.cwd,
+      llmRuntime: this.llmRuntime,
+      providerAdmission: this.providerAdmission("planner")
+    }));
     let fofaConfig: FofaConfig | undefined;
     let fofaConfigInvalid = false;
     try {
@@ -539,6 +556,26 @@ export class SecurityAgentController {
 
   async initialize(): Promise<void> {
     await mkdir(this.runtimeDir, { recursive: true });
+    try {
+      this.skillSnapshot = this.skillRegistry.scan();
+      await this.executionLog.append({
+        role: "runtime",
+        eventType: "skill_registry_scanned",
+        summary: `Discovered ${this.skillSnapshot.skills.length} project skill(s)`,
+        payload: {
+          skills: this.skillSnapshot.skills.map((skill) => ({ name: skill.name, enabled: skill.enabled, valid: skill.valid })),
+          diagnostics: this.skillSnapshot.diagnostics
+        }
+      });
+    } catch (error) {
+      this.skillSnapshot = { scannedAt: new Date().toISOString(), skills: [], diagnostics: [] };
+      await this.executionLog.append({
+        role: "runtime",
+        eventType: "skill_registry_failed",
+        summary: error instanceof Error ? error.message : String(error),
+        payload: {}
+      });
+    }
     if (this.executorSandboxMode === "docker") {
       const persistedTaskIds = this.graphStore.query("task", [], 1_000_000).nodes
         .filter((node) => node.type === "Task")
@@ -2955,6 +2992,7 @@ export class SecurityAgentController {
     const sandbox = this.requireExecutorSandbox(taskEnvelope.taskId);
     const persisted = this.runtimeStore.getExecutorSession(taskEnvelope.taskId);
     if (persisted) {
+      const selectedSkillDirs = await this.selectTaskSkillDirs(taskEnvelope.goal, taskEnvelope.taskId);
       const sessionManager = SessionManager.open(persisted.sessionFile, undefined, sandbox.root);
       const executor = await createExecutorAgentSession({
         cwd: sandbox.root,
@@ -2962,7 +3000,7 @@ export class SecurityAgentController {
         artifactStore: this.artifactStore,
         llmRuntime: this.llmRuntime,
         sessionManager,
-        skillsDirs: projectSkillsDirs(this.cwd),
+        skillsDirs: selectedSkillDirs,
         additionalTools: this.createTaskRuntimeTools(taskEnvelope),
         providerAdmission: this.providerAdmission("executor")
       });
@@ -3002,6 +3040,7 @@ export class SecurityAgentController {
       return { session: this.requireAgents().executor, dynamicExecutor: false, resumed: false, resumeCount: 0 };
     }
     const sandbox = this.requireExecutorSandbox(taskEnvelope.taskId);
+    const selectedSkillDirs = await this.selectTaskSkillDirs(taskEnvelope.goal, taskEnvelope.taskId);
     const sessionDir = join(this.runtimeDir, EXECUTOR_SESSION_DIR);
     const sessionManager = SessionManager.create(sandbox.root, sessionDir);
     const executor = await createExecutorAgentSession({
@@ -3010,7 +3049,7 @@ export class SecurityAgentController {
       artifactStore: this.artifactStore,
       llmRuntime: this.llmRuntime,
       sessionManager,
-      skillsDirs: projectSkillsDirs(this.cwd),
+      skillsDirs: selectedSkillDirs,
       additionalTools: this.createTaskRuntimeTools(taskEnvelope),
       providerAdmission: this.providerAdmission("executor")
     });
@@ -3024,6 +3063,43 @@ export class SecurityAgentController {
       resumeCount: 0
     });
     return { session: executor.session, dynamicExecutor: true, resumed: false, resumeCount: 0 };
+  }
+
+  private async selectTaskSkillDirs(taskGoal: string, taskId: string): Promise<string[]> {
+    try {
+      const snapshot = this.skillSnapshot ?? this.skillRegistry.scan();
+      this.skillSnapshot = snapshot;
+      if (snapshot.skills.length === 0) return [];
+      const result = await this.skillSelector({ taskGoal, snapshot });
+      for (const skill of result.selected) {
+        await this.executionLog.append({
+          taskId,
+          role: "runtime",
+          eventType: "skill_selected",
+          summary: skill.name,
+          payload: { skillName: skill.name, baseDir: skill.baseDir, reason: result.reasons[skill.name] }
+        });
+      }
+      for (const diagnostic of result.diagnostics) {
+        await this.executionLog.append({
+          taskId,
+          role: "runtime",
+          eventType: "skill_skipped",
+          summary: diagnostic.message,
+          payload: { code: diagnostic.code, skillName: diagnostic.skillName }
+        });
+      }
+      return [...new Set(result.selected.map((skill) => skill.baseDir))];
+    } catch (error) {
+      await this.executionLog.append({
+        taskId,
+        role: "runtime",
+        eventType: "skill_selection_failed",
+        summary: error instanceof Error ? error.message : String(error),
+        payload: {}
+      }).catch(() => undefined);
+      return [];
+    }
   }
 
   private async renderInitialExecutorInput(input: {
