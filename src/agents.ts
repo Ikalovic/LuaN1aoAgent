@@ -36,6 +36,7 @@ import {
   createGraphSearchTool,
   createGraphTraceTool,
   createPlannerSubmitTool,
+  createScopeDocumentSubmitTool,
   createScopeSubmitTool,
   createTaskResultSubmitTool,
   type GraphToolMaterialsResolver
@@ -286,6 +287,40 @@ export async function createScopeResolverAgentSession(input: {
     cwd: input.cwd,
     noTools: "builtin",
     customTools: [createScopeSubmitTool()],
+    authStorage: input.llmRuntime.authStorage,
+    modelRegistry: input.llmRuntime.modelRegistry,
+    model: input.llmRuntime.models.planner,
+    thinkingLevel: input.llmRuntime.roleConfig.planner.thinkingLevel,
+    resourceLoader: loader,
+    settingsManager: createRuntimeSettingsManager(input.llmRuntime.roleConfig.planner.contextWindow),
+    sessionManager: SessionManager.inMemory(input.cwd)
+  });
+}
+
+export const SCOPE_DOCUMENT_RESOLVER_SYSTEM_PROMPT =
+  `你是授权文件范围解析步骤。只选择输入片段中逐字出现的域名、IPv4 地址或 IPv4 CIDR。\n\n` +
+  `规则：\n` +
+  `- 每个候选必须引用其准确片段索引。\n` +
+  `- 不得执行 DNS，不得补全相关资产、旁站或子站。\n` +
+  `- 不得扩大 CIDR，不得把描述性网络措辞转换为地址。\n` +
+  `- 不输出端口、协议、URL 路径或 IPv6。\n` +
+  `- 可以提交空候选数组；只调用 scope_document_submit 一次并结束。`;
+
+export async function createScopeDocumentResolverAgentSession(input: {
+  cwd: string;
+  llmRuntime: LlmRuntime;
+  providerAdmission?: ProviderAdmissionOptions;
+}): Promise<CreateAgentSessionResult> {
+  const loader = await createPromptLoader(
+    input.cwd,
+    SCOPE_DOCUMENT_RESOLVER_SYSTEM_PROMPT,
+    [],
+    input.providerAdmission
+  );
+  return createAgentSession({
+    cwd: input.cwd,
+    noTools: "builtin",
+    customTools: [createScopeDocumentSubmitTool()],
     authStorage: input.llmRuntime.authStorage,
     modelRegistry: input.llmRuntime.modelRegistry,
     model: input.llmRuntime.models.planner,

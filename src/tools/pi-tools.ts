@@ -202,6 +202,25 @@ export function createScopeSubmitTool() {
   });
 }
 
+export function createScopeDocumentSubmitTool() {
+  return defineTool({
+    name: "scope_document_submit",
+    label: "Submit Document Scope Candidates",
+    description: "Submit only literal domain, IPv4, and CIDR candidates with the exact source fragment index, then terminate.",
+    parameters: Type.Object({
+      candidates: Type.Array(Type.Object({
+        value: Type.String({ minLength: 3, maxLength: 253 }),
+        fragmentIndex: Type.Integer({ minimum: 0 })
+      }, { additionalProperties: false }), { maxItems: 256 })
+    }, { additionalProperties: false }),
+    execute: async (_toolCallId, params) => ({
+      content: [{ type: "text", text: "Document scope candidates submitted" }],
+      details: params,
+      terminate: true
+    })
+  });
+}
+
 export function createTaskResultSubmitTool() {
   return defineTool({
     name: "task_result_submit",
