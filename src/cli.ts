@@ -3,7 +3,7 @@ import { cliHelp, parseCliOptions, shouldUseTui } from "./cli-options.js";
 import { resolveCliRunContext } from "./cli-runtime.js";
 import { createLlmRuntime, loadLocalEnvFile } from "./llm-config.js";
 import { resolveCliScopeDocuments } from "./cli-scope-documents.js";
-import { normalizeScope } from "./scope.js";
+import { defaultScopeForTask, normalizeScope } from "./scope.js";
 import { resolveDocumentScopeWithLlm } from "./scope-documents/scope-document-resolver.js";
 import { parseTransparentProxy } from "./proxy-config.js";
 import { deriveFinalReport } from "./run-report.js";
@@ -111,7 +111,8 @@ async function run(options: ReturnType<typeof parseCliOptions>): Promise<void> {
         ? fileScope.normalizedScope
         : runContext.scopeSummary
         ? normalizeScope(runContext.scopeSummary)
-        : await controller.inferScopeFromGoal(runContext.userGoal);
+        : defaultScopeForTask(options.taskType)
+          ?? await controller.inferScopeFromGoal(runContext.userGoal);
     if (transparentProxy) {
       await controller.configureTransparentProxy(transparentProxy, scopeSummary);
     }

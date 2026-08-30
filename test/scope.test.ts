@@ -3,12 +3,18 @@ import test from "node:test";
 import {
   authorizedScopeContainsDomain,
   authorizedScopeContainsIp,
+  defaultScopeForTask,
   extractLiteralGoalCidrs,
   normalizeInferredScopeCidrs,
   normalizeScope,
   normalizeScopeCidrs,
   parseAuthorizedScope
 } from "../src/scope.js";
+
+test("defaults only an omitted CTF scope to unrestricted IPv4", () => {
+  assert.equal(defaultScopeForTask("ctf"), "0.0.0.0/0");
+  assert.equal(defaultScopeForTask("pentest"), undefined);
+});
 
 test("authorized Scope includes root subdomains and CIDR addresses", () => {
   const scope = parseAuthorizedScope("example.com,10.20.0.0/16");

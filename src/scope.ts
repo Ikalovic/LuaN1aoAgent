@@ -2,6 +2,8 @@ import { domainToASCII } from "node:url";
 
 const IPV4_CIDR_PATTERN = /(?<![\d.])(\d{1,3}(?:\.\d{1,3}){3})(?:\/(\d{1,2}))?(?![\d.])/g;
 
+export const UNRESTRICTED_CTF_SCOPE = "0.0.0.0/0";
+
 export type ScopeResolution = {
   cidrs: string[];
 };
@@ -15,6 +17,10 @@ export type NormalizedScopeEntry = {
   kind: "cidr" | "domain";
   value: string;
 };
+
+export function defaultScopeForTask(taskType: "ctf" | "pentest"): string | undefined {
+  return taskType === "ctf" ? UNRESTRICTED_CTF_SCOPE : undefined;
+}
 
 export function authorizedScopeContainsDomain(scope: AuthorizedScope, input: string): boolean {
   const candidate = normalizeDomainCandidate(input);

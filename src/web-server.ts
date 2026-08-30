@@ -36,7 +36,7 @@ import { ConnectivityStore, type ConnectivityDefinition } from "./stores/connect
 import { ExecutionLog } from "./stores/execution-log.js";
 import { discoverRuntimeSessionDirs } from "./runtime-session-discovery.js";
 import { RuntimePathPolicy, RuntimePathPolicyError } from "./runtime-path-policy.js";
-import { normalizeScope } from "./scope.js";
+import { defaultScopeForTask, normalizeScope } from "./scope.js";
 import { ScopeDocumentError, SCOPE_DOCUMENT_LIMITS } from "./scope-documents/scope-document-formats.js";
 import { resolveDocumentScopeWithLlm } from "./scope-documents/scope-document-resolver.js";
 import { ScopeDocumentService, ScopeDocumentServiceError } from "./scope-documents/scope-document-service.js";
@@ -1630,8 +1630,12 @@ async function handleStartRun(request: IncomingMessage, response: ServerResponse
     await sendJson(response, { error: { code: "invalid_request", message: error instanceof Error ? error.message : String(error) } }, 400);
     return;
   }
-  if (!goal || (!rawScope && !scopeDocumentId && !confirmedDocumentScope)) {
-    await sendJson(response, { error: { code: "invalid_request", message: "goal 不能为空，且必须提供 scope 或已确认的授权文件" } }, 400);
+  if (!goal) {
+    await sendJson(response, { error: { code: "invalid_request", message: "goal 不能为空" } }, 400);
+    return;
+  }
+  if (taskType === "pentest" && !rawScope && !scopeDocumentId && !confirmedDocumentScope) {
+    await sendJson(response, { error: { code: "invalid_request", message: "渗透测试必须提供 scope 或已确认的授权文件" } }, 400);
     return;
   }
   if (Boolean(scopeDocumentId) !== Boolean(confirmedDocumentScope)) {
@@ -1654,7 +1658,9 @@ async function handleStartRun(request: IncomingMessage, response: ServerResponse
         confirmedScope: confirmedDocumentScope,
         manualScope: rawScope
       })
-      : normalizeScope(rawScope);
+      : rawScope
+        ? normalizeScope(rawScope)
+        : defaultScopeForTask(taskType)!;
   } catch (error) {
     if (error instanceof ScopeDocumentServiceError) throw error;
     await sendJson(response, {

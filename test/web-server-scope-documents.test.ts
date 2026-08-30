@@ -18,7 +18,17 @@ test("Web API parses, reads, and requires exact confirmation of scope documents"
     "--runtime-dir", root,
     "--auth-db", join(root, "auth.sqlite"),
     "--port", String(port)
-  ], { cwd: process.cwd(), stdio: ["ignore", "pipe", "pipe"] });
+  ], {
+    cwd: process.cwd(),
+    stdio: ["ignore", "pipe", "pipe"],
+    env: {
+      ...process.env,
+      EXECUTOR_SANDBOX_MODE: "workspace",
+      LLM_API_BASE_URL: "http://127.0.0.1:1/v1",
+      LLM_API_KEY: "test-key",
+      LLM_DEFAULT_MODEL: "test-model"
+    }
+  });
   let serverStderr = "";
   child.stderr?.on("data", (chunk) => { serverStderr += String(chunk); });
   const baseUrl = `http://127.0.0.1:${port}`;
@@ -75,6 +85,34 @@ test("Web API parses, reads, and requires exact confirmation of scope documents"
     assert.equal(read.status, 200);
     assert.equal((await read.json() as { normalizedScope: string }).normalizedScope, parsed.normalizedScope);
 
+    const emptyPentest = await postRun(baseUrl, cookie, csrf, {
+      goal: "执行渗透测试",
+      scope: "",
+      taskType: "pentest"
+    });
+    assert.equal(emptyPentest.status, 400);
+
+    const emptyCtf = await postRun(baseUrl, cookie, csrf, {
+      goal: "完成 CTF 挑战",
+      scope: "",
+      taskType: "ctf",
+      maxRunTimeMs: 60_000
+    });
+    assert.equal(emptyCtf.status, 201);
+    const ctfRun = await emptyCtf.json() as { runtimeDir: string; scope: string };
+    assert.equal(ctfRun.scope, "0.0.0.0/0");
+
+    const stopped = await fetch(`${baseUrl}/api/runs/stop`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        cookie,
+        "x-csrf-token": csrf
+      },
+      body: JSON.stringify({ runtimeDir: ctfRun.runtimeDir })
+    });
+    assert.equal(stopped.status, 200);
+
     const mismatch = await fetch(`${baseUrl}/api/runs`, {
       method: "POST",
       headers: {
@@ -110,6 +148,23 @@ function postDocument(
   body: Record<string, unknown>
 ): Promise<Response> {
   return fetch(`${baseUrl}/api/scope-documents`, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      cookie,
+      "x-csrf-token": csrf
+    },
+    body: JSON.stringify(body)
+  });
+}
+
+function postRun(
+  baseUrl: string,
+  cookie: string,
+  csrf: string,
+  body: Record<string, unknown>
+): Promise<Response> {
+  return fetch(`${baseUrl}/api/runs`, {
     method: "POST",
     headers: {
       "content-type": "application/json",
