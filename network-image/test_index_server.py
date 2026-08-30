@@ -1,5 +1,6 @@
 import json
 import os
+import stat
 import sys
 import tempfile
 import threading
@@ -210,6 +211,24 @@ class FlowIndexTest(unittest.TestCase):
 
 
 class RouteProxyTest(unittest.TestCase):
+    def test_gateway_epoch_files_expose_only_network_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            flow_file = root / "epoch.mitm"
+            net_file = root / "epoch.net.jsonl"
+            control = GatewayControl(
+                str(root / "gateway.sock"), MagicMock(), root / "epoch.json", root, root / "routes.json"
+            )
+
+            control.begin_epoch({
+                "epochRef": "epoch:test",
+                "flowFile": str(flow_file),
+                "netFile": str(net_file),
+            })
+
+            self.assertEqual(stat.S_IMODE(flow_file.stat().st_mode), 0o660)
+            self.assertEqual(stat.S_IMODE(net_file.stat().st_mode), 0o644)
+
     def test_missing_readiness_file_is_not_ready(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "missing.ready"

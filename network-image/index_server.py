@@ -533,10 +533,10 @@ class GatewayControl:
             raise ValueError("invalid epochRef")
         flow_file = self._capture_path(payload.get("flowFile"), ".mitm")
         net_file = self._capture_path(payload.get("netFile"), ".net.jsonl")
-        for path in (flow_file, net_file):
+        for path, mode in ((flow_file, 0o660), (net_file, 0o644)):
             path.parent.mkdir(parents=True, exist_ok=True)
             path.touch(exist_ok=True)
-            os.chmod(path, 0o660)
+            os.chmod(path, mode)
         self._write_epoch({
             "active": True,
             "epochRef": epoch_ref,
