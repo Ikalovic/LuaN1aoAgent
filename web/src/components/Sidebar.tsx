@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { Badge, Button, Empty, Menu, Tooltip } from "antd";
-import { Activity, BrainCircuit, Cable, ChevronRight, FileText, Folder, FolderOpen, GitBranch, ListTree, Network, PanelLeftClose } from "lucide-react";
+import { Activity, BrainCircuit, Cable, ChevronRight, FileText, Folder, FolderOpen, GitBranch, ListTree, Network, PanelLeftClose, Wrench } from "lucide-react";
 import { useLanguage } from "../language";
 import { buildSessionTree, sessionRelativePath, type SessionFolderNode } from "../sessions";
 import type { AgentEvent, RuntimeSession, ViewKey } from "../types";
@@ -25,6 +25,7 @@ export function Sidebar(props: SidebarProps) {
     { key: "reports", icon: <FileText size={17} />, label: t("nav.reports") },
     { key: "traffic", icon: <Network size={17} />, label: t("nav.traffic") },
     { key: "connections", icon: <Cable size={17} />, label: t("nav.connections") },
+    { key: "skills", icon: <Wrench size={17} />, label: t("nav.skills") },
     { key: "reasoning", icon: <BrainCircuit size={17} />, label: t("nav.reasoning") },
     { key: "operation", icon: <GitBranch size={17} />, label: t("nav.operation") },
     { key: "task", icon: <ListTree size={17} />, label: t("nav.task") }

@@ -3,7 +3,7 @@ export type JsonRecord = Record<string, JsonValue | undefined>;
 
 export type Role = "planner" | "executor" | "observer" | "runtime" | string;
 export type GraphKind = "reasoning" | "operation" | "task";
-export type ViewKey = "trace" | "reports" | GraphKind | "traffic" | "connections";
+export type ViewKey = "trace" | "reports" | GraphKind | "traffic" | "connections" | "skills";
 
 export interface AuthUser {
   id: string;

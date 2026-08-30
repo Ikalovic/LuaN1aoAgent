@@ -1,12 +1,14 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { Alert, Button, Empty, Input, Select, Spin, Switch, Table, Tag, Typography, type TableColumnsType } from "antd";
+import { Alert, Button, Empty, Input, Select, Spin, Switch, Table, Tag, Tooltip, Typography, type TableColumnsType } from "antd";
 import { RefreshCw, Search } from "lucide-react";
 import { fetchSkills, setSkillEnabled } from "../api";
+import { useLanguage } from "../language";
 import type { AuthUser, RegisteredSkill, SkillRegistrySnapshot } from "../types";
 
 type SkillStatusFilter = "all" | "enabled" | "disabled" | "invalid";
 
 export function SkillsView({ user }: { user: AuthUser }) {
+  const { t } = useLanguage();
   const [snapshot, setSnapshot] = useState<SkillRegistrySnapshot>();
   const [query, setQuery] = useState("");
   const [status, setStatus] = useState<SkillStatusFilter>("all");
@@ -67,87 +69,100 @@ export function SkillsView({ user }: { user: AuthUser }) {
       render: (name: string) => <Typography.Text strong code>{name}</Typography.Text>
     },
     {
-      title: "描述",
+      title: t("skills.columnDescription"),
       dataIndex: "description",
       key: "description",
       render: (description: string) => <span className="skill-description">{description}</span>
     },
     {
-      title: "有效性",
+      title: t("skills.columnValidity"),
       key: "valid",
       width: 110,
-      render: (_, skill) => <Tag color={skill.valid ? "green" : "red"}>{skill.valid ? "有效" : "无效"}</Tag>
+      render: (_, skill) => <Tag color={skill.valid ? "green" : "red"}>{skill.valid ? t("skills.valid") : t("skills.filterInvalid")}</Tag>
     },
     {
-      title: "模型调用",
+      title: t("skills.columnModelInvocation"),
       key: "modelInvocable",
       width: 120,
-      render: (_, skill) => <Tag color={skill.modelInvocable ? "blue" : "default"}>{skill.modelInvocable ? "可调用" : "不可调用"}</Tag>
+      render: (_, skill) => <Tag color={skill.modelInvocable ? "blue" : "default"}>{skill.modelInvocable ? t("skills.modelInvocable") : t("skills.notInvocable")}</Tag>
     },
     {
-      title: "启用",
+      title: t("skills.columnEnabled"),
       key: "enabled",
       width: 88,
       align: "center",
-      render: (_, skill) => (
-        <Switch
-          aria-label={skill.name}
-          checked={skill.enabled}
-          disabled={user.role !== "admin" || !skill.valid || !skill.modelInvocable || mutating === skill.name}
-          loading={mutating === skill.name}
-          onChange={(enabled) => void changeState(skill, enabled)}
-        />
-      )
+      render: (_, skill) => {
+        const reason = user.role !== "admin"
+          ? t("skills.operatorRequired")
+          : !skill.valid
+            ? t("skills.invalidState")
+            : !skill.modelInvocable
+              ? t("skills.notInvocable")
+              : undefined;
+        return (
+          <Tooltip title={reason}>
+            <span>
+              <Switch
+                aria-label={skill.name}
+                checked={skill.enabled}
+                disabled={Boolean(reason) || mutating === skill.name}
+                loading={mutating === skill.name}
+                onChange={(enabled) => void changeState(skill, enabled)}
+              />
+            </span>
+          </Tooltip>
+        );
+      }
     }
   ];
 
   return (
     <div className="skills-view">
       <div className="skills-summary">
-        <span>{skills.length} 个 Skill</span>
-        <span>{skills.filter((skill) => skill.enabled).length} 个已启用</span>
-        <span>{skills.filter((skill) => !skill.valid).length} 个无效</span>
-        <span>{snapshot?.diagnostics.length ?? 0} 条诊断</span>
+        <span>{t("skills.total", { value: skills.length })}</span>
+        <span>{t("skills.enabled", { value: skills.filter((skill) => skill.enabled).length })}</span>
+        <span>{t("skills.invalid", { value: skills.filter((skill) => !skill.valid).length })}</span>
+        <span>{t("skills.diagnostics", { value: snapshot?.diagnostics.length ?? 0 })}</span>
       </div>
       <div className="skills-toolbar">
         <div>
           <Typography.Title level={5}>Skills</Typography.Title>
-          <span>检查项目 Skill，并控制是否允许模型在任务中选择。</span>
+          <span>{t("skills.description")}</span>
         </div>
         <div className="skills-toolbar-controls">
           <Input
             allowClear
             prefix={<Search size={15} />}
-            placeholder="搜索名称或描述"
+            placeholder={t("skills.search")}
             value={query}
             onChange={(event) => setQuery(event.target.value)}
           />
           <Select<SkillStatusFilter>
-            aria-label="Skill 状态"
+            aria-label={t("skills.filterLabel")}
             value={status}
             onChange={setStatus}
             options={[
-              { value: "all", label: "全部状态" },
-              { value: "enabled", label: "已启用" },
-              { value: "disabled", label: "已停用" },
-              { value: "invalid", label: "无效" }
+              { value: "all", label: t("skills.filterAll") },
+              { value: "enabled", label: t("skills.filterEnabled") },
+              { value: "disabled", label: t("skills.filterDisabled") },
+              { value: "invalid", label: t("skills.filterInvalid") }
             ]}
           />
-          <Button icon={<RefreshCw size={15} />} loading={loading} onClick={() => void load()}>刷新</Button>
+          <Button icon={<RefreshCw size={15} />} loading={loading} onClick={() => void load()}>{t("skills.refresh")}</Button>
         </div>
       </div>
-      {error ? <Alert type="error" showIcon title={error} action={<Button size="small" onClick={() => void load()}>重试</Button>} /> : null}
+      {error ? <Alert type="error" showIcon title={error} action={<Button size="small" onClick={() => void load()}>{t("skills.retry")}</Button>} /> : null}
       {snapshot?.diagnostics.length ? (
         <Alert
           className="skills-diagnostics"
           type="warning"
           showIcon
-          title={`${snapshot.diagnostics.length} 条 Registry 诊断`}
+          title={t("skills.registryDiagnostics", { value: snapshot.diagnostics.length })}
           description={snapshot.diagnostics.map((diagnostic) => <div key={`${diagnostic.code}:${diagnostic.path ?? diagnostic.skillName ?? diagnostic.message}`}>{diagnostic.message}</div>)}
         />
       ) : null}
       {loading && !snapshot ? <div className="skills-loading"><Spin /></div> : !skills.length ? (
-        <Empty description=".agents/skills 中没有可用 Skill" />
+        <Empty description={t("skills.empty")} />
       ) : (
         <Table<RegisteredSkill>
           className="skills-table"
@@ -157,10 +172,10 @@ export function SkillsView({ user }: { user: AuthUser }) {
           pagination={false}
           size="small"
           scroll={{ x: 780 }}
-          locale={{ emptyText: "没有符合筛选条件的 Skill" }}
+          locale={{ emptyText: t("skills.noMatches") }}
         />
       )}
-      {user.role !== "admin" ? <span className="skills-readonly-note">当前账号仅可查看 Skill。</span> : null}
+      {user.role !== "admin" ? <span className="skills-readonly-note">{t("skills.readOnly")}</span> : null}
     </div>
   );
 }

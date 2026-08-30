@@ -19,4 +19,21 @@ describe("Sidebar", () => {
     fireEvent.click(screen.getByText("Web Traffic"));
     expect(onViewChange).toHaveBeenCalledWith("traffic");
   });
+
+  it("opens the Skills management view", () => {
+    const onViewChange = vi.fn();
+    render(
+      <Sidebar
+        activeView="trace"
+        runtimeDir="runtime/a"
+        sessions={[]}
+        agents={{}}
+        onViewChange={onViewChange}
+        onRuntimeChange={vi.fn()}
+      />
+    );
+
+    fireEvent.click(screen.getByText("Skills"));
+    expect(onViewChange).toHaveBeenCalledWith("skills");
+  });
 });
