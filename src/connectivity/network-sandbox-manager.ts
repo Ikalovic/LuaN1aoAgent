@@ -69,6 +69,16 @@ export type GatewayEpochDrainAck = {
   flushed: true;
 };
 
+export type TaskNetworkHealth = {
+  status: "healthy" | "scope_blocked" | "gateway_unreachable"
+    | "broker_unreachable" | "target_timeout" | "icmp_proxy_unsupported";
+  tcpDataPlane: boolean;
+  broker: boolean;
+  icmp: "supported" | "proxy_unsupported";
+  checkedAt: string;
+  detail?: string;
+};
+
 type CommandResult = { code: number | null; stdout: string; stderr: string };
 type CommandRunner = (args: string[], stdin?: string) => Promise<CommandResult>;
 
@@ -582,6 +592,38 @@ export class NetworkSandboxManager {
 
   hostEgress(): Promise<HostEgressBrokerEndpoint> {
     return this.ensureHostEgressBroker();
+  }
+
+  async taskNetworkHealth(taskId: string): Promise<TaskNetworkHealth> {
+    const checkedAt = new Date().toISOString();
+    const icmp = this.routes.size > 0 ? "proxy_unsupported" as const : "supported" as const;
+    const gateway = this.gateways.get(taskId);
+    if (!gateway) {
+      return {
+        status: "gateway_unreachable", tcpDataPlane: false, broker: false, icmp, checkedAt,
+        detail: "Task Gateway is not active"
+      };
+    }
+    const gatewayHealth = await this.runner([
+      "exec", gateway.containerName, "gatewayctl", "health", "{}"
+    ]).catch((error: unknown) => ({ code: 1, stdout: "", stderr: String(error) }));
+    if (gatewayHealth.code !== 0 || !gatewayHealth.stdout.includes('"ok":true')) {
+      return {
+        status: "gateway_unreachable", tcpDataPlane: false, broker: false, icmp, checkedAt,
+        detail: "Gateway control plane is unavailable"
+      };
+    }
+    const endpoint = await this.ensureHostEgressBroker();
+    const brokerHealth = await this.runner([
+      "exec", gateway.containerName, "nc", "-z", "-w", "2", endpoint.host, String(endpoint.port)
+    ]).catch((error: unknown) => ({ code: 1, stdout: "", stderr: String(error) }));
+    if (brokerHealth.code !== 0) {
+      return {
+        status: "broker_unreachable", tcpDataPlane: false, broker: false, icmp, checkedAt,
+        detail: "Gateway cannot reach the HostEgressBroker"
+      };
+    }
+    return { status: "healthy", tcpDataPlane: true, broker: true, icmp, checkedAt };
   }
 
   replaceRoutes(routes: NetworkRoute[]): Promise<void> {

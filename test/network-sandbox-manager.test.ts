@@ -186,6 +186,18 @@ test("network sandbox gives only the gateway network capability and reconciles l
     await manager.configureAuthorizedScope("198.51.100.0/24");
     await manager.start();
     const gateway = await manager.createGateway({ taskId: "task:test", epochId: "epoch:test" });
+    const health = await (manager as unknown as {
+      taskNetworkHealth(taskId: string): Promise<{ status: string; tcpDataPlane: boolean; broker: boolean }>;
+    }).taskNetworkHealth("task:test");
+    assert.deepEqual(
+      { status: health.status, tcpDataPlane: health.tcpDataPlane, broker: health.broker },
+      { status: "healthy", tcpDataPlane: true, broker: true }
+    );
+    const missingHealth = await (manager as unknown as {
+      taskNetworkHealth(taskId: string): Promise<{ status: string; tcpDataPlane: boolean; broker: boolean }>;
+    }).taskNetworkHealth("task:missing");
+    assert.equal(missingHealth.status, "gateway_unreachable");
+    assert.equal(missingHealth.tcpDataPlane, false);
     const nextEpoch = await manager.createGateway({ taskId: "task:test", epochId: "epoch:next" });
     await manager.replaceRoutes([{
       routeRef: "route:test",

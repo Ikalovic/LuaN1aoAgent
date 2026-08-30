@@ -14,6 +14,7 @@ import {
   type LlmRuntime
 } from "./llm-config.js";
 import { ConnectivityRuntime } from "./connectivity/connectivity-runtime.js";
+import type { TaskNetworkHealth } from "./connectivity/network-sandbox-manager.js";
 import type { MitmFlowClient } from "./connectivity/mitm-flow-client.js";
 import type { GatewayReplayInput } from "./connectivity/replay-gateway-runtime.js";
 import type { RouteOpenInput, RouteProjectionContext, RouteStatus } from "./connectivity/route-manager.js";
@@ -429,6 +430,7 @@ export class SecurityAgentController {
   private connectivityStore?: ConnectivityStore;
   private connectivityRuntimeCleanupComplete = false;
   private taskExecutorSandboxes = new Map<string, DockerTaskSandbox>();
+  private taskNetworkHealth = new Map<string, TaskNetworkHealth>();
   private networkFinalizations = new Map<string, Promise<void>>();
   private taskExecutorResourceCleanups = new Map<string, Promise<void>>();
   private agents?: SecurityAgentRuntime;
@@ -2598,8 +2600,19 @@ export class SecurityAgentController {
       }
       await sandbox.start();
       this.taskExecutorSandboxes.set(taskId, sandbox);
+      const networkHealth = await this.connectivityRuntime.network.taskNetworkHealth(taskId);
+      this.taskNetworkHealth.set(taskId, networkHealth);
+      await this.executionLog.append({
+        epochId: state.epochId,
+        taskId,
+        role: "runtime",
+        eventType: "executor_network_health",
+        summary: `task network ${networkHealth.status}`,
+        payload: networkHealth
+      });
     } catch (error) {
       this.taskExecutorSandboxes.delete(taskId);
+      this.taskNetworkHealth.delete(taskId);
       await sandbox?.dispose().catch(() => undefined);
       await this.connectivityRuntime.disposeTask(taskId).catch(() => undefined);
       throw error;
@@ -2698,7 +2711,8 @@ export class SecurityAgentController {
         sandboxRoot: sandbox.root,
         containerWorkdir: sandbox.mode === "docker" ? "/workspace" : undefined,
         tmpdir: sandbox.mode === "docker" ? "/tmp" : undefined,
-        image: sandbox.mode === "docker" ? executorDockerImage() : undefined
+        image: sandbox.mode === "docker" ? executorDockerImage() : undefined,
+        networkHealth: sandbox.mode === "docker" ? this.taskNetworkHealth.get(taskId) : undefined
       });
     } catch {
       return undefined;
@@ -2936,6 +2950,7 @@ export class SecurityAgentController {
         failures.push(error);
       }
     }
+    this.taskNetworkHealth.delete(taskId);
     if (this.connectivityRuntime && !this.connectivityRuntimeCleanupComplete) {
       try {
         await this.connectivityRuntime.disposeTask(taskId);

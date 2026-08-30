@@ -75,6 +75,10 @@ test("executor prompt uses bounded experimental method and runtime steering", ()
   assert.match(EXECUTOR_SYSTEM_PROMPT, /completed TaskOutcome\.artifactRefs 引用该报告 Artifact/);
   assert.match(EXECUTOR_SYSTEM_PROMPT, /当前工作目录是 Task workspace，跨命令、checkpoint 和同一 Task 的 epoch 持久/);
   assert.match(EXECUTOR_SYSTEM_PROMPT, /Runtime 注入授权 Scope，并在 Docker 模式机械执行网络边界/);
+  assert.match(EXECUTOR_SYSTEM_PROMPT, /不得使用授权范围外的公网主机作为网络正对照/);
+  assert.match(EXECUTOR_SYSTEM_PROMPT, /Gateway 地址的 80\/443 端口不是代理监听端口/);
+  assert.match(EXECUTOR_SYSTEM_PROMPT, /ICMP 无响应不能单独证明目标宕机/);
+  assert.match(EXECUTOR_SYSTEM_PROMPT, /只有 Runtime 明确报告 TCP 数据面健康/);
   assert.match(EXECUTOR_SYSTEM_PROMPT, /artifact_read\(\{ref:"artifact:\.\.\.",materialize:true\}\)/);
   assert.doesNotMatch(EXECUTOR_SYSTEM_PROMPT, /source=\{type:"(?:file|inline)"/);
   assert.match(EXECUTOR_SYSTEM_PROMPT, /没有变量对照时不得把固定调用扩大成通用能力/);

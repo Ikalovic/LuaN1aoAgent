@@ -65,7 +65,14 @@ test("docker facts describe the container workspace, tmpfs, uid and transparent 
       containerWorkdir: "/workspace",
       tmpdir: "/tmp",
       image: "luanniao-executor:latest",
-      platform: "linux arm64"
+      platform: "linux arm64",
+      networkHealth: {
+        status: "healthy",
+        tcpDataPlane: true,
+        broker: true,
+        icmp: "supported",
+        checkedAt: "2026-08-31T00:00:00.000Z"
+      }
     },
     async (toolNames) => {
       probedWith.push(toolNames);
@@ -84,6 +91,9 @@ test("docker facts describe the container workspace, tmpfs, uid and transparent 
   assert.ok(facts.includes("Gateway"));
   assert.ok(facts.includes("无原始套接字"));
   assert.ok(facts.includes("不要设置代理环境变量"));
+  assert.ok(facts.includes("TCP 数据面：已验证可用"));
+  assert.ok(facts.includes("Broker：可达"));
+  assert.ok(facts.includes("ICMP：支持"));
   assert.ok(facts.includes("可用工具：python3 curl nc"));
   assert.ok(facts.split("\n").length <= 25);
 });

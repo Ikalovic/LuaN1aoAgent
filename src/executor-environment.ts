@@ -1,5 +1,6 @@
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
+import type { TaskNetworkHealth } from "./connectivity/network-sandbox-manager.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -11,6 +12,7 @@ export type ExecutorEnvironmentFactsInput = {
   image?: string;
   platform?: string;
   hostNetworkRuntime?: string;
+  networkHealth?: TaskNetworkHealth;
 };
 
 // Returns the subset of toolNames present on PATH. Injectable so tests and the
@@ -50,6 +52,13 @@ export async function getExecutorEnvironmentFacts(
       "- 身份：uid 1000；无附加 capability；无原始套接字；根文件系统只读；可写位置只有 cwd 与 tmp",
       "- 网络：独立任务网络以 Gateway 为唯一出口；HTTP/HTTPS 透明内容代理，其他协议只做路由与连接元数据审计；不要设置代理环境变量；IPv6 已禁用"
     );
+    if (input.networkHealth) {
+      const health = input.networkHealth;
+      const tcp = health.tcpDataPlane ? "已验证可用" : `不可用（${health.status}）`;
+      const broker = health.broker ? "可达" : "不可达";
+      const icmp = health.icmp === "supported" ? "支持" : "经 SOCKS 路由时不支持";
+      lines.push(`- Runtime 网络健康：TCP 数据面：${tcp}；Broker：${broker}；ICMP：${icmp}；检查时间 ${health.checkedAt}`);
+    }
   } else {
     lines.push(
       `- 运行模式：${hostModeLabel(input.mode)}`,
