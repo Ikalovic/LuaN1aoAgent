@@ -68,29 +68,62 @@ describe("StartRunModal", () => {
     expect(mockedStart).not.toHaveBeenCalled();
   });
 
-  it("uploads, previews, confirms, and submits the exact parsed document scope", async () => {
+  it("edits and appends parsed scope without document confirmation fields", async () => {
     render(<StartRunModal open onClose={() => undefined} onStarted={() => undefined} />);
 
+    fireEvent.change(screen.getByLabelText("授权范围"), {
+      target: { value: "manual.example,api.example" }
+    });
     fireEvent.change(screen.getByLabelText("授权范围文件"), {
       target: { files: [new File(["api.example\n10.0.0.1"], "scope.txt", { type: "text/plain" })] }
     });
 
-    expect(await screen.findByText("api.example")).toBeInTheDocument();
-    expect(screen.getByText("10.0.0.1/32")).toBeInTheDocument();
-    expect(screen.getByText("允许 api.example")).toBeInTheDocument();
-    const start = screen.getByRole("button", { name: /启\s*动/ });
-    expect(start).toBeDisabled();
+    const preview = await screen.findByLabelText("文件解析范围内容");
+    expect(preview).toHaveValue(parsed.normalizedScope);
+    expect(preview).toHaveAttribute("readonly");
 
-    fireEvent.click(screen.getByRole("checkbox", { name: /确认使用以上解析范围/ }));
+    fireEvent.click(screen.getByRole("button", { name: /修\s*改/ }));
+    expect(preview).not.toHaveAttribute("readonly");
+    fireEvent.change(preview, {
+      target: { value: "api.example,10.0.0.1/32,extra.example" }
+    });
+    const fileInput = screen.getByLabelText("授权范围文件");
+    Object.defineProperty(fileInput, "value", {
+      configurable: true,
+      writable: true,
+      value: "C:\\fakepath\\scope.txt"
+    });
+    fireEvent.click(screen.getByRole("button", { name: /添\s*加/ }));
+
+    expect(screen.getByLabelText("授权范围")).toHaveValue(
+      "manual.example,api.example,10.0.0.1/32,extra.example"
+    );
+    expect(fileInput).toHaveValue("");
+    expect(screen.queryByLabelText("文件解析范围内容")).not.toBeInTheDocument();
+
     fireEvent.change(screen.getByLabelText("任务目标"), { target: { value: "测试授权资产" } });
-    fireEvent.click(start);
+    fireEvent.click(screen.getByRole("button", { name: /启\s*动/ }));
 
     await waitFor(() => expect(mockedStart).toHaveBeenCalledWith(expect.objectContaining({
       goal: "测试授权资产",
-      scope: "",
-      scopeDocumentId: parsed.documentId,
-      confirmedDocumentScope: parsed.normalizedScope
+      scope: "manual.example,api.example,10.0.0.1/32,extra.example"
     })));
+    expect(mockedStart.mock.calls[0][0]).not.toHaveProperty("scopeDocumentId");
+    expect(mockedStart.mock.calls[0][0]).not.toHaveProperty("confirmedDocumentScope");
+  });
+
+  it("does not treat an unadded file preview as pentest scope", async () => {
+    render(<StartRunModal open onClose={() => undefined} onStarted={() => undefined} />);
+
+    fireEvent.change(screen.getByLabelText("授权范围文件"), {
+      target: { files: [new File(["api.example"], "scope.txt", { type: "text/plain" })] }
+    });
+    await screen.findByLabelText("文件解析范围内容");
+    fireEvent.change(screen.getByLabelText("任务目标"), { target: { value: "执行渗透测试" } });
+    fireEvent.click(screen.getByRole("button", { name: /启\s*动/ }));
+
+    expect(await screen.findByText("请输入授权范围")).toBeInTheDocument();
+    expect(mockedStart).not.toHaveBeenCalled();
   });
 
   it("keeps the legacy manual-scope submission unchanged", async () => {

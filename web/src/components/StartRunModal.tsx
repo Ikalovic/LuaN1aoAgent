@@ -1,5 +1,5 @@
-import { useState } from "react";
-import { Alert, Checkbox, Form, Input, InputNumber, Modal, Select, Space, Tag, Typography } from "antd";
+import { useRef, useState } from "react";
+import { Alert, Button, Form, Input, InputNumber, Modal, Select, Space, Typography } from "antd";
 import { parseScopeDocument, startRun } from "../api";
 import { useLanguage } from "../language";
 import type { ParsedScopeDocument } from "../types";
@@ -18,11 +18,15 @@ export function StartRunModal({ open, onClose, onStarted }: StartRunModalProps) 
   const [parsing, setParsing] = useState(false);
   const [error, setError] = useState<string>();
   const [parsedDocument, setParsedDocument] = useState<ParsedScopeDocument>();
-  const [documentConfirmed, setDocumentConfirmed] = useState(false);
+  const [scopeDraft, setScopeDraft] = useState("");
+  const [editingScopeDraft, setEditingScopeDraft] = useState(false);
+  const fileInputRef = useRef<HTMLInputElement>(null);
 
   const resetDocument = () => {
     setParsedDocument(undefined);
-    setDocumentConfirmed(false);
+    setScopeDraft("");
+    setEditingScopeDraft(false);
+    if (fileInputRef.current) fileInputRef.current.value = "";
   };
 
   const selectDocument = async (file: File | undefined) => {
@@ -31,12 +35,32 @@ export function StartRunModal({ open, onClose, onStarted }: StartRunModalProps) 
     setParsing(true);
     setError(undefined);
     try {
-      setParsedDocument(await parseScopeDocument(file));
+      const parsed = await parseScopeDocument(file);
+      setParsedDocument(parsed);
+      setScopeDraft(parsed.normalizedScope);
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : String(cause));
     } finally {
       setParsing(false);
     }
+  };
+
+  const addScopeDraft = () => {
+    const entries = [String(form.getFieldValue("scope") ?? ""), scopeDraft]
+      .flatMap((value) => value.split(/[\s,，;；]+/u))
+      .map((value) => value.trim())
+      .filter(Boolean);
+    const seen = new Set<string>();
+    const merged = entries.filter((value) => {
+      const key = value.toLowerCase();
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+    if (merged.length === 0) return;
+    form.setFieldValue("scope", merged.join(","));
+    void form.validateFields(["scope"]).catch(() => undefined);
+    resetDocument();
   };
 
   const submit = async () => {
@@ -47,10 +71,6 @@ export function StartRunModal({ open, onClose, onStarted }: StartRunModalProps) 
       const result = await startRun({
         goal: String(values.goal).trim(),
         scope: String(values.scope ?? "").trim(),
-        ...(parsedDocument && documentConfirmed ? {
-          scopeDocumentId: parsedDocument.documentId,
-          confirmedDocumentScope: parsedDocument.normalizedScope
-        } : {}),
         taskType: values.taskType ?? "pentest",
         maxRunTimeMs: values.maxRunTimeMin ? Math.round(values.maxRunTimeMin * 60_000) : undefined,
         maxParallelTasks: values.maxParallelTasks ?? undefined,
@@ -73,7 +93,7 @@ export function StartRunModal({ open, onClose, onStarted }: StartRunModalProps) 
       okText={t("common.start")}
       cancelText={t("common.cancel")}
       confirmLoading={submitting}
-      okButtonProps={{ disabled: parsing || Boolean(parsedDocument && !documentConfirmed) }}
+      okButtonProps={{ disabled: parsing }}
       width={560}
       destroyOnHidden
       onOk={() => void submit().catch(() => undefined)}
@@ -101,7 +121,7 @@ export function StartRunModal({ open, onClose, onStarted }: StartRunModalProps) 
           <Input.TextArea rows={4} maxLength={4000} placeholder={t("startRun.goalPlaceholder")} />
         </Form.Item>
         <Form.Item name="scope" label={t("startRun.scope")} dependencies={["taskType"]} rules={taskType === "ctf" ? [] : [{
-          validator: (_, value) => parsedDocument || String(value ?? "").trim()
+          validator: (_, value) => String(value ?? "").trim()
             ? Promise.resolve()
             : Promise.reject(new Error(t("startRun.scopeRequired")))
         }]}>
@@ -109,6 +129,7 @@ export function StartRunModal({ open, onClose, onStarted }: StartRunModalProps) 
         </Form.Item>
         <Form.Item label={t("startRun.scopeFile")}>
           <input
+            ref={fileInputRef}
             aria-label={t("startRun.scopeFile")}
             type="file"
             accept=".txt,.md,.csv,.json,.docx,.xlsx,.pdf"
@@ -120,22 +141,24 @@ export function StartRunModal({ open, onClose, onStarted }: StartRunModalProps) 
           <Alert
             type="info"
             showIcon
-            message={t("startRun.scopePreview")}
+            title={t("startRun.scopePreview")}
             description={(
-              <Space direction="vertical" size={6}>
-                <Space wrap>
-                  {[...parsedDocument.ipv4Cidrs, ...parsedDocument.domains].map((candidate) => (
-                    <Tag key={candidate.value}>{candidate.value}</Tag>
-                  ))}
+              <Space orientation="vertical" size={8} style={{ width: "100%" }}>
+                <Input.TextArea
+                  aria-label={t("startRun.scopePreviewContent")}
+                  rows={3}
+                  value={scopeDraft}
+                  readOnly={!editingScopeDraft}
+                  onChange={(event) => setScopeDraft(event.target.value)}
+                />
+                <Space>
+                  <Button disabled={editingScopeDraft} onClick={() => setEditingScopeDraft(true)}>
+                    {t("startRun.modifyScopePreview")}
+                  </Button>
+                  <Button type="primary" disabled={!scopeDraft.trim()} onClick={addScopeDraft}>
+                    {t("startRun.addScopePreview")}
+                  </Button>
                 </Space>
-                {[...parsedDocument.ipv4Cidrs, ...parsedDocument.domains].map((candidate) => (
-                  <Typography.Text type="secondary" key={`${candidate.value}-evidence`}>
-                    {candidate.evidence.excerpt}
-                  </Typography.Text>
-                ))}
-                <Checkbox checked={documentConfirmed} onChange={(event) => setDocumentConfirmed(event.target.checked)}>
-                  {t("startRun.confirmScopeDocument")}
-                </Checkbox>
               </Space>
             )}
           />
