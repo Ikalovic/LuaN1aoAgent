@@ -627,7 +627,7 @@ test("rejects malformed projection drafts with actionable per-node and per-edge 
       nodes: [baseNode],
       edges: [{ from: "new:1", to: "new:1", type: "tunnel_to", evidenceRefs: ["o1"] }]
     }
-  }), /edge at index 0 has type "tunnel_to"; valid edge types:/);
+  }), /edge at index 0 has type "tunnel_to"; for Host -> Host, use "resolves_to"/);
 });
 
 test("keeps Hypothesis statuses canonical without conflating contrary evidence with refutation", () => {

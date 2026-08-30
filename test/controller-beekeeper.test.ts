@@ -34,13 +34,25 @@ test("Controller starts Beekeeper MCP and injects unrestricted credential tools"
   });
   const harness = controller as unknown as ControllerBeekeeperHarness;
 
-  assert.ok(harness.createTaskRuntimeTools(taskEnvelope()).every((tool) => !tool.name.includes("credential")));
+  assert.deepEqual(
+    harness.createTaskRuntimeTools(taskEnvelope()).map((tool) => tool.name).filter((name) => name.includes("credential")).sort(),
+    ["credential_invalidate", "credential_list_by_role", "credential_query", "credential_read", "credential_store"]
+  );
   await harness.configureBeekeeperRuntime();
   assert.equal(fake.startCalls, 1);
   assert.equal(options?.config.root, resolve("vendor/Beekeeper"));
   assert.deepEqual(
     harness.createTaskRuntimeTools(taskEnvelope()).map((tool) => tool.name).filter((name) => name.includes("credential")).sort(),
-    ["mark_credential_invalid", "query_credentials", "store_credential"]
+    [
+      "credential_invalidate",
+      "credential_list_by_role",
+      "credential_query",
+      "credential_read",
+      "credential_store",
+      "mark_credential_invalid",
+      "query_credentials",
+      "store_credential"
+    ]
   );
   const events = (await controller.executionLog.window({ limit: 20 })).events;
   assert.match(JSON.stringify(events), /beekeeper_mcp_ready/);
@@ -63,7 +75,13 @@ test("Controller reports Beekeeper disabled or malformed without losing normal t
     await harness.configureBeekeeperRuntime();
     const names = harness.createTaskRuntimeTools(taskEnvelope()).map((tool) => tool.name);
     assert.ok(names.includes("evidence_list"));
-    assert.ok(names.every((name) => !name.includes("credential")));
+    assert.deepEqual(
+      names.filter((name) => name.includes("credential")).sort(),
+      ["credential_invalidate", "credential_list_by_role", "credential_query", "credential_read", "credential_store"]
+    );
+    assert.ok(!names.includes("query_credentials"));
+    assert.ok(!names.includes("store_credential"));
+    assert.ok(!names.includes("mark_credential_invalid"));
     assert.equal(factoryCalls, 0);
     const events = (await controller.executionLog.window({ limit: 20 })).events;
     assert.match(JSON.stringify(events), /beekeeper_mcp_(disabled|failed)/);
