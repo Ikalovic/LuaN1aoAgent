@@ -67,13 +67,22 @@ try {
   }
   if (bypassSucceeded) throw new Error("Executor bypassed Gateway through the task bridge host");
 
+  const icmp = await manager.icmpEcho("task:network-live", targetAddress, 1_000);
+  if (!["reply", "timeout"].includes(icmp.status)) {
+    throw new Error(`authorized controlled ICMP returned ${JSON.stringify(icmp)}`);
+  }
+  const blockedIcmp = await manager.icmpEcho("task:network-live", "198.51.100.10", 1_000);
+  if (blockedIcmp.status !== "scope_blocked") {
+    throw new Error(`out-of-scope ICMP was not blocked: ${JSON.stringify(blockedIcmp)}`);
+  }
+
   await manager.endEpoch("task:network-live", "epoch:network-live");
   const telemetry = await readFile(gateway.netFile, "utf8");
   const expectedDestination = `\"destination\":{\"host\":\"${targetAddress}\",\"port\":${targetPort}}`;
   if (!telemetry.includes(expectedDestination)) {
     throw new Error(`Gateway telemetry did not contain authorized target ${targetAddress}:${targetPort}`);
   }
-  console.log("PASS authorized TCP traversed Gateway and task-bridge bypass was rejected");
+  console.log(`PASS authorized TCP traversed Gateway, task-bridge bypass was rejected, ICMP=${icmp.status}`);
 } finally {
   await sandbox?.dispose().catch(() => undefined);
   await manager.close().catch(() => undefined);
