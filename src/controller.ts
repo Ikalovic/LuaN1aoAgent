@@ -2954,7 +2954,7 @@ export class SecurityAgentController {
         failures.push(error);
       }
     }
-    this.taskNetworkHealth.delete(taskId);
+    this.taskNetworkHealth?.delete(taskId);
     if (this.connectivityRuntime && !this.connectivityRuntimeCleanupComplete) {
       try {
         await this.connectivityRuntime.disposeTask(taskId);
