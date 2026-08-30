@@ -11,6 +11,11 @@ export type AuthorizedScope = {
   domains: string[];
 };
 
+export type NormalizedScopeEntry = {
+  kind: "cidr" | "domain";
+  value: string;
+};
+
 export function authorizedScopeContainsDomain(scope: AuthorizedScope, input: string): boolean {
   const candidate = normalizeDomainCandidate(input);
   if (!candidate) {
@@ -44,6 +49,14 @@ export function authorizedScopeContainsIp(scope: AuthorizedScope, input: string)
 export function normalizeScope(values: string | string[]): string {
   const scope = parseAuthorizedScope(values);
   return [...scope.cidrs, ...scope.domains].join(",");
+}
+
+export function normalizeScopeEntry(value: string): NormalizedScopeEntry {
+  const raw = value.trim();
+  if (/^\d{1,3}(?:\.\d{1,3}){3}(?:\/\d{1,2})?$/.test(raw)) {
+    return { kind: "cidr", value: normalizeIpv4Cidr(raw) };
+  }
+  return { kind: "domain", value: normalizeDomainPattern(raw) };
 }
 
 export function parseAuthorizedScope(values: string | string[]): AuthorizedScope {
