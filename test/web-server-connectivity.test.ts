@@ -217,6 +217,29 @@ test("connections combine route definitions with distinct network observations a
   assert.deepEqual(adminConnections.find((item) => item.externalId === "route:test-one")?.actions, ["status", "stop", "reconnect", "forget"]);
 });
 
+test("connections skip one unreadable network observation", async () => {
+  const trafficDir = join(fixture.runtimeDir, "traffic", "flows", "task-unreadable");
+  await mkdir(trafficDir, { recursive: true });
+  await writeFile(join(trafficDir, "readable.net.jsonl"), `${JSON.stringify({
+    kind: "network_connection",
+    network_ref: "net:readable",
+    event: "new",
+    protocol: "tcp",
+    source: { host: "127.0.0.1", port: 40100 },
+    destination: { host: "127.0.0.1", port: 8080 },
+    observed_at: "2026-08-31T00:00:00Z"
+  })}\n`);
+  const unreadable = join(trafficDir, "unreadable.net.jsonl");
+  await writeFile(unreadable, "unreadable\n");
+  await chmod(unreadable, 0o000);
+
+  const response = await authenticatedGet(fixture.analystCookie, "/api/connectivity");
+
+  assert.equal(response.status, 200);
+  const connections = (await json(response)).connections as Array<Record<string, unknown>>;
+  assert(connections.some((item) => item.externalId === "net:readable"));
+});
+
 test("historical actions return 409 without touching Docker when another process owns the runtime", async () => {
   const runtimeDir = join(fixture.root, "externally-owned-runtime");
   await mkdir(runtimeDir, { recursive: true });

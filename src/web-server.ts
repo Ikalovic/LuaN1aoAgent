@@ -803,14 +803,8 @@ async function readNetworkConnections(runtimeDir: string): Promise<WebConnection
   const closedEpochRefs = readClosedEpochRefs(join(runtimeDir, "state.sqlite"));
   const latest = new Map<string, JsonRecord>();
   for (const file of files) {
-    const lines = createInterface({ input: createReadStream(file, { encoding: "utf8" }), crlfDelay: Infinity });
-    for await (const line of lines) {
-      let record: JsonRecord;
-      try {
-        record = JSON.parse(line) as JsonRecord;
-      } catch {
-        continue;
-      }
+    const records = await readNetworkConnectionFile(file);
+    for (const record of records) {
       const networkRef = stringProperty(record.network_ref) ?? stringProperty(record.connection_ref);
       if (!networkRef) continue;
       const previous = latest.get(networkRef);
@@ -821,6 +815,23 @@ async function readNetworkConnections(runtimeDir: string): Promise<WebConnection
   return [...latest.values()]
     .sort((left, right) => (stringProperty(right.observed_at) ?? "").localeCompare(stringProperty(left.observed_at) ?? ""))
     .map((record) => networkConnection(record, closedEpochRefs));
+}
+
+async function readNetworkConnectionFile(file: string): Promise<JsonRecord[]> {
+  const records: JsonRecord[] = [];
+  try {
+    const lines = createInterface({ input: createReadStream(file, { encoding: "utf8" }), crlfDelay: Infinity });
+    for await (const line of lines) {
+      try {
+        records.push(JSON.parse(line) as JsonRecord);
+      } catch {
+        continue;
+      }
+    }
+  } catch {
+    return [];
+  }
+  return records;
 }
 
 function networkConnection(record: JsonRecord, closedEpochRefs: ReadonlySet<string>): WebConnection {
