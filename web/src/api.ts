@@ -1,5 +1,5 @@
 import { translate } from "./language";
-import type { ActiveRunsResponse, ArtifactContent, AuthResponse, ConnectionItem, ConnectionsResponse, RuntimeState, SessionsResponse, StartRunInput, StartRunResponse, StopRunResponse, TrafficExchange, TrafficFlowRef, TrafficHistoryBody, TrafficHistoryFilters, TrafficHistoryPage, TrafficReplayInput, TrafficReplayResponse } from "./types";
+import type { ActiveRunsResponse, ArtifactContent, AuthResponse, ConnectionItem, ConnectionsResponse, ParsedScopeDocument, RuntimeState, SessionsResponse, StartRunInput, StartRunResponse, StopRunResponse, TrafficExchange, TrafficFlowRef, TrafficHistoryBody, TrafficHistoryFilters, TrafficHistoryPage, TrafficReplayInput, TrafficReplayResponse } from "./types";
 
 export class ApiError extends Error {
   constructor(message: string, readonly status: number, readonly code?: string) {
@@ -64,6 +64,32 @@ export function startRun(input: StartRunInput): Promise<StartRunResponse> {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(input)
+  });
+}
+
+export async function parseScopeDocument(file: File, useAi = true): Promise<ParsedScopeDocument> {
+  return requestJson("/api/scope-documents", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      fileName: file.name,
+      contentBase64: await fileAsBase64(file),
+      useAi
+    })
+  });
+}
+
+function fileAsBase64(file: File): Promise<string> {
+  return new Promise((resolveFile, reject) => {
+    const reader = new FileReader();
+    reader.onerror = () => reject(new Error(translate("startRun.fileReadFailed")));
+    reader.onload = () => {
+      const result = String(reader.result ?? "");
+      const separator = result.indexOf(",");
+      if (separator < 0) reject(new Error(translate("startRun.fileReadFailed")));
+      else resolveFile(result.slice(separator + 1));
+    };
+    reader.readAsDataURL(file);
   });
 }
 

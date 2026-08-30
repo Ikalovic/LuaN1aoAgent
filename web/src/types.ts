@@ -112,10 +112,32 @@ export interface RuntimeSession {
 export interface StartRunInput {
   goal: string;
   scope: string;
+  scopeDocumentId?: string;
+  confirmedDocumentScope?: string;
   taskType?: "ctf" | "pentest";
   maxRunTimeMs?: number;
   maxParallelTasks?: number;
   maxPlannerCycles?: number;
+}
+
+export interface ScopeDocumentCandidate {
+  value: string;
+  source: "rule" | "ai";
+  evidence: {
+    page?: number;
+    paragraph?: number;
+    line?: number;
+    excerpt: string;
+  };
+}
+
+export interface ParsedScopeDocument {
+  documentId: string;
+  fileName: string;
+  domains: ScopeDocumentCandidate[];
+  ipv4Cidrs: ScopeDocumentCandidate[];
+  normalizedScope: string;
+  diagnostics: Array<{ code: string; message: string }>;
 }
 
 export interface StartRunResponse {
