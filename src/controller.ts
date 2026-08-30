@@ -5834,6 +5834,12 @@ export class SecurityAgentController {
     taskEnvelope: TaskEnvelope,
     state = this.getActiveTaskState(taskEnvelope.taskId)
   ): Promise<TaskResult> {
+    const networkHealth = this.taskNetworkHealth.get(taskEnvelope.taskId);
+    const inconclusiveNetworkResult = Boolean(
+      networkHealth
+      && !networkHealth.tcpDataPlane
+      && /\b(filtered|timed?\s*out|timeout|no\s+response|unreachable)\b|超时|无响应|不可达|端口.*过滤/i.test(taskResult.summary)
+    );
     const checkpointReason = taskResult.checkpointReason
       ?? state?.controlSignal?.reason
       ?? (taskResult.status === "partial" ? "Executor returned a partial epoch result" : undefined);
@@ -5873,11 +5879,17 @@ export class SecurityAgentController {
     ]);
     return {
       ...taskResult,
+      status: inconclusiveNetworkResult ? "partial" : taskResult.status,
       evidenceRefs,
       artifactRefs: dedupeStrings(submittedArtifactRefs),
       capabilityRefs,
-      checkpointReason,
-      retryable,
+      checkpointReason: inconclusiveNetworkResult
+        ? "Executor network data plane was unhealthy; negative target observations are inconclusive"
+        : checkpointReason,
+      blockerReason: inconclusiveNetworkResult
+        ? `infrastructure_failure: ${networkHealth!.status}`
+        : taskResult.blockerReason,
+      retryable: inconclusiveNetworkResult ? true : retryable,
       attempt: state?.attempt ?? this.nextTaskAttempt(taskEnvelope.taskId),
       resumeCursor: lastEventId,
       lastEventId

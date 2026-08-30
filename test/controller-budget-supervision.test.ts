@@ -1348,6 +1348,36 @@ test("runtime grounds evidence but keeps incidental observation artifacts out of
   harness.controller.close();
 });
 
+test("runtime does not turn filtered ports into target evidence while the TCP data plane is unhealthy", async () => {
+  const harness = createControllerHarness();
+  const taskEnvelope = makeTaskEnvelope();
+  const state = harness.controllerHarness.beginTaskExecution(taskEnvelope);
+  (harness.controller as unknown as { taskNetworkHealth: Map<string, unknown> }).taskNetworkHealth.set(
+    taskEnvelope.taskId,
+    {
+      status: "broker_unreachable",
+      tcpDataPlane: false,
+      broker: false,
+      icmp: "supported",
+      checkedAt: "2026-08-31T00:00:00.000Z"
+    }
+  );
+
+  const enriched = await harness.controllerHarness.enrichTaskResultLifecycle({
+    taskId: taskEnvelope.taskId,
+    status: "completed",
+    summary: "All ports filtered; HTTP and ICMP timed out.",
+    evidenceRefs: [],
+    artifactRefs: []
+  }, taskEnvelope, state);
+
+  assert.equal(enriched.status, "partial");
+  assert.equal(enriched.retryable, true);
+  assert.match(enriched.blockerReason ?? "", /infrastructure_failure: broker_unreachable/);
+  harness.controllerHarness.finishTaskExecution(taskEnvelope.taskId, "executor_submitted");
+  await harness.controller.close({ drainProjectionJobs: false });
+});
+
 test("does not let Supervisor extend the runtime-owned turn budget", async () => {
   const harness = createObserverControllerHarness(JSON.stringify({
     decision: "continue",
