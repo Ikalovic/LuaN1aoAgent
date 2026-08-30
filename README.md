@@ -344,9 +344,11 @@ Starting without `--resume` always creates a fresh session and never reads an ol
 
 `--scope` is the network authorization root and accepts comma-separated IPv4 addresses, CIDRs, exact
 domains, or leading-wildcard domains. Bare IP addresses are normalized to `/32`. When `--scope` is
-omitted, the Planner model extracts only IPv4 addresses and CIDRs explicitly present in `--goal`;
-deterministic validation rejects invented or widened ranges. Domain scope must be supplied explicitly.
-If the Goal contains no explicit IPv4 target, startup fails and asks for `--scope`.
+omitted for a pentest, the Planner model extracts only IPv4 addresses and CIDRs explicitly present in
+`--goal`; deterministic validation rejects invented or widened ranges. Domain scope must be supplied
+explicitly. If a pentest Goal contains no explicit IPv4 target, startup fails and asks for `--scope`.
+CTF runs may omit scope entirely; an omitted CTF scope is normalized to the unrestricted IPv4 boundary
+`0.0.0.0/0`. This does not change pentest scope handling.
 
 `--proxy` is a Docker-mode, run-level transparent SOCKS5 egress. Runtime authenticates and installs
 the proxy Route before Planner or Executor work begins; each task Gateway still enforces the normalized
@@ -364,13 +366,14 @@ npm start -- --resume 20260720-080000Z-a1b2c3d4
 
 `--resume` accepts either the session name under `.agent-runtime/sessions/` or its full runtime path. Do not pass `--goal` or `--scope` when resuming.
 
-Scope may also be extracted from TXT, Markdown, CSV, JSON, DOCX, or text-layer PDF files:
+Scope may also be extracted from TXT, Markdown, CSV, JSON, DOCX, XLSX, or text-layer PDF files.
+XLSX parsing reads every worksheet and preserves worksheet/cell evidence for extracted candidates:
 
 ```bash
 npm start -- --goal "Assess authorized assets" --scope-file authorization.docx --confirm-scope-files --no-tui
 ```
 
-Repeat `--scope-file` and combine it with `--scope` to form a union. The Web start-run dialog also uploads and previews scope documents. Each file is limited to 5 MiB; scanned PDFs are not OCRed; AI may select only evidence-backed assets literally present in the document and cannot broaden authorization through DNS, FOFA, or inferred relationships.
+Repeat `--scope-file` and combine it with `--scope` to form a union. The Web start-run dialog also uploads and previews scope documents. Each file is limited to 5 MiB; scanned PDFs are not OCRed; AI may select only evidence-backed assets literally present in the document and cannot broaden authorization through DNS, FOFA, or inferred relationships. In both CLI and Web flows, only CTF runs may omit scope; pentest behavior is unchanged.
 
 ### CLI options
 
