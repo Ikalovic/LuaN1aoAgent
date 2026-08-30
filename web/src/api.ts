@@ -1,5 +1,5 @@
 import { translate } from "./language";
-import type { ActiveRunsResponse, ArtifactContent, AuthResponse, ConnectionItem, ConnectionsResponse, ParsedScopeDocument, RuntimeState, SessionsResponse, StartRunInput, StartRunResponse, StopRunResponse, TrafficExchange, TrafficFlowRef, TrafficHistoryBody, TrafficHistoryFilters, TrafficHistoryPage, TrafficReplayInput, TrafficReplayResponse } from "./types";
+import type { ActiveRunsResponse, ArtifactContent, AuthResponse, ConnectionItem, ConnectionsResponse, ParsedScopeDocument, RegisteredSkill, RuntimeState, SessionsResponse, SkillRegistrySnapshot, StartRunInput, StartRunResponse, StopRunResponse, TrafficExchange, TrafficFlowRef, TrafficHistoryBody, TrafficHistoryFilters, TrafficHistoryPage, TrafficReplayInput, TrafficReplayResponse } from "./types";
 
 export class ApiError extends Error {
   constructor(message: string, readonly status: number, readonly code?: string) {
@@ -57,6 +57,18 @@ export function fetchRuntimeState(runtimeDir: string, signal?: AbortSignal): Pro
 
 export function fetchSessions(runtimeDir: string, signal?: AbortSignal): Promise<SessionsResponse> {
   return requestJson(`/api/sessions?rootDir=${encodeURIComponent(runtimeRoot(runtimeDir))}`, { signal });
+}
+
+export function fetchSkills(signal?: AbortSignal): Promise<SkillRegistrySnapshot> {
+  return requestJson("/api/skills", { signal });
+}
+
+export function setSkillEnabled(name: string, enabled: boolean): Promise<RegisteredSkill> {
+  return requestJson(`/api/skills/${encodeURIComponent(name)}/state`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ enabled })
+  });
 }
 
 export function startRun(input: StartRunInput): Promise<StartRunResponse> {

@@ -17,6 +17,29 @@ export interface AuthResponse {
   user: AuthUser;
 }
 
+export interface RegisteredSkill {
+  name: string;
+  description: string;
+  filePath: string;
+  baseDir: string;
+  valid: boolean;
+  enabled: boolean;
+  modelInvocable: boolean;
+}
+
+export interface SkillRegistryDiagnostic {
+  code: string;
+  message: string;
+  path?: string;
+  skillName?: string;
+}
+
+export interface SkillRegistrySnapshot {
+  scannedAt: string;
+  skills: RegisteredSkill[];
+  diagnostics: SkillRegistryDiagnostic[];
+}
+
 export interface GraphNode {
   id: string;
   graphKind: string;

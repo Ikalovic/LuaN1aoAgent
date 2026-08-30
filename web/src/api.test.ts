@@ -90,3 +90,28 @@ describe("mutation CSRF handling", () => {
     expect(JSON.parse(String(connectionOptions.body))).toEqual({ runtimeDir: ".agent-runtime/sessions/test" });
   });
 });
+
+describe("skills API", () => {
+  it("lists skills and posts encoded state changes with CSRF", async () => {
+    vi.resetModules();
+    const { fetchSkills, setSkillEnabled } = await import("./api");
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        json: async () => ({ skills: [], diagnostics: [], scannedAt: "2026-08-30T00:00:00.000Z" })
+      })
+      .mockResolvedValueOnce({ ok: true, status: 200, json: async () => ({ csrfToken: "skills-csrf" }) })
+      .mockResolvedValueOnce({ ok: true, status: 200, json: async () => ({ name: "ctf/web", enabled: false }) });
+    vi.stubGlobal("fetch", fetchMock);
+
+    await fetchSkills();
+    await setSkillEnabled("ctf/web", false);
+
+    expect(fetchMock.mock.calls[0]?.[0]).toBe("/api/skills");
+    const [url, options] = fetchMock.mock.calls[2] as [string, RequestInit];
+    expect(url).toBe("/api/skills/ctf%2Fweb/state");
+    expect(new Headers(options.headers).get("X-CSRF-Token")).toBe("skills-csrf");
+    expect(JSON.parse(String(options.body))).toEqual({ enabled: false });
+  });
+});
