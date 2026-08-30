@@ -5271,7 +5271,6 @@ export class SecurityAgentController {
     const globalDeadlineTimer = setTimeout(() => {
       void session.abort().catch(() => undefined);
     }, remainingGlobalRunMs);
-    globalDeadlineTimer.unref?.();
     const startedAt = Date.now();
     const statsBefore = readPiSessionStats(session);
     const inputBytes = Buffer.byteLength(prompt);
