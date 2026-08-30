@@ -430,6 +430,7 @@ export class SecurityAgentController {
   private connectivityRuntimeCleanupComplete = false;
   private taskExecutorSandboxes = new Map<string, DockerTaskSandbox>();
   private networkFinalizations = new Map<string, Promise<void>>();
+  private taskExecutorResourceCleanups = new Map<string, Promise<void>>();
   private agents?: SecurityAgentRuntime;
   private supervisorInFlight = new Map<string, Promise<SupervisorVerdict>>();
   private supervisorAbortByEpoch = new Map<string, AbortController>();
@@ -1291,6 +1292,7 @@ export class SecurityAgentController {
       this.finishTaskExecution(state.taskEnvelope.taskId, "shutdown");
     }
     await Promise.allSettled([...(this.networkFinalizations?.values() ?? [])]);
+    await Promise.allSettled([...(this.taskExecutorResourceCleanups?.values() ?? [])]);
     await this.closeExecutorResources();
     await this.fofaRuntime?.close("Controller shutdown");
     await this.beekeeperRuntime?.close("Controller shutdown");
@@ -2524,8 +2526,7 @@ export class SecurityAgentController {
           taskResult.status,
           taskResult.retryable === true
         );
-        const finalization = this.networkFinalizations.get(state.epochId) ?? Promise.resolve();
-        void finalization.then(() => this.disposeTaskExecutorResources(taskEnvelope.taskId)).catch(() => undefined);
+        this.scheduleTaskExecutorResourceCleanup(taskEnvelope.taskId, state.epochId);
       }
       return {
         taskEnvelope,
@@ -2574,6 +2575,7 @@ export class SecurityAgentController {
       return;
     }
     const taskId = state.taskEnvelope.taskId;
+    await this.waitForTaskExecutorResourceCleanup(taskId);
     const gateway = await this.connectivityRuntime.beginTaskEpoch({ taskId, epochId: state.epochId });
     let sandbox = this.taskExecutorSandboxes.get(taskId);
     try {
@@ -2894,6 +2896,26 @@ export class SecurityAgentController {
       || (status === "failed" && !retryable)) {
       this.fofaRuntime?.invalidateTask(taskRef);
     }
+  }
+
+  private scheduleTaskExecutorResourceCleanup(taskId: string, epochId: string): Promise<void> {
+    const existing = this.taskExecutorResourceCleanups.get(taskId);
+    if (existing) return existing;
+    const finalization = this.networkFinalizations.get(epochId) ?? Promise.resolve();
+    const cleanup = finalization
+      .then(() => this.disposeTaskExecutorResources(taskId))
+      .catch(() => undefined)
+      .finally(() => {
+        if (this.taskExecutorResourceCleanups.get(taskId) === cleanup) {
+          this.taskExecutorResourceCleanups.delete(taskId);
+        }
+      });
+    this.taskExecutorResourceCleanups.set(taskId, cleanup);
+    return cleanup;
+  }
+
+  private async waitForTaskExecutorResourceCleanup(taskId: string): Promise<void> {
+    await this.taskExecutorResourceCleanups.get(taskId);
   }
 
   private async disposeTaskExecutorResources(

@@ -362,6 +362,71 @@ test("endExecutorNetworkEpoch still drains after quiesce failure", async () => {
   assert.ok(!fixture.loggedEventTypes().includes("network_capture_finalized"));
 });
 
+test("reopened Task waits for prior epoch resource cleanup", async () => {
+  const calls: string[] = [];
+  const finalization = deferred();
+  const controller = Object.create(SecurityAgentController.prototype) as SecurityAgentController;
+  const harness = controller as unknown as LifecycleFenceHarness;
+  harness.networkFinalizations = new Map([["epoch:old", finalization.promise]]);
+  harness.taskExecutorResourceCleanups = new Map();
+  harness.disposeTaskExecutorResources = async () => { calls.push("cleanup"); };
+
+  harness.scheduleTaskExecutorResourceCleanup("task:recon", "epoch:old");
+  let resumed = false;
+  const waiting = harness.waitForTaskExecutorResourceCleanup("task:recon")
+    .then(() => {
+      resumed = true;
+      calls.push("resume");
+    });
+
+  await Promise.resolve();
+  assert.equal(resumed, false);
+  finalization.resolve();
+  await waiting;
+  assert.deepEqual(calls, ["cleanup", "resume"]);
+});
+
+test("failed prior cleanup releases the Task lifecycle fence", async () => {
+  const controller = Object.create(SecurityAgentController.prototype) as SecurityAgentController;
+  const harness = controller as unknown as LifecycleFenceHarness;
+  harness.networkFinalizations = new Map();
+  harness.taskExecutorResourceCleanups = new Map();
+  harness.disposeTaskExecutorResources = async () => { throw new Error("cleanup failed"); };
+
+  harness.scheduleTaskExecutorResourceCleanup("task:recon", "epoch:old");
+  await harness.waitForTaskExecutorResourceCleanup("task:recon");
+
+  assert.equal(harness.taskExecutorResourceCleanups.has("task:recon"), false);
+});
+
+test("Controller close waits for registered Task resource cleanup", async () => {
+  const cleanup = deferred();
+  const fixture = createControllerCloseFixture({});
+  (fixture.controller as unknown as {
+    taskExecutorResourceCleanups: Map<string, Promise<void>>;
+  }).taskExecutorResourceCleanups = new Map([["task:recon", cleanup.promise]]);
+
+  const closing = fixture.controller.close();
+  const closeState = await Promise.race([
+    closing.then(() => "closed" as const),
+    new Promise<"pending">((resolve) => setTimeout(() => resolve("pending"), 25))
+  ]);
+
+  assert.equal(closeState, "pending");
+  assert.equal(fixture.graphStoreCloseCount(), 0);
+  cleanup.resolve();
+  await closing;
+  assert.equal(fixture.graphStoreCloseCount(), 1);
+});
+
+type LifecycleFenceHarness = {
+  networkFinalizations: Map<string, Promise<void>>;
+  taskExecutorResourceCleanups: Map<string, Promise<void>>;
+  disposeTaskExecutorResources(taskId: string): Promise<void>;
+  scheduleTaskExecutorResourceCleanup(taskId: string, epochId: string): Promise<void>;
+  waitForTaskExecutorResourceCleanup(taskId: string): Promise<void>;
+};
+
 function createControllerCloseFixture(input: {
   taskSandboxes?: Map<string, { dispose(): Promise<void> }>;
   connectivityRuntime?: { disposeTask(taskId: string): Promise<void>; close(): Promise<void> };
@@ -384,6 +449,7 @@ function createControllerCloseFixture(input: {
     activeEpochs: Map<string, unknown>;
     activeTaskRuns: Map<string, unknown>;
     networkFinalizations: Map<string, Promise<void>>;
+    taskExecutorResourceCleanups: Map<string, Promise<void>>;
     projectionRequestsClosed: boolean;
     pendingSupervisorRequests: Map<string, unknown>;
     activeSupervisorSessions: Set<unknown>;
@@ -415,6 +481,7 @@ function createControllerCloseFixture(input: {
     activeEpochs: new Map(),
     activeTaskRuns: new Map(),
     networkFinalizations: new Map(),
+    taskExecutorResourceCleanups: new Map(),
     projectionRequestsClosed: false,
     pendingSupervisorRequests: new Map(),
     activeSupervisorSessions: new Set(),
@@ -462,4 +529,10 @@ function gatewayDrainAck(epochRef: string): Record<string, unknown> {
     netBytes: 256,
     flushed: true
   };
+}
+
+function deferred(): { promise: Promise<void>; resolve(): void } {
+  let resolve!: () => void;
+  const promise = new Promise<void>((settle) => { resolve = settle; });
+  return { promise, resolve };
 }

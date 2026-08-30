@@ -15,7 +15,7 @@
 **Files:**
 - Modify: `test/controller-connectivity-boundary.test.ts`
 
-- [ ] **Step 1: Write the failing lifecycle-fence test**
+- [x] **Step 1: Write the failing lifecycle-fence test**
 
 Add a Controller harness with a deferred network finalization and a stubbed
 `disposeTaskExecutorResources`. Schedule terminal cleanup for one epoch, then
@@ -45,7 +45,7 @@ test("reopened Task waits for prior epoch resource cleanup", async () => {
 });
 ```
 
-- [ ] **Step 2: Write the cleanup-failure release test**
+- [x] **Step 2: Write the cleanup-failure release test**
 
 ```ts
 test("failed prior cleanup releases the Task lifecycle fence", async () => {
@@ -61,7 +61,7 @@ test("failed prior cleanup releases the Task lifecycle fence", async () => {
 });
 ```
 
-- [ ] **Step 3: Build and run the focused test to verify RED**
+- [x] **Step 3: Build and run the focused test to verify RED**
 
 Run:
 
@@ -82,13 +82,13 @@ map do not exist, or the new behavior test fails for the same missing boundary.
 - Modify: `src/controller.ts:2899-2935`
 - Test: `test/controller-connectivity-boundary.test.ts`
 
-- [ ] **Step 1: Add the per-Task cleanup registry**
+- [x] **Step 1: Add the per-Task cleanup registry**
 
 ```ts
 private taskExecutorResourceCleanups = new Map<string, Promise<void>>();
 ```
 
-- [ ] **Step 2: Add scheduling and waiting helpers**
+- [x] **Step 2: Add scheduling and waiting helpers**
 
 ```ts
 private scheduleTaskExecutorResourceCleanup(taskId: string, epochId: string): Promise<void> {
@@ -112,7 +112,7 @@ private async waitForTaskExecutorResourceCleanup(taskId: string): Promise<void> 
 }
 ```
 
-- [ ] **Step 3: Register terminal cleanup before returning execution**
+- [x] **Step 3: Register terminal cleanup before returning execution**
 
 Replace the detached finalization chain with:
 
@@ -123,7 +123,7 @@ this.scheduleTaskExecutorResourceCleanup(taskEnvelope.taskId, state.epochId);
 This call registers the Promise fence synchronously; it intentionally does not
 await cleanup before returning the outcome to Planner.
 
-- [ ] **Step 4: Wait at the new-epoch preparation boundary**
+- [x] **Step 4: Wait at the new-epoch preparation boundary**
 
 At the start of `prepareExecutorSandboxForEpoch`, after deriving `taskId` and
 before `beginTaskEpoch`, add:
@@ -132,7 +132,13 @@ before `beginTaskEpoch`, add:
 await this.waitForTaskExecutorResourceCleanup(taskId);
 ```
 
-- [ ] **Step 5: Run focused tests to verify GREEN**
+- [x] **Step 5: Wait for registered cleanup during Controller shutdown**
+
+After joining network finalizations, wait for the current snapshot of Task
+resource cleanup fences before closing shared Executor and connectivity
+resources.
+
+- [x] **Step 6: Run focused tests to verify GREEN**
 
 Run:
 
@@ -143,7 +149,7 @@ node --test dist/test/controller-connectivity-boundary.test.js
 
 Expected: all Controller connectivity-boundary tests pass.
 
-- [ ] **Step 6: Run broader Controller tests**
+- [x] **Step 7: Run broader Controller tests**
 
 Run:
 
@@ -159,7 +165,7 @@ Expected: all Controller tests pass with zero failures.
 - Modify: `src/controller.ts`
 - Modify: `test/controller-connectivity-boundary.test.ts`
 
-- [ ] **Step 1: Run static and whitespace checks**
+- [x] **Step 1: Run static and whitespace checks**
 
 ```bash
 npm run build:server
@@ -168,7 +174,7 @@ git diff --check
 
 Expected: both commands exit 0.
 
-- [ ] **Step 2: Review the scoped diff**
+- [x] **Step 2: Review the scoped diff**
 
 ```bash
 git diff -- src/controller.ts test/controller-connectivity-boundary.test.ts
@@ -177,7 +183,7 @@ git diff -- src/controller.ts test/controller-connectivity-boundary.test.ts
 Expected: only the Task lifecycle fence, terminal cleanup registration, wait
 boundary, and regression tests are present.
 
-- [ ] **Step 3: Commit the implementation**
+- [x] **Step 3: Commit the implementation**
 
 ```bash
 git add src/controller.ts test/controller-connectivity-boundary.test.ts docs/superpowers/plans/2026-08-30-task-network-lifecycle-fence.md
