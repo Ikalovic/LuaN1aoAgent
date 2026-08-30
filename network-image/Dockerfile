@@ -28,7 +28,7 @@ ARG TARGETARCH
 RUN sed -i 's|http://deb.debian.org/debian|https://deb.debian.org/debian|g; s|http://deb.debian.org/debian-security|https://deb.debian.org/debian-security|g' /etc/apt/sources.list.d/debian.sources \
     && apt-get update \
     && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-      ca-certificates conntrack curl iproute2 iptables jq netcat-openbsd nftables openssh-client procps sshpass util-linux \
+      ca-certificates conntrack curl iproute2 iptables iputils-ping jq netcat-openbsd nftables openssh-client procps sshpass util-linux \
     && pip install --no-cache-dir "mitmproxy==${MITMPROXY_VERSION}" "httpx==0.28.1" \
     && arch="${TARGETARCH:-amd64}" \
     && case "${arch}" in amd64|arm64) ;; *) echo "unsupported architecture: ${arch}" >&2; exit 65 ;; esac \

@@ -32,6 +32,7 @@ import {
   type ExecutorSandboxRequestedMode
 } from "./executor-sandbox.js";
 import { getExecutorEnvironmentFacts } from "./executor-environment.js";
+import { createNetworkDiagnosticsTools } from "./tools/network-diagnostics-tools.js";
 import { EpochBudgetClock } from "./epoch-budget-clock.js";
 import { summarizeSupervisorTrace } from "./log-summary.js";
 import { normalizePlannerDecision, validatePlannerBasedOnRefs } from "./planner-commands.js";
@@ -2739,6 +2740,9 @@ export class SecurityAgentController {
   private createTaskRuntimeTools(taskEnvelope: TaskEnvelope) {
     return [
       ...this.createTaskConnectivityTools(taskEnvelope.taskId),
+      ...(this.connectivityRuntime
+        ? createNetworkDiagnosticsTools(this.connectivityRuntime, taskEnvelope.taskId)
+        : []),
       ...(this.fofaRuntime
         ? createExecutorFofaTools(this.fofaRuntime, this.artifactStore, taskEnvelope.taskId)
         : []),

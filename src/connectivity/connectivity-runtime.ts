@@ -5,6 +5,8 @@ import type { MitmFlowClient } from "./mitm-flow-client.js";
 import {
   NetworkSandboxManager,
   type GatewayEpochDrainAck,
+  type IcmpEchoResult,
+  type TaskNetworkHealth,
   type TaskGateway
 } from "./network-sandbox-manager.js";
 import {
@@ -154,6 +156,14 @@ export class ConnectivityRuntime {
       await this.assertOwner();
       await this.network.disposeGateway(taskId);
     });
+  }
+
+  networkStatus(taskId: string): Promise<TaskNetworkHealth> {
+    return this.network.taskNetworkHealth(taskId);
+  }
+
+  icmpEcho(taskId: string, target: string, timeoutMs: number): Promise<IcmpEchoResult> {
+    return this.network.icmpEcho(taskId, target, timeoutMs);
   }
 
   openRoute(input: RouteOpenInput, ownerTaskId: string): Promise<RouteStatus> {

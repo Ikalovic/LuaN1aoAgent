@@ -233,6 +233,7 @@ test("network sandbox gives only the gateway network capability and reconciles l
     assert.equal(index.includes("NET_ADMIN"), false);
     assert.equal(index.includes(manager.networkName), false);
     assert.ok(gatewayRun.includes("NET_ADMIN"));
+    assert.ok(gatewayRun.includes("NET_RAW"));
     assert.ok(gatewayRun.includes("SETUID"));
     assert.ok(gatewayRun.includes("SETGID"));
     assert.ok(gatewayRun.includes("/dev/net/tun:/dev/net/tun"));

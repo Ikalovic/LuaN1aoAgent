@@ -399,6 +399,7 @@ class GatewayControl:
         drain_timeout_seconds: float = GATEWAY_DRAIN_TIMEOUT_SECONDS,
         network_epoch_drain: Callable[[str], None] | None = None,
         route_guard_replace: Callable[[list[dict]], None] | None = None,
+        icmp_runner: Callable[..., object] | None = None,
     ) -> None:
         self.socket_path = socket_path
         self.ready = ready
@@ -411,6 +412,8 @@ class GatewayControl:
         self.network_epoch_drain = network_epoch_drain
         self.drain_timeout_seconds = max(0.1, drain_timeout_seconds)
         self.route_guard_replace = route_guard_replace
+        self.icmp_runner = icmp_runner or subprocess.run
+        self.icmp_rate: dict[str, list[float]] = {}
 
     def serve(self) -> None:
         Path(self.socket_path).parent.mkdir(parents=True, exist_ok=True)
@@ -441,6 +444,10 @@ class GatewayControl:
                     elif request.get("command") == "health":
                         if not self.ready.is_set():
                             raise RuntimeError("gateway data plane is not ready")
+                    elif request.get("command") == "icmp.echo":
+                        if not self.ready.is_set():
+                            raise RuntimeError("gateway data plane is not ready")
+                        result = self.icmp_echo(request.get("payload", {}))
                     else:
                         raise ValueError("unknown command")
                     connection.sendall((json.dumps({
@@ -488,6 +495,81 @@ class GatewayControl:
         if self.route_guard_replace:
             self.route_guard_replace(ordered)
         self._write_routes({"routes": ordered})
+
+    def icmp_echo(self, payload: dict) -> dict:
+        target = str(payload.get("target", "")).strip()
+        timeout_ms = int(payload.get("timeoutMs", 1000))
+        if not target or len(target) > 253 or any(character.isspace() for character in target):
+            return {"status": "scope_blocked", "target": target, "detail": "invalid target"}
+        if not 250 <= timeout_ms <= 3000:
+            return {"status": "infrastructure_failure", "target": target, "detail": "timeoutMs must be 250-3000"}
+
+        address = self._authorized_icmp_address(target)
+        if address is None:
+            return {"status": "scope_blocked", "target": target}
+        if self._address_uses_route(address):
+            return {"status": "icmp_proxy_unsupported", "target": target, "address": address}
+        if not self._take_icmp_token(address):
+            return {"status": "infrastructure_failure", "target": target, "address": address, "detail": "rate_limited"}
+
+        try:
+            completed = self.icmp_runner(
+                ["ping", "-n", "-c", "1", "-W", str(max(1, (timeout_ms + 999) // 1000)), address],
+                capture_output=True, text=True, timeout=(timeout_ms / 1000) + 1,
+            )
+        except (OSError, subprocess.SubprocessError) as error:
+            return {"status": "infrastructure_failure", "target": target, "address": address, "detail": str(error)}
+        output = f"{getattr(completed, 'stdout', '')}\n{getattr(completed, 'stderr', '')}"
+        if int(getattr(completed, "returncode", 1)) != 0:
+            return {"status": "timeout", "target": target, "address": address}
+        match = re.search(r"time[=<]([0-9.]+)\s*ms", output)
+        result = {"status": "reply", "target": target, "address": address}
+        if match:
+            result["roundTripMs"] = float(match.group(1))
+        return result
+
+    def _authorized_icmp_address(self, target: str) -> str | None:
+        networks = []
+        for value in os.environ.get("LUANNIAO_AUTHORIZED_CIDRS", "").split(","):
+            if value.strip():
+                networks.append(ipaddress.ip_network(value.strip(), strict=False))
+        try:
+            address = ipaddress.ip_address(target)
+            return str(address) if address.version == 4 and any(address in network for network in networks) else None
+        except ValueError:
+            normalized = target.rstrip(".").lower()
+            authorized = any(
+                normalized == domain.lstrip("*.").rstrip(".").lower()
+                or normalized.endswith("." + domain.lstrip("*.").rstrip(".").lower())
+                for domain in _authorized_domains()
+            )
+            if not authorized:
+                return None
+            try:
+                addresses = sorted({
+                    item[4][0] for item in socket.getaddrinfo(normalized, None, socket.AF_INET, socket.SOCK_STREAM)
+                })
+            except OSError:
+                return None
+            return addresses[0] if addresses else None
+
+    def _address_uses_route(self, address: str) -> bool:
+        try:
+            routes = json.loads(self.routes_path.read_text(encoding="utf-8")).get("routes", [])
+        except (FileNotFoundError, OSError, json.JSONDecodeError):
+            routes = []
+        candidate = ipaddress.ip_address(address)
+        return any(candidate in ipaddress.ip_network(str(route.get("cidr", "")), strict=False) for route in routes)
+
+    def _take_icmp_token(self, address: str) -> bool:
+        now = time.monotonic()
+        recent = [stamp for stamp in self.icmp_rate.get(address, []) if now - stamp < 3.0]
+        if len(recent) >= 3:
+            self.icmp_rate[address] = recent
+            return False
+        recent.append(now)
+        self.icmp_rate[address] = recent
+        return True
 
     @staticmethod
     def _read_request(connection: socket.socket) -> dict:

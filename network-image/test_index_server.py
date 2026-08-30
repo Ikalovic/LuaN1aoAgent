@@ -211,6 +211,44 @@ class FlowIndexTest(unittest.TestCase):
 
 
 class RouteProxyTest(unittest.TestCase):
+    def test_gateway_control_icmp_echo_enforces_scope_and_reports_reply(self) -> None:
+        with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {
+            "LUANNIAO_AUTHORIZED_CIDRS": "192.0.2.0/24",
+            "LUANNIAO_AUTHORIZED_DOMAINS": "",
+        }, clear=False):
+            root = Path(directory)
+            runner = MagicMock(return_value=SimpleNamespace(returncode=0, stdout="64 bytes time=4.20 ms", stderr=""))
+            control = GatewayControl(
+                str(root / "gateway.sock"), MagicMock(), root / "epoch.json", root,
+                root / "routes.json", icmp_runner=runner,
+            )
+
+            reply = control.icmp_echo({"target": "192.0.2.10", "timeoutMs": 750})
+            blocked = control.icmp_echo({"target": "198.51.100.10", "timeoutMs": 750})
+
+            self.assertEqual(reply["status"], "reply")
+            self.assertEqual(reply["roundTripMs"], 4.2)
+            self.assertEqual(blocked["status"], "scope_blocked")
+            runner.assert_called_once()
+
+    def test_gateway_control_icmp_echo_never_bypasses_matching_socks_route(self) -> None:
+        with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {
+            "LUANNIAO_AUTHORIZED_CIDRS": "192.0.2.0/24",
+            "LUANNIAO_AUTHORIZED_DOMAINS": "",
+        }, clear=False):
+            root = Path(directory)
+            routes_path = root / "routes.json"
+            routes_path.write_text(json.dumps({"routes": [{"cidr": "192.0.2.0/24"}]}))
+            runner = MagicMock()
+            control = GatewayControl(
+                str(root / "gateway.sock"), MagicMock(), root / "epoch.json", root,
+                routes_path, icmp_runner=runner,
+            )
+
+            result = control.icmp_echo({"target": "192.0.2.10", "timeoutMs": 750})
+
+            self.assertEqual(result["status"], "icmp_proxy_unsupported")
+            runner.assert_not_called()
     def test_gateway_epoch_files_expose_only_network_metadata(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

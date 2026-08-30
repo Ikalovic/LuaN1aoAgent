@@ -79,6 +79,14 @@ export type TaskNetworkHealth = {
   detail?: string;
 };
 
+export type IcmpEchoResult = {
+  status: "reply" | "timeout" | "scope_blocked" | "icmp_proxy_unsupported" | "infrastructure_failure";
+  target: string;
+  address?: string;
+  roundTripMs?: number;
+  detail?: string;
+};
+
 type CommandResult = { code: number | null; stdout: string; stderr: string };
 type CommandRunner = (args: string[], stdin?: string) => Promise<CommandResult>;
 
@@ -412,7 +420,7 @@ export class NetworkSandboxManager {
       "--sysctl", "net.ipv4.conf.all.rp_filter=0",
       "--sysctl", "net.ipv4.conf.default.rp_filter=0",
       "--read-only", "--cap-drop", "ALL",
-      "--cap-add", "NET_ADMIN", "--cap-add", "SETUID", "--cap-add", "SETGID",
+      "--cap-add", "NET_ADMIN", "--cap-add", "NET_RAW", "--cap-add", "SETUID", "--cap-add", "SETGID",
       "--group-add", "101",
       "--device", "/dev/net/tun:/dev/net/tun",
       "--security-opt", "no-new-privileges",
@@ -624,6 +632,27 @@ export class NetworkSandboxManager {
       };
     }
     return { status: "healthy", tcpDataPlane: true, broker: true, icmp, checkedAt };
+  }
+
+  async icmpEcho(taskId: string, target: string, timeoutMs = 1_000): Promise<IcmpEchoResult> {
+    const gateway = this.gateways.get(taskId);
+    if (!gateway) return { status: "infrastructure_failure", target, detail: "Task Gateway is not active" };
+    const result = await this.runner([
+      "exec", gateway.containerName, "gatewayctl", "icmp.echo",
+      JSON.stringify({ target, timeoutMs })
+    ]).catch((error: unknown) => ({ code: 1, stdout: "", stderr: String(error) }));
+    if (result.code !== 0) {
+      return { status: "infrastructure_failure", target, detail: result.stderr || "Gateway control failed" };
+    }
+    try {
+      const response = JSON.parse(result.stdout) as { ok?: boolean; result?: IcmpEchoResult; error?: string };
+      if (!response.ok || !response.result) {
+        return { status: "infrastructure_failure", target, detail: response.error ?? "Invalid Gateway response" };
+      }
+      return response.result;
+    } catch {
+      return { status: "infrastructure_failure", target, detail: "Invalid Gateway response" };
+    }
   }
 
   replaceRoutes(routes: NetworkRoute[]): Promise<void> {
