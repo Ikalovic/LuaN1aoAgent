@@ -221,6 +221,25 @@ export function createScopeDocumentSubmitTool() {
   });
 }
 
+export function createSkillSelectionSubmitTool() {
+  return defineTool({
+    name: "skill_selection_submit",
+    label: "Submit Skill Selection",
+    description: "Select only installed skills that materially help the current task, then terminate.",
+    parameters: Type.Object({
+      selections: Type.Array(Type.Object({
+        name: Type.String({ minLength: 1, maxLength: 64 }),
+        reason: Type.String({ minLength: 1, maxLength: 500 })
+      }, { additionalProperties: false }), { maxItems: 16 })
+    }, { additionalProperties: false }),
+    execute: async (_toolCallId, params) => ({
+      content: [{ type: "text", text: "Skill selection submitted" }],
+      details: params,
+      terminate: true
+    })
+  });
+}
+
 export function createTaskResultSubmitTool() {
   return defineTool({
     name: "task_result_submit",

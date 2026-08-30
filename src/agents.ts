@@ -37,6 +37,7 @@ import {
   createGraphTraceTool,
   createPlannerSubmitTool,
   createScopeDocumentSubmitTool,
+  createSkillSelectionSubmitTool,
   createScopeSubmitTool,
   createTaskResultSubmitTool,
   type GraphToolMaterialsResolver
@@ -321,6 +322,30 @@ export async function createScopeDocumentResolverAgentSession(input: {
     cwd: input.cwd,
     noTools: "builtin",
     customTools: [createScopeDocumentSubmitTool()],
+    authStorage: input.llmRuntime.authStorage,
+    modelRegistry: input.llmRuntime.modelRegistry,
+    model: input.llmRuntime.models.planner,
+    thinkingLevel: input.llmRuntime.roleConfig.planner.thinkingLevel,
+    resourceLoader: loader,
+    settingsManager: createRuntimeSettingsManager(input.llmRuntime.roleConfig.planner.contextWindow),
+    sessionManager: SessionManager.inMemory(input.cwd)
+  });
+}
+
+export const SKILL_SELECTOR_SYSTEM_PROMPT =
+  `你是任务 Skill 选择步骤。根据任务目标，从给出的已安装 Skill 元数据中选择真正有帮助的 Skill。\n` +
+  `可以选择空列表；不得编造名称；不得选择与任务无关的 Skill；只调用 skill_selection_submit 一次并结束。`;
+
+export async function createSkillSelectorAgentSession(input: {
+  cwd: string;
+  llmRuntime: LlmRuntime;
+  providerAdmission?: ProviderAdmissionOptions;
+}): Promise<CreateAgentSessionResult> {
+  const loader = await createPromptLoader(input.cwd, SKILL_SELECTOR_SYSTEM_PROMPT, [], input.providerAdmission);
+  return createAgentSession({
+    cwd: input.cwd,
+    noTools: "builtin",
+    customTools: [createSkillSelectionSubmitTool()],
     authStorage: input.llmRuntime.authStorage,
     modelRegistry: input.llmRuntime.modelRegistry,
     model: input.llmRuntime.models.planner,
