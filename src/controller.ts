@@ -2843,7 +2843,21 @@ export class SecurityAgentController {
       }
       return;
     }
-    const scope = parseAuthorizedScope(scopeSummary);
+    let scope;
+    try {
+      scope = parseAuthorizedScope(scopeSummary);
+    } catch {
+      if (!this.fofaCapabilityReported) {
+        this.fofaCapabilityReported = true;
+        await this.executionLog.append({
+          role: "runtime",
+          eventType: "fofa_mcp_failed",
+          summary: "FOFA MCP requires a machine-readable domain or IPv4 Scope",
+          payload: { enabled: false }
+        });
+      }
+      return;
+    }
     const policy = new FofaScopePolicy(scope);
     const runtime = this.fofaRuntimeFactory({
       runRef: this.runId,

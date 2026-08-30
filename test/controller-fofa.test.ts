@@ -72,6 +72,24 @@ test("Controller leaves normal Executor tools available when FOFA is missing or 
   }
 });
 
+test("Controller skips FOFA when the Agent scope has no machine-readable asset", async () => {
+  const runtimeDir = mkdtempSync(join(tmpdir(), "controller-fofa-scope-disabled-"));
+  let factoryCalls = 0;
+  const controller = createController(runtimeDir, { FOFA_API_KEY: "sentinel-secret" }, () => {
+    factoryCalls += 1;
+    return fakeRuntime() as never;
+  });
+  const harness = controller as unknown as ControllerFofaHarness;
+
+  await harness.configureFofaRuntime("Authorized target only");
+
+  assert.equal(factoryCalls, 0);
+  assert.ok(harness.createTaskRuntimeTools(taskEnvelope()).every((tool) => !tool.name.startsWith("fofa_")));
+  const events = (await controller.executionLog.window({ limit: 20 })).events;
+  assert.ok(events.some((event) => event.eventType === "fofa_mcp_failed"));
+  await controller.close({ drainProjectionJobs: false });
+});
+
 test("Controller stop closes FOFA and terminal Task states invalidate cursors", async () => {
   const runtimeDir = mkdtempSync(join(tmpdir(), "controller-fofa-stop-"));
   const fake = fakeRuntime();
