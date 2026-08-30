@@ -1,6 +1,8 @@
 export type CliOptions = {
   goal: string;
   scope?: string;
+  scopeFiles: string[];
+  confirmScopeFiles: boolean;
   proxy?: string;
   runtimeDir?: string;
   resumeDir?: string;
@@ -16,11 +18,13 @@ export type CliOptions = {
 
 export function parseCliOptions(rawArgs: string[]): CliOptions {
   const values = new Map<string, string>();
+  const scopeFiles: string[] = [];
   const flags = new Set<string>();
-  const booleanFlags = new Set(["json", "jsonl", "no-tui", "help"]);
+  const booleanFlags = new Set(["json", "jsonl", "no-tui", "confirm-scope-files", "help"]);
   const valueOptions = new Set([
     "goal",
     "scope",
+    "scope-file",
     "proxy",
     "runtime-dir",
     "resume",
@@ -47,7 +51,8 @@ export function parseCliOptions(rawArgs: string[]): CliOptions {
     if (!value || value.startsWith("--")) {
       throw new Error(`Missing value for --${key}`);
     }
-    values.set(key, value);
+    if (key === "scope-file") scopeFiles.push(value);
+    else values.set(key, value);
     index += 1;
   }
 
@@ -60,10 +65,15 @@ export function parseCliOptions(rawArgs: string[]): CliOptions {
   if (values.has("resume") && values.has("scope")) {
     throw new Error("--scope cannot be used with --resume; the stored authorized scope will be restored");
   }
+  if (values.has("resume") && scopeFiles.length > 0) {
+    throw new Error("--scope-file cannot be used with --resume; the stored authorized scope will be restored");
+  }
 
   return {
     goal: values.get("goal") ?? "在授权范围内完成 Web 安全评估",
     scope: values.get("scope"),
+    scopeFiles,
+    confirmScopeFiles: flags.has("confirm-scope-files"),
     proxy: values.get("proxy"),
     runtimeDir: values.get("runtime-dir"),
     resumeDir: values.get("resume"),
@@ -90,6 +100,8 @@ export function cliHelp(): string {
     "Options:",
     "  --goal <text>                Agent goal",
     "  --scope <entries>            Authorized IPv4/CIDRs/domains (for example baidu.com,*.baidu.com)",
+    "  --scope-file <path>          Parse authorized scope from a file; may be repeated",
+    "  --confirm-scope-files        Confirm parsed file scope in non-interactive mode",
     "  --proxy <socks5-url>         Transparently route all scoped Agent TCP through SOCKS5",
     "  --runtime-dir <path>         New runtime directory; must be empty",
     "  --resume <session>           Resume one runtime; do not pass --goal",

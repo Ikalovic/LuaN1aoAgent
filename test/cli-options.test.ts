@@ -17,3 +17,21 @@ test("rejects missing and invalid numeric option values", () => {
   assert.throws(() => parseCliOptions(["--scope"]), /Missing value/);
   assert.throws(() => parseCliOptions(["--max-cycles", "many"]), /Invalid number/);
 });
+
+test("preserves repeated scope files and their explicit confirmation flag", () => {
+  const options = parseCliOptions([
+    "--scope-file", "first.txt",
+    "--scope-file", "second.docx",
+    "--confirm-scope-files",
+    "--no-tui"
+  ]);
+  assert.deepEqual(options.scopeFiles, ["first.txt", "second.docx"]);
+  assert.equal(options.confirmScopeFiles, true);
+});
+
+test("forbids scope files when resuming a stored runtime", () => {
+  assert.throws(
+    () => parseCliOptions(["--resume", "runtime-a", "--scope-file", "scope.txt"]),
+    /--scope-file cannot be used with --resume/
+  );
+});

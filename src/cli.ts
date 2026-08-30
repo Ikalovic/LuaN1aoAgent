@@ -1,13 +1,16 @@
 import { bootstrapAgentRuntime } from "./agent-runtime-bootstrap.js";
 import { cliHelp, parseCliOptions, shouldUseTui } from "./cli-options.js";
 import { resolveCliRunContext } from "./cli-runtime.js";
-import { loadLocalEnvFile } from "./llm-config.js";
+import { createLlmRuntime, loadLocalEnvFile } from "./llm-config.js";
+import { resolveCliScopeDocuments } from "./cli-scope-documents.js";
 import { normalizeScope } from "./scope.js";
+import { resolveDocumentScopeWithLlm } from "./scope-documents/scope-document-resolver.js";
 import { parseTransparentProxy } from "./proxy-config.js";
 import { deriveFinalReport } from "./run-report.js";
 import { loadPentestTemplates } from "./reporting/task-reporting.js";
 import { dirname, join } from "node:path";
 import { AgentCliApp } from "./tui/app.js";
+import { createInterface } from "node:readline/promises";
 
 try {
   loadLocalEnvFile(process.env);
@@ -30,6 +33,32 @@ async function run(options: ReturnType<typeof parseCliOptions>): Promise<void> {
     stdinIsTTY: process.stdin.isTTY,
     stdoutIsTTY: process.stdout.isTTY
   });
+  if (options.scopeFiles.length > 0 && !useTui && !options.confirmScopeFiles) {
+    throw new Error("--scope-file requires --confirm-scope-files in non-interactive mode");
+  }
+  const fileScope = options.scopeFiles.length > 0
+    ? await resolveCliScopeDocuments({
+      cwd,
+      runtimeDir: runContext.runtimeDir,
+      files: options.scopeFiles,
+      manualScope: options.scope,
+      aiResolver: async (fragments) => resolveDocumentScopeWithLlm({
+        cwd,
+        fragments,
+        llmRuntime: createLlmRuntime()
+      })
+    })
+    : undefined;
+  if (fileScope && useTui && !options.confirmScopeFiles) {
+    console.log(`解析出的授权范围：${fileScope.normalizedScope}`);
+    const prompt = createInterface({ input: process.stdin, output: process.stdout });
+    try {
+      const answer = (await prompt.question("确认使用以上范围？[y/N] ")).trim().toLowerCase();
+      if (answer !== "y" && answer !== "yes") throw new Error("已取消：未确认授权范围文件");
+    } finally {
+      prompt.close();
+    }
+  }
   let agentRuntime: Awaited<ReturnType<typeof bootstrapAgentRuntime>> | undefined;
   let app: AgentCliApp | undefined;
   let receivedSignal: NodeJS.Signals | undefined;
@@ -78,7 +107,9 @@ async function run(options: ReturnType<typeof parseCliOptions>): Promise<void> {
     }
     const scopeSummary = runContext.resumed
       ? runContext.scopeSummary!
-      : runContext.scopeSummary
+      : fileScope
+        ? fileScope.normalizedScope
+        : runContext.scopeSummary
         ? normalizeScope(runContext.scopeSummary)
         : await controller.inferScopeFromGoal(runContext.userGoal);
     if (transparentProxy) {
