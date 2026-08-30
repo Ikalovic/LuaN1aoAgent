@@ -35,6 +35,39 @@ beforeEach(() => {
 });
 
 describe("StartRunModal", () => {
+  it("accepts XLSX authorization files", () => {
+    render(<StartRunModal open onClose={() => undefined} onStarted={() => undefined} />);
+
+    expect(screen.getByLabelText("授权范围文件"))
+      .toHaveAttribute("accept", expect.stringContaining(".xlsx"));
+  });
+
+  it("submits a CTF run without an explicit scope", async () => {
+    render(<StartRunModal open onClose={() => undefined} onStarted={() => undefined} />);
+
+    fireEvent.mouseDown(screen.getByLabelText("任务类型"));
+    fireEvent.click(await screen.findByText("CTF 题目"));
+    await waitFor(() => expect(screen.getAllByTitle("CTF 题目").length).toBeGreaterThan(0));
+    fireEvent.change(screen.getByLabelText("任务目标"), { target: { value: "完成 CTF 挑战" } });
+    fireEvent.click(screen.getByRole("button", { name: /启\s*动/ }));
+
+    await waitFor(() => expect(mockedStart).toHaveBeenCalledWith(expect.objectContaining({
+      goal: "完成 CTF 挑战",
+      scope: "",
+      taskType: "ctf"
+    })));
+  });
+
+  it("still requires a scope for pentest runs", async () => {
+    render(<StartRunModal open onClose={() => undefined} onStarted={() => undefined} />);
+
+    fireEvent.change(screen.getByLabelText("任务目标"), { target: { value: "执行渗透测试" } });
+    fireEvent.click(screen.getByRole("button", { name: /启\s*动/ }));
+
+    expect(await screen.findByText("请输入授权范围")).toBeInTheDocument();
+    expect(mockedStart).not.toHaveBeenCalled();
+  });
+
   it("uploads, previews, confirms, and submits the exact parsed document scope", async () => {
     render(<StartRunModal open onClose={() => undefined} onStarted={() => undefined} />);
 

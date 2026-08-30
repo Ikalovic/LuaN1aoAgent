@@ -13,6 +13,7 @@ interface StartRunModalProps {
 export function StartRunModal({ open, onClose, onStarted }: StartRunModalProps) {
   const { t } = useLanguage();
   const [form] = Form.useForm();
+  const taskType = Form.useWatch("taskType", form) ?? "pentest";
   const [submitting, setSubmitting] = useState(false);
   const [parsing, setParsing] = useState(false);
   const [error, setError] = useState<string>();
@@ -75,7 +76,7 @@ export function StartRunModal({ open, onClose, onStarted }: StartRunModalProps) 
       okButtonProps={{ disabled: parsing || Boolean(parsedDocument && !documentConfirmed) }}
       width={560}
       destroyOnHidden
-      onOk={() => void submit()}
+      onOk={() => void submit().catch(() => undefined)}
       onCancel={() => {
         if (submitting) return;
         setError(undefined);
@@ -99,7 +100,7 @@ export function StartRunModal({ open, onClose, onStarted }: StartRunModalProps) 
         <Form.Item name="goal" label={t("startRun.goal")} rules={[{ required: true, whitespace: true, message: t("startRun.goalRequired") }]}>
           <Input.TextArea rows={4} maxLength={4000} placeholder={t("startRun.goalPlaceholder")} />
         </Form.Item>
-        <Form.Item name="scope" label={t("startRun.scope")} rules={[{
+        <Form.Item name="scope" label={t("startRun.scope")} dependencies={["taskType"]} rules={taskType === "ctf" ? [] : [{
           validator: (_, value) => parsedDocument || String(value ?? "").trim()
             ? Promise.resolve()
             : Promise.reject(new Error(t("startRun.scopeRequired")))
@@ -110,7 +111,7 @@ export function StartRunModal({ open, onClose, onStarted }: StartRunModalProps) 
           <input
             aria-label={t("startRun.scopeFile")}
             type="file"
-            accept=".txt,.md,.csv,.json,.docx,.pdf"
+            accept=".txt,.md,.csv,.json,.docx,.xlsx,.pdf"
             disabled={parsing || submitting}
             onChange={(event) => void selectDocument(event.currentTarget.files?.[0])}
           />

@@ -127,6 +127,8 @@ export interface ScopeDocumentCandidate {
     page?: number;
     paragraph?: number;
     line?: number;
+    sheet?: string;
+    cell?: string;
     excerpt: string;
   };
 }
