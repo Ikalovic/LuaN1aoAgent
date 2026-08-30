@@ -41,6 +41,7 @@ import { ScopeDocumentError, SCOPE_DOCUMENT_LIMITS } from "./scope-documents/sco
 import { resolveDocumentScopeWithLlm } from "./scope-documents/scope-document-resolver.js";
 import { ScopeDocumentService, ScopeDocumentServiceError } from "./scope-documents/scope-document-service.js";
 import { ScopeDocumentStore } from "./scope-documents/scope-document-store.js";
+import { SkillRegistry } from "./skills/skill-registry.js";
 import { loadPentestTemplates, normalizeTaskType, type ReportingContext, type TaskType } from "./reporting/task-reporting.js";
 import {
   clearCsrfCookie,
@@ -252,6 +253,7 @@ const defaultRuntimeDir = args["runtime-dir"] ?? ".agent-runtime";
 const authService = new WebAuthService(resolve(cwd, args["auth-db"] ?? ".agent-runtime/web-auth.sqlite"));
 const runtimePathPolicy = await RuntimePathPolicy.create(defaultRuntimeDir, { baseDir: cwd });
 const scopeDocumentStore = new ScopeDocumentStore(join(runtimePathPolicy.rootDir, "scope-documents"));
+const skillRegistry = new SkillRegistry(join(cwd, ".agents", "skills"));
 await reapStaleManagedDockerResources({
   roots: [cwd, runtimePathPolicy.rootDir],
   runner: defaultDockerRunner
@@ -302,6 +304,36 @@ const server = createServer(async (request, response) => {
       }
       requireRuntimeAccess(user!, "operator:mutate");
       await handleScopeDocumentUpload(request, response);
+      return;
+    }
+    if (url.pathname === "/api/skills") {
+      if (request.method !== "GET") {
+        await sendJson(response, { error: { code: "method_not_allowed", message: "仅支持 GET" } }, 405);
+        return;
+      }
+      requireRuntimeAccess(user!, "viewer:metadata");
+      await sendJson(response, skillRegistry.scan());
+      return;
+    }
+    const skillStateRoute = /^\/api\/skills\/([^/]+)\/state$/.exec(url.pathname);
+    if (skillStateRoute) {
+      if (request.method !== "POST") {
+        await sendJson(response, { error: { code: "method_not_allowed", message: "仅支持 POST" } }, 405);
+        return;
+      }
+      requireRuntimeAccess(user!, "operator:mutate");
+      const body = await readJsonBody(request);
+      assertOnlyKeys(body, ["enabled"]);
+      if (typeof body.enabled !== "boolean") throw new HttpError(400, "invalid_request", "enabled 必须是布尔值");
+      const name = decodeURIComponent(skillStateRoute[1]);
+      if (!/^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(name)) throw new HttpError(400, "invalid_request", "Skill 名称无效");
+      try {
+        skillRegistry.setEnabled(name, body.enabled);
+      } catch {
+        throw new HttpError(404, "skill_not_found", "Skill 不存在");
+      }
+      const skill = skillRegistry.snapshot().skills.find((item) => item.name === name)!;
+      await sendJson(response, skill);
       return;
     }
     const scopeDocumentRoute = /^\/api\/scope-documents\/([^/]+)$/.exec(url.pathname);
