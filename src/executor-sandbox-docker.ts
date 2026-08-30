@@ -69,6 +69,7 @@ type ExpectedContainerSpec = {
 
 export type DockerTaskNetworkAttachment = {
   networkName: string;
+  taskNetworkCidr: string;
   gatewayAddress: string;
   dnsAddress: string;
 };
@@ -458,6 +459,10 @@ export async function createDockerTaskSandbox(input: DockerTaskSandboxInput): Pr
           "--pids-limit", "32", "--memory", "128m", "--cpus", "0.25",
           image, "nsenter", "--target", "1", "--net", "sh", "-c",
           `set -eu; ip route replace default via ${shellQuote(input.network.gatewayAddress)}; `
+          + `iptables -C OUTPUT -d ${shellQuote(`${input.network.gatewayAddress}/32`)} -j ACCEPT 2>/dev/null `
+          + `|| iptables -I OUTPUT 1 -d ${shellQuote(`${input.network.gatewayAddress}/32`)} -j ACCEPT; `
+          + `iptables -C OUTPUT -d ${shellQuote(input.network.taskNetworkCidr)} -j REJECT 2>/dev/null `
+          + `|| iptables -A OUTPUT -d ${shellQuote(input.network.taskNetworkCidr)} -j REJECT; `
           + "iptables -t raw -C OUTPUT -d 127.0.0.11 -p udp --dport 53 -j DROP 2>/dev/null "
           + "|| iptables -t raw -I OUTPUT -d 127.0.0.11 -p udp --dport 53 -j DROP; "
           + "iptables -t raw -C OUTPUT -d 127.0.0.11 -p tcp --dport 53 -j DROP 2>/dev/null "

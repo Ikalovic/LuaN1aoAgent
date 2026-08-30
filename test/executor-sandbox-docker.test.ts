@@ -16,6 +16,7 @@ import { createBrowserRenderTool } from "../src/tools/browser-tools.js";
 
 const TEST_NETWORK = {
   networkName: "task-network",
+  taskNetworkCidr: "172.30.0.0/16",
   gatewayAddress: "172.30.0.2",
   dnsAddress: "172.30.0.2"
 };
@@ -312,6 +313,10 @@ test("sandbox start reconciles containers by config and tool operations map to d
   assert.ok(calls.some((call) => call[0] === "run" && call.includes("--rm") && call.includes("--privileged") && call.includes("nsenter")));
   const networkInit = calls.find((call) => call[0] === "run" && call.includes("nsenter"));
   assert.ok(networkInit?.some((argument) => argument.includes("set -eu")));
+  const networkInitScript = networkInit?.at(-1) ?? "";
+  assert.match(networkInitScript, /iptables -C OUTPUT -d '172\.30\.0\.2\/32' -j ACCEPT/);
+  assert.match(networkInitScript, /iptables -A OUTPUT -d '172\.30\.0\.0\/16' -j REJECT/);
+  assert.ok(networkInitScript.indexOf("172.30.0.2/32") < networkInitScript.indexOf("172.30.0.0/16"));
   assert.equal(
     await import("node:fs/promises").then(({ readFile }) => readFile(join(hostDir, "resolv.conf"), "utf8")),
     `nameserver ${TEST_NETWORK.dnsAddress}\noptions ndots:0\n`

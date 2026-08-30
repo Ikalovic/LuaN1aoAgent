@@ -31,7 +31,7 @@ function fakeDockerNetworkCommand(
     networks.set(name, {
       internal: args.includes("--internal"),
       labels,
-      subnet: args.includes("--internal") ? "172.31.0.0/24" : "172.30.0.0/24"
+      subnet: labels.get("luanniao.role") === "task-network" ? "172.31.0.0/24" : "172.30.0.0/24"
     });
     return { code: 0, stdout: `${name}\n`, stderr: "" };
   }
@@ -78,7 +78,7 @@ function ownedNetworkInspect(
   return {
     code: 0,
     stdout: taskNetwork
-      ? `true|task-network|${runRef}|${taskId}|172.31.0.0/24|true`
+      ? `true|task-network|${runRef}|${taskId}|172.31.0.0/24|false`
       : `true|run-network|${runRef}`,
     stderr: ""
   };
@@ -250,9 +250,12 @@ test("network sandbox gives only the gateway network capability and reconciles l
     assert.equal(index.some((value) => value.startsWith("luanniao.task_ref=")), false);
     const networkCreate = commands.find((args) => args[0] === "network" && args[1] === "create");
     assert.ok(networkCreate?.includes("luanniao.run_ref=run:test"));
-    const taskNetworkCreate = commands.find((args) => args[0] === "network" && args[1] === "create" && args.includes("--internal"));
+    const taskNetworkCreate = commands.find((args) => args[0] === "network" && args[1] === "create"
+      && args.includes("luanniao.role=task-network"));
+    assert.equal(taskNetworkCreate?.includes("--internal"), false);
     assert.ok(taskNetworkCreate?.includes("luanniao.role=task-network"));
     assert.ok(taskNetworkCreate?.includes("luanniao.task_ref=task:test"));
+    assert.equal((gateway as unknown as { taskNetworkCidr?: string }).taskNetworkCidr, "172.31.0.0/24");
     assert.ok(gatewayRun.includes("--network") && gatewayRun.includes(manager.networkName));
     assert.ok(commands.some((args) => args[0] === "network" && args[1] === "connect"
       && args[2] === gateway.networkName && args[3] === gateway.containerName));
@@ -649,7 +652,7 @@ test("gateway startup cleanup failure remains owned for close retry", async () =
           return { code: 0, stdout: args.at(-1)?.startsWith("luanniao-task-") ? "172.31.0.0/24" : "172.30.0.0/24", stderr: "" };
         }
         return args.at(-1)?.startsWith("luanniao-task-")
-          ? { code: 0, stdout: "true|task-network|run:gateway-start-cleanup|task:partial|172.31.0.0/24|true", stderr: "" }
+          ? { code: 0, stdout: "true|task-network|run:gateway-start-cleanup|task:partial|172.31.0.0/24|false", stderr: "" }
           : { code: 0, stdout: "true|run-network|run:gateway-start-cleanup", stderr: "" };
       }
       if (args[0] === "inspect" && args[2]?.includes("with index .NetworkSettings.Networks")) {

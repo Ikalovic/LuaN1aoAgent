@@ -2588,6 +2588,7 @@ export class SecurityAgentController {
           environment: this.environment,
           network: {
             networkName: gateway.networkName,
+            taskNetworkCidr: gateway.taskNetworkCidr,
             gatewayAddress: gateway.gatewayAddress,
             dnsAddress: gateway.dnsAddress
           },
@@ -2616,6 +2617,7 @@ export class SecurityAgentController {
         netFile: gateway.netFile,
         network: {
           task: { name: gateway.networkName, address: gateway.gatewayAddress },
+          taskNetworkCidr: gateway.taskNetworkCidr,
           control: { name: gateway.controlNetworkName, address: gateway.controlAddress },
           dnsAddress: gateway.dnsAddress,
           imageId: gateway.imageId,

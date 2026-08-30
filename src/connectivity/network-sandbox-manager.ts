@@ -46,6 +46,7 @@ export type TaskGateway = {
   epochId: string;
   containerName: string;
   networkName: string;
+  taskNetworkCidr: string;
   controlNetworkName?: string;
   gatewayAddress: string;
   controlAddress?: string;
@@ -331,6 +332,7 @@ export class NetworkSandboxManager {
         epochId: "",
         containerName,
         networkName: taskNetwork.name,
+        taskNetworkCidr: taskNetwork.subnet,
         controlNetworkName: this.networkName,
         gatewayAddress,
         controlAddress,
@@ -492,6 +494,7 @@ export class NetworkSandboxManager {
         epochId,
         containerName: spec.containerName,
         networkName: taskNetwork.name,
+        taskNetworkCidr: taskNetwork.subnet,
         controlNetworkName: this.networkName,
         gatewayAddress: gatewayAddress ?? "",
         controlAddress: running === "true"
@@ -530,6 +533,7 @@ export class NetworkSandboxManager {
     this.gateways.set(taskId, {
       ...gateway,
       networkName: taskNetwork.name,
+      taskNetworkCidr: taskNetwork.subnet,
       controlNetworkName: this.networkName,
       gatewayAddress,
       controlAddress,
@@ -859,14 +863,14 @@ export class NetworkSandboxManager {
       if (managed !== "true" || role !== "task-network"
         || optionalDockerLabel(rawRunRef) !== this.runRef
         || optionalDockerLabel(rawTaskRef) !== taskId
-        || internal !== "true" || !subnet) {
+        || internal !== "false" || !subnet) {
         throw new Error(`Refusing to reuse invalid task network ${name}`);
       }
       this.taskNetworks.add(taskId);
       return { name, subnet };
     }
     const created = await this.runner([
-      "network", "create", "--driver", "bridge", "--internal",
+      "network", "create", "--driver", "bridge",
       "--label", "luanniao.managed=true", "--label", "luanniao.role=task-network",
       "--label", `luanniao.run_ref=${this.runRef}`,
       "--label", `luanniao.task_ref=${taskId}`,

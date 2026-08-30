@@ -36,6 +36,7 @@ test("ConnectivityRuntime owns startup, task serialization, and non-destructive 
         epochId,
         containerName: "gateway",
         networkName: "task-network",
+        taskNetworkCidr: "172.30.0.0/16",
         gatewayAddress: "172.30.0.2",
         dnsAddress: "172.30.0.2",
         flowFile: `${epochId}.mitm`,
