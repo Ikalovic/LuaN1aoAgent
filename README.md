@@ -358,6 +358,14 @@ is stored as a non-searchable `0600` credential Artifact and is omitted from eve
 Because SOCKS5 carries TCP, scoped TCP tools such as `curl`, `nmap -sT`, and TCP clients use the proxy;
 route-matched UDP and ICMP fail closed.
 
+An opt-in Docker smoke test verifies that authorized Executor TCP crosses the Gateway while direct
+task-bridge access remains blocked:
+
+```bash
+npm run build:server
+LUANNIAO_DOCKER_LIVE_TEST=1 npm run test:network-live
+```
+
 Resume one specific unfinished session without repeating or replacing its Goal or authorized Scope:
 
 ```bash
