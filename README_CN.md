@@ -221,7 +221,7 @@ npx skills add ljagiello/ctf-skills \
   --skill '*' --agent pi --global --yes
 ```
 
-`./install.sh` 安装的技能位于项目本地 `.agents/skills/`（已加入 gitignore）。Executor 会话通过运行时的 additional skill paths 加载它们，Executor 沙箱也将该目录加入读白名单。它们是独立第三方项目，分别遵循各自的许可证和更新周期。
+`./install.sh` 安装的技能位于项目本地 `.agents/skills/`（已加入 gitignore）。运行时会校验 Skill 的名称、描述和真实路径，模型根据每个 Task 自动选择，再只向该 Task 的 Executor 暴露选中的 Skill；目录缺失、Skill 无效或选择失败时使用空列表继续运行。状态接口为 `GET /api/skills`，管理员可通过 `POST /api/skills/<name>/state` 和 `{ "enabled": false }` 禁用 Skill。
 
 ### 沙箱隔离
 
@@ -347,11 +347,21 @@ npm start -- --resume 20260720-080000Z-a1b2c3d4
 
 `--resume` 接受 `.agent-runtime/sessions/` 下的 Session 名称或完整运行时路径。恢复时不要传入 `--goal` 或 `--scope`。
 
+也可以从 TXT、Markdown、CSV、JSON、DOCX 或带文本层的 PDF 提取域名、IPv4 和 CIDR：
+
+```bash
+npm start -- --goal "评估授权资产" --scope-file authorization.docx --confirm-scope-files --no-tui
+```
+
+`--scope-file` 可重复并与 `--scope` 合并。Web 启动任务窗口也可上传并预览范围文件。单文件上限 5 MiB；扫描 PDF 不做 OCR；模型只能选择文件原文中有证据的资产，不能通过 DNS、FOFA 或关联关系扩大授权范围。
+
 ### CLI 参数
 
 ```text
 --goal <text>                Agent 目标
 --scope <text>               授权范围摘要
+--scope-file <path>          从文件解析授权范围，可重复
+--confirm-scope-files        非交互模式确认使用文件解析结果
 --runtime-dir <path>         新运行使用的空目录
 --resume <session>           恢复一个运行，同时恢复 Goal 与 Scope
 --max-cycles <number>        Planner 最大循环数

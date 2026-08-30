@@ -221,7 +221,7 @@ npx skills add ljagiello/ctf-skills \
   --skill '*' --agent pi --global --yes
 ```
 
-Skills installed by `./install.sh` live in the project-local `.agents/skills/` (gitignored). The Executor session loads them through the runtime's additional skill paths, and the Executor sandbox whitelists the directory for reads. They remain separate third-party projects with their own licenses and update cycles.
+Skills installed by `./install.sh` live in the project-local `.agents/skills/` (gitignored). Runtime validates each name, description, and canonical path, selects relevant Skills per Task with the Planner model, and exposes only those selected directories to that Task's Executor. Missing, invalid, or failed Skill selection falls back to an empty list. Inspect status with `GET /api/skills`; administrators can toggle a Skill with `POST /api/skills/<name>/state` and `{ "enabled": false }`.
 
 ### Sandbox Isolation
 
@@ -364,11 +364,21 @@ npm start -- --resume 20260720-080000Z-a1b2c3d4
 
 `--resume` accepts either the session name under `.agent-runtime/sessions/` or its full runtime path. Do not pass `--goal` or `--scope` when resuming.
 
+Scope may also be extracted from TXT, Markdown, CSV, JSON, DOCX, or text-layer PDF files:
+
+```bash
+npm start -- --goal "Assess authorized assets" --scope-file authorization.docx --confirm-scope-files --no-tui
+```
+
+Repeat `--scope-file` and combine it with `--scope` to form a union. The Web start-run dialog also uploads and previews scope documents. Each file is limited to 5 MiB; scanned PDFs are not OCRed; AI may select only evidence-backed assets literally present in the document and cannot broaden authorization through DNS, FOFA, or inferred relationships.
+
 ### CLI options
 
 ```text
 --goal <text>                Agent goal
 --scope <entries>            Authorized IPv4/CIDRs/domains (for example baidu.com,*.baidu.com)
+--scope-file <path>          Parse authorized scope from a file; may be repeated
+--confirm-scope-files        Confirm parsed files in non-interactive mode
 --proxy <socks5-url>         Transparently route all scoped Agent TCP through SOCKS5
 --runtime-dir <path>         Empty directory for a new runtime
 --resume <session>           Resume one runtime; restores Goal and Scope
