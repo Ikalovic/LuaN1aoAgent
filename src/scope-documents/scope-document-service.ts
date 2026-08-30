@@ -63,15 +63,10 @@ export class ScopeDocumentService {
     if (!stored) {
       throw new ScopeDocumentServiceError("scope_document_not_found", "授权文件解析结果不存在或已失效");
     }
-    let confirmed: string;
-    try {
-      confirmed = normalizeScope(input.confirmedScope);
-    } catch {
-      throw new ScopeDocumentServiceError("scope_confirmation_mismatch", "确认范围不是有效的解析结果");
-    }
-    if (confirmed !== stored.parsed.normalizedScope) {
+    if (input.confirmedScope !== stored.parsed.normalizedScope) {
       throw new ScopeDocumentServiceError("scope_confirmation_mismatch", "确认范围与文件解析结果不一致");
     }
+    const confirmed = stored.parsed.normalizedScope;
     return input.manualScope?.trim()
       ? normalizeScope(`${confirmed},${input.manualScope}`)
       : confirmed;

@@ -7,7 +7,7 @@ import { createInterface } from "node:readline";
 import { DatabaseSync } from "node:sqlite";
 import { WebAuthError, WebAuthService, type WebUser } from "./web-auth.js";
 import { SecurityAgentController } from "./controller.js";
-import { loadLocalEnvFile } from "./llm-config.js";
+import { createLlmRuntime, loadLocalEnvFile } from "./llm-config.js";
 import { stableSessionNodeId } from "./operation-identity.js";
 import {
   bootstrapAgentRuntime,
@@ -37,6 +37,10 @@ import { ExecutionLog } from "./stores/execution-log.js";
 import { discoverRuntimeSessionDirs } from "./runtime-session-discovery.js";
 import { RuntimePathPolicy, RuntimePathPolicyError } from "./runtime-path-policy.js";
 import { normalizeScope } from "./scope.js";
+import { ScopeDocumentError, SCOPE_DOCUMENT_LIMITS } from "./scope-documents/scope-document-formats.js";
+import { resolveDocumentScopeWithLlm } from "./scope-documents/scope-document-resolver.js";
+import { ScopeDocumentService, ScopeDocumentServiceError } from "./scope-documents/scope-document-service.js";
+import { ScopeDocumentStore } from "./scope-documents/scope-document-store.js";
 import { loadPentestTemplates, normalizeTaskType, type ReportingContext, type TaskType } from "./reporting/task-reporting.js";
 import {
   clearCsrfCookie,
@@ -247,6 +251,7 @@ const staticRoot = resolve(cwd, "web", "dist");
 const defaultRuntimeDir = args["runtime-dir"] ?? ".agent-runtime";
 const authService = new WebAuthService(resolve(cwd, args["auth-db"] ?? ".agent-runtime/web-auth.sqlite"));
 const runtimePathPolicy = await RuntimePathPolicy.create(defaultRuntimeDir, { baseDir: cwd });
+const scopeDocumentStore = new ScopeDocumentStore(join(runtimePathPolicy.rootDir, "scope-documents"));
 await reapStaleManagedDockerResources({
   roots: [cwd, runtimePathPolicy.rootDir],
   runner: defaultDockerRunner
@@ -288,6 +293,25 @@ const server = createServer(async (request, response) => {
       requireRuntimeAccess(user!, "viewer:metadata");
       const rootDir = url.searchParams.get("rootDir") ?? defaultRuntimeDir;
       await sendJson(response, await readRuntimeSessions(rootDir));
+      return;
+    }
+    if (url.pathname === "/api/scope-documents") {
+      if (request.method !== "POST") {
+        await sendJson(response, { error: { code: "method_not_allowed", message: "仅支持 POST" } }, 405);
+        return;
+      }
+      requireRuntimeAccess(user!, "operator:mutate");
+      await handleScopeDocumentUpload(request, response);
+      return;
+    }
+    const scopeDocumentRoute = /^\/api\/scope-documents\/([^/]+)$/.exec(url.pathname);
+    if (scopeDocumentRoute) {
+      if (request.method !== "GET") {
+        await sendJson(response, { error: { code: "method_not_allowed", message: "仅支持 GET" } }, 405);
+        return;
+      }
+      requireRuntimeAccess(user!, "viewer:metadata");
+      await handleScopeDocumentRead(response, decodeURIComponent(scopeDocumentRoute[1]));
       return;
     }
     if (url.pathname === "/api/runs") {
@@ -407,6 +431,28 @@ const server = createServer(async (request, response) => {
     }
     if (error instanceof RuntimePathPolicyError) {
       const statusCode = error.code === "runtime_path_not_found" ? 404 : error.code === "runtime_path_outside_root" ? 403 : 400;
+      await sendJson(response, { error: { code: error.code, message: error.message } }, statusCode);
+      return;
+    }
+    if (error instanceof ScopeDocumentError) {
+      const statusCode = error.code === "document_too_large"
+        ? 413
+        : error.code === "unsupported_document_type"
+          ? 415
+          : ["scanned_pdf_not_supported", "encrypted_pdf_not_supported"].includes(error.code)
+            ? 422
+            : 400;
+      await sendJson(response, { error: { code: error.code, message: error.message } }, statusCode);
+      return;
+    }
+    if (error instanceof ScopeDocumentServiceError) {
+      const statusCode = error.code === "scope_document_not_found"
+        ? 404
+        : error.code === "scope_confirmation_mismatch"
+          ? 409
+          : error.code === "no_scope_candidates"
+            ? 422
+            : 400;
       await sendJson(response, { error: { code: error.code, message: error.message } }, statusCode);
       return;
     }
@@ -1265,7 +1311,13 @@ function optionalReplayText(value: unknown, name: string, maxLength: number, all
 }
 
 function validBase64(value: string): boolean {
-  return /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(value);
+  if (value.length === 0 || value.length % 4 !== 0) return false;
+  const firstPadding = value.indexOf("=");
+  const content = firstPadding === -1 ? value : value.slice(0, firstPadding);
+  const padding = firstPadding === -1 ? "" : value.slice(firstPadding);
+  return !/[^A-Za-z0-9+/]/.test(content)
+    && (padding === "" || padding === "=" || padding === "==")
+    && (padding.length === 0 || content.length % 4 === 4 - padding.length);
 }
 
 function replayResultBody(result: TrafficReplayResult): JsonRecord {
@@ -1483,10 +1535,62 @@ function integerValue(value: string, name: string, min: number, max: number): nu
   return parsed;
 }
 
+async function handleScopeDocumentUpload(request: IncomingMessage, response: ServerResponse): Promise<void> {
+  const body = await readJsonBody(request, 8 << 20);
+  assertOnlyKeys(body, ["fileName", "contentBase64", "useAi"]);
+  const fileName = stringValue(body.fileName).trim();
+  const contentBase64 = stringValue(body.contentBase64);
+  if (
+    !fileName ||
+    fileName.length > 255 ||
+    /[\\/\u0000-\u001f\u007f]/.test(fileName) ||
+    basename(fileName) !== fileName
+  ) {
+    throw new HttpError(400, "invalid_document_name", "授权文件名无效");
+  }
+  if (!contentBase64 || !validBase64(contentBase64)) {
+    throw new HttpError(400, "invalid_document_base64", "授权文件内容不是有效的 Base64");
+  }
+  if (body.useAi !== undefined && typeof body.useAi !== "boolean") {
+    throw new HttpError(400, "invalid_request", "useAi 必须是布尔值");
+  }
+  const data = Buffer.from(contentBase64, "base64");
+  if (data.byteLength > SCOPE_DOCUMENT_LIMITS.inputBytes) {
+    throw new ScopeDocumentError("document_too_large", "授权文件不能超过 5 MiB");
+  }
+  const useAi = body.useAi !== false;
+  const service = new ScopeDocumentService({
+    store: scopeDocumentStore,
+    aiResolver: useAi
+      ? async (fragments) => resolveDocumentScopeWithLlm({
+        cwd,
+        fragments,
+        llmRuntime: createLlmRuntime()
+      })
+      : undefined
+  });
+  await sendJson(response, await service.parse({ fileName, data }), 201);
+}
+
+async function handleScopeDocumentRead(response: ServerResponse, documentId: string): Promise<void> {
+  let stored;
+  try {
+    stored = await scopeDocumentStore.get(documentId);
+  } catch {
+    throw new ScopeDocumentServiceError("scope_document_not_found", "授权文件解析结果不存在或已失效");
+  }
+  if (!stored) {
+    throw new ScopeDocumentServiceError("scope_document_not_found", "授权文件解析结果不存在或已失效");
+  }
+  await sendJson(response, stored.parsed);
+}
+
 async function handleStartRun(request: IncomingMessage, response: ServerResponse): Promise<void> {
   const body = await readJsonBody(request);
   const goal = stringValue(body.goal, "").trim();
   const rawScope = stringValue(body.scope, "").trim();
+  const scopeDocumentId = stringValue(body.scopeDocumentId, "").trim();
+  const confirmedDocumentScope = stringValue(body.confirmedDocumentScope, "").trim();
   let taskType: TaskType;
   try {
     taskType = normalizeTaskType(body.taskType);
@@ -1494,18 +1598,33 @@ async function handleStartRun(request: IncomingMessage, response: ServerResponse
     await sendJson(response, { error: { code: "invalid_request", message: error instanceof Error ? error.message : String(error) } }, 400);
     return;
   }
-  if (!goal || !rawScope) {
-    await sendJson(response, { error: { code: "invalid_request", message: "goal 和 scope 不能为空" } }, 400);
+  if (!goal || (!rawScope && !scopeDocumentId && !confirmedDocumentScope)) {
+    await sendJson(response, { error: { code: "invalid_request", message: "goal 不能为空，且必须提供 scope 或已确认的授权文件" } }, 400);
+    return;
+  }
+  if (Boolean(scopeDocumentId) !== Boolean(confirmedDocumentScope)) {
+    await sendJson(response, { error: { code: "invalid_request", message: "scopeDocumentId 与 confirmedDocumentScope 必须同时提供" } }, 400);
     return;
   }
   if (goal.length > 4000 || rawScope.length > 4000) {
     await sendJson(response, { error: { code: "invalid_request", message: "goal/scope 长度不能超过 4000 字符" } }, 400);
     return;
   }
+  if (confirmedDocumentScope.length > 64 * 1024) {
+    await sendJson(response, { error: { code: "invalid_request", message: "confirmedDocumentScope 长度不能超过 65536 字符" } }, 400);
+    return;
+  }
   let scope: string;
   try {
-    scope = normalizeScope(rawScope);
+    scope = scopeDocumentId
+      ? await new ScopeDocumentService({ store: scopeDocumentStore }).confirm({
+        documentId: scopeDocumentId,
+        confirmedScope: confirmedDocumentScope,
+        manualScope: rawScope
+      })
+      : normalizeScope(rawScope);
   } catch (error) {
+    if (error instanceof ScopeDocumentServiceError) throw error;
     await sendJson(response, {
       error: { code: "invalid_request", message: error instanceof Error ? error.message : String(error) }
     }, 400);
@@ -1542,6 +1661,18 @@ async function handleStartRun(request: IncomingMessage, response: ServerResponse
       trafficProxyRegistry
     });
     const { controller } = agentRuntime;
+    if (scopeDocumentId) {
+      await scopeDocumentStore.copyToRuntime(scopeDocumentId, runtimeDir);
+      await controller.executionLog.append({
+        role: "runtime",
+        eventType: "scope_document_confirmed",
+        summary: `Confirmed scope document ${scopeDocumentId}`,
+        payload: {
+          documentId: scopeDocumentId,
+          normalizedScope: confirmedDocumentScope
+        }
+      });
+    }
 
     run = {
       runtimeDir,

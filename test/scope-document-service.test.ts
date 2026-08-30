@@ -41,6 +41,14 @@ test("rejects changed confirmation, missing documents, and empty extraction", as
       documentId: parsed.documentId,
       confirmedScope: "0.0.0.0/0"
     }), (error: unknown) => hasCode(error, "scope_confirmation_mismatch"));
+    const multi = await service.parse({
+      fileName: "multi.txt",
+      data: Buffer.from("api.example\n10.0.0.1")
+    });
+    await assert.rejects(() => service.confirm({
+      documentId: multi.documentId,
+      confirmedScope: "api.example,10.0.0.1/32"
+    }), (error: unknown) => hasCode(error, "scope_confirmation_mismatch"));
     await assert.rejects(() => service.confirm({
       documentId: "00000000-0000-4000-8000-000000000000",
       confirmedScope: "api.example"
