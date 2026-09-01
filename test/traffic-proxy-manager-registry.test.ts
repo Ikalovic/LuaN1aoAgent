@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { chmod, lstat, mkdtemp, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdtemp, mkdir, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { createServer, type Socket } from "node:net";
 import { join } from "node:path";
 import test from "node:test";
@@ -152,7 +152,10 @@ test("concurrent closeAll calls share one promise and reject later get calls", a
 });
 
 test("long project runtime uses the private agent-runtime socket directory", async () => {
-  const root = await mkdtemp(join(process.cwd(), ".agent-runtime", "traffic-proxy-long-"));
+  const projectRoot = await mkdtemp("/tmp/traffic-proxy-long-project-");
+  const agentRuntime = join(projectRoot, ".agent-runtime");
+  await mkdir(agentRuntime);
+  const root = await mkdtemp(join(agentRuntime, "traffic-proxy-long-"));
   const runtime = join(root, "deep-runtime-".repeat(8), "session");
   const alias = join(root, "runtime-alias");
   const owner = new TrafficProxyManager(runtime, { binary });
@@ -161,9 +164,9 @@ test("long project runtime uses the private agent-runtime socket directory", asy
     assert.ok(Buffer.byteLength(join(runtime, "traffic-proxy", "control.sock"), "utf8") > 103);
     await owner.start();
     assert.equal((await owner.client.historyList()).items.length, 0);
-    assert.equal(owner.controlSocket.startsWith(join(process.cwd(), ".agent-runtime", ".s")), true);
+    assert.equal(owner.controlSocket.startsWith(join(agentRuntime, ".s")), true);
     assert.ok(Buffer.byteLength(owner.controlSocket, "utf8") <= 103);
-    assert.equal((await lstat(join(process.cwd(), ".agent-runtime", ".s"))).mode & 0o777, 0o700);
+    assert.equal((await lstat(join(agentRuntime, ".s"))).mode & 0o777, 0o700);
 
     await symlink(runtime, alias);
     attached = new TrafficProxyManager(alias, { binary });
@@ -184,7 +187,7 @@ test("long project runtime uses the private agent-runtime socket directory", asy
       }
     }
     await assert.rejects(lstat(owner.controlSocket), /ENOENT/);
-    await rm(root, { recursive: true, force: true });
+    await rm(projectRoot, { recursive: true, force: true });
   }
 });
 
