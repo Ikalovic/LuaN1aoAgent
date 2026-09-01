@@ -2,7 +2,6 @@ import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { mkdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
-import { performance } from "node:perf_hooks";
 import { promisify } from "node:util";
 
 const LEASE_DIRECTORY = ".connectivity-runtime-owner";
@@ -12,7 +11,6 @@ const ACQUIRE_ATTEMPTS = 100;
 const HEARTBEAT_INTERVAL_MS = 15_000;
 const HEARTBEAT_EXPIRY_MS = 90_000;
 const execFileAsync = promisify(execFile);
-const CURRENT_PROCESS_START_IDENTITY = `${process.platform}:${process.pid}:node-${Math.floor(performance.timeOrigin)}`;
 const localOwners = new Map<string, ConnectivityRuntimeOwnerLease>();
 
 type LegacyLeaseRecord = {
@@ -326,7 +324,6 @@ function processIsAlive(pid: number): boolean {
 }
 
 async function readProcessStartIdentity(pid: number): Promise<string | undefined> {
-  if (pid === process.pid) return CURRENT_PROCESS_START_IDENTITY;
   if (process.platform === "linux") {
     try {
       const statLine = await readFile(`/proc/${pid}/stat`, "utf8");
