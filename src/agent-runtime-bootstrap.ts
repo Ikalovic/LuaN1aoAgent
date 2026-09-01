@@ -56,7 +56,7 @@ export async function bootstrapAgentRuntime(input: AgentRuntimeBootstrapOptions)
   const executorSandboxMode: ExecutorSandboxRequestedMode = dockerBackend ? "docker" : requestedMode;
   if (dockerBackend) {
     await reapStaleManagedDockerResources({
-      roots: [input.cwd, input.runtimeDir],
+      roots: [input.runtimeDir],
       runner: input.dockerRunner ?? defaultDockerRunner
     });
   }

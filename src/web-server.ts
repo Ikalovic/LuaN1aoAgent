@@ -255,7 +255,7 @@ const runtimePathPolicy = await RuntimePathPolicy.create(defaultRuntimeDir, { ba
 const scopeDocumentStore = new ScopeDocumentStore(join(runtimePathPolicy.rootDir, "scope-documents"));
 const skillRegistry = new SkillRegistry(join(cwd, ".agents", "skills"));
 await reapStaleManagedDockerResources({
-  roots: [cwd, runtimePathPolicy.rootDir],
+  roots: [runtimePathPolicy.rootDir],
   runner: defaultDockerRunner
 });
 const sessionCookieName = "luanniao_session";
