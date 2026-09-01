@@ -249,7 +249,7 @@ class RouteProxyTest(unittest.TestCase):
 
             self.assertEqual(result["status"], "icmp_proxy_unsupported")
             runner.assert_not_called()
-    def test_gateway_epoch_files_expose_only_network_metadata(self) -> None:
+    def test_gateway_epoch_files_are_writable_across_gateway_uids(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             flow_file = root / "epoch.mitm"
@@ -264,8 +264,8 @@ class RouteProxyTest(unittest.TestCase):
                 "netFile": str(net_file),
             })
 
-            self.assertEqual(stat.S_IMODE(flow_file.stat().st_mode), 0o660)
-            self.assertEqual(stat.S_IMODE(net_file.stat().st_mode), 0o644)
+            self.assertEqual(stat.S_IMODE(flow_file.stat().st_mode), 0o666)
+            self.assertEqual(stat.S_IMODE(net_file.stat().st_mode), 0o666)
 
     def test_missing_readiness_file_is_not_ready(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

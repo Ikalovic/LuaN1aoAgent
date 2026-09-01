@@ -615,7 +615,11 @@ class GatewayControl:
             raise ValueError("invalid epochRef")
         flow_file = self._capture_path(payload.get("flowFile"), ".mitm")
         net_file = self._capture_path(payload.get("netFile"), ".net.jsonl")
-        for path, mode in ((flow_file, 0o660), (net_file, 0o644)):
+        # The control server creates these files as root while gateway-tun
+        # persists capture data as uid 101. Bind mounts (notably WSL/Docker
+        # Desktop) do not reliably support chown, so keep both files writable
+        # across the privilege boundary instead of depending on ownership.
+        for path, mode in ((flow_file, 0o666), (net_file, 0o666)):
             path.parent.mkdir(parents=True, exist_ok=True)
             path.touch(exist_ok=True)
             os.chmod(path, mode)
