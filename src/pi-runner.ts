@@ -800,7 +800,7 @@ function positiveInteger(value: number | undefined): number | undefined {
 
 export function classifyLlmErrorKind(message: string): LlmErrorKind {
   const normalized = message.toLowerCase();
-  if (/concurrency limit|too many concurrent|concurrent request/.test(normalized)) {
+  if (/concurrency limit|too many concurrent|concurrent request|agent is already processing|already processing.*streamingbehavior/.test(normalized)) {
     return "provider_concurrency";
   }
   if (/rate limit|too many requests|\b429\b|quota/.test(normalized)) {

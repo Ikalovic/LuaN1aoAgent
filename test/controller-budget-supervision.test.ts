@@ -4913,6 +4913,22 @@ test("Projector knowledge steer does not invalidate an active Planner submission
   await harness.controller.close({ drainProjectionJobs: false });
 });
 
+test("a streaming shared Planner session is not reused for a new cycle", async () => {
+  const harness = createControllerHarness();
+  const busyPlanner = {
+    isStreaming: true,
+    async abort(): Promise<void> {}
+  };
+  harness.controllerHarness.agents.planner = busyPlanner;
+
+  const selected = await harness.controllerHarness.createPlannerSessionForCycle();
+
+  assert.equal(selected.isolated, true);
+  assert.notEqual(selected.session, busyPlanner);
+  (selected.session as unknown as { dispose?: () => void }).dispose?.();
+  await harness.controller.close({ drainProjectionJobs: false });
+});
+
 test("every projector commit sends an evidence-backed semantic manifest to all active executors", async () => {
   const harness = createControllerHarness();
   const steersByTask = new Map<string, string[]>();
