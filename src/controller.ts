@@ -2,7 +2,11 @@ import { createHash, randomUUID } from "node:crypto";
 import { mkdir } from "node:fs/promises";
 import { join } from "node:path";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
-import { createExecutorAgentSession, createObserverAgentSession, createPlannerAgentSession, createScopeResolverAgentSession, projectSkillsDirs, type SecurityAgentRuntime, type SecurityAgentSession } from "./agents.js";
+import { createExecutorAgentSession, createObserverAgentSession, createPlannerAgentSession, createScopeResolverAgentSession, createApprovalJudgeAgentSession, projectSkillsDirs, type SecurityAgentRuntime, type SecurityAgentSession } from "./agents.js";
+import type { ApprovalMode } from "./approval/dangerous-tool-policy.js";
+import { LlmRiskJudge } from "./approval/llm-risk-judge.js";
+import type { TerminalApprover } from "./approval/tool-approval-extension.js";
+import type { ToolApprovalRegistry } from "./approval/tool-approval-registry.js";
 import { SkillRegistry, type SkillRegistrySnapshot } from "./skills/skill-registry.js";
 import { selectSkillsForTask, type SkillSelectionResult } from "./skills/skill-selector.js";
 import { extractJsonObject } from "./json.js";
@@ -477,6 +481,11 @@ export class SecurityAgentController {
   private activeRun?: ActiveRunRecord;
   private currentUserGoal?: string;
   private reportingContext: ReportingContext = { taskType: "pentest" };
+  private readonly approvalMode: ApprovalMode | (() => ApprovalMode);
+  private readonly approvalRegistry?: ToolApprovalRegistry;
+  private readonly terminalApprover?: TerminalApprover;
+  private approvalJudge?: LlmRiskJudge;
+  private activeScopeSummary?: string;
 
   constructor(input: {
     cwd: string;
@@ -487,6 +496,11 @@ export class SecurityAgentController {
     beekeeperRuntimeFactory?: (input: BeekeeperMcpRuntimeOptions) => BeekeeperMcpRuntime;
     skillRegistry?: { scan(): SkillRegistrySnapshot };
     skillSelector?: (input: { taskGoal: string; snapshot: SkillRegistrySnapshot }) => Promise<SkillSelectionResult>;
+    toolApproval?: {
+      mode: ApprovalMode | (() => ApprovalMode);
+      registry?: ToolApprovalRegistry;
+      terminalApprover?: TerminalApprover;
+    };
   }) {
     this.cwd = input.cwd;
     this.runtimeDir = input.runtimeDir ?? join(input.cwd, ".agent-runtime");
@@ -496,6 +510,9 @@ export class SecurityAgentController {
     this.beekeeperRuntimeFactory = input.beekeeperRuntimeFactory
       ?? ((options) => new BeekeeperMcpRuntime(options));
     this.skillRegistry = input.skillRegistry ?? new SkillRegistry(join(input.cwd, ".agents", "skills"));
+    this.approvalMode = input.toolApproval?.mode ?? "off";
+    this.approvalRegistry = input.toolApproval?.registry;
+    this.terminalApprover = input.toolApproval?.terminalApprover;
     this.skillSelector = input.skillSelector ?? ((selectionInput) => selectSkillsForTask({
       ...selectionInput,
       cwd: this.cwd,
@@ -902,6 +919,7 @@ export class SecurityAgentController {
     maxParallelTasks?: number;
     maxRunTimeMs?: number;
   }): Promise<RunResult> {
+    this.activeScopeSummary = input.scopeSummary;
     this.reportingContext = input.reportingContext ?? { taskType: input.taskType ?? "pentest" };
     this.reportingContext = { ...this.reportingContext, taskType: input.taskType ?? this.reportingContext.taskType ?? "pentest" };
     await this.connectivityRuntime?.configureAuthorizedScope(input.scopeSummary);
@@ -1265,6 +1283,9 @@ export class SecurityAgentController {
     if (this.graphStoreClosed) {
       return Promise.resolve();
     }
+    // Settle any approval request still waiting on an operator so the
+    // executor sessions parked on them can terminate during shutdown.
+    this.approvalRegistry?.settleRun(this.runId);
     this.closePromise ??= this.closeInternal(input).catch((error: unknown) => {
       this.closePromise = undefined;
       throw error;
@@ -1278,6 +1299,8 @@ export class SecurityAgentController {
     projectionCancelGraceMs?: number;
   }): Promise<void> {
     this.invocationAbortController.abort("Controller shutdown");
+    this.approvalJudge?.dispose();
+    this.approvalJudge = undefined;
     const executorTerminations: Array<{ state: ActiveTaskState; promise: Promise<void> }> = [];
     for (const state of [...this.activeEpochs.values()]) {
       if (state.lifecycleState === "closed") {
@@ -2725,6 +2748,43 @@ export class SecurityAgentController {
     return this.connectivityRuntime;
   }
 
+  /**
+   * Per-task tool approval configuration for executor sessions. The extension
+   * is always installed so the WebUI can switch modes live; the mode getter is
+   * read on every tool call and the judge session is created lazily the first
+   * time a mode actually needs it.
+   */
+  private async executorToolApproval(taskEnvelope: TaskEnvelope) {
+    return {
+      mode: this.approvalMode,
+      context: {
+        runId: this.runId,
+        runtimeDir: this.runtimeDir,
+        taskId: taskEnvelope.taskId,
+        taskGoal: taskEnvelope.goal,
+        scopeSummary: this.activeScopeSummary
+      },
+      judge: () => this.requireApprovalJudge(),
+      registry: this.approvalRegistry,
+      terminalApprover: this.terminalApprover
+    };
+  }
+
+  /** Lazily create the shared LLM risk judge session; undefined when unavailable. */
+  private async requireApprovalJudge(): Promise<LlmRiskJudge | undefined> {
+    if (this.approvalJudge) return this.approvalJudge;
+    try {
+      const judgeSession = await createApprovalJudgeAgentSession({
+        cwd: this.cwd,
+        llmRuntime: this.llmRuntime
+      });
+      this.approvalJudge = new LlmRiskJudge(judgeSession.session);
+    } catch {
+      this.approvalJudge = undefined;
+    }
+    return this.approvalJudge;
+  }
+
   private createTaskConnectivityTools(taskId: string) {
     const runtime = this.connectivityRuntime;
     if (!runtime) return [];
@@ -3059,7 +3119,8 @@ export class SecurityAgentController {
         sessionManager,
         skillsDirs: selectedSkillDirs,
         additionalTools: this.createTaskRuntimeTools(taskEnvelope),
-        providerAdmission: this.providerAdmission("executor")
+        providerAdmission: this.providerAdmission("executor"),
+        toolApproval: await this.executorToolApproval(taskEnvelope)
       });
       const lease: ExecutorSessionLease = {
         session: executor.session,
@@ -3108,7 +3169,8 @@ export class SecurityAgentController {
       sessionManager,
       skillsDirs: selectedSkillDirs,
       additionalTools: this.createTaskRuntimeTools(taskEnvelope),
-      providerAdmission: this.providerAdmission("executor")
+      providerAdmission: this.providerAdmission("executor"),
+      toolApproval: await this.executorToolApproval(taskEnvelope)
     });
     const sessionFile = executor.session.sessionFile;
     if (!sessionFile) {

@@ -63,6 +63,13 @@ import {
   type TraceIntentSource,
   type TraceToolCall
 } from "./web-trace-presentation.js";
+import { ToolApprovalRegistry } from "./approval/tool-approval-registry.js";
+import {
+  APPROVAL_MODE_ENV,
+  DEFAULT_APPROVAL_MODE,
+  resolveApprovalMode,
+  type ApprovalMode
+} from "./approval/dangerous-tool-policy.js";
 
 type JsonRecord = Record<string, unknown>;
 
@@ -262,6 +269,22 @@ const sessionCookieName = "luanniao_session";
 const MAX_CONCURRENT_TRAFFIC_REPLAYS = 4;
 let activeTrafficReplays = 0;
 const activeRuns = new Map<string, ActiveRun>();
+
+// Dangerous-operation approval: resolved at server startup from the environment;
+// operators can switch modes at runtime via POST /api/approvals/mode. The
+// registry is shared by all runs and its audit trail writes into each run's
+// own log.
+let approvalMode: ApprovalMode;
+try {
+  approvalMode = resolveApprovalMode(process.env[APPROVAL_MODE_ENV]);
+} catch (error) {
+  console.error(`[approval] ${error instanceof Error ? error.message : String(error)}; falling back to ${DEFAULT_APPROVAL_MODE}`);
+  approvalMode = DEFAULT_APPROVAL_MODE;
+}
+console.log(`[approval] mode: ${approvalMode}`);
+const toolApprovalRegistry = new ToolApprovalRegistry({
+  executionLogProvider: (runtimeDir) => activeRuns.get(runtimeDir)?.controller.executionLog
+});
 const historicalConnectivityRuntimes = new HistoricalConnectivityRuntimeRegistry();
 const trafficProxyRegistry = createAgentTrafficProxyRegistry();
 
@@ -367,6 +390,64 @@ const server = createServer(async (request, response) => {
       }
       requireRuntimeAccess(user!, "operator:mutate");
       await handleStopRun(request, response);
+      return;
+    }
+    if (url.pathname === "/api/approvals") {
+      if (request.method !== "GET") {
+        await sendJson(response, { error: { code: "method_not_allowed", message: "仅支持 GET" } }, 405);
+        return;
+      }
+      requireRuntimeAccess(user!, "approval:decide");
+      const runtimeInput = url.searchParams.get("runtimeDir")?.trim();
+      let runtimeDir: string | undefined;
+      if (runtimeInput) {
+        runtimeDir = await runtimePathPolicy.resolveRuntime(runtimeInput, "existing");
+      }
+      await sendJson(response, {
+        loadedAt: new Date().toISOString(),
+        mode: approvalMode,
+        approvals: toolApprovalRegistry.list(runtimeDir ? { runtimeDir } : {})
+      });
+      return;
+    }
+    if (url.pathname === "/api/approvals/mode") {
+      if (request.method !== "POST") {
+        await sendJson(response, { error: { code: "method_not_allowed", message: "仅支持 POST" } }, 405);
+        return;
+      }
+      requireRuntimeAccess(user!, "approval:decide");
+      const body = await readJsonBody(request);
+      if (typeof body.mode !== "string") {
+        throw new HttpError(400, "invalid_request", "mode 必须是 off、auto 或 strict");
+      }
+      let nextMode: ApprovalMode;
+      try {
+        nextMode = resolveApprovalMode(body.mode);
+      } catch {
+        throw new HttpError(400, "invalid_request", `无效的批准模式 "${body.mode}"：应为 off、auto 或 strict`);
+      }
+      approvalMode = nextMode;
+      console.log(`[approval] mode switched to: ${approvalMode}`);
+      await sendJson(response, { ok: true, mode: approvalMode });
+      return;
+    }
+    const approvalDecisionRoute = /^\/api\/approvals\/([^/]+)$/.exec(url.pathname);
+    if (approvalDecisionRoute) {
+      if (request.method !== "POST") {
+        await sendJson(response, { error: { code: "method_not_allowed", message: "仅支持 POST" } }, 405);
+        return;
+      }
+      requireRuntimeAccess(user!, "approval:decide");
+      const body = await readJsonBody(request);
+      const decision = body.decision;
+      if (decision !== "approve" && decision !== "deny") {
+        throw new HttpError(400, "invalid_request", "decision 必须是 approve 或 deny");
+      }
+      const approvalId = decodeURIComponent(approvalDecisionRoute[1]);
+      if (!toolApprovalRegistry.decide(approvalId, decision)) {
+        throw new HttpError(404, "approval_not_found", "批准请求不存在或已处理");
+      }
+      await sendJson(response, { ok: true, approvalId, decision });
       return;
     }
     if (url.pathname === "/api/connectivity") {
@@ -1707,7 +1788,8 @@ async function handleStartRun(request: IncomingMessage, response: ServerResponse
       cwd,
       runtimeDir,
       routeRef: "web-run",
-      trafficProxyRegistry
+      trafficProxyRegistry,
+      toolApproval: { mode: () => approvalMode, registry: toolApprovalRegistry }
     });
     const { controller } = agentRuntime;
     if (scopeDocumentId) {

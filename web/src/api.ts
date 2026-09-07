@@ -1,5 +1,5 @@
 import { translate } from "./language";
-import type { ActiveRunsResponse, ArtifactContent, AuthResponse, ConnectionItem, ConnectionsResponse, ParsedScopeDocument, RegisteredSkill, RuntimeState, SessionsResponse, SkillRegistrySnapshot, StartRunInput, StartRunResponse, StopRunResponse, TrafficExchange, TrafficFlowRef, TrafficHistoryBody, TrafficHistoryFilters, TrafficHistoryPage, TrafficReplayInput, TrafficReplayResponse } from "./types";
+import type { ActiveRunsResponse, ApprovalDecisionResponse, ApprovalMode, ApprovalModeUpdateResponse, ApprovalsResponse, ArtifactContent, AuthResponse, ConnectionItem, ConnectionsResponse, ParsedScopeDocument, RegisteredSkill, RuntimeState, SessionsResponse, SkillRegistrySnapshot, StartRunInput, StartRunResponse, StopRunResponse, TrafficExchange, TrafficFlowRef, TrafficHistoryBody, TrafficHistoryFilters, TrafficHistoryPage, TrafficReplayInput, TrafficReplayResponse } from "./types";
 
 export class ApiError extends Error {
   constructor(message: string, readonly status: number, readonly code?: string) {
@@ -114,6 +114,27 @@ export function stopRun(runtimeDir: string): Promise<StopRunResponse> {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ runtimeDir })
+  });
+}
+
+export function fetchApprovals(runtimeDir?: string, signal?: AbortSignal): Promise<ApprovalsResponse> {
+  const query = runtimeDir ? `?runtimeDir=${encodeURIComponent(runtimeDir)}` : "";
+  return requestJson(`/api/approvals${query}`, { signal });
+}
+
+export function decideApproval(id: string, decision: "approve" | "deny"): Promise<ApprovalDecisionResponse> {
+  return requestJson(`/api/approvals/${encodeURIComponent(id)}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ decision })
+  });
+}
+
+export function updateApprovalMode(mode: ApprovalMode): Promise<ApprovalModeUpdateResponse> {
+  return requestJson("/api/approvals/mode", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ mode })
   });
 }
 

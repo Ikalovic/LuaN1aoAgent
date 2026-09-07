@@ -13,6 +13,9 @@ import {
   type ExecutorSandboxRequestedMode
 } from "./executor-sandbox.js";
 import { ExecutionLog } from "./stores/execution-log.js";
+import type { ApprovalMode } from "./approval/dangerous-tool-policy.js";
+import type { TerminalApprover } from "./approval/tool-approval-extension.js";
+import type { ToolApprovalRegistry } from "./approval/tool-approval-registry.js";
 
 export type AgentRuntimeLifecycle = {
   controller: SecurityAgentController;
@@ -28,11 +31,21 @@ export type AgentRuntimeBootstrapOptions = {
   executorSandboxMode?: ExecutorSandboxRequestedMode;
   trafficProxyRegistry?: TrafficProxyManagerRegistry;
   dockerRunner?: DockerRunner;
+  toolApproval?: {
+    mode: ApprovalMode | (() => ApprovalMode);
+    registry?: ToolApprovalRegistry;
+    terminalApprover?: TerminalApprover;
+  };
   controllerFactory?: (input: {
     cwd: string;
     runtimeDir: string;
     environment?: NodeJS.ProcessEnv;
     executorSandboxMode: ExecutorSandboxRequestedMode;
+    toolApproval?: {
+      mode: ApprovalMode | (() => ApprovalMode);
+      registry?: ToolApprovalRegistry;
+      terminalApprover?: TerminalApprover;
+    };
   }) => SecurityAgentController;
 };
 
@@ -70,7 +83,8 @@ export async function bootstrapAgentRuntime(input: AgentRuntimeBootstrapOptions)
       cwd: input.cwd,
       runtimeDir: input.runtimeDir,
       environment: trafficProxyManager?.managedEnvironment(),
-      executorSandboxMode
+      executorSandboxMode,
+      toolApproval: input.toolApproval
     });
     await controller.initialize();
     if (trafficProxyManager) {

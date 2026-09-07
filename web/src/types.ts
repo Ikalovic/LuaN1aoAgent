@@ -3,7 +3,7 @@ export type JsonRecord = Record<string, JsonValue | undefined>;
 
 export type Role = "planner" | "executor" | "observer" | "runtime" | string;
 export type GraphKind = "reasoning" | "operation" | "task";
-export type ViewKey = "trace" | "reports" | GraphKind | "traffic" | "connections" | "skills";
+export type ViewKey = "trace" | "reports" | GraphKind | "traffic" | "connections" | "skills" | "approvals";
 
 export interface AuthUser {
   id: string;
@@ -15,6 +15,42 @@ export interface AuthUser {
 
 export interface AuthResponse {
   user: AuthUser;
+}
+
+export type ApprovalMode = "off" | "auto" | "strict";
+
+export interface PendingApproval {
+  id: string;
+  runId: string;
+  runtimeDir: string;
+  taskId?: string;
+  taskGoal?: string;
+  scopeSummary?: string;
+  toolName: string;
+  toolArgs: string;
+  intent?: string;
+  riskLevel: "low" | "medium" | "high";
+  reason?: string;
+  createdAt: string;
+  status: "pending" | "approved" | "denied" | "settled";
+  decidedAt?: string;
+}
+
+export interface ApprovalsResponse {
+  loadedAt: string;
+  mode: ApprovalMode;
+  approvals: PendingApproval[];
+}
+
+export interface ApprovalDecisionResponse {
+  ok: boolean;
+  approvalId: string;
+  decision: "approve" | "deny";
+}
+
+export interface ApprovalModeUpdateResponse {
+  ok: boolean;
+  mode: ApprovalMode;
 }
 
 export interface RegisteredSkill {

@@ -6,7 +6,8 @@ import {
   SessionManager,
   SettingsManager,
   type ToolDefinition,
-  type CreateAgentSessionResult
+  type CreateAgentSessionResult,
+  type ExtensionFactory
 } from "@earendil-works/pi-coding-agent";
 import {
   EXECUTOR_SYSTEM_PROMPT,
@@ -54,6 +55,14 @@ import {
   type ProviderAdmissionOptions
 } from "./pi-runner.js";
 import { createBrowserRenderTool } from "./tools/browser-tools.js";
+import {
+  createToolApprovalExtension,
+  type ToolApprovalExtensionOptions
+} from "./approval/tool-approval-extension.js";
+import {
+  APPROVAL_JUDGE_SYSTEM_PROMPT,
+  createApprovalJudgeSubmitTool
+} from "./approval/llm-risk-judge.js";
 
 /** Project-local skills directory (./.agents/skills) installed by install.sh. */
 export function projectSkillsDirs(cwd: string): string[] {
@@ -168,6 +177,7 @@ export async function createExecutorAgentSession(input: {
   skillsDirs?: string[];
   additionalTools?: ToolDefinition<any, any, any>[];
   providerAdmission?: ProviderAdmissionOptions;
+  toolApproval?: ToolApprovalExtensionOptions;
 }): Promise<CreateAgentSessionResult> {
   const sandbox = input.sandbox ?? await createExecutorSandbox({
     runtimeDir: `${input.cwd}/.agent-runtime`,
@@ -178,7 +188,8 @@ export async function createExecutorAgentSession(input: {
     sandbox.hostRoot,
     EXECUTOR_SYSTEM_PROMPT,
     input.skillsDirs ?? [],
-    input.providerAdmission
+    input.providerAdmission,
+    input.toolApproval ? [createToolApprovalExtension(input.toolApproval)] : undefined
   );
   rejectUnmanagedProviderAdmission(input.executorLoader, input.providerAdmission);
   const customTools: ToolDefinition<any, any, any>[] = [
@@ -356,6 +367,29 @@ export async function createSkillSelectorAgentSession(input: {
   });
 }
 
+/**
+ * Single-purpose judge session for the tool approval LLM judge. Uses the
+ * planner model; invocations are serialized by LlmRiskJudge.
+ */
+export async function createApprovalJudgeAgentSession(input: {
+  cwd: string;
+  llmRuntime: LlmRuntime;
+}): Promise<CreateAgentSessionResult> {
+  const loader = await createPromptLoader(input.cwd, APPROVAL_JUDGE_SYSTEM_PROMPT);
+  return createAgentSession({
+    cwd: input.cwd,
+    noTools: "builtin",
+    customTools: [createApprovalJudgeSubmitTool()],
+    authStorage: input.llmRuntime.authStorage,
+    modelRegistry: input.llmRuntime.modelRegistry,
+    model: input.llmRuntime.models.planner,
+    thinkingLevel: "off",
+    resourceLoader: loader,
+    settingsManager: createRuntimeSettingsManager(input.llmRuntime.roleConfig.planner.contextWindow),
+    sessionManager: SessionManager.inMemory(input.cwd)
+  });
+}
+
 function createValidatedPlannerSubmitTool(
   graphStore: SQLiteGraphStore,
   artifactStore: ArtifactStore,
@@ -451,15 +485,19 @@ async function createPromptLoader(
   cwd: string,
   systemPrompt: string,
   additionalSkillPaths: string[] = [],
-  providerAdmission?: ProviderAdmissionOptions
+  providerAdmission?: ProviderAdmissionOptions,
+  extraExtensionFactories?: ExtensionFactory[]
 ): Promise<DefaultResourceLoader> {
   const loader = new DefaultResourceLoader({
     cwd,
     agentDir: getAgentDir(),
     additionalSkillPaths,
-    extensionFactories: providerAdmission
-      ? [createProviderAdmissionExtension(providerAdmission)]
-      : undefined,
+    extensionFactories: [
+      ...(providerAdmission
+        ? [createProviderAdmissionExtension(providerAdmission)]
+        : []),
+      ...(extraExtensionFactories ?? [])
+    ],
     systemPromptOverride: () => systemPrompt
   });
   await loader.reload();

@@ -3,6 +3,7 @@ export type CliOptions = {
   scope?: string;
   scopeFiles: string[];
   confirmScopeFiles: boolean;
+  approvalMode: "off" | "auto" | "strict";
   proxy?: string;
   runtimeDir?: string;
   resumeDir?: string;
@@ -31,7 +32,8 @@ export function parseCliOptions(rawArgs: string[]): CliOptions {
     "max-cycles",
     "max-parallel-tasks",
     "max-run-time-ms",
-    "task-type"
+    "task-type",
+    "approval-mode"
   ]);
 
   for (let index = 0; index < rawArgs.length; index += 1) {
@@ -74,6 +76,7 @@ export function parseCliOptions(rawArgs: string[]): CliOptions {
     scope: values.get("scope"),
     scopeFiles,
     confirmScopeFiles: flags.has("confirm-scope-files"),
+    approvalMode: values.get("approval-mode") === "off" ? "off" : values.get("approval-mode") === "strict" ? "strict" : values.get("approval-mode") === "auto" || !values.has("approval-mode") ? "auto" : (() => { throw new Error("--approval-mode must be off, auto or strict"); })(),
     proxy: values.get("proxy"),
     runtimeDir: values.get("runtime-dir"),
     resumeDir: values.get("resume"),
@@ -102,6 +105,7 @@ export function cliHelp(): string {
     "  --scope <entries>            Authorized IPv4/CIDRs/domains (for example baidu.com,*.baidu.com)",
     "  --scope-file <path>          Parse authorized scope from a file; may be repeated",
     "  --confirm-scope-files        Confirm parsed file scope in non-interactive mode",
+    "  --approval-mode <mode>       Dangerous-operation approval: off|auto|strict (default: auto)",
     "  --proxy <socks5-url>         Transparently route all scoped Agent TCP through SOCKS5",
     "  --runtime-dir <path>         New runtime directory; must be empty",
     "  --resume <session>           Resume one runtime; do not pass --goal",

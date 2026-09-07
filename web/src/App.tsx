@@ -1,9 +1,10 @@
 import { lazy, Suspense, useEffect, useMemo, useState } from "react";
 import { Alert, Avatar, Badge, Button, Drawer, Dropdown, Input, Popconfirm, Skeleton, Spin, Statistic, Switch, Tag, Tooltip, Typography } from "antd";
 import { Activity, ChevronDown, Database, FileBox, LogOut, Menu, PanelRight, Play, RefreshCw, Share2, Square } from "lucide-react";
-import { stopRun } from "./api";
+import { stopRun, fetchApprovals } from "./api";
 import { Inspector } from "./components/Inspector";
 import { ConnectionsView } from "./components/ConnectionsView";
+import { ApprovalsView } from "./components/ApprovalsView";
 import { ArtifactsView } from "./components/ArtifactsView";
 import { ResizableWorkspace } from "./components/ResizableWorkspace";
 import { Sidebar } from "./components/Sidebar";
@@ -41,8 +42,29 @@ export default function App({ user, onLogout }: { user: AuthUser; onLogout: () =
   const [stopping, setStopping] = useState(false);
   const [actionError, setActionError] = useState<string>();
   const [pendingStartDir, setPendingStartDir] = useState<string>();
+  const [approvalPendingCount, setApprovalPendingCount] = useState(0);
+  const isAdmin = user.role === "admin";
   const dashboard = useRuntimeDashboard(runtimeDir);
   const data = dashboard.data;
+
+  useEffect(() => {
+    if (!isAdmin) {
+      setApprovalPendingCount(0);
+      return;
+    }
+    let disposed = false;
+    const poll = async () => {
+      try {
+        const next = await fetchApprovals();
+        if (!disposed) setApprovalPendingCount(next.approvals.length);
+      } catch {
+        // Keep the last known count; the approvals view surfaces load errors itself.
+      }
+    };
+    void poll();
+    const timer = window.setInterval(() => void poll(), 15_000);
+    return () => { disposed = true; window.clearInterval(timer); };
+  }, [isAdmin]);
 
   useEffect(() => {
     if (!data?.traceItems.length) {
@@ -55,7 +77,7 @@ export default function App({ user, onLogout }: { user: AuthUser; onLogout: () =
   }, [data?.traceItems, selectedTraceId]);
 
   useEffect(() => {
-    if (activeView === "trace" || activeView === "reports" || activeView === "traffic" || activeView === "connections" || activeView === "skills") setSelectedNodeId(undefined);
+    if (activeView === "trace" || activeView === "reports" || activeView === "traffic" || activeView === "connections" || activeView === "skills" || activeView === "approvals") setSelectedNodeId(undefined);
     if (activeView !== "traffic") {
       setSelectedExchangeId(undefined);
       setSelectedExchange(undefined);
@@ -131,6 +153,8 @@ export default function App({ user, onLogout }: { user: AuthUser; onLogout: () =
       onViewChange={setView}
       onRuntimeChange={(value) => { setRuntimeDraft(value); applyRuntime(value); }}
       onClose={mobileSidebarOpen ? () => setMobileSidebarOpen(false) : undefined}
+      canApprove={isAdmin}
+      pendingApprovalCount={approvalPendingCount}
     />
   );
   const inspector = activeView === "skills" ? (
@@ -156,6 +180,11 @@ export default function App({ user, onLogout }: { user: AuthUser; onLogout: () =
       <Typography.Title level={5}>{t("app.connectionsInspectorTitle")}</Typography.Title>
       <p>{t("app.connectionsInspectorDescription")}</p>
     </div>
+  ) : activeView === "approvals" ? (
+    <div className="connections-inspector">
+      <Typography.Title level={5}>{t("nav.approvals")}</Typography.Title>
+      <p>{t("approvals.description")}</p>
+    </div>
   ) : activeView === "reports" ? (
     <div className="connections-inspector">
       <Typography.Title level={5}>{locale === "zh-CN" ? "产物与报告" : "Artifacts & reports"}</Typography.Title>
@@ -174,7 +203,7 @@ export default function App({ user, onLogout }: { user: AuthUser; onLogout: () =
     />
   );
 
-  const viewEyebrow = activeView === "trace" ? "LIVE TRACE" : activeView === "reports" ? "RUN OUTPUT" : activeView === "traffic" ? "WEB TRAFFIC" : activeView === "connections" ? "CONNECTIVITY" : activeView === "skills" ? "SKILL REGISTRY" : "TRI-GRAPH";
+  const viewEyebrow = activeView === "trace" ? "LIVE TRACE" : activeView === "reports" ? "RUN OUTPUT" : activeView === "traffic" ? "WEB TRAFFIC" : activeView === "connections" ? "CONNECTIVITY" : activeView === "skills" ? "SKILL REGISTRY" : activeView === "approvals" ? "APPROVALS" : "TRI-GRAPH";
 
   return (
     <>
@@ -264,7 +293,9 @@ export default function App({ user, onLogout }: { user: AuthUser; onLogout: () =
             </section>
 
             <section className="stage-body">
-              {activeView === "skills" ? (
+              {activeView === "approvals" ? (
+                <ApprovalsView user={user} onPendingChange={setApprovalPendingCount} />
+              ) : activeView === "skills" ? (
                 <SkillsView user={user} />
               ) : activeView === "connections" ? (
                 <ConnectionsView runtimeDir={runtimeDir} user={user} />
@@ -365,6 +396,7 @@ function viewTitle(view: ViewKey, locale: Locale, t: Translate): string {
   if (view === "traffic") return "Web Traffic";
   if (view === "connections") return "Connections";
   if (view === "skills") return t("nav.skills");
+  if (view === "approvals") return t("nav.approvals");
   return graphLabel(view, locale);
 }
 
@@ -374,6 +406,7 @@ function viewStageTitle(view: ViewKey, locale: Locale, t: Translate): string {
   if (view === "traffic") return t("app.trafficStageTitle");
   if (view === "connections") return t("app.connectionsStageTitle");
   if (view === "skills") return t("app.skillsStageTitle");
+  if (view === "approvals") return t("app.approvalsStageTitle");
   return graphLabel(view, locale);
 }
 
@@ -383,6 +416,7 @@ function viewStageSubtitle(view: ViewKey, t: Translate): string {
   if (view === "traffic") return t("app.trafficStageSubtitle");
   if (view === "connections") return t("app.connectionsStageSubtitle");
   if (view === "skills") return t("app.skillsStageSubtitle");
+  if (view === "approvals") return t("app.approvalsStageSubtitle");
   if (view === "reasoning") return t("graph.reasoningSubtitle");
   if (view === "operation") return t("graph.operationSubtitle");
   return t("graph.taskSubtitle");
@@ -392,7 +426,7 @@ function readInitialState(): { runtimeDir: string; view: ViewKey } {
   const params = new URLSearchParams(window.location.search);
   const runtimeDir = params.get("runtimeDir") || localStorage.getItem("luanniao-runtime-dir") || DEFAULT_RUNTIME;
   const candidate = params.get("view");
-  const view = candidate && ["trace", "reports", "reasoning", "operation", "task", "traffic", "connections", "skills"].includes(candidate) ? candidate as ViewKey : "trace";
+  const view = candidate && ["trace", "reports", "reasoning", "operation", "task", "traffic", "connections", "skills", "approvals"].includes(candidate) ? candidate as ViewKey : "trace";
   return { runtimeDir, view };
 }
 

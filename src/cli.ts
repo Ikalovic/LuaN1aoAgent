@@ -11,6 +11,7 @@ import { loadPentestTemplates } from "./reporting/task-reporting.js";
 import { dirname, join } from "node:path";
 import { AgentCliApp } from "./tui/app.js";
 import { createInterface } from "node:readline/promises";
+import { createStdinApprover } from "./approval/tool-approval-extension.js";
 
 try {
   loadLocalEnvFile(process.env);
@@ -84,7 +85,11 @@ async function run(options: ReturnType<typeof parseCliOptions>): Promise<void> {
     agentRuntime = await bootstrapAgentRuntime({
       cwd,
       runtimeDir: runContext.runtimeDir,
-      routeRef: "cli-run"
+      routeRef: "cli-run",
+      toolApproval: {
+        mode: options.approvalMode,
+        terminalApprover: createStdinApprover()
+      }
     });
     if (transparentProxy && agentRuntime.executorSandboxMode !== "docker") {
       throw new Error("--proxy requires EXECUTOR_SANDBOX_MODE=docker because transparent SOCKS5 routing is owned by the Docker Gateway");

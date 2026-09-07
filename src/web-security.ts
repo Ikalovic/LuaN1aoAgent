@@ -11,6 +11,7 @@ export type WebCapability =
   | "traffic:replay"
   | "connectivity:manage"
   | "operator:mutate"
+  | "approval:decide"
   | "admin:credential"
   | "admin:delete"
   | "admin:export";
@@ -22,6 +23,7 @@ const roleCapabilities: Record<WebUser["role"], ReadonlySet<WebCapability>> = {
     "traffic:replay",
     "connectivity:manage",
     "operator:mutate",
+    "approval:decide",
     "admin:credential",
     "admin:delete",
     "admin:export"
