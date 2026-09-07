@@ -33,3 +33,11 @@ test("keeps invalid_submit retryable and tool_error non-retryable", () => {
   );
   assert.equal(toolError.retryable, false);
 });
+
+test("classifies a busy Pi Planner session as retryable provider concurrency", () => {
+  const failure = classifyPlannerProviderFailure(
+    new Error("Agent is already processing. Specify streamingBehavior ('steer' or 'followUp') to queue the message.")
+  );
+  assert.equal(failure.errorKind, "provider_concurrency");
+  assert.equal(failure.retryable, true);
+});

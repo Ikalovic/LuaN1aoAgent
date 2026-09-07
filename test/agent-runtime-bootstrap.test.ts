@@ -201,6 +201,61 @@ test("Docker bootstrap skips the legacy traffic proxy and passes the resolved ba
   }
 });
 
+test("Docker bootstrap does not reap managed resources from a sibling Runtime under cwd", async () => {
+  const root = await mkdtemp("/tmp/agent-runtime-docker-cleanup-boundary-");
+  const runtimeDir = join(root, "selected-runtime");
+  const siblingRuntimeDir = join(root, "sibling-runtime");
+  const calls: string[][] = [];
+  try {
+    const runtime = await bootstrapAgentRuntime({
+      cwd: root,
+      runtimeDir,
+      routeRef: "docker-cleanup-boundary",
+      executorSandboxMode: "docker",
+      dockerRunner: async (args) => {
+        calls.push(args);
+        if (args[0] === "version") {
+          return { code: 0, stdout: Buffer.from("27.0.0"), stderr: Buffer.alloc(0) };
+        }
+        if (args[0] === "ps") {
+          return { code: 0, stdout: Buffer.from("sibling-container\n"), stderr: Buffer.alloc(0) };
+        }
+        if (args[0] === "inspect") {
+          return {
+            code: 0,
+            stdout: Buffer.from(JSON.stringify([{
+              Name: "/sibling-executor",
+              Config: {
+                Labels: {
+                  "luanniao.managed": "true",
+                  "luanniao.role": "executor",
+                  "luanniao.run_ref": "run:sibling",
+                  "luanniao.runtime_dir": siblingRuntimeDir
+                }
+              },
+              Mounts: []
+            }])),
+            stderr: Buffer.alloc(0)
+          };
+        }
+        if (args[0] === "network" && args[1] === "ls") {
+          return { code: 0, stdout: Buffer.alloc(0), stderr: Buffer.alloc(0) };
+        }
+        if (args[0] === "rm") {
+          return { code: 0, stdout: Buffer.alloc(0), stderr: Buffer.alloc(0) };
+        }
+        return { code: 1, stdout: Buffer.alloc(0), stderr: Buffer.from(`unexpected: ${args.join(" ")}`) };
+      },
+      controllerFactory: () => fakeController({ runId: "run:cleanup-boundary" })
+    });
+
+    assert.equal(calls.some((args) => args[0] === "rm" && args.includes("sibling-executor")), false);
+    await runtime.close();
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("CLI and Web run entrypoints both use the shared bootstrap", async () => {
   const [cliSource, webSource] = await Promise.all([
     readFile(join(process.cwd(), "src", "cli.ts"), "utf8"),
@@ -227,6 +282,16 @@ test("CLI and Web run entrypoints both use the shared bootstrap", async () => {
     cliSource,
     /try \{\s*await stopRequest;\s*\} finally \{\s*try \{\s*await agentRuntime\?\.close\(\);/,
     "runtime close must run even when the stop request rejects"
+  );
+  assert.match(
+    webSource,
+    /reapStaleManagedDockerResources\(\{\s*roots:\s*\[runtimePathPolicy\.rootDir\],/,
+    "Web startup cleanup must be scoped to its configured Runtime root"
+  );
+  assert.doesNotMatch(
+    webSource,
+    /reapStaleManagedDockerResources\(\{\s*roots:\s*\[[^\]]*\bcwd\b/,
+    "Web startup cleanup must not inherit the project cwd as a cleanup root"
   );
 });
 

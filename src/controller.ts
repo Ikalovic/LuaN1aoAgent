@@ -3622,13 +3622,10 @@ export class SecurityAgentController {
     forceIsolated = false,
     versionSnapshot?: Record<string, number>
   ): Promise<{ session: SecurityAgentSession; isolated: boolean }> {
-    if (!forceIsolated) {
-      if (this.agents?.planner) {
-        return { session: this.agents.planner, isolated: false };
-      }
-      if (this.ownedPlannerSession) {
-        return { session: this.ownedPlannerSession, isolated: false };
-      }
+    const reusablePlanner = this.agents?.planner ?? this.ownedPlannerSession;
+    const useIsolatedSession = forceIsolated || reusablePlanner?.isStreaming === true;
+    if (!useIsolatedSession && reusablePlanner) {
+      return { session: reusablePlanner, isolated: false };
     }
     const planner = await createPlannerAgentSession({
       cwd: this.cwd,
@@ -3646,7 +3643,7 @@ export class SecurityAgentController {
         }
         : {})
     });
-    if (forceIsolated) {
+    if (useIsolatedSession) {
       return { session: planner.session, isolated: true };
     }
     this.ownedPlannerSession = planner.session;

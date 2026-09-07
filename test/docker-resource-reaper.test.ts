@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, rm, stat } from "node:fs/promises";
 import { join } from "node:path";
 import test from "node:test";
 import { ConnectivityRuntimeOwnerLease } from "../src/connectivity/runtime-owner-lease.js";
@@ -44,7 +44,30 @@ test("orphan reaper leaves resources owned by an active runtime untouched", asyn
   }
 });
 
-function fakeRunner(runtimeDir: string, calls: string[][]): DockerRunner {
+test("orphan reaper never crosses into a sibling Runtime", async () => {
+  const root = await mkdtemp("/tmp/luanniao-reaper-boundary-");
+  const runtimeDir = join(root, "selected-runtime");
+  const siblingRuntimeDir = join(root, "sibling-runtime");
+  const calls: string[][] = [];
+  try {
+    const result = await reapStaleManagedDockerResources({
+      roots: [runtimeDir],
+      runner: fakeRunner(runtimeDir, calls, siblingRuntimeDir)
+    });
+
+    assert.deepEqual(result.removed, ["executor-one", "gateway-one", "connector-one", "network-one"]);
+    assert.equal(result.removed.includes("sibling-executor"), false);
+    assert.equal(calls.some((args) => args[0] === "rm" && args.includes("sibling-executor")), false);
+    await assert.rejects(
+      stat(join(siblingRuntimeDir, ".connectivity-runtime-owner")),
+      (error: unknown) => error instanceof Error && "code" in error && error.code === "ENOENT"
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+function fakeRunner(runtimeDir: string, calls: string[][], siblingRuntimeDir?: string): DockerRunner {
   const runRef = "run:stale";
   const containers: Record<string, unknown> = {
     c1: inspectContainer("executor-one", "executor", runRef, runtimeDir),
@@ -52,11 +75,14 @@ function fakeRunner(runtimeDir: string, calls: string[][]): DockerRunner {
       Source: join(runtimeDir, "traffic", "ca"),
       Destination: "/traffic/ca"
     }]),
-    c3: inspectContainer("connector-one", "connector", runRef)
+    c3: inspectContainer("connector-one", "connector", runRef),
+    ...(siblingRuntimeDir
+      ? { c4: inspectContainer("sibling-executor", "executor", "run:sibling", siblingRuntimeDir) }
+      : {})
   };
   return async (args) => {
     calls.push(args);
-    if (args[0] === "ps") return dockerResult(0, "c1\nc2\nc3\n");
+    if (args[0] === "ps") return dockerResult(0, `c1\nc2\nc3\n${siblingRuntimeDir ? "c4\n" : ""}`);
     if (args[0] === "inspect") return dockerResult(0, JSON.stringify([containers[args[1] ?? ""]]));
     if (args[0] === "network" && args[1] === "ls") return dockerResult(0, "n1\n");
     if (args[0] === "network" && args[1] === "inspect") {

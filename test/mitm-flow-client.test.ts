@@ -1,8 +1,10 @@
 import assert from "node:assert/strict";
-import { chmod, mkdtemp, mkdir, readFile, writeFile } from "node:fs/promises";
+import { execFile } from "node:child_process";
+import { chmod, mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import { promisify } from "node:util";
 import { closeHistoricalMitmIndexes, MitmFlowClient, runMitmIndexDockerCommand } from "../src/connectivity/mitm-flow-client.js";
 import {
   ConnectivityRuntimeOwnerLease,
@@ -10,6 +12,67 @@ import {
 } from "../src/connectivity/runtime-owner-lease.js";
 
 const token = "a".repeat(64);
+const execFileAsync = promisify(execFile);
+const runtimeOwnerLeaseModuleUrl = new URL(
+  "../src/connectivity/runtime-owner-lease.js",
+  import.meta.url
+).href;
+
+async function runLeaseChild(runtimeDir: string, operation: "inspect" | "acquire"): Promise<Record<string, unknown>> {
+  const script = operation === "inspect"
+    ? `
+      import { ConnectivityRuntimeOwnerLease } from ${JSON.stringify(runtimeOwnerLeaseModuleUrl)};
+      console.log(JSON.stringify(await ConnectivityRuntimeOwnerLease.inspect(${JSON.stringify(runtimeDir)})));
+    `
+    : `
+      import { ConnectivityRuntimeOwnerLease } from ${JSON.stringify(runtimeOwnerLeaseModuleUrl)};
+      const lease = new ConnectivityRuntimeOwnerLease(${JSON.stringify(runtimeDir)});
+      try {
+        await lease.acquire();
+        console.log(JSON.stringify({ state: "acquired" }));
+        await lease.release();
+      } catch (error) {
+        console.log(JSON.stringify({ state: "rejected", code: error?.code }));
+      }
+    `;
+  const { stdout } = await execFileAsync(process.execPath, ["--input-type=module", "--eval", script], {
+    encoding: "utf8"
+  });
+  return JSON.parse(stdout.trim()) as Record<string, unknown>;
+}
+
+test("independent process recognizes a live Runtime owner", async () => {
+  const runtimeDir = await mkdtemp(join(tmpdir(), "luanniao-runtime-owner-observer-"));
+  const lease = new ConnectivityRuntimeOwnerLease(runtimeDir);
+  try {
+    await lease.acquire();
+
+    assert.deepEqual(await runLeaseChild(runtimeDir, "inspect"), {
+      state: "active",
+      ownerPid: process.pid
+    });
+  } finally {
+    await lease.release();
+    await rm(runtimeDir, { recursive: true, force: true });
+  }
+});
+
+test("independent process cannot replace a live Runtime owner", async () => {
+  const runtimeDir = await mkdtemp(join(tmpdir(), "luanniao-runtime-owner-contender-"));
+  const lease = new ConnectivityRuntimeOwnerLease(runtimeDir);
+  try {
+    await lease.acquire();
+
+    assert.deepEqual(await runLeaseChild(runtimeDir, "acquire"), {
+      state: "rejected",
+      code: "connectivity_runtime_owned"
+    });
+    assert.equal(await lease.isOwner(), true);
+  } finally {
+    await lease.release();
+    await rm(runtimeDir, { recursive: true, force: true });
+  }
+});
 
 function createOwnedIndexRunner(options: { failPort?: boolean; failRemove?: boolean } = {}) {
   const commands: string[][] = [];
