@@ -8,12 +8,19 @@ interface StartRunModalProps {
   open: boolean;
   onClose: () => void;
   onStarted: (runtimeDir: string) => void;
+  continueFrom?: {
+    runtimeDir: string;
+    goal: string;
+    scopeSummary?: string;
+    taskType?: "ctf" | "pentest";
+  };
 }
 
-export function StartRunModal({ open, onClose, onStarted }: StartRunModalProps) {
+export function StartRunModal({ open, onClose, onStarted, continueFrom }: StartRunModalProps) {
   const { t } = useLanguage();
   const [form] = Form.useForm();
-  const taskType = Form.useWatch("taskType", form) ?? "pentest";
+  const continuing = Boolean(continueFrom);
+  const taskType = Form.useWatch("taskType", form) ?? continueFrom?.taskType ?? "pentest";
   const [submitting, setSubmitting] = useState(false);
   const [parsing, setParsing] = useState(false);
   const [error, setError] = useState<string>();
@@ -71,7 +78,8 @@ export function StartRunModal({ open, onClose, onStarted }: StartRunModalProps) 
       const result = await startRun({
         goal: String(values.goal).trim(),
         scope: String(values.scope ?? "").trim(),
-        taskType: values.taskType ?? "pentest",
+        taskType: values.taskType ?? continueFrom?.taskType ?? "pentest",
+        ...(continueFrom ? { runtimeDir: continueFrom.runtimeDir } : {}),
         maxRunTimeMs: values.maxRunTimeMin ? Math.round(values.maxRunTimeMin * 60_000) : undefined,
         maxParallelTasks: values.maxParallelTasks ?? undefined,
         maxPlannerCycles: values.maxPlannerCycles ?? undefined
@@ -88,9 +96,9 @@ export function StartRunModal({ open, onClose, onStarted }: StartRunModalProps) 
 
   return (
     <Modal
-      title={t("startRun.title")}
+      title={continuing ? t("startRun.continueTitle") : t("startRun.title")}
       open={open}
-      okText={t("common.start")}
+      okText={continuing ? t("startRun.continueAction") : t("common.start")}
       cancelText={t("common.cancel")}
       confirmLoading={submitting}
       okButtonProps={{ disabled: parsing }}
@@ -105,10 +113,18 @@ export function StartRunModal({ open, onClose, onStarted }: StartRunModalProps) 
       }}
     >
       {error ? <Alert style={{ marginBottom: 12 }} type="error" showIcon message={error} /> : null}
+      {continuing ? <Alert style={{ marginBottom: 12 }} type="info" showIcon message={t("startRun.continueHint")} /> : null}
       <Form
         form={form}
         layout="vertical"
-        initialValues={{ taskType: "pentest", maxRunTimeMin: 15, maxParallelTasks: 2, maxPlannerCycles: 8 }}
+        initialValues={{
+          taskType: continueFrom?.taskType ?? "pentest",
+          goal: continueFrom?.goal ?? undefined,
+          scope: continueFrom?.scopeSummary ?? undefined,
+          maxRunTimeMin: 15,
+          maxParallelTasks: 2,
+          maxPlannerCycles: 8
+        }}
       >
         <Form.Item name="taskType" label={t("startRun.taskType")}>
           <Select options={[

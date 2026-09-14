@@ -45,7 +45,8 @@ import {
   renderExecutorResumeInput,
   renderObserverInput,
   renderPlannerInput,
-  renderSupervisorInput
+  renderSupervisorInput,
+  truncatePromptText
 } from "./prompts.js";
 import {
   attachExecutionLogging,
@@ -480,6 +481,7 @@ export class SecurityAgentController {
   private structuredInvocationsEnabled = false;
   private activeRun?: ActiveRunRecord;
   private currentUserGoal?: string;
+  private continuationDigest?: string;
   private reportingContext: ReportingContext = { taskType: "pentest" };
   private readonly approvalMode: ApprovalMode | (() => ApprovalMode);
   private readonly approvalRegistry?: ToolApprovalRegistry;
@@ -918,6 +920,7 @@ export class SecurityAgentController {
     maxPlannerCycles?: number;
     maxParallelTasks?: number;
     maxRunTimeMs?: number;
+    continuation?: { reopenRootGoal?: boolean };
   }): Promise<RunResult> {
     this.activeScopeSummary = input.scopeSummary;
     this.reportingContext = input.reportingContext ?? { taskType: input.taskType ?? "pentest" };
@@ -928,6 +931,7 @@ export class SecurityAgentController {
     const maxPlannerCycles = input.maxPlannerCycles ?? 8;
     const maxParallelTasks = normalizeParallelTaskLimit(input.maxParallelTasks);
     const maxRunTimeMs = normalizeRunTimeBudgetMs(input.maxRunTimeMs);
+    const continuationRound = input.continuation?.reopenRootGoal === true;
     const cycles: Array<Awaited<ReturnType<SecurityAgentController["runOnce"]>>> = [];
     const invocationId = `run:${randomUUID()}`;
     const startedAt = Date.now();
@@ -980,7 +984,8 @@ export class SecurityAgentController {
         },
         defaultTaskBudget: DEFAULT_TASK_BUDGET,
         minTaskBudget: MIN_TASK_BUDGET,
-        maxTaskBudget: MAX_TASK_BUDGET
+        maxTaskBudget: MAX_TASK_BUDGET,
+        continuation: continuationRound
       }
     });
     this.activeRun = {
@@ -990,7 +995,13 @@ export class SecurityAgentController {
       deadlineAt,
       startSeq: runStartedEvent.seq ?? 0
     };
-    await this.ensureRootGraph(input);
+    this.continuationDigest = undefined;
+    const priorRootGoalStatus = this.graphStore.query("task", ["goal:root"], 1).nodes
+      .find((node) => node.id === "goal:root")?.properties.status;
+    await this.ensureRootGraph({ ...input, reopenRootGoal: continuationRound });
+    if (continuationRound) {
+      await this.prepareContinuationRound(typeof priorRootGoalStatus === "string" ? priorRootGoalStatus : undefined);
+    }
     await this.runReadyTaskGraph({ maxParallelTasks });
     const decideRun = async (result: RunResult): Promise<RunResult> => {
       if (this.activeRun?.invocationId === invocationId) {
@@ -1487,7 +1498,7 @@ export class SecurityAgentController {
     };
   }
 
-  private async ensureRootGraph(input: { userGoal: string; scopeSummary: string }): Promise<void> {
+  private async ensureRootGraph(input: { userGoal: string; scopeSummary: string; reopenRootGoal?: boolean }): Promise<void> {
     this.currentUserGoal = input.userGoal;
     const goalId = "goal:root";
     const scopeId = "scope:root";
@@ -1501,7 +1512,10 @@ export class SecurityAgentController {
           graphKind: "task",
           type: "Goal",
           label: input.userGoal,
-          properties: { ...(existingGoal?.properties ?? {}), status: existingGoal?.properties.status ?? "open" }
+          properties: {
+            ...(existingGoal?.properties ?? {}),
+            status: input.reopenRootGoal ? "open" : existingGoal?.properties.status ?? "open"
+          }
         },
         {
           id: scopeId,
@@ -1514,6 +1528,43 @@ export class SecurityAgentController {
       edges: [
         { from: goalId, to: scopeId, type: "within_scope" }
       ]
+    });
+  }
+
+  /**
+   * Prepares a continuation round: persists a run_continued event and builds a
+   * compact digest of the previous round's outcomes for the first Planner snapshot.
+   */
+  private async prepareContinuationRound(priorRootGoalStatus: string | undefined): Promise<void> {
+    const taskOutcomes = this.runtimeStore.listTaskOutcomes(Number.MAX_SAFE_INTEGER);
+    const epochOutcomes = this.runtimeStore.listEpochOutcomes(5);
+    const artifacts = await this.artifactStore.list();
+    const outcomeLines = taskOutcomes.length > 0
+      ? taskOutcomes.map((outcome) => `- ${outcome.taskRef} [${outcome.status}] ${truncatePromptText(outcome.summary, 220) ?? ""}`).join("\n")
+      : "- （上轮没有 TaskOutcome）";
+    const epochLines = epochOutcomes.length > 0
+      ? epochOutcomes.map((epoch) => `- ${epoch.epochRef} [${epoch.status}] ${truncatePromptText(epoch.reason, 160) ?? ""}`).join("\n")
+      : "- （无）";
+    const artifactLines = artifacts.length > 0
+      ? artifacts.map((artifact) => `- ${artifact.artifactRef} (${artifact.kind})`).join("\n")
+      : "- （无）";
+    this.continuationDigest = [
+      `本轮是基于上一轮运行成果的续跑。上一轮 Root Goal 状态为 ${priorRootGoalStatus ?? "未知"}，现已重开为 open；运行级预算已重置。`,
+      "优先复用以下已验证成果规划下一步：不得重复已经完成的侦察、验证或利用；新任务需要复用旧 Task 的 workspace 或 Session 时，将旧 Task 设为 completed 并用 dependsOnTaskRefs + continueFromTaskRef 创建唯一顺序后继。",
+      `\n上轮 TaskOutcome（${taskOutcomes.length}）：\n${outcomeLines}`,
+      `\n最近 EpochOutcome（最多 5）：\n${epochLines}`,
+      `\n上轮持久 Artifact（${artifacts.length}）：\n${artifactLines}`
+    ].join("\n");
+    await this.executionLog.append({
+      role: "runtime",
+      eventType: "run_continued",
+      summary: `Continued run from prior Root Goal status ${priorRootGoalStatus ?? "unknown"}`,
+      payload: {
+        priorRootGoalStatus: priorRootGoalStatus ?? null,
+        taskOutcomeCount: taskOutcomes.length,
+        epochOutcomeCount: epochOutcomes.length,
+        artifactCount: artifacts.length
+      }
     });
   }
 
@@ -3450,8 +3501,10 @@ export class SecurityAgentController {
         ...input,
         repairFeedback: attemptFeedback,
         plannerDecisionView,
-        ...(plannerSessionResult.isolated || !this.lastPlannerDecisionView
-          ? {}
+        ...(plannerStateDelivery === "snapshot"
+          ? this.continuationDigest
+            ? { continuationContext: this.continuationDigest }
+            : {}
           : {
             previousPlannerDecisionView: this.lastPlannerDecisionView,
             previousDeliverySeq: this.lastPlannerDeliverySeq

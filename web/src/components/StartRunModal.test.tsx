@@ -138,4 +138,48 @@ describe("StartRunModal", () => {
     })));
     expect(mockedStart.mock.calls[0][0]).not.toHaveProperty("scopeDocumentId");
   });
+
+  it("prefills stored goal and scope in continuation mode and submits runtimeDir", async () => {
+    render(<StartRunModal
+      open
+      onClose={() => undefined}
+      onStarted={() => undefined}
+      continueFrom={{
+        runtimeDir: ".agent-runtime/sessions/prior",
+        goal: "既有目标",
+        scopeSummary: "api.example",
+        taskType: "pentest"
+      }}
+    />);
+
+    expect(screen.getByText("基于已有成果继续渗透")).toBeInTheDocument();
+    expect(screen.getByText("将在该会话已有任务图、成果、凭据与工件的基础上重开 Root Goal 并开始新一轮规划；可修改目标与授权范围。")).toBeInTheDocument();
+    expect(screen.getByLabelText("任务目标")).toHaveValue("既有目标");
+    expect(screen.getByLabelText("授权范围")).toHaveValue("api.example");
+
+    fireEvent.change(screen.getByLabelText("任务目标"), { target: { value: "换一个目标继续" } });
+    fireEvent.click(screen.getByRole("button", { name: /继\s*续\s*渗\s*透/ }));
+
+    await waitFor(() => expect(mockedStart).toHaveBeenCalledWith(expect.objectContaining({
+      goal: "换一个目标继续",
+      scope: "api.example",
+      runtimeDir: ".agent-runtime/sessions/prior"
+    })));
+  });
+
+  it("does not carry continuation fields into a plain start", async () => {
+    render(<StartRunModal open onClose={() => undefined} onStarted={() => undefined} />);
+    expect(screen.getByText("启动新任务")).toBeInTheDocument();
+    expect(screen.queryByText("将在该会话已有任务图、成果、凭据与工件的基础上重开 Root Goal 并开始新一轮规划；可修改目标与授权范围。")).not.toBeInTheDocument();
+
+    fireEvent.change(screen.getByLabelText("任务目标"), { target: { value: "全新任务" } });
+    fireEvent.change(screen.getByLabelText("授权范围"), { target: { value: "new.example" } });
+    fireEvent.click(screen.getByRole("button", { name: /启\s*动/ }));
+
+    await waitFor(() => expect(mockedStart).toHaveBeenCalledWith(expect.objectContaining({
+      goal: "全新任务",
+      scope: "new.example"
+    })));
+    expect(mockedStart.mock.calls[0][0]).not.toHaveProperty("runtimeDir");
+  });
 });

@@ -94,6 +94,10 @@ button, input { letter-spacing: 0; }
 .session-folder-toggle > small { min-width: 22px; padding: 1px 5px; border-radius: 8px; color: #64748b; background: #eef2f7; font-size: 9px; text-align: center; }
 .session-folder-children { display: flex; flex-direction: column; gap: 5px; border-left: 1px solid #e5eaf1; }
 .session-button { width: 100%; padding: 10px; text-align: left; border: 1px solid transparent; border-radius: var(--radius-control); color: #172033; background: transparent; cursor: pointer; }
+.session-button-row { display: flex; align-items: flex-start; gap: 2px; }
+.session-button-row > .session-button { flex: 1 1 auto; min-width: 0; }
+.session-button-row > .session-continue { flex: 0 0 auto; margin-top: 8px; padding: 4px; border: 1px solid transparent; border-radius: 6px; color: #64748b; background: transparent; cursor: pointer; line-height: 0; }
+.session-button-row > .session-continue:hover { color: #2563eb; background: #eff6ff; border-color: #bfdbfe; }
 .session-button:hover { background: #f6f8fb; }
 .session-button.active { border-color: #bfdbfe; background: #eff6ff; }
 .session-button > span, .session-button > strong { display: block; overflow: hidden; text-overflow: ellipsis; }

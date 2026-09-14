@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { Badge, Button, Empty, Menu, Tooltip } from "antd";
-import { Activity, BrainCircuit, Cable, ChevronRight, FileText, Folder, FolderOpen, GitBranch, ListTree, Network, PanelLeftClose, ShieldAlert, Wrench } from "lucide-react";
+import { Activity, BrainCircuit, Cable, ChevronRight, FileText, Folder, FolderOpen, GitBranch, ListTree, Network, PanelLeftClose, Play, ShieldAlert, Wrench } from "lucide-react";
 import { useLanguage } from "../language";
 import { buildSessionTree, sessionRelativePath, type SessionFolderNode } from "../sessions";
 import type { AgentEvent, RuntimeSession, ViewKey } from "../types";
@@ -13,6 +13,7 @@ interface SidebarProps {
   agents: Record<string, AgentEvent | undefined>;
   onViewChange: (view: ViewKey) => void;
   onRuntimeChange: (runtimeDir: string) => void;
+  onContinue?: (session: RuntimeSession) => void;
   onClose?: () => void;
   canApprove?: boolean;
   pendingApprovalCount?: number;
@@ -120,14 +121,23 @@ function SessionFolder({ folder, depth, expandedFolders, onToggle, sidebarProps 
   </div>;
 }
 
-function SessionButton({ session, runtimeDir, onRuntimeChange }: SidebarProps & { session: RuntimeSession }) {
+function SessionButton({ session, runtimeDir, onRuntimeChange, onContinue }: SidebarProps & { session: RuntimeSession }) {
   const { t, formatRelative } = useLanguage();
   const active = normalize(session.runtimeDir) === normalize(runtimeDir);
-  return <button className={`session-button${active ? " active" : ""}`} type="button" onClick={() => onRuntimeChange(session.runtimeDir)}>
-    <span className="session-name">{session.running ? <Badge status="processing" /> : null}{session.name}</span>
-    <strong>{session.goal || session.latestTask || t("sidebar.noGoal")}</strong>
-    <span className="session-meta">{t("sidebar.tasksTrace", { tasks: session.taskCount, events: session.eventCount, time: formatRelative(session.updatedAt) })}</span>
-  </button>;
+  return <div className="session-button-row">
+    <button className={`session-button${active ? " active" : ""}`} type="button" onClick={() => onRuntimeChange(session.runtimeDir)}>
+      <span className="session-name">{session.running ? <Badge status="processing" /> : null}{session.name}</span>
+      <strong>{session.goal || session.latestTask || t("sidebar.noGoal")}</strong>
+      <span className="session-meta">{t("sidebar.tasksTrace", { tasks: session.taskCount, events: session.eventCount, time: formatRelative(session.updatedAt) })}</span>
+    </button>
+    {onContinue && !session.running ? (
+      <Tooltip title={t("sidebar.continue")}>
+        <button className="session-continue" type="button" aria-label={t("sidebar.continue")} onClick={() => onContinue(session)}>
+          <Play size={14} />
+        </button>
+      </Tooltip>
+    ) : null}
+  </div>;
 }
 
 function normalize(value: string): string {

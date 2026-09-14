@@ -35,6 +35,7 @@ import { TrafficProxyManager } from "./connectivity/traffic-proxy-manager.js";
 import { ConnectivityStore, type ConnectivityDefinition } from "./stores/connectivity-store.js";
 import { ExecutionLog } from "./stores/execution-log.js";
 import { discoverRuntimeSessionDirs } from "./runtime-session-discovery.js";
+import { readStoredRunIdentity, type StoredRunIdentity } from "./runtime-identity.js";
 import { RuntimePathPolicy, RuntimePathPolicyError } from "./runtime-path-policy.js";
 import { defaultScopeForTask, normalizeScope } from "./scope.js";
 import { ScopeDocumentError, SCOPE_DOCUMENT_LIMITS } from "./scope-documents/scope-document-formats.js";
@@ -173,6 +174,9 @@ type RuntimeSession = {
   eventCount: number;
   artifactCount: number;
   goal?: string;
+  scopeSummary?: string;
+  rootGoalStatus?: string;
+  taskType?: "ctf" | "pentest";
   latestTask?: string;
   latestTaskStatus?: string;
   running?: boolean;
@@ -1711,13 +1715,32 @@ async function handleScopeDocumentRead(response: ServerResponse, documentId: str
 
 async function handleStartRun(request: IncomingMessage, response: ServerResponse): Promise<void> {
   const body = await readJsonBody(request);
-  const goal = stringValue(body.goal, "").trim();
+  const goalInput = stringValue(body.goal, "").trim();
   const rawScope = stringValue(body.scope, "").trim();
   const scopeDocumentId = stringValue(body.scopeDocumentId, "").trim();
   const confirmedDocumentScope = stringValue(body.confirmedDocumentScope, "").trim();
+  const requestedRuntimeDir = stringValue(body.runtimeDir, "").trim();
+  let runtimeDir: string;
+  let continued = false;
+  let storedIdentity: StoredRunIdentity | undefined;
+  if (requestedRuntimeDir) {
+    runtimeDir = await runtimePathPolicy.resolveRuntime(requestedRuntimeDir, "existing");
+    if (activeRuns.has(runtimeDir)) {
+      throw new HttpError(409, "run_already_active", "该会话已有正在进行的运行，不能重复继续");
+    }
+    storedIdentity = readStoredRunIdentity(runtimeDir);
+    continued = true;
+  } else {
+    const timestamp = new Date().toISOString().replace(/[-:]/g, "").replace(/\.\d{3}Z$/, "Z").replace("T", "-");
+    runtimeDir = await runtimePathPolicy.resolveRuntime(
+      join(runtimePathPolicy.rootDir, "sessions", `${timestamp}-web-${randomUUID().slice(0, 8)}`),
+      "create"
+    );
+  }
+  const goal = goalInput || storedIdentity?.userGoal || "";
   let taskType: TaskType;
   try {
-    taskType = normalizeTaskType(body.taskType);
+    taskType = normalizeTaskType(body.taskType ?? storedIdentity?.taskType);
   } catch (error) {
     await sendJson(response, { error: { code: "invalid_request", message: error instanceof Error ? error.message : String(error) } }, 400);
     return;
@@ -1726,7 +1749,7 @@ async function handleStartRun(request: IncomingMessage, response: ServerResponse
     await sendJson(response, { error: { code: "invalid_request", message: "goal 不能为空" } }, 400);
     return;
   }
-  if (taskType === "pentest" && !rawScope && !scopeDocumentId && !confirmedDocumentScope) {
+  if (taskType === "pentest" && !rawScope && !scopeDocumentId && !confirmedDocumentScope && !storedIdentity?.scopeSummary) {
     await sendJson(response, { error: { code: "invalid_request", message: "渗透测试必须提供 scope 或已确认的授权文件" } }, 400);
     return;
   }
@@ -1752,7 +1775,9 @@ async function handleStartRun(request: IncomingMessage, response: ServerResponse
       })
       : rawScope
         ? normalizeScope(rawScope)
-        : defaultScopeForTask(taskType)!;
+        : storedIdentity?.scopeSummary
+          ? storedIdentity.scopeSummary
+          : defaultScopeForTask(taskType)!;
   } catch (error) {
     if (error instanceof ScopeDocumentServiceError) throw error;
     await sendJson(response, {
@@ -1761,11 +1786,6 @@ async function handleStartRun(request: IncomingMessage, response: ServerResponse
     return;
   }
 
-  const timestamp = new Date().toISOString().replace(/[-:]/g, "").replace(/\.\d{3}Z$/, "Z").replace("T", "-");
-  const runtimeDir = await runtimePathPolicy.resolveRuntime(
-    join(runtimePathPolicy.rootDir, "sessions", `${timestamp}-web-${randomUUID().slice(0, 8)}`),
-    "create"
-  );
   let agentRuntime: AgentRuntimeLifecycle | undefined;
   let run: ActiveRun | undefined;
   try {
@@ -1818,7 +1838,13 @@ async function handleStartRun(request: IncomingMessage, response: ServerResponse
     };
     activeRuns.set(runtimeDir, run);
 
-    const options: Parameters<SecurityAgentController["runUntilDone"]>[0] = { userGoal: goal, scopeSummary: scope, taskType, reportingContext };
+    const options: Parameters<SecurityAgentController["runUntilDone"]>[0] = {
+      userGoal: goal,
+      scopeSummary: scope,
+      taskType,
+      reportingContext,
+      ...(continued ? { continuation: { reopenRootGoal: true } } : {})
+    };
     const maxRunTimeMs = optionalPositiveNumber(body.maxRunTimeMs);
     const maxParallelTasks = optionalPositiveNumber(body.maxParallelTasks);
     const maxPlannerCycles = optionalPositiveNumber(body.maxPlannerCycles);
@@ -1849,7 +1875,8 @@ async function handleStartRun(request: IncomingMessage, response: ServerResponse
       taskType,
       templateDigest: reportingContext.templateDigest,
       startedAt: activeRun.startedAt,
-      running: true
+      running: true,
+      continued
     }, 201);
   } catch (error) {
     activeRuns.delete(runtimeDir);
@@ -2320,6 +2347,9 @@ async function readRuntimeSession(rootDir: string, runtimeDir: string): Promise<
     eventCount,
     artifactCount,
     goal: graphMeta.goal,
+    scopeSummary: graphMeta.scopeSummary,
+    rootGoalStatus: graphMeta.rootGoalStatus,
+    taskType: graphMeta.taskType,
     latestTask: graphMeta.latestTask,
     latestTaskStatus: graphMeta.latestTaskStatus,
     running: activeRuns.has(runtimeDir)
@@ -2332,6 +2362,9 @@ async function readRuntimeSessionGraphMeta(runtimeDir: string): Promise<{
   edgeCount: number;
   taskCount: number;
   goal?: string;
+  scopeSummary?: string;
+  rootGoalStatus?: string;
+  taskType?: "ctf" | "pentest";
   latestTask?: string;
   latestTaskStatus?: string;
 }> {
@@ -2354,6 +2387,21 @@ async function readRuntimeSessionGraphMeta(runtimeDir: string): Promise<{
           ORDER BY updated_at DESC
           LIMIT 1
         `).get());
+        const scopeRow = asRecord(database.prepare(`
+          SELECT properties_json
+          FROM nodes
+          WHERE id = 'scope:root'
+        `).get());
+        const rootGoalRow = asRecord(database.prepare(`
+          SELECT properties_json
+          FROM nodes
+          WHERE id = 'goal:root'
+        `).get());
+        const runRow = asRecord(database.prepare(`
+          SELECT payload_json
+          FROM execution_events
+          WHERE event_type = 'run_started' ORDER BY seq DESC LIMIT 1
+        `).get());
         const taskRow = asRecord(database.prepare(`
           SELECT label, properties_json
           FROM nodes
@@ -2362,12 +2410,18 @@ async function readRuntimeSessionGraphMeta(runtimeDir: string): Promise<{
           LIMIT 1
         `).get());
         const taskProperties = parseJsonObject(taskRow.properties_json);
+        const runPayload = parseJsonObject(runRow.payload_json);
         return {
           source: "sqlite",
           nodeCount: numberValue(nodeRow.nodeCount),
           edgeCount: numberValue(edgeRow.edgeCount),
           taskCount: numberValue(nodeRow.taskCount),
           goal: stringValue(goalRow.label, ""),
+          scopeSummary: stringValue(parseJsonObject(scopeRow.properties_json)?.summary, ""),
+          rootGoalStatus: stringValue(parseJsonObject(rootGoalRow.properties_json)?.status, ""),
+          taskType: runPayload?.taskType === "ctf" || runPayload?.taskType === "pentest"
+            ? runPayload.taskType
+            : undefined,
           latestTask: stringValue(taskRow.label, ""),
           latestTaskStatus: stringValue(taskProperties.status, "")
         };
@@ -2382,12 +2436,16 @@ async function readRuntimeSessionGraphMeta(runtimeDir: string): Promise<{
   const graph = graphFromDeltas(graphDeltas);
   const tasks = graph.nodes.filter((node) => node.type === "Task");
   const goal = graph.nodes.find((node) => node.type === "Goal");
+  const rootGoal = graph.nodes.find((node) => node.id === "goal:root");
+  const rootScope = graph.nodes.find((node) => node.id === "scope:root");
   return {
     source: graph.source,
     nodeCount: graph.nodes.length,
     edgeCount: graph.edges.length,
     taskCount: tasks.length,
     goal: goal?.label,
+    scopeSummary: stringValue(rootScope?.properties.summary, ""),
+    rootGoalStatus: stringValue(rootGoal?.properties.status, ""),
     latestTask: tasks[0]?.label,
     latestTaskStatus: stringValue(tasks[0]?.properties.status, "")
   };

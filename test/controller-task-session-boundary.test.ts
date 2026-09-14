@@ -17,6 +17,17 @@ type ControllerHarness = {
   executionLog: SecurityAgentController["executionLog"];
   isolatedSessionsEnabled: boolean;
   structuredInvocationsEnabled: boolean;
+  createPlannerSessionForCycle: (forceIsolated?: boolean) => Promise<{
+    session: {
+      prompt: (text: string) => Promise<void>;
+      steer: (text: string) => Promise<void>;
+      subscribe: (listener: (event: unknown) => void) => () => void;
+      abort: () => Promise<void>;
+      promptCount: () => number;
+      prompts: () => string[];
+    };
+    isolated: boolean;
+  }>;
   enqueueProjectionJob: (input: unknown) => Promise<unknown>;
   enqueueSupervisorCheck: (input: unknown) => Promise<unknown>;
   createExecutorSessionForTask: (
@@ -68,7 +79,8 @@ type ControllerHarness = {
     };
   };
   finishTaskExecution: (taskId: string, reason?: string) => void;
-  ensureRootGraph: (input: { userGoal: string; scopeSummary: string }) => Promise<void>;
+  ensureRootGraph: (input: { userGoal: string; scopeSummary: string; reopenRootGoal?: boolean }) => Promise<void>;
+  prepareContinuationRound: (priorRootGoalStatus: string | undefined) => Promise<void>;
   createTaskRuntimeTools: (taskEnvelope: TaskEnvelope) => Array<{
     name: string;
     execute: (
@@ -639,3 +651,184 @@ test("unforced Supervisor handoff advice creates neither task nor epoch outcome"
   harness.finishTaskExecution(taskEnvelope.taskId, "supervisor_handoff");
   await controller.close({ drainProjectionJobs: false });
 });
+
+test("continuation reopens a completed Root Goal and appends a run_continued digest", async () => {
+  const runtimeDir = mkdtempSync(join(tmpdir(), "luanniao-continuation-"));
+  const { controller, harness } = createHarness(runtimeDir);
+  await controller.initialize();
+  await harness.ensureRootGraph({ userGoal: "Obtain flag", scopeSummary: "authorized target" });
+  harness.graphStore.setNodeStatus({ nodeId: "goal:root", status: "completed", reason: "previous run finished" });
+  const rootStatus = () => harness.graphStore.query("task", ["goal:root"], 1).nodes[0]?.properties.status;
+  assert.equal(rootStatus(), "completed");
+
+  // Without reopenRootGoal the persisted status survives (existing CLI resume semantics).
+  await harness.ensureRootGraph({ userGoal: "Obtain flag", scopeSummary: "authorized target" });
+  assert.equal(rootStatus(), "completed");
+
+  // With reopenRootGoal the completed Root Goal becomes open again.
+  await harness.ensureRootGraph({ userGoal: "Obtain flag", scopeSummary: "authorized target", reopenRootGoal: true });
+  assert.equal(rootStatus(), "open");
+
+  harness.runtimeStore.upsertTaskOutcome({
+    taskRef: "task:recon",
+    epochRef: "epoch:recon",
+    status: "completed",
+    summary: "Reconnaissance finished with admin endpoint confirmed",
+    evidenceRefs: [],
+    artifactRefs: ["artifact:recon-report"],
+    capabilityRefs: [],
+    terminalSeq: 4,
+    createdAt: new Date(0).toISOString()
+  });
+  harness.runtimeStore.upsertEpochOutcome({
+    epochRef: "epoch:recon",
+    taskRef: "task:recon",
+    status: "checkpointed",
+    reason: "Task result submitted",
+    terminalSeq: 4,
+    taskOutcomeRef: "task:recon",
+    retryable: false,
+    createdAt: new Date(0).toISOString()
+  });
+  await controller.artifactStore.write({
+    taskId: "task:recon",
+    kind: "report",
+    mediaType: "text/markdown",
+    data: "recon report"
+  });
+
+  await harness.prepareContinuationRound("completed");
+  const events = await controller.executionLog.readAll();
+  const continued = events.find((event) => event.eventType === "run_continued");
+  assert.ok(continued, "run_continued event persisted");
+  assert.deepEqual(continued?.payload, {
+    priorRootGoalStatus: "completed",
+    taskOutcomeCount: 1,
+    epochOutcomeCount: 1,
+    artifactCount: 1
+  });
+  const digest = (controller as unknown as { continuationDigest?: string }).continuationDigest ?? "";
+  assert.match(digest, /上一轮 Root Goal 状态为 completed，现已重开为 open/);
+  assert.match(digest, /task:recon \[completed\]/);
+  assert.match(digest, /Reconnaissance finished/);
+  assert.match(digest, /artifact:\S+ \(report\)/);
+  await controller.close({ drainProjectionJobs: false });
+});
+
+test("continuation digest reaches the first Planner snapshot of a continued run", async () => {
+  const runtimeDir = mkdtempSync(join(tmpdir(), "luanniao-continuation-input-"));
+  const { controller, harness } = createHarness(runtimeDir);
+  await controller.initialize();
+  await harness.ensureRootGraph({ userGoal: "Obtain flag", scopeSummary: "authorized target" });
+  harness.graphStore.setNodeStatus({ nodeId: "goal:root", status: "completed", reason: "previous run finished" });
+  harness.runtimeStore.upsertTaskOutcome({
+    taskRef: "task:prior",
+    epochRef: "epoch:prior",
+    status: "completed",
+    summary: "PRIOR_ROUND_MARKER authenticated foothold",
+    evidenceRefs: [],
+    artifactRefs: [],
+    capabilityRefs: [],
+    terminalSeq: 3,
+    createdAt: new Date(0).toISOString()
+  });
+  const plannerSession = createPlannerStructuredSession({
+    decision: "apply_commands",
+    commands: [{
+      kind: "set_node_status",
+      nodeId: "goal:root",
+      status: "achieved",
+      reason: "goal achieved",
+      basedOnRefs: ["goal:root"]
+    }],
+    reason: "goal achieved",
+    basedOnRefs: ["goal:root"]
+  });
+  harness.structuredInvocationsEnabled = true;
+  harness.createPlannerSessionForCycle = async () => ({
+    session: plannerSession,
+    isolated: true
+  });
+
+  const result = await controller.runUntilDone({
+    userGoal: "Obtain flag",
+    scopeSummary: "authorized target",
+    continuation: { reopenRootGoal: true },
+    maxPlannerCycles: 1
+  });
+
+  assert.equal(result.completed, true);
+  const firstPrompt = plannerSession.prompts()[0] ?? "";
+  assert.match(firstPrompt, /<continuation_context>/);
+  assert.match(firstPrompt, /PRIOR_ROUND_MARKER/);
+  assert.match(firstPrompt, /task:prior \[completed\]/);
+  const events = await controller.executionLog.readAll();
+  assert.equal(events.find((event) => event.eventType === "run_started")?.payload.continuation, true);
+  assert.ok(events.some((event) => event.eventType === "run_continued"));
+  await controller.close({ drainProjectionJobs: false });
+});
+
+function createPlannerTextSession(output: string): {
+  prompt: (text: string) => Promise<void>;
+  steer: (text: string) => Promise<void>;
+  subscribe: (listener: (event: unknown) => void) => () => void;
+  promptCount: () => number;
+  prompts: () => string[];
+} {
+  const listeners: Array<(event: unknown) => void> = [];
+  const promptTexts: string[] = [];
+  return {
+    async prompt(text: string): Promise<void> {
+      promptTexts.push(text);
+      for (const listener of [...listeners]) {
+        listener({ type: "message_end", message: { content: [{ type: "text", text: output }] } });
+      }
+    },
+    async steer(): Promise<void> {},
+    subscribe(listener: (event: unknown) => void): () => void {
+      listeners.push(listener);
+      return () => {
+        const index = listeners.indexOf(listener);
+        if (index >= 0) listeners.splice(index, 1);
+      };
+    },
+    promptCount: () => promptTexts.length,
+    prompts: () => [...promptTexts]
+  };
+}
+
+function createPlannerStructuredSession(details: Record<string, unknown>): {
+  prompt: (text: string) => Promise<void>;
+  steer: (text: string) => Promise<void>;
+  subscribe: (listener: (event: unknown) => void) => () => void;
+  abort: () => Promise<void>;
+  promptCount: () => number;
+  prompts: () => string[];
+} {
+  const listeners: Array<(event: unknown) => void> = [];
+  const promptTexts: string[] = [];
+  return {
+    async prompt(text: string): Promise<void> {
+      promptTexts.push(text);
+      for (const listener of [...listeners]) {
+        listener({
+          type: "tool_execution_end",
+          toolName: "planner_submit",
+          isError: false,
+          result: { details }
+        });
+      }
+    },
+    async steer(): Promise<void> {},
+    subscribe(listener: (event: unknown) => void): () => void {
+      listeners.push(listener);
+      return () => {
+        const index = listeners.indexOf(listener);
+        if (index >= 0) listeners.splice(index, 1);
+      };
+    },
+    promptCount: () => promptTexts.length,
+    prompts: () => [...promptTexts],
+    async abort(): Promise<void> {}
+  };
+}

@@ -244,6 +244,7 @@ export function renderPlannerInput(input: {
   previousDeliverySeq?: number;
   deliverySeq?: number;
   repairFeedback?: string;
+  continuationContext?: string;
 }): string {
   const compactDecisionView = compactPlannerDecisionViewForPrompt(input.plannerDecisionView);
   const previousCompactDecisionView = input.previousPlannerDecisionView
@@ -264,7 +265,10 @@ export function renderPlannerInput(input: {
   const fixedContext = previousCompactDecisionView
     ? ""
     : `<goal>\n${input.userGoal}\n</goal>\n\n<authorized_scope>\n${input.scopeSummary}\n</authorized_scope>\n\n`;
-  return `${fixedContext}<planner_state format="compact-json">
+  const continuationContext = input.continuationContext?.trim()
+    ? `<continuation_context>\n${truncatePromptText(input.continuationContext, 8_000)}\n</continuation_context>\n\n`
+    : "";
+  return `${fixedContext}${continuationContext}<planner_state format="compact-json">
 ${stableCompactJson(statePayload)}
 </planner_state>
 ${repairFeedback}
@@ -408,7 +412,7 @@ function compactPromptProperties(properties: Record<string, unknown>): Record<st
   ]));
 }
 
-function truncatePromptText(value: string | undefined, limit: number): string | undefined {
+export function truncatePromptText(value: string | undefined, limit: number): string | undefined {
   if (!value) {
     return undefined;
   }

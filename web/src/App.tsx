@@ -15,7 +15,7 @@ import { TrafficInspector } from "./components/TrafficInspector";
 import { TrafficView } from "./components/TrafficView";
 import { projectTaskTree } from "./graph";
 import { useLanguage, type Locale, type TranslationKey } from "./language";
-import type { AuthUser, TrafficExchange, TrafficFlowRef, ViewKey } from "./types";
+import type { AuthUser, RuntimeSession, TrafficExchange, TrafficFlowRef, ViewKey } from "./types";
 import { graphLabel } from "./utils";
 import { useRuntimeDashboard } from "./useRuntimeDashboard";
 
@@ -39,6 +39,7 @@ export default function App({ user, onLogout }: { user: AuthUser; onLogout: () =
   const [mobileSidebarOpen, setMobileSidebarOpen] = useState(false);
   const [mobileInspectorOpen, setMobileInspectorOpen] = useState(false);
   const [startRunOpen, setStartRunOpen] = useState(false);
+  const [continueTarget, setContinueTarget] = useState<RuntimeSession>();
   const [stopping, setStopping] = useState(false);
   const [actionError, setActionError] = useState<string>();
   const [pendingStartDir, setPendingStartDir] = useState<string>();
@@ -152,6 +153,7 @@ export default function App({ user, onLogout }: { user: AuthUser; onLogout: () =
       agents={data?.overview.agents || {}}
       onViewChange={setView}
       onRuntimeChange={(value) => { setRuntimeDraft(value); applyRuntime(value); }}
+      onContinue={setContinueTarget}
       onClose={mobileSidebarOpen ? () => setMobileSidebarOpen(false) : undefined}
       canApprove={isAdmin}
       pendingApprovalCount={approvalPendingCount}
@@ -356,10 +358,20 @@ export default function App({ user, onLogout }: { user: AuthUser; onLogout: () =
       <Drawer placement="left" width={286} open={mobileSidebarOpen} onClose={() => setMobileSidebarOpen(false)} closable={false} styles={{ body: { padding: 0 } }}>{sidebar}</Drawer>
       <Drawer placement="right" width={380} open={mobileInspectorOpen} onClose={() => setMobileInspectorOpen(false)} title={t("app.inspectorDrawer")}>{inspector}</Drawer>
       <StartRunModal
-        open={startRunOpen}
-        onClose={() => setStartRunOpen(false)}
+        open={startRunOpen || Boolean(continueTarget)}
+        continueFrom={continueTarget ? {
+          runtimeDir: continueTarget.runtimeDir,
+          goal: continueTarget.goal ?? "",
+          scopeSummary: continueTarget.scopeSummary,
+          taskType: continueTarget.taskType
+        } : undefined}
+        onClose={() => {
+          setStartRunOpen(false);
+          setContinueTarget(undefined);
+        }}
         onStarted={(dir) => {
           setStartRunOpen(false);
+          setContinueTarget(undefined);
           setPendingStartDir(dir);
           applyRuntime(dir);
         }}

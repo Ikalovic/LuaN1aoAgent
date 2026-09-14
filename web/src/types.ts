@@ -163,6 +163,9 @@ export interface RuntimeSession {
   eventCount: number;
   artifactCount: number;
   goal?: string;
+  scopeSummary?: string;
+  rootGoalStatus?: string;
+  taskType?: "ctf" | "pentest";
   latestTask?: string;
   latestTaskStatus?: string;
   running?: boolean;
@@ -174,6 +177,7 @@ export interface StartRunInput {
   scopeDocumentId?: string;
   confirmedDocumentScope?: string;
   taskType?: "ctf" | "pentest";
+  runtimeDir?: string;
   maxRunTimeMs?: number;
   maxParallelTasks?: number;
   maxPlannerCycles?: number;
@@ -210,6 +214,7 @@ export interface StartRunResponse {
   templateDigest?: string;
   startedAt: string;
   running: boolean;
+  continued?: boolean;
 }
 
 export interface ActiveRun {

@@ -215,6 +215,41 @@ test("planner prompt carries the canonical TaskOutcome without ledger summary tr
   assert.ok(input.length < 8_000, `Planner prompt too large: ${input.length}`);
 });
 
+test("planner snapshot renders continuation context between fixed context and planner state", () => {
+  const view: PlannerDecisionView = {
+    view: "planner_decision",
+    rootRefs: { goalRef: "goal:root", scopeRef: "scope:root" },
+    taskLedger: [],
+    taskOutcomes: [],
+    reasoningDigest: [],
+    operationDigest: [],
+    blockers: [],
+    graphSummary: { nodeCount: 2, edgeCount: 1, taskStatusCounts: {} }
+  };
+  const input = renderPlannerInput({
+    userGoal: "Continue from prior results",
+    scopeSummary: "10.0.0.0/24",
+    plannerDecisionView: view,
+    continuationContext: "本轮是续跑，优先复用已验证成果。\n- task:recon [completed] 侦察已完成"
+  });
+
+  const fixedIndex = input.indexOf("<authorized_scope>");
+  const continuationIndex = input.indexOf("<continuation_context>");
+  const stateIndex = input.indexOf('<planner_state format="compact-json">');
+  assert.ok(fixedIndex >= 0, "fixed context present");
+  assert.ok(continuationIndex > fixedIndex, "continuation context must follow fixed context");
+  assert.ok(stateIndex > continuationIndex, "continuation context must precede planner state");
+  assert.match(input, /本轮是续跑，优先复用已验证成果/);
+  assert.match(input, /task:recon \[completed\] 侦察已完成/);
+
+  const without = renderPlannerInput({
+    userGoal: "Continue from prior results",
+    scopeSummary: "10.0.0.0/24",
+    plannerDecisionView: view
+  });
+  assert.doesNotMatch(without, /<continuation_context>/);
+});
+
 test("planner follow-up carries a complete structural delta without repeating fixed context", () => {
   const previous: PlannerDecisionView = {
     view: "planner_decision",
