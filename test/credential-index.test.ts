@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtempSync } from "node:fs";
+import { existsSync, mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -192,5 +192,54 @@ test("listCredentialAccessLog filters by credentialRef", async () => {
 
   const allLogs = await store.listCredentialAccessLog();
   assert.equal(allLogs.length, 3);
+  store.close();
+});
+
+test("listCredentials without scopeRef returns credentials from every scope", async () => {
+  const store = createStore();
+  await store.writeCredential({ data: "cross-a", scopeRef: "scope:A", kind: "token" });
+  await store.writeCredential({ data: "cross-b", scopeRef: "scope:B", kind: "token" });
+
+  const all = await store.listCredentials(undefined);
+  assert.equal(all.length, 2);
+  assert.deepEqual(all.map((entry) => entry.scopeRef).sort(), ["scope:A", "scope:B"]);
+  store.close();
+});
+
+test("getCredentialIndex returns a single credential row", async () => {
+  const store = createStore();
+  const record = await store.writeCredential({ data: "single-row", scopeRef: "scope:one", kind: "token", label: "one" });
+
+  const entry = store.getCredentialIndex(record.artifactRef);
+  assert.equal(entry?.artifactRef, record.artifactRef);
+  assert.equal(entry?.label, "one");
+  assert.equal(store.getCredentialIndex("artifact:missing"), undefined);
+  store.close();
+});
+
+test("deleteCredential removes the index row, artifact row and secret file", async () => {
+  const store = createStore();
+  const record = await store.writeCredential({ data: "delete-me-please", scopeRef: "scope:del", kind: "token" });
+  assert.equal(existsSync(record.path), true);
+
+  const deleted = await store.deleteCredential(record.artifactRef);
+  assert.equal(deleted, true);
+
+  assert.equal((await store.listCredentials("scope:del")).length, 0);
+  assert.equal(store.getCredentialIndex(record.artifactRef), undefined);
+  assert.equal(await store.get(record.artifactRef), undefined);
+  assert.equal(existsSync(record.path), false);
+  store.close();
+});
+
+test("deleteCredential returns false for unknown refs and non-credential artifacts", async () => {
+  const store = createStore();
+  const plain = await store.write({ kind: "report", mediaType: "text/plain", data: "not a credential" });
+  assert.equal(await store.deleteCredential(plain.artifactRef), false);
+  assert.equal(await store.deleteCredential("artifact:00000000-0000-4000-8000-000000000000"), false);
+
+  const kept = await store.writeCredential({ data: "keep-me", scopeRef: "scope:keep" });
+  assert.equal((await store.listCredentials(undefined)).length, 1);
+  assert.equal(store.getCredentialIndex(kept.artifactRef)?.valid, true);
   store.close();
 });

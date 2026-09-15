@@ -32,6 +32,7 @@ import {
 } from "./connectivity/connectivity-runtime-registry.js";
 import { ConnectivityRuntimeOwnershipError } from "./connectivity/connectivity-runtime.js";
 import { TrafficProxyManager } from "./connectivity/traffic-proxy-manager.js";
+import { ArtifactStore } from "./stores/artifact-store.js";
 import { ConnectivityStore, type ConnectivityDefinition } from "./stores/connectivity-store.js";
 import { ExecutionLog } from "./stores/execution-log.js";
 import { discoverRuntimeSessionDirs } from "./runtime-session-discovery.js";
@@ -597,6 +598,51 @@ const server = createServer(async (request, response) => {
       await sendJson(response, await readArtifactContent(runtimeDir, artifactRef));
       return;
     }
+    if (url.pathname === "/api/credentials") {
+      if (request.method === "GET") {
+        requireRuntimeAccess(user!, "admin:credential");
+        await sendJson(response, await readCredentialsView(url.searchParams.get("runtimeDir") ?? defaultRuntimeDir));
+        return;
+      }
+      if (request.method === "POST") {
+        requireRuntimeAccess(user!, "admin:credential");
+        await handleCreateCredential(request, response, user!, url.searchParams.get("runtimeDir") ?? defaultRuntimeDir);
+        return;
+      }
+      await sendJson(response, { error: { code: "method_not_allowed", message: "仅支持 GET/POST" } }, 405);
+      return;
+    }
+    const credentialActionRoute = /^\/api\/credentials\/([^/]+)\/(invalidate|reveal)$/.exec(url.pathname);
+    if (credentialActionRoute) {
+      if (request.method !== "POST") {
+        await sendJson(response, { error: { code: "method_not_allowed", message: "仅支持 POST" } }, 405);
+        return;
+      }
+      requireRuntimeAccess(user!, "admin:credential");
+      await handleCredentialAction(
+        response,
+        user!,
+        decodeURIComponent(credentialActionRoute[1]),
+        credentialActionRoute[2] as "invalidate" | "reveal",
+        url.searchParams.get("runtimeDir") ?? defaultRuntimeDir
+      );
+      return;
+    }
+    const credentialRefRoute = /^\/api\/credentials\/([^/]+)$/.exec(url.pathname);
+    if (credentialRefRoute) {
+      if (request.method !== "DELETE") {
+        await sendJson(response, { error: { code: "method_not_allowed", message: "仅支持 DELETE" } }, 405);
+        return;
+      }
+      requireRuntimeAccess(user!, "admin:credential");
+      await handleDeleteCredential(
+        response,
+        user!,
+        decodeURIComponent(credentialRefRoute[1]),
+        url.searchParams.get("runtimeDir") ?? defaultRuntimeDir
+      );
+      return;
+    }
     await sendStatic(url.pathname, response);
   } catch (error) {
     if (error instanceof WebAuthError || error instanceof WebSecurityError) {
@@ -628,6 +674,17 @@ const server = createServer(async (request, response) => {
             ? 422
             : 400;
       await sendJson(response, { error: { code: error.code, message: error.message } }, statusCode);
+      return;
+    }
+    if (error instanceof ConnectivityRuntimeOwnershipError) {
+      await sendJson(response, {
+        error: {
+          code: error.code,
+          message: error.ownerPid
+            ? `该会话的网络运行时正被进程 ${error.ownerPid} 占用，请稍后重试`
+            : "该会话的网络运行时暂不可用，请稍后重试"
+        }
+      }, 409);
       return;
     }
     if (error instanceof HttpError) {
@@ -1846,6 +1903,12 @@ async function handleStartRun(request: IncomingMessage, response: ServerResponse
   let agentRuntime: AgentRuntimeLifecycle | undefined;
   let run: ActiveRun | undefined;
   try {
+    // A continuation must win over this process's own read-only history
+    // viewers: the mitm flow index owner and the historical connectivity
+    // runtime both hold the runtime ownership lease while alive, and the new
+    // controller cannot acquire it until they are released.
+    await closeHistoricalMitmIndexes(runtimeDir).catch(() => undefined);
+    await historicalConnectivityRuntimes.close(runtimeDir).catch(() => undefined);
     let reportingContext: ReportingContext;
     try {
       reportingContext = taskType === "pentest"
@@ -2292,6 +2355,175 @@ function optionalNumber(value: unknown): number | undefined {
 
 function optionalText(value: unknown): string | undefined {
   return typeof value === "string" && value ? value : undefined;
+}
+
+const MAX_CREDENTIAL_REQUEST_BYTES = 2 * 1024 * 1024;
+const MAX_CREDENTIAL_VALUE_LENGTH = 1_048_576;
+const CREDENTIAL_KINDS = new Set(["cookie", "token", "api_key", "password", "certificate", "ssh_key", "other"]);
+const CREDENTIAL_REF_PATTERN = /^artifact:[\w-]+$/i;
+
+async function readCredentialsView(runtimeDirInput: string): Promise<JsonRecord> {
+  const runtimeDir = await runtimePathPolicy.resolveRuntime(runtimeDirInput, "existing");
+  if (!existsSync(join(runtimeDir, "state.sqlite"))) {
+    return { runtimeDir, available: false, records: [], scopes: [] };
+  }
+  const store = await openRuntimeCredentialStore(runtimeDir);
+  try {
+    const records = await store.listCredentials(undefined);
+    return {
+      runtimeDir,
+      available: true,
+      records,
+      scopes: [...new Set(records.map((record) => record.scopeRef))].sort()
+    };
+  } finally {
+    store.close();
+  }
+}
+
+async function openRuntimeCredentialStore(runtimeDir: string): Promise<ArtifactStore> {
+  const databasePath = await runtimePathPolicy.resolveRuntimeChild(runtimeDir, "state.sqlite", "existing");
+  const artifactsRoot = await runtimePathPolicy.resolveRuntimeChild(runtimeDir, "artifacts", "create");
+  return new ArtifactStore(artifactsRoot, databasePath);
+}
+
+async function handleCreateCredential(
+  request: IncomingMessage,
+  response: ServerResponse,
+  user: WebUser,
+  runtimeDirInput: string
+): Promise<void> {
+  const body = await readJsonBody(request, MAX_CREDENTIAL_REQUEST_BYTES);
+  assertOnlyKeys(body, ["kind", "value", "scopeRef", "hostRef", "label", "username", "role"]);
+  const kind = requiredCredentialField(body.kind, "kind", 64);
+  if (!CREDENTIAL_KINDS.has(kind)) {
+    throw new HttpError(400, "invalid_request", "kind 必须是受支持的凭据类型");
+  }
+  const value = requiredCredentialField(body.value, "value", MAX_CREDENTIAL_VALUE_LENGTH);
+  const scopeRef = requiredCredentialField(body.scopeRef, "scopeRef", 256);
+  const hostRef = optionalCredentialField(body.hostRef, "hostRef", 2_048);
+  const label = optionalCredentialField(body.label, "label", 512);
+  const username = optionalCredentialField(body.username, "username", 512);
+  const role = optionalCredentialField(body.role, "role", 256);
+
+  const runtimeDir = await runtimePathPolicy.resolveRuntime(runtimeDirInput, "existing");
+  if (!existsSync(join(runtimeDir, "state.sqlite"))) {
+    throw new HttpError(404, "credential_store_unavailable", "所选 Runtime 尚未初始化凭据存储");
+  }
+  const store = await openRuntimeCredentialStore(runtimeDir);
+  try {
+    const record = await store.writeCredential({
+      data: value,
+      scopeRef,
+      kind,
+      hostRef,
+      label,
+      username,
+      role,
+      source: "manual"
+    });
+    await store.logCredentialAccess({
+      credentialRef: record.artifactRef,
+      action: "store",
+      actor: `web:${user.username}`,
+      details: `kind=${kind} source=manual`
+    });
+    await sendJson(response, { ok: true, record: store.getCredentialIndex(record.artifactRef) });
+  } finally {
+    store.close();
+  }
+}
+
+async function handleCredentialAction(
+  response: ServerResponse,
+  user: WebUser,
+  artifactRef: string,
+  action: "invalidate" | "reveal",
+  runtimeDirInput: string
+): Promise<void> {
+  if (!CREDENTIAL_REF_PATTERN.test(artifactRef)) {
+    throw new HttpError(400, "invalid_request", "artifactRef 格式不正确");
+  }
+  const runtimeDir = await runtimePathPolicy.resolveRuntime(runtimeDirInput, "existing");
+  if (!existsSync(join(runtimeDir, "state.sqlite"))) {
+    throw new HttpError(404, "credential_store_unavailable", "所选 Runtime 尚未初始化凭据存储");
+  }
+  const store = await openRuntimeCredentialStore(runtimeDir);
+  try {
+    if (!store.getCredentialIndex(artifactRef)) {
+      throw new HttpError(404, "credential_not_found", "凭证不存在");
+    }
+    if (action === "reveal") {
+      const value = await store.readCredential(artifactRef).catch(() => {
+        throw new HttpError(404, "credential_not_found", "凭证文件不存在");
+      });
+      await store.touchCredential(artifactRef);
+      await store.logCredentialAccess({
+        credentialRef: artifactRef,
+        action: "read",
+        actor: `web:${user.username}`,
+        details: "revealed in web workbench"
+      });
+      await sendJson(response, { ok: true, value });
+      return;
+    }
+    await store.invalidateCredential(artifactRef);
+    await store.logCredentialAccess({
+      credentialRef: artifactRef,
+      action: "invalidate",
+      actor: `web:${user.username}`
+    });
+    await sendJson(response, { ok: true });
+  } finally {
+    store.close();
+  }
+}
+
+async function handleDeleteCredential(
+  response: ServerResponse,
+  user: WebUser,
+  artifactRef: string,
+  runtimeDirInput: string
+): Promise<void> {
+  if (!CREDENTIAL_REF_PATTERN.test(artifactRef)) {
+    throw new HttpError(400, "invalid_request", "artifactRef 格式不正确");
+  }
+  const runtimeDir = await runtimePathPolicy.resolveRuntime(runtimeDirInput, "existing");
+  if (!existsSync(join(runtimeDir, "state.sqlite"))) {
+    throw new HttpError(404, "credential_store_unavailable", "所选 Runtime 尚未初始化凭据存储");
+  }
+  const store = await openRuntimeCredentialStore(runtimeDir);
+  try {
+    const deleted = await store.deleteCredential(artifactRef);
+    if (!deleted) {
+      throw new HttpError(404, "credential_not_found", "凭证不存在");
+    }
+    await store.logCredentialAccess({
+      credentialRef: artifactRef,
+      action: "delete",
+      actor: `web:${user.username}`
+    });
+    await sendJson(response, { ok: true });
+  } finally {
+    store.close();
+  }
+}
+
+function requiredCredentialField(value: unknown, name: string, maxLength: number): string {
+  if (typeof value !== "string" || value.length === 0 || value.length > maxLength || value.includes("\u0000")) {
+    throw new HttpError(400, "invalid_request", `${name} 无效`);
+  }
+  return value;
+}
+
+function optionalCredentialField(value: unknown, name: string, maxLength: number): string | undefined {
+  if (value === undefined || value === null || value === "") {
+    return undefined;
+  }
+  if (typeof value !== "string" || value.length > maxLength || value.includes("\u0000")) {
+    throw new HttpError(400, "invalid_request", `${name} 无效`);
+  }
+  return value;
 }
 
 const MAX_ARTIFACT_TEXT_BYTES = 512 * 1024;

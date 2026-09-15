@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { Badge, Button, Empty, Menu, Tooltip } from "antd";
-import { Activity, BrainCircuit, Cable, ChevronRight, FileText, Folder, FolderOpen, GitBranch, ListTree, Network, PanelLeftClose, Play, Plug, ShieldAlert, Wrench } from "lucide-react";
+import { Activity, BrainCircuit, Cable, ChevronRight, FileText, Folder, FolderOpen, GitBranch, KeyRound, ListTree, Network, PanelLeftClose, Play, Plug, ShieldAlert, Wrench } from "lucide-react";
 import { useLanguage } from "../language";
 import { buildSessionTree, sessionRelativePath, type SessionFolderNode } from "../sessions";
 import type { AgentEvent, RuntimeSession, ViewKey } from "../types";
@@ -19,6 +19,7 @@ interface SidebarProps {
   selectedAgentRole?: string;
   canApprove?: boolean;
   pendingApprovalCount?: number;
+  canManageCredentials?: boolean;
 }
 
 export function Sidebar(props: SidebarProps) {
@@ -32,6 +33,7 @@ export function Sidebar(props: SidebarProps) {
     { key: "connections", icon: <Cable size={17} />, label: t("nav.connections") },
     { key: "skills", icon: <Wrench size={17} />, label: t("nav.skills") },
     { key: "mcp", icon: <Plug size={17} />, label: t("nav.mcp") },
+    ...(props.canManageCredentials ? [{ key: "credentials", icon: <KeyRound size={17} />, label: t("nav.credentials") }] : []),
     { key: "reasoning", icon: <BrainCircuit size={17} />, label: t("nav.reasoning") },
     { key: "operation", icon: <GitBranch size={17} />, label: t("nav.operation") },
     { key: "task", icon: <ListTree size={17} />, label: t("nav.task") },

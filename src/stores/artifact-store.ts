@@ -1,6 +1,6 @@
 import { createReadStream, createWriteStream, existsSync, mkdirSync, readFileSync } from "node:fs";
 import { appendFile, chmod, link, lstat, mkdir, readFile, stat, unlink, writeFile } from "node:fs/promises";
-import { dirname, extname, join } from "node:path";
+import { dirname, extname, join, sep } from "node:path";
 import { createHash, randomUUID } from "node:crypto";
 import { DatabaseSync } from "node:sqlite";
 import { Transform } from "node:stream";
@@ -154,14 +154,18 @@ export class ArtifactStore {
     return record;
   }
 
-  async listCredentials(scopeRef: string, options?: {
+  async listCredentials(scopeRef: string | undefined, options?: {
     hostRef?: string;
     kind?: string;
     role?: string;
     validOnly?: boolean;
   }): Promise<CredentialIndexRecord[]> {
-    const conditions: string[] = ["scope_ref = ?"];
-    const params: string[] = [scopeRef];
+    const conditions: string[] = [];
+    const params: string[] = [];
+    if (scopeRef) {
+      conditions.push("scope_ref = ?");
+      params.push(scopeRef);
+    }
     if (options?.hostRef) {
       conditions.push("host_ref = ?");
       params.push(options.hostRef);
@@ -177,9 +181,16 @@ export class ArtifactStore {
     if (options?.validOnly) {
       conditions.push("valid = 1");
     }
-    const sql = `SELECT * FROM credential_index WHERE ${conditions.join(" AND ")} ORDER BY created_at ASC`;
+    const where = conditions.length ? `WHERE ${conditions.join(" AND ")}` : "";
+    const sql = `SELECT * FROM credential_index ${where} ORDER BY created_at ASC`;
     const rows = this.database.prepare(sql).all(...params) as CredentialIndexRow[];
     return rows.map(credentialRowToRecord);
+  }
+
+  getCredentialIndex(artifactRef: string): CredentialIndexRecord | undefined {
+    const row = this.database.prepare("SELECT * FROM credential_index WHERE artifact_ref = ?")
+      .get(artifactRef) as CredentialIndexRow | undefined;
+    return row ? credentialRowToRecord(row) : undefined;
   }
 
   async readCredential(artifactRef: string): Promise<string> {
@@ -195,6 +206,35 @@ export class ArtifactStore {
       this.database.exec("ROLLBACK");
       throw error;
     }
+  }
+
+  async deleteCredential(artifactRef: string): Promise<boolean> {
+    const record = await this.get(artifactRef);
+    if (!record || record.kind !== "credential") {
+      return false;
+    }
+    const rootPrefix = this.rootDir.endsWith(sep) ? this.rootDir : `${this.rootDir}${sep}`;
+    if (!record.path.startsWith(rootPrefix)) {
+      throw new Error("Credential path escapes the artifact root");
+    }
+    try {
+      await unlink(record.path);
+    } catch (error) {
+      if (!isNotFoundError(error)) {
+        throw error;
+      }
+    }
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      this.database.prepare("DELETE FROM credential_index WHERE artifact_ref = ?").run(artifactRef);
+      this.database.prepare("DELETE FROM artifacts WHERE artifact_ref = ?").run(artifactRef);
+      this.database.prepare("DELETE FROM artifact_chunks_fts WHERE artifact_ref = ?").run(artifactRef);
+      this.database.exec("COMMIT");
+    } catch (error) {
+      this.database.exec("ROLLBACK");
+      throw error;
+    }
+    return true;
   }
 
   async touchCredential(artifactRef: string): Promise<void> {
@@ -679,4 +719,8 @@ function accessLogRowToRecord(row: CredentialAccessLogRow): CredentialAccessLogR
 
 function isAlreadyExistsError(error: unknown): boolean {
   return Boolean(error && typeof error === "object" && "code" in error && error.code === "EEXIST");
+}
+
+function isNotFoundError(error: unknown): boolean {
+  return Boolean(error && typeof error === "object" && "code" in error && error.code === "ENOENT");
 }

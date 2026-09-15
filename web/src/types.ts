@@ -3,7 +3,7 @@ export type JsonRecord = Record<string, JsonValue | undefined>;
 
 export type Role = "planner" | "executor" | "observer" | "runtime" | string;
 export type GraphKind = "reasoning" | "operation" | "task";
-export type ViewKey = "trace" | "reports" | GraphKind | "traffic" | "connections" | "skills" | "mcp" | "approvals";
+export type ViewKey = "trace" | "reports" | GraphKind | "traffic" | "connections" | "skills" | "mcp" | "credentials" | "approvals";
 
 export interface AuthUser {
   id: string;
@@ -112,6 +112,38 @@ export interface EnvConfigView {
 export interface EnvConfigChanges {
   set: Record<string, string>;
   remove: string[];
+}
+
+export interface CredentialRecord {
+  artifactRef: string;
+  scopeRef: string;
+  kind: string;
+  hostRef?: string;
+  label: string;
+  username?: string;
+  role?: string;
+  source: string;
+  valid: boolean;
+  graphNodeId?: string;
+  createdAt: string;
+  lastUsedAt?: string;
+}
+
+export interface CredentialsResponse {
+  runtimeDir: string;
+  available: boolean;
+  records: CredentialRecord[];
+  scopes: string[];
+}
+
+export interface CredentialCreateInput {
+  kind: string;
+  value: string;
+  scopeRef: string;
+  hostRef?: string;
+  label?: string;
+  username?: string;
+  role?: string;
 }
 
 export interface GraphNode {

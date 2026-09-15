@@ -455,22 +455,31 @@ button.artifact-row-button:hover span { color: #2563eb; }
 .reports-view { height: 100%; min-height: 0; overflow-y: auto; padding: 14px; background: #f7f9fc; }
 
 /* Skill registry and MCP server management */
-.skills-view, .mcp-view { height: 100%; min-height: 0; overflow: auto; padding: 14px; background: #f7f9fc; }
-.skills-summary, .mcp-summary { display: grid; grid-template-columns: repeat(4, minmax(120px, 1fr)); margin-bottom: 12px; border: 1px solid #e1e6ee; border-radius: 6px; background: #fff; }
-.skills-summary span, .mcp-summary span { min-width: 0; padding: 10px 12px; color: #475569; border-right: 1px solid #edf0f4; font-size: 11px; font-weight: 700; }
-.skills-summary span:last-child, .mcp-summary span:last-child { border-right: 0; }
-.skills-toolbar, .mcp-toolbar { display: flex; align-items: center; justify-content: space-between; gap: 16px; margin-bottom: 10px; }
-.skills-toolbar h5, .mcp-toolbar h5 { margin: 0 0 2px !important; font-size: 14px !important; }
-.skills-toolbar > div:first-child > span, .mcp-toolbar > div:first-child > span { color: #657187; font-size: 11px; }
-.skills-toolbar-controls, .mcp-toolbar-controls { display: grid; grid-template-columns: minmax(210px, 1fr) 130px auto; gap: 7px; align-items: center; }
+.skills-view, .mcp-view, .credentials-view { height: 100%; min-height: 0; overflow: auto; padding: 14px; background: #f7f9fc; }
+.skills-summary, .mcp-summary, .credentials-summary { display: grid; grid-template-columns: repeat(4, minmax(120px, 1fr)); margin-bottom: 12px; border: 1px solid #e1e6ee; border-radius: 6px; background: #fff; }
+.skills-summary span, .mcp-summary span, .credentials-summary span { min-width: 0; padding: 10px 12px; color: #475569; border-right: 1px solid #edf0f4; font-size: 11px; font-weight: 700; }
+.skills-summary span:last-child, .mcp-summary span:last-child, .credentials-summary span:last-child { border-right: 0; }
+.skills-toolbar, .mcp-toolbar, .credentials-toolbar { display: flex; align-items: center; justify-content: space-between; gap: 16px; margin-bottom: 10px; }
+.skills-toolbar h5, .mcp-toolbar h5, .credentials-toolbar h5 { margin: 0 0 2px !important; font-size: 14px !important; }
+.skills-toolbar > div:first-child > span, .mcp-toolbar > div:first-child > span, .credentials-toolbar > div:first-child > span { color: #657187; font-size: 11px; }
+.skills-toolbar-controls, .mcp-toolbar-controls, .credentials-toolbar-controls { display: grid; grid-template-columns: minmax(210px, 1fr) 130px auto; gap: 7px; align-items: center; }
 .skills-diagnostics, .mcp-diagnostics { margin-bottom: 10px; }
-.skills-loading, .mcp-loading { display: grid; min-height: 240px; place-items: center; }
-.skills-table, .mcp-table { overflow: hidden; border: 1px solid #e1e6ee; border-radius: 6px; background: #fff; }
+.skills-loading, .mcp-loading, .credentials-loading { display: grid; min-height: 240px; place-items: center; }
+.skills-table, .mcp-table, .credentials-table { overflow: hidden; border: 1px solid #e1e6ee; border-radius: 6px; background: #fff; }
 .skill-description, .mcp-description { display: block; min-width: 240px; color: #526078; line-height: 1.5; overflow-wrap: anywhere; }
 .skills-readonly-note, .mcp-readonly-note { display: block; margin-top: 9px; color: #778399; font-size: 10px; }
-.skills-inspector h5, .mcp-inspector h5 { margin: 0 0 8px !important; font-size: 14px !important; }
-.skills-inspector p, .mcp-inspector p { margin: 0; color: #657187; font-size: 11px; line-height: 1.65; }
+.skills-inspector h5, .mcp-inspector h5, .credentials-inspector h5 { margin: 0 0 8px !important; font-size: 14px !important; }
+.skills-inspector p, .mcp-inspector p, .credentials-inspector p { margin: 0; color: #657187; font-size: 11px; line-height: 1.65; }
 .mcp-toolbar-controls { grid-template-columns: minmax(210px, 1fr) 130px auto auto; }
+.credentials-toolbar-controls { grid-template-columns: minmax(210px, 1fr) 116px 116px auto auto; }
+.credentials-summary { grid-template-columns: repeat(3, minmax(120px, 1fr)); }
+.credentials-view > .ant-alert { margin-bottom: 10px; }
+.credentials-label { display: flex; flex-direction: column; min-width: 0; }
+.credentials-label > span { color: #8490a3; font-size: 11px; }
+.credentials-scope { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 11px; }
+.credentials-reveal-meta { display: flex; flex-wrap: wrap; gap: 6px; }
+.credentials-reveal-meta > span { padding: 2px 8px; border-radius: 4px; background: #f1f5f9; color: #475569; font-size: 11px; }
+.credentials-secret, .credentials-secret textarea { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; word-break: break-all; }
 .env-drawer-body { display: flex; flex-direction: column; gap: 10px; }
 .env-drawer-loading { display: grid; min-height: 240px; place-items: center; }
 .env-drawer-table { overflow: hidden; border: 1px solid #e1e6ee; border-radius: 6px; background: #fff; }
