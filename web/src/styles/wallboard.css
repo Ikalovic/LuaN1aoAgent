@@ -1,0 +1,163 @@
+@font-face { font-family: "Smiley Sans"; src: url('/fonts/SmileySans-Oblique.ttf.woff2') format('woff2'); font-weight: 400; font-display: swap; }
+@font-face { font-family: "Chakra Petch"; src: url('/fonts/chakra-petch-medium.ttf') format('truetype'); font-weight: 500; font-display: swap; }
+.wallboard {
+  --bg: transparent; --surface: transparent; --surface-raised: transparent; --border: #54777e66;
+  --text: #d7e9ed; --text-secondary: #8faeb8; --accent: #88ead6; --accent-soft: transparent;
+  --body-size: 16px; --aux-size: 12px; --heading-size: 26px; --number-size: 58px;
+  --display-font: "Smiley Sans", "Microsoft YaHei", sans-serif; --instrument-font: "Chakra Petch", sans-serif;
+  position: relative; isolation: isolate; display: grid; grid-template-rows: 104px 116px minmax(380px,1fr) 144px 48px;
+  width: 100%; height: 100dvh; min-height: 920px; padding: 24px 48px; gap: 20px;
+  overflow: auto; color: var(--text); color-scheme: dark; background: transparent;
+  font: 400 var(--body-size)/1.5 "Noto Sans SC", "Microsoft YaHei", "Droid Sans Fallback", sans-serif;
+}
+.wallboard *, .wall-settings * { box-sizing: border-box; letter-spacing: 0; }
+.wallboard ::selection { background: #82e6d52b; color: #e5fff6; }
+.wallboard h1, .wallboard h2, .wallboard h3, .wallboard p { margin: 0; }
+.wallboard h1, .wallboard h2, .wallboard h3 { font-family: var(--display-font); font-weight: 400; font-synthesis: none; text-shadow: 0 0 16px #9ededd33; }
+.wallboard h2, .wallboard h3 { font-size: var(--heading-size); line-height: 1.2; color: #d9f6f4; }
+.wallboard small { font-size: var(--aux-size); color: var(--text-secondary); }
+.wallboard button { font: inherit; }.wallboard button, .wallboard a { -webkit-tap-highlight-color: transparent; }
+.wallboard button:focus-visible, .wallboard a:focus-visible { outline: 1px solid #a0f4df; outline-offset: 3px; }
+.wallboard .ant-btn { min-width: 36px; min-height: 36px; box-shadow: none; }
+.wallboard .ant-select { min-width: 0; }.wallboard .ant-select, .wallboard .ant-input { font-size: 12px; }
+.wallboard .ant-select-selector, .wallboard .ant-segmented { align-items: center; }
+.wallboard .ant-segmented-item-selected { box-shadow: inset 0 -1px #8ce8d6; border-radius: 0; }
+.wallboard .ant-segmented-thumb { box-shadow: none; background: transparent; }
+.wallboard ::-webkit-scrollbar { width: 4px; height: 4px; }.wallboard ::-webkit-scrollbar-track { background: transparent; }.wallboard ::-webkit-scrollbar-thumb { background: #76aca666; }
+.wallboard { scrollbar-width: thin; scrollbar-color: #76aca666 transparent; }
+.wall-background { position: fixed; inset: 0; z-index: 0; pointer-events: none; }
+.wall-background img { display: block; width: 100%; height: 100%; object-fit: cover; }
+.wall-header, .wall-metrics, .wall-primary, .wall-bottom, .wall-footer { position: relative; z-index: 1; min-width: 0; }
+.wall-header { display: grid; grid-template-columns: minmax(0,1fr) 560px minmax(0,1fr); align-items: center; gap: 32px; }
+.wall-header::after { content: ""; position: absolute; bottom: -7px; width: 320px; left: calc(50% - 160px); height: 1px; background: #81d7ca55; }
+.wall-target { max-width: 400px; min-width: 0; }.wall-target > span { display: block; font-size: 11px; color: #82c7bf; margin-bottom: 5px; }
+.wall-target strong { font-size: 14px; line-height: 1.65; font-weight: 400; overflow-wrap: anywhere; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+.wall-brand { display: flex; justify-content: center; align-items: center; gap: 22px; user-select: none; }
+.wall-brand img { width: 64px; height: 64px; object-fit: contain; }
+.wall-brand h1 { font-size: 72px; line-height: .98; color: #e0f7f3; }
+.wall-brand p { margin-top: 10px; font-size: 12px; color: #a7c2ca; white-space: nowrap; }
+.wall-brand p span { margin-left: 16px; padding-left: 16px; border-left: 1px solid #648c9466; color: #84c7bd; }
+.wall-live { display: flex; justify-content: flex-end; align-items: center; gap: 24px; }
+.wall-state { color: #e8c991; font-size: 12px; white-space: nowrap; }.wall-state.running { color: #98ddc5; }
+.wall-clock { font: 500 28px/1.5 var(--instrument-font); text-align: right; font-variant-numeric: tabular-nums; }
+.wall-clock small { display: block; font: 400 10px/1.5 sans-serif; }
+.wall-metrics { display: grid; grid-template-columns: repeat(6,minmax(0,1fr)); gap: 36px; padding: 8px 0 2px; user-select: none; }
+.wall-metric { --metric-color: #99d7ef; position: relative; display: flex; flex-direction: column; align-items: center; justify-content: center; min-width: 0; gap: 3px; border-bottom: 1px solid #7bb5bb33; }
+.wall-metric::after { content: ""; position: absolute; bottom: -1px; width: 32px; height: 2px; background: var(--metric-color); opacity: .65; }
+.wall-metric + .wall-metric::before { content: ""; position: absolute; left: -18px; top: 32%; bottom: 22%; width: 1px; background: #7096a033; }
+.wall-metric > span { display: flex; align-items: center; gap: 8px; font-size: 14px; white-space: nowrap; color: #bad0d7; }
+.wall-metric svg { width: 16px; height: 16px; color: var(--metric-color); stroke-width: 1.4; }
+.wall-metric strong { display: block; max-width: 100%; font: 500 var(--number-size)/1.06 var(--instrument-font); font-variant-numeric: tabular-nums; color: var(--metric-color); text-shadow: 0 0 18px #abd9de25; }
+.wall-metric small { font-size: 10px; white-space: nowrap; opacity: .85; }
+.wall-metric.teal { --metric-color: #8ee9d2; }.wall-metric.amber { --metric-color: #e8c991; }.wall-metric.coral { --metric-color: #ec99a5; }.wall-metric.green { --metric-color: #a9d8b5; }
+.wall-primary { display: grid; grid-template-columns: minmax(280px,21fr) minmax(0,56fr) minmax(280px,23fr); gap: 32px; min-height: 0; }
+.wall-band { min-width: 0; min-height: 0; background: transparent; padding: 0; }
+.wallboard section > header { display: flex; align-items: center; justify-content: space-between; gap: 12px; min-height: 34px; flex-shrink: 0; margin-bottom: 12px; padding-bottom: 8px; border-bottom: 1px solid #658b9344; }
+.wallboard section > header h2 { position: relative; padding-left: 16px; }
+.wallboard section > header h2::before { content: ""; position: absolute; left: 1px; top: 6px; width: 4px; height: 15px; transform: skew(-15deg); background: #8fddce; }
+.wallboard section > header > span { color: #90aeb7; font-size: 10px; white-space: nowrap; }
+.wall-left { display: grid; grid-template-rows: minmax(0,1fr) minmax(0,1fr) 110px; gap: 20px; }
+.wall-distribution { min-height: 0; display: flex; flex-direction: column; }
+.wall-distribution-body { display: grid; grid-template-columns: 48% 1fr; grid-template-rows: minmax(0,1fr); align-items: center; gap: 24px; flex: 1; min-height: 0; }
+.wall-donut { position: relative; width: 100%; height: 100%; max-height: 176px; min-height: 60px; --dial-size: min(100cqw,100cqh); container-type: size; }
+.wall-donut::before, .wall-donut::after { content: ""; position: absolute; width: calc(var(--dial-size) - 3px); height: calc(var(--dial-size) - 3px); left: 50%; top: 50%; transform: translate(-50%,-50%); border: 1px dashed #97c2c355; border-radius: 50%; pointer-events: none; }
+.wall-donut::after { width: calc(var(--dial-size) * .69); height: calc(var(--dial-size) * .69); border-style: solid; border-color: #90cbd433; }
+.wall-donut-center { position: absolute; inset: 0; display: flex; flex-direction: column; justify-content: center; align-items: center; pointer-events: none; }
+.wall-donut-center strong { font: 500 30px/1.1 var(--instrument-font); color: #d7f5f2; }
+.wall-donut-center span { font-size: 9px; margin-top: 6px; color: #99bdc7; }
+.wall-donut-empty { position: absolute; inset: 18%; border: 2px solid #93b3bd44; border-radius: 50%; }
+.wall-chart-legend { display: flex; flex-direction: column; gap: 9px; max-height: 100%; }
+.wall-distribution:first-child .wall-chart-legend { height: 100%; display: grid; grid-template-rows: repeat(6,minmax(0,1fr)); gap: 0; }
+.wall-chart-legend > div { min-height: 0; display: grid; grid-template-columns: 6px 1fr auto; align-items: center; gap: 9px; font-size: 11px; color: #a9c5ce; }
+.wall-chart-legend i { height: 2px; }.wall-chart-legend strong { font: 500 17px/1 var(--instrument-font); color: #d9edec; }
+.wall-roles { display: grid; grid-template-columns: 1fr 1fr; grid-template-rows: auto 1fr 1fr; gap: 5px 24px; min-height: 0; }
+.wall-roles > header { grid-column: 1/-1; margin-bottom: 0 !important; }
+.wall-role { min-width: 0; }.wall-role > div { display: flex; justify-content: space-between; align-items: center; gap: 5px; }
+.wall-role strong { font: 500 14px var(--instrument-font); text-transform: uppercase; }.wall-role time { font: 500 10px var(--instrument-font); color: #99b6bf; }
+.wall-role p { margin-top: 2px; font-size: 10px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; color: #93aeb7; }
+.wall-role.planner strong { color: #e8c991; }.wall-role.executor strong { color: #8ee9d2; }.wall-role.observer strong { color: #a9d8b5; }
+.wall-stage { position: relative; min-width: 0; min-height: 0; display: flex; flex-direction: column; }
+.wall-stage-graph { position: relative; flex: 1; min-height: 0; }
+.wall-three { position: relative; width: 100%; height: 100%; overflow: hidden; }
+.wall-three canvas { display: block; width: 100%; height: 100%; touch-action: none; }
+.wall-scene-labels { position: absolute; inset: 0; pointer-events: none; overflow: hidden; }
+.wall-scene-labels button { position: absolute; transform: translateX(-50%); max-width: 156px; padding: 0 4px 3px; border: 0; border-bottom: 1px solid #9cd9d266; border-radius: 0; background: transparent; color: #cce9e9; font: 500 12px/18px var(--instrument-font); text-shadow: 0 1px 3px #0c1b1d,0 0 6px #0c1b1d; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; pointer-events: auto; cursor: pointer; }
+.wall-scene-labels button[hidden] { display: none; }.wall-scene-labels button.selected { color: #b3ffe1; border-color: #b3ffe1; }
+.wall-scene-tools { position: absolute; right: 0; bottom: 4px; display: flex; gap: 6px; }.wall-scene-tools .ant-btn { border: 0; }
+.wall-scene-empty { position: absolute; inset: 42% 0 auto; text-align: center; color: var(--text-secondary); pointer-events: none; }
+.wall-stage-caption { display: flex; justify-content: space-between; align-items: center; gap: 12px; min-height: 42px; color: #8fafba; font-size: 11px; }
+.wall-stage-caption > span { overflow-wrap: anywhere; }.wall-stage-caption .ant-select { flex: 0 0 140px; }.wall-stage-caption .ant-select-selector { border: 0 !important; box-shadow: none !important; }
+.wall-fallback { display: flex; align-items: center; justify-content: space-between; gap: 12px; font-size: var(--aux-size); color: #e8c991; }
+.wall-stage .graph-workspace { width: 100%; height: 100%; min-height: 0; background: transparent; }
+.wall-stage .graph-body { display: flex; width: 100%; flex: 1; min-height: 0; background: transparent; }
+.wall-stage .graph-canvas-wrap { flex: 1 1 0; width: 100%; height: 100%; min-width: 0; background: transparent; background-image: none; }
+.wall-stage .graph-canvas { width: 100%; height: 100%; min-height: 0; }
+.wall-stage .graph-toolbar, .wall-stage .graph-legend, .wall-stage .graph-counts { display: none; }
+.wall-right { min-height: 0; display: flex; flex-direction: column; gap: 20px; }
+.wall-findings { min-height: 0; flex: 1; overflow: auto; scrollbar-width: thin; scrollbar-color: #7cbcb766 transparent; }
+.wall-finding { position: relative; display: block; width: 100%; border: 0; background: transparent; padding: 4px 0 8px 14px; margin-bottom: 16px; text-align: left; color: var(--text); cursor: pointer; }
+.wall-finding::before { content: ""; position: absolute; left: 0; top: 8px; bottom: 10px; width: 1px; background: #dd8192; }
+.wall-finding.selected::before { background: #a1eacf; }.wall-finding.selected strong { color: #bcf8e6; }
+.wall-finding > span { display: flex; justify-content: space-between; align-items: center; gap: 8px; color: #e8a0ad; font-size: 11px; }.wall-finding small { font-size: 10px; white-space: nowrap; }
+.wall-finding strong { display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; overflow-wrap: anywhere; margin-top: 5px; font-size: 15px; font-weight: 400; line-height: 1.5; }
+.wall-finding em { display: block; margin-top: 3px; font: 400 10px sans-serif; color: #849da8; }
+.wall-exceptions { flex-shrink: 0; }.wall-exceptions button { display: flex; gap: 12px; width: 100%; padding: 5px 0; border: 0; background: transparent; color: #bcd1d6; font-size: 12px; text-align: left; cursor: pointer; }.wall-exceptions button span { flex-shrink: 0; color: #e8c991; }.wall-exceptions button strong { font-weight: 400; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.wall-bottom { display: grid; grid-template-columns: 1.2fr 1fr 1fr; gap: 36px; min-height: 0; padding-top: 8px; border-top: 1px solid #6a919844; }
+.wall-bottom > section { min-height: 0; min-width: 0; }.wall-bottom section > header { margin-bottom: 8px; }
+.wall-trend { display: flex; flex-direction: column; }.wall-trend-plot { flex: 1; min-height: 0; }
+.wall-focus > strong { display: block; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-size: 15px; font-weight: 400; }
+.wall-focus p { margin: 7px 0; font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }.wall-focus > a { display: inline-flex; align-items: center; gap: 6px; min-height: 26px; font-size: 12px; color: #95d8c5; }.wall-focus .ant-btn { min-width: 24px; min-height: 24px; height: 24px; border: 0; }
+.wall-events > a { display: flex; align-items: center; gap: 16px; min-height: 27px; color: #bcd1d6; font-size: 12px; text-decoration: none; }.wall-events a time { flex-shrink: 0; font: 500 13px var(--instrument-font); color: #92bfcf; }.wall-events a span { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.wall-empty { color: #8faaaf; font-size: 12px; padding: 6px 0; }
+.wall-footer { display: flex; flex-direction: column; justify-content: center; align-items: flex-start; gap: 3px; max-width: 25%; color: #8da8b2; font-size: 10px; }.wall-footer > span { max-width: 100%; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.wall-controls { position: absolute; right: 48px; bottom: 25px; z-index: 8; display: flex; align-items: center; gap: 10px; max-width: 72%; }
+.wall-controls-aux { display: flex; align-items: center; flex-wrap: nowrap; gap: 8px; padding: 4px 0; overflow-x: auto; background: transparent; border: 0; transition: opacity .2s; }
+.wall-controls-aux > * { flex-shrink: 0; }.wall-controls.asleep .wall-controls-aux { opacity: 0; visibility: hidden; pointer-events: none; }
+.wall-controls .wall-runtime-select { width: 170px; }.wall-controls .ant-input { width: 185px; }.wall-controls .ant-select-selector { border-color: transparent !important; }.wall-controls .ant-btn { border-color: transparent; }.wall-controls .ant-segmented-item-label { min-height: 32px; display: flex; align-items: center; }
+.wall-settings-trigger { flex: 0 0 36px; }.wall-settings { width: min(330px,80vw); color: #d1e5e9; }.wall-settings label { display: flex; align-items: center; justify-content: space-between; gap: 16px; margin-bottom: 16px; }.wall-settings label .ant-input { width: 210px; }.wall-settings p { max-height: 200px; overflow: auto; overflow-wrap: anywhere; }.wall-settings details { margin-bottom: 16px; }
+.wall-control-error { position: absolute; bottom: 105%; right: 0; padding: 8px; color: #f0a4b3; background: #302229; font-size: 12px; }
+.wall-distance { --body-size: 24px; --aux-size: 18px; --heading-size: 34px; --number-size: 80px; grid-template-rows: 140px 148px minmax(490px,1fr) 210px 54px; min-height: 1170px; }
+.wall-distance .wall-brand h1 { font-size: 88px; }.wall-distance .wall-brand img { width: 88px; height: 88px; }.wall-distance .wall-metric > span { font-size: 20px; }.wall-distance .wall-chart-legend > div { font-size: 15px; }.wall-distance .wall-chart-legend strong { font-size: 22px; }.wall-distance .wall-donut-center strong { font-size: 36px; }.wall-distance .wall-donut-center span { font-size: 11px; }.wall-distance .wall-finding strong { font-size: 22px; }.wall-distance .wall-focus > strong { font-size: 22px; }.wall-distance .wall-focus p, .wall-distance .wall-events > a { font-size: 18px; }.wall-distance .wall-events > a { min-height: 38px; }
+@media (max-width: 1599px), (max-height: 899px) {
+  .wallboard:not(.wall-distance) { --body-size: 14px; --aux-size: 11px; --heading-size: 22px; --number-size: 46px; grid-template-rows: 80px 100px minmax(290px,1fr) 122px 42px; padding: 18px 32px; gap: 14px; min-height: 730px; }
+  .wall-header { grid-template-columns: minmax(0,1fr) 400px minmax(0,1fr); gap: 20px; }.wall-brand h1 { font-size: 58px; }.wall-brand img { width: 52px; height: 52px; }.wall-brand p { font-size: 10px; }.wall-brand { gap: 15px; }.wall-target strong { font-size: 12px; }.wall-clock { font-size: 22px; }.wall-state { font-size: 10px; }.wall-live { gap: 16px; }
+  .wall-metrics { gap: 28px; padding-top: 6px; }.wall-metric > span { font-size: 12px; }.wall-metric + .wall-metric::before { left: -14px; }.wall-metric small { font-size: 9px; }.wall-metric svg { width: 14px; height: 14px; }
+  .wall-primary { grid-template-columns: minmax(228px,21fr) minmax(0,56fr) minmax(240px,23fr); gap: 26px; }.wallboard section > header { min-height: 28px; padding-bottom: 6px; margin-bottom: 8px; }.wallboard section > header > span { font-size: 9px; }
+  .wall-left { grid-template-rows: minmax(0,1fr) minmax(0,1fr) 84px; gap: 16px; }.wall-distribution-body { gap: 16px; }.wall-donut-center strong { font-size: 23px; }.wall-donut-center span { font-size: 7px; }.wall-chart-legend > div { font-size: 9px; gap: 6px; }.wall-chart-legend strong { font-size: 13px; }.wall-chart-legend { gap: 5px; }.wall-role strong { font-size: 11px; }.wall-role time { font-size: 9px; }.wall-role p { display: none; }
+  .wall-finding { margin-bottom: 12px; }.wall-finding strong { font-size: 13px; }.wall-finding > span { font-size: 10px; }.wall-exceptions button { font-size: 11px; }.wall-right { gap: 12px; }.wall-stage-caption { font-size: 10px; min-height: 36px; }.wall-stage-caption .ant-select { flex-basis: 124px; }.wall-scene-labels button { font-size: 10px; max-width: 130px; }
+  .wall-bottom { gap: 26px; padding-top: 5px; }.wall-focus > strong { font-size: 13px; }.wall-focus p { font-size: 11px; margin: 4px 0; }.wall-events > a { min-height: 23px; font-size: 11px; }.wall-events a time { font-size: 11px; }.wall-controls { right: 32px; bottom: 18px; max-width: 76%; }.wall-controls .wall-runtime-select { width: 140px; }.wall-footer { max-width: 21%; font-size: 9px; }
+  .wall-distance .wall-left { grid-template-rows: 1fr 1fr 100px; }.wall-distance .wall-controls { position: static; grid-row: 6; justify-self: end; max-width: 100%; }
+}
+@media (min-width: 1024px) and (max-width: 1279px) {
+  .wallboard:not(.wall-distance) { grid-template-rows: 90px 102px auto 154px 44px; }.wallboard { height: 100dvh; min-height: 0; overflow-y: auto; }
+  .wall-primary { grid-template-columns: 1fr 1fr; }.wall-stage { grid-row: 1; grid-column: 1/-1; height: 430px; }.wall-left, .wall-right { height: 360px; }.wall-controls { position: static; grid-row: 6; justify-self: end; max-width: 100%; }.wall-footer { max-width: 100%; }
+}
+@media (min-width: 1280px) and (max-height: 799px) {
+  .wallboard:not(.wall-distance) .wall-left { grid-template-rows: minmax(0,1fr) minmax(0,1fr) 66px; gap: 12px; }
+  .wallboard:not(.wall-distance) .wall-donut-center strong { font-size: 19px; }
+  .wallboard:not(.wall-distance) .wall-roles { gap: 2px 18px; }
+}
+@media (max-width: 1023px), (orientation: portrait) {
+  .wallboard, .wallboard:not(.wall-distance), .wallboard.wall-distance { display: flex; flex-direction: column; height: 100dvh; min-height: 0; padding: 22px; gap: 24px; overflow-y: auto; --heading-size: 26px; --number-size: 42px; }
+  .wallboard > * { flex-shrink: 0; }.wall-background img { object-position: center top; }
+  .wall-header { grid-template-columns: minmax(0,1fr) minmax(0,1fr); gap: 24px 16px; min-height: 174px; }.wall-header::after { display: none; }.wall-brand { grid-row: 1; grid-column: 1/-1; gap: 15px; }.wall-brand h1 { font-size: 64px; }.wall-brand img { width: 52px; height: 52px; }.wall-brand p { font-size: 9px; }.wall-brand p span { padding-left: 10px; margin-left: 10px; }.wall-target { grid-row: 2; }.wall-target strong { font-size: 12px; }.wall-live { flex-direction: column; align-items: flex-end; gap: 3px; }.wall-clock { font-size: 20px; }.wall-clock small { font-size: 9px; }
+  .wall-metrics { grid-template-columns: repeat(2,minmax(0,1fr)); gap: 20px; padding: 0; }.wall-metric { min-height: 96px; }.wall-metric > span { font-size: 12px; }.wall-metric + .wall-metric::before { display: none; }.wall-metric small { font-size: 9px; }
+  .wall-primary { display: flex; flex-direction: column; gap: 26px; }.wall-stage { order: -1; min-height: 390px; }.wall-stage-graph { flex: none; height: 320px; min-height: 320px; }.wall-stage-caption { flex-wrap: wrap; }.wall-stage-caption .ant-select { flex: 1; }
+  .wall-left { grid-template-rows: 170px 170px 120px; gap: 24px; height: auto; }.wall-donut-center strong { font-size: 30px; }.wall-donut-center span { font-size: 9px; }.wall-chart-legend > div { font-size: 12px; }.wall-chart-legend strong { font-size: 17px; }.wall-role strong { font-size: 13px; }.wall-role p { display: block; }.wall-right { min-height: 310px; height: auto; }.wall-finding { margin-bottom: 16px; }.wall-finding strong { font-size: 14px; }
+  .wall-bottom { display: flex; flex-direction: column; gap: 22px; }.wall-bottom > section { min-height: 140px; }.wall-bottom .wall-trend { height: 220px; }.wall-focus > strong { font-size: 14px; }.wall-focus p { font-size: 12px; }.wall-events > a { min-height: 30px; font-size: 12px; }
+  .wall-footer { max-width: 100%; font-size: 10px; }.wall-footer > span { white-space: normal; }.wall-controls, .wall-distance .wall-controls { position: static; max-width: 100%; gap: 8px; align-items: flex-start; }.wall-controls-aux { flex: 1; min-width: 0; flex-wrap: wrap; opacity: 1 !important; visibility: visible !important; pointer-events: auto !important; }.wall-controls .wall-runtime-select { width: 100%; }.wall-controls .ant-input, .wall-controls .ant-segmented { max-width: 100%; }.wallboard .ant-btn { min-width: 44px; min-height: 44px; }.wall-control-error { position: static; }
+  .wall-distance .wall-brand h1 { font-size: 74px; }.wall-distance .wall-brand img { width: 58px; height: 58px; }.wall-distance .wall-metric strong { font-size: 54px; }.wall-distance .wall-metric > span { font-size: 15px; }.wall-distance .wall-metric { min-height: 112px; }.wall-distance .wall-left { grid-template-rows: 190px 190px 140px; }
+}
+@media (min-width: 2500px) and (orientation: landscape) {
+  .wall-primary { grid-template-columns: minmax(0,600px) minmax(0,1fr) minmax(0,600px); gap: 48px; }.wall-left { grid-template-rows: 1fr 1fr 140px; }.wall-donut { max-height: 280px; }.wall-donut-center strong { font-size: 42px; }.wall-donut-center span { font-size: 13px; }.wall-chart-legend > div { font-size: 18px; }.wall-chart-legend strong { font-size: 26px; }.wall-chart-legend { gap: 16px; }
+}
+@media (min-width: 3000px) and (orientation: landscape) {
+  .wallboard { --body-size: 26px; --aux-size: 20px; --heading-size: 46px; --number-size: 104px; grid-template-rows: 180px 210px minmax(760px,1fr) 270px 80px; padding: 48px 96px; gap: 36px; }
+  .wall-header { grid-template-columns: minmax(0,1fr) 900px minmax(0,1fr); }.wall-brand h1 { font-size: 120px; }.wall-brand img { width: 112px; height: 112px; }.wall-brand p { font-size: 22px; }.wall-target { max-width: 700px; }.wall-target strong { font-size: 22px; }.wall-target > span { font-size: 18px; }.wall-clock { font-size: 44px; }.wall-state, .wall-clock small { font-size: 18px; }
+  .wall-metrics { gap: 60px; }.wall-metric > span { font-size: 24px; }.wall-metric small { font-size: 18px; }.wall-metric svg { width: 28px; height: 28px; }.wall-metric + .wall-metric::before { left: -30px; }
+  .wall-primary { grid-template-columns: 690px minmax(0,1fr) 690px; gap: 64px; }.wall-left { grid-template-rows: 1fr 1fr 190px; gap: 36px; }.wallboard section > header { min-height: 56px; margin-bottom: 20px; padding-bottom: 12px; }.wallboard section > header > span { font-size: 18px; }.wallboard section > header h2 { padding-left: 26px; }.wallboard section > header h2::before { height: 25px; width: 6px; top: 10px; }
+  .wall-donut { max-height: 340px; }.wall-donut-center strong { font-size: 54px; }.wall-donut-center span { font-size: 16px; }.wall-chart-legend > div { font-size: 21px; }.wall-chart-legend strong { font-size: 30px; }.wall-role strong { font-size: 24px; }.wall-role time { font-size: 17px; }.wall-role p { font-size: 17px; }
+  .wall-finding { margin-bottom: 30px; padding-left: 24px; }.wall-finding strong { font-size: 24px; }.wall-finding > span { font-size: 20px; }.wall-finding small, .wall-finding em { font-size: 17px; }.wall-exceptions button, .wall-empty { font-size: 20px; }.wall-stage-caption { font-size: 18px; }.wall-stage-caption .ant-select { flex-basis: 180px; }.wall-scene-labels button { font-size: 18px; line-height: 26px; max-width: 210px; }
+  .wall-focus > strong { font-size: 24px; }.wall-focus p, .wall-focus > a { font-size: 20px; }.wall-events > a { min-height: 48px; font-size: 20px; }.wall-events a time { font-size: 23px; }.wall-footer { font-size: 17px; }.wall-controls { bottom: 56px; right: 96px; }
+}
+@media (prefers-reduced-motion: reduce) { .wallboard *, .wallboard *::before, .wallboard *::after { animation: none !important; transition: none !important; } }

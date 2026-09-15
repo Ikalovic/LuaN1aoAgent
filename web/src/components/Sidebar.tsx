@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import { Badge, Button, Empty, Menu, Tooltip } from "antd";
 import { Activity, BrainCircuit, Cable, ChevronRight, FileText, Folder, FolderOpen, GitBranch, KeyRound, ListTree, Network, PanelLeftClose, Play, Plug, ShieldAlert, Wrench } from "lucide-react";
 import { useLanguage } from "../language";
+import { Brand } from "./Brand";
 import { buildSessionTree, sessionRelativePath, type SessionFolderNode } from "../sessions";
 import type { AgentEvent, RuntimeSession, ViewKey } from "../types";
 import { formatRelative, isRecent, roleLabel, shortRef } from "../utils";
@@ -73,8 +74,7 @@ export function Sidebar(props: SidebarProps) {
   return (
     <div className="sidebar-content">
       <div className="sidebar-brand">
-        <div className="brand-mark">鸾</div>
-        <div className="brand-copy"><strong>{t("auth.brand")}</strong><span>Agent Workbench</span></div>
+        <Brand />
         {props.onClose ? <Tooltip title={t("nav.close")}><Button type="text" icon={<PanelLeftClose size={18} />} onClick={props.onClose} aria-label={t("nav.close")} /></Tooltip> : null}
       </div>
       <Menu className="view-menu" mode="inline" selectedKeys={[props.activeView]} items={viewItems} onClick={({ key }) => props.onViewChange(key as ViewKey)} />

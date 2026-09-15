@@ -1,0 +1,147 @@
+:root,
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --bg: #141618;
+  --surface: #1c1f22;
+  --surface-raised: #25292d;
+  --border: #363c42;
+  --text: #f1f3f5;
+  --text-secondary: #aab4bf;
+  --accent: #53d6bd;
+  --success: #83d98e;
+  --info: #7db7ff;
+  --warning: #f2c066;
+  --danger: #ff8087;
+  --accent-soft: #203934;
+  --success-soft: #253a2a;
+  --info-soft: #223144;
+  --warning-soft: #393222;
+  --danger-soft: #3d262b;
+  --shadow-panel: none;
+  --radius-panel: 6px;
+  --radius-control: 5px;
+}
+
+:root[data-theme="light"] {
+  color-scheme: light;
+  --bg: #f5f6f8;
+  --surface: #ffffff;
+  --surface-raised: #ffffff;
+  --border: #dde2e7;
+  --text: #182026;
+  --text-secondary: #56616d;
+  --accent: #087f6b;
+  --success: #267239;
+  --info: #245cb4;
+  --warning: #8b5e00;
+  --danger: #b42335;
+  --accent-soft: #e5f4ef;
+  --success-soft: #e9f5eb;
+  --info-soft: #edf3fc;
+  --warning-soft: #fff5dc;
+  --danger-soft: #fdeef0;
+}
+
+:root { color: var(--text); background: var(--bg); font-family: "Avenir Next", "PingFang SC", "Microsoft YaHei", "Noto Sans CJK SC", "Droid Sans Fallback", sans-serif; }
+body { color: var(--text); background: var(--bg); font-family: inherit; }
+body * { letter-spacing: 0; }
+::selection { color: var(--text); background: var(--accent-soft); }
+:focus-visible { outline-color: var(--accent); }
+
+.qingxuan-brand { display: flex; align-items: center; gap: 10px; min-width: 0; }
+.qingxuan-brand-symbol { display: block; width: 44px; height: 44px; flex: 0 0 44px; object-fit: contain; }
+.qingxuan-brand-copy { display: flex; flex-direction: column; gap: 3px; min-width: 0; }
+.qingxuan-brand-copy strong { color: var(--text); font-size: 22px; line-height: 1.25; font-weight: 700; }
+.qingxuan-brand-copy span { color: var(--text-secondary); font-size: 12px; line-height: 1.4; overflow-wrap: anywhere; }
+.sidebar-brand > .qingxuan-brand { flex: 1; }
+.sidebar-brand .qingxuan-brand-copy strong { font-size: 18px; }
+.sidebar-brand .qingxuan-brand-copy span { font-size: 11px; }
+
+.auth-shell {
+  position: relative;
+  display: block;
+  height: 100%;
+  min-height: 100%;
+  overflow-y: auto;
+  background: #141618 url("/art/login-surface-dark.webp") center / cover no-repeat;
+}
+.auth-preferences { position: absolute; z-index: 2; top: 24px; right: 28px; display: flex; gap: 8px; }
+.auth-preferences .ant-btn { width: 44px; height: 44px; color: #f1f3f5; background: #1c1f22; border: 1px solid #363c42; }
+.auth-preferences .ant-btn:hover { color: #53d6bd !important; background: #25292d !important; }
+.auth-access { width: 100%; min-height: 100%; padding: 96px 24px 56px; background: transparent; }
+.auth-panel { width: min(100%, 390px); padding: 28px; border: 1px solid var(--border); border-radius: 8px; background: var(--surface); box-shadow: 0 16px 48px rgb(0 0 0 / 22%); }
+.auth-panel-brand { margin: 0 0 24px; }
+.auth-panel-brand .qingxuan-brand-symbol { width: 56px; height: 56px; flex-basis: 56px; }
+.auth-panel-brand .qingxuan-brand-copy strong { font-size: 28px; }
+.auth-panel .ant-form-item-label > label { color: var(--text-secondary); font-size: 13px; }
+.auth-panel .ant-btn-primary { width: 100%; }
+
+/* Compatibility colors for the existing analysis tools. */
+[data-theme] :is(.app-shell, .app-main, .content-area, .reports-view, .skills-view, .mcp-view, .approvals-view, .panel-resize-handle) { background: var(--bg); }
+[data-theme] :is(.desktop-sidebar, .desktop-inspector, .sidebar-content, .topbar, .mission-band, .stage-body, .inspector-content, .auth-loading, .trace-card, .agent-activity-item, .traffic-row, .approval-card, .skills-table, .mcp-table, .env-drawer-table, .skills-summary, .mcp-summary, .approvals-summary, .reports-toolbar, .graph-legend, .graph-counts) { color: var(--text); background: var(--surface); border-color: var(--border); }
+[data-theme] :is(.trace-toolbar, .graph-toolbar, .graph-node-index, .traffic-toolbar, .trace-preview-block, .trace-detail-grid, .agent-current-card, .replay-form, .tool-run, .task-progress-item, .node-id, .approval-card-args) { color: var(--text); background: var(--surface-raised); border-color: var(--border); }
+[data-theme] :is(.sidebar-brand, .sidebar-section, .session-folder-children, .mission-copy, .metric-item, .graph-index-head, .inspector-block, .trace-detail-grid > div, .connection-facts > div, .skills-summary span, .mcp-summary span, .approvals-summary > span, .replay-editor) { border-color: var(--border); }
+[data-theme] :is(.sidebar-section-title, .session-folder-toggle, .session-meta, .agent-status span, .agent-status time, .agent-status-tail svg, .agent-detail-identity p, .agent-detail-meta, .agent-detail-section-title, .agent-current-head time, .agent-current-fact > span, .agent-current-command > span, .agent-activity-meta time, .agent-activity-item small, .auto-refresh, .user-menu-identity span, .mission-copy p, .metric-item > span, .stage-heading p, .stage-meta, .trace-role-line, .trace-preview-block > span, .trace-card-foot time, .tool-run-title > span, .zoom-readout, .graph-index-head, .graph-index-list button small, .graph-counts, .inspector-primary > p, .inspector-primary .ant-descriptions-item-label, .inspector-block > strong, .traffic-row-primary code, .traffic-row-url, .traffic-row-meta, .artifact-loading, .artifact-meta, .connections-toolbar span, .connections-inspector p, .connection-card-heading > div span, .connection-facts dt, .skill-description, .mcp-description, .skills-readonly-note, .mcp-readonly-note, .skills-inspector p, .mcp-inspector p, .env-change-count, .approvals-mode-switch-label, .approvals-live-note, .approval-card-meta, .approval-card-label, .approvals-readonly-note) { color: var(--text-secondary); }
+[data-theme] :is(.session-button, .agent-status, .agent-activity-item strong, .agent-current-card > p, .agent-current-fact p, .user-menu-identity strong, .trace-preview-block p, .trace-detail-grid p, .graph-index-list button strong, .inspector-primary .ant-descriptions-item-content, .task-progress-title > span, .skills-summary span, .mcp-summary span, .approvals-summary > span, .approval-card-details p, .approval-card-intent p, .approval-card-reason p) { color: var(--text); }
+[data-theme] :is(.session-name, .topbar-title span, .mission-copy > span, .trace-detail-grid span, .graph-index-list button em, .inspector-heading > span, .trace-preview-block.thought > span, .trace-preview-block.action > span) { color: var(--accent); }
+[data-theme] :is(.session-button.active, .agent-status.active, .graph-index-list button.active, .approval-card-intent) { color: var(--text); background: var(--accent-soft); border-color: var(--accent); }
+[data-theme] :is(.session-button:hover, .session-folder-toggle:hover, .agent-status.clickable:hover, .graph-index-list button:hover, .traffic-row:hover, .agent-activity-item:hover:not(:disabled), button.artifact-row-button:hover) { background: var(--surface-raised); border-color: var(--accent); }
+[data-theme] .session-button-row > .session-continue { color: var(--text-secondary); }
+[data-theme] .session-button-row > .session-continue:hover { color: var(--accent); background: var(--accent-soft); border-color: var(--accent); }
+[data-theme] .view-menu .ant-menu-item-selected { color: var(--accent); border-left-color: var(--accent); }
+[data-theme] :is(.session-folder-toggle > small, .agent-detail-state, .agent-detail-section-title em) { color: var(--text-secondary); background: var(--surface-raised); }
+[data-theme] .agent-detail-state.active { color: var(--success); background: var(--success-soft); }
+[data-theme] .agent-status.clickable:focus-visible { outline-color: var(--accent); }
+[data-theme] .trace-card.role-planner { border-left-color: var(--warning); }
+[data-theme] .trace-card.role-executor { border-left-color: var(--accent); }
+[data-theme] .trace-card.role-observer { border-left-color: var(--success); }
+[data-theme] .trace-card.role-runtime { border-left-color: var(--text-secondary); }
+[data-theme] :is(.trace-card.selected, .traffic-row.selected) { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); }
+[data-theme] :is(.trace-preview-block.thought, .trace-preview-block.action, .tool-run, .task-progress-item) { border-left-color: var(--accent); }
+[data-theme] :is(.tool-run.running, .approval-card-reason) { color: var(--warning); background: var(--warning-soft); border-color: var(--warning); }
+[data-theme] :is(.tool-run.error, .task-progress-item.blocker) { background: var(--danger-soft); border-color: var(--danger); }
+[data-theme] .approval-card-icon { color: var(--warning); background: var(--warning-soft); }
+[data-theme] .trace-expand > .ant-collapse-item > .ant-collapse-header { color: var(--text-secondary); }
+[data-theme] :is(.tool-run pre, .json-block, .agent-current-command pre, .traffic-body-preview, .http-message) { color: var(--text); background: var(--bg); }
+[data-theme] .graph-canvas-wrap { background-color: var(--bg); background-image: linear-gradient(var(--border) 1px, transparent 1px), linear-gradient(90deg, var(--border) 1px, transparent 1px); }
+[data-theme] .panel-resize-handle::before { background: var(--border); }
+[data-theme] .panel-resize-handle span { background: var(--text-secondary); }
+[data-theme] :is(.panel-resize-handle:hover, .panel-resize-handle:focus-visible, .panel-resize-handle[data-separator="active"]) { background: var(--accent-soft); }
+[data-theme] :is(.panel-resize-handle:hover, .panel-resize-handle:focus-visible, .panel-resize-handle[data-separator="active"])::before,
+[data-theme] :is(.panel-resize-handle:hover, .panel-resize-handle:focus-visible, .panel-resize-handle[data-separator="active"]) span { background: var(--accent); }
+
+[data-theme] :is(.outcome-card, .linked-artifacts, .artifact-card, .artifact-preview-panel, .planning-decision-index, .planning-decision-facts, .planning-decision-body, .planning-task-row, .planning-decision-marker > i, .planning-section-heading > b) { color: var(--text); background: var(--surface); border-color: var(--border); border-radius: 6px; box-shadow: none; }
+[data-theme] :is(.epoch-item, .sr-kv dt, .json-tree-row > strong, .planning-activity-pane, .planning-input-note, .planning-task-details, .planning-attempts > div > div, .run-initializing, .command-detail-row, .artifact-preview-image) { color: var(--text); background: var(--surface-raised); border-color: var(--border); }
+[data-theme] :is(.outcome-heading h4, .outcome-details dd, .epoch-item p, .artifact-card-copy strong, .sr-paragraph, .sr-list, .sr-kv dd, .json-leaf, .markdown-body, .markdown-body h1, .markdown-body h2, .markdown-body h3, .markdown-body h4, .markdown-body h5, .markdown-body h6, .markdown-body strong, .planning-decision-index-copy strong, .planning-decision-facts b, .planning-input-note b, .planning-section-heading strong, .planning-task-copy strong, .planning-task-details p, .planning-attempts b, .planning-activity-copy strong, .run-initializing p, .stage-meta .ant-badge) { color: var(--text); }
+[data-theme] :is(.muted-line, .artifact-row small, .task-inspector-row span, .agent-inspector-row span, .reports-toolbar > span, .outcome-details dt, .epoch-item > span, .epoch-item small, .artifact-card-copy small, .markdown-body blockquote, .planning-decision-index > header span, .planning-decision-index-copy em, .planning-decision-index-copy time, .planning-decision-index-copy small, .planning-decision-facts small, .planning-input-note > p, .planning-input-note small, .planning-section-heading small, .planning-task-copy small, .planning-task-chevron, .planning-task-details section > span, .planning-attempts small, .planning-activity-copy time, .planning-activity-copy em, .planning-activity-copy small, .run-initializing-hint, .skills-toolbar > div:first-child > span, .mcp-toolbar > div:first-child > span) { color: var(--text-secondary); }
+[data-theme] :is(.artifact-row, .edge-inspector-row, .agent-inspector-row, .task-inspector-row, .outcome-details, .outcome-details > div, .artifact-preview-head, .sr-section, .sr-kv, .sr-kv-row, .sr-kv dd, .json-tree, .json-tree-row, .markdown-body th, .markdown-body td, .markdown-body hr, .planning-decision-index > header, .planning-decision-facts > span, .planning-tasks-pane, .planning-section-heading, .planning-task-details) { border-color: var(--border); }
+[data-theme] :is(.outcome-heading span, .artifact-preview-head span, .markdown-body a, .planning-input-note > span, .planning-attempts em, .planning-activity-item:hover .planning-activity-copy strong, .planning-activity-item.selected .planning-activity-copy strong) { color: var(--accent); }
+[data-theme] :is(.artifact-card-icon, .planning-decision-index-item.selected, .planning-task-status.running) { color: var(--accent); background: var(--accent-soft); }
+[data-theme] :is(.artifact-card:hover, .planning-task-row:hover, .planning-task-row.expanded) { border-color: var(--accent); }
+[data-theme] .artifact-card:focus-visible { outline-color: var(--accent); }
+[data-theme] .final-outcome { border-top-color: var(--accent); }
+[data-theme] :is(.structured-report-raw, .sr-code, .markdown-body pre) { color: var(--text); background: var(--bg); }
+[data-theme] .markdown-body code { color: var(--info); background: var(--info-soft); }
+[data-theme] .markdown-body pre code { color: inherit; background: transparent; }
+[data-theme] .markdown-body th { color: var(--text); background: var(--surface-raised); }
+[data-theme] .planning-workbench { --planner-ink: var(--text); --planner-muted: var(--text-secondary); --planner-line: var(--border); --planner-blue: var(--accent); color: var(--text); background: var(--bg); }
+[data-theme] .planning-decision-hero { color: var(--text); background: var(--surface-raised); border-radius: 6px 6px 0 0; }
+[data-theme] .planning-decision-hero h2 { color: var(--text); }
+[data-theme] :is(.planning-decision-eyebrow, .planning-decision-hero p, .planning-decision-hero-meta > span, .planning-decision-hero-meta small) { color: var(--text-secondary); }
+[data-theme] :is(.planning-decision-index > header > b, .planning-decision-index-item.selected .planning-decision-marker > i) { color: var(--surface); background: var(--text); border-color: var(--text); }
+[data-theme] :is(.planning-decision-marker > b, .planning-activity-track b) { background: var(--border); }
+[data-theme] :is(.planning-decision-delta i, .planning-task-copy .planning-context-tag) { color: var(--text-secondary); background: var(--surface-raised); border-color: var(--border); }
+[data-theme] .planning-decision-index-item:hover { background: var(--surface-raised); }
+[data-theme] .planning-task-status { color: var(--warning); background: var(--warning-soft); }
+[data-theme] .planning-task-status.completed { color: var(--success); background: var(--success-soft); }
+[data-theme] .planning-activity-track i { border-color: var(--surface); background: var(--text-secondary); box-shadow: 0 0 0 2px var(--border); }
+[data-theme] .planning-activity-item.role-planner .planning-activity-track i { background: var(--warning); box-shadow: 0 0 0 2px var(--warning-soft); }
+[data-theme] .planning-activity-item.role-executor .planning-activity-track i { background: var(--accent); box-shadow: 0 0 0 2px var(--accent-soft); }
+[data-theme] .planning-activity-item.role-observer .planning-activity-track i { background: var(--success); box-shadow: 0 0 0 2px var(--success-soft); }
+
+@media (max-width: 600px) {
+  .auth-preferences { top: 12px; right: 12px; }
+  .auth-access { padding: 80px 16px 32px; }
+  .auth-panel { padding: 24px; }
+  .qingxuan-brand-copy span { max-width: 220px; }
+}

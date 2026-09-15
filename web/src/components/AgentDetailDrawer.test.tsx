@@ -59,7 +59,7 @@ describe("AgentDetailDrawer", () => {
     expect(screen.getByText("nmap -sV target")).toBeInTheDocument();
     expect(screen.getByText("Planner 请求用户输入")).toBeInTheDocument();
     expect(screen.getByText("7 条事件")).toBeInTheDocument();
-    expect(screen.getByText("活跃中")).toBeInTheDocument();
+    expect(screen.getByText("最近有活动")).toBeInTheDocument();
     expect(screen.queryByText("Executor 执行动作")).not.toBeInTheDocument();
   });
 
@@ -88,7 +88,7 @@ describe("AgentDetailDrawer", () => {
     );
 
     expect(screen.getByText("控制信号已应用")).toBeInTheDocument();
-    expect(screen.getByText("空闲")).toBeInTheDocument();
+    expect(screen.getByText("最近活动", { selector: ".agent-detail-state" })).toBeInTheDocument();
     expect(screen.getByText("该 Agent 暂无活动记录")).toBeInTheDocument();
   });
 

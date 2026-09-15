@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { Alert, Badge, Collapse, Descriptions, Empty, Modal, Spin, Tag, Typography } from "antd";
+import { Alert, Badge, Button, Collapse, Descriptions, Empty, Modal, Spin, Tag, Typography } from "antd";
 import { fetchArtifact } from "../api";
 import { taskProgressItems, type TaskProgressItem } from "../graph";
 import { useLanguage } from "../language";
@@ -16,6 +16,10 @@ interface InspectorProps {
   artifacts: ArtifactRecord[];
   tasks: TaskSummary[];
   agents: Record<string, AgentEvent | undefined>;
+  nodes?: GraphNode[];
+  traceItems?: TraceItem[];
+  onSelectNode?: (node: GraphNode) => void;
+  onSelectTrace?: (traceId: string) => void;
 }
 
 export function Inspector(props: InspectorProps) {
@@ -27,7 +31,7 @@ export function Inspector(props: InspectorProps) {
         <Typography.Title level={4}>{t(props.view === "trace" ? "inspector.currentStep" : "inspector.nodeDetails")}</Typography.Title>
       </div>
       {props.view === "trace" ? <TraceInspector trace={props.trace} artifacts={props.artifacts} runtimeDir={props.runtimeDir} /> : (
-        <NodeInspector node={props.node} edges={props.edges} />
+        <NodeInspector node={props.node} edges={props.edges} context={props} />
       )}
       <RuntimeOverview tasks={props.tasks} agents={props.agents} />
     </div>
@@ -143,7 +147,7 @@ function ArtifactViewer({ runtimeDir, artifactRef, fallback, onClose }: {
   );
 }
 
-function NodeInspector({ node, edges }: { node?: GraphNode; edges: GraphEdge[] }) {
+function NodeInspector({ node, edges, context }: { node?: GraphNode; edges: GraphEdge[]; context: InspectorProps }) {
   const { t } = useLanguage();
   if (!node) return <Empty description={t("inspector.selectNode")} />;
   const incoming = edges.filter((edge) => edge.to === node.id);
@@ -162,9 +166,10 @@ function NodeInspector({ node, edges }: { node?: GraphNode; edges: GraphEdge[] }
       {properties.length ? <Descriptions size="small" column={1} colon={false} items={properties.slice(0, 12)} /> : null}
       {node.type === "Task" ? <TaskProgressSection title={t("inspector.milestones", { value: milestones.length })} type="milestone" items={milestones} /> : null}
       {node.type === "Task" ? <TaskProgressSection title={t("inspector.blockers", { value: blockers.length })} type="blocker" items={blockers} /> : null}
-      <RefSection title={t("inspector.evidence")} refs={node.evidenceRefs} />
-      <EdgeSection title={t("inspector.incoming", { value: incoming.length })} edges={incoming} direction="in" />
-      <EdgeSection title={t("inspector.outgoing", { value: outgoing.length })} edges={outgoing} direction="out" />
+      <ResolvedReferences refs={node.evidenceRefs} context={context} />
+      {Array.isArray(node.properties.artifactRefs) ? <ResolvedReferences refs={node.properties.artifactRefs.filter((ref): ref is string => typeof ref === "string")} context={context} /> : null}
+      <EdgeSection title={t("inspector.incoming", { value: incoming.length })} edges={incoming} direction="in" context={context} />
+      <EdgeSection title={t("inspector.outgoing", { value: outgoing.length })} edges={outgoing} direction="out" context={context} />
     </section>
   );
 }
@@ -198,26 +203,45 @@ function RefSection({ title, refs }: { title: string; refs: string[] }) {
   );
 }
 
-function EdgeSection({ title, edges, direction }: { title: string; edges: GraphEdge[]; direction: "in" | "out" }) {
+function EdgeSection({ title, edges, direction, context }: { title: string; edges: GraphEdge[]; direction: "in" | "out"; context?: InspectorProps }) {
   const { t } = useLanguage();
   return (
     <div className="inspector-block">
       <strong>{title}</strong>
       {edges.length ? edges.slice(0, 20).map((edge, index) => {
         const status = typeof edge.properties.status === "string" ? edge.properties.status : undefined;
+        const ref = direction === "in" ? edge.from : edge.to;
+        const target = context?.nodes?.find((node) => node.id === ref);
         const details = ["tunnelId", "routeId", "transport", "localHost", "localPort", "remoteHost", "remotePort", "via", "lastSeenAt", "expiresAt"]
           .filter((key) => edge.properties[key] !== undefined)
           .map((key) => `${key}=${valueText(edge.properties[key])}`)
           .join(" · ");
         return (
           <div className="edge-inspector-row" key={edge.id || `${edge.from}:${edge.type}:${edge.to}:${index}`}>
-            <Tag>{edge.type}</Tag>{status ? <Tag>{status}</Tag> : null}<span>{shortRef(direction === "in" ? edge.from : edge.to, 30)}</span>
+            <Tag>{edge.type}</Tag>{status ? <Tag>{status}</Tag> : null}{target && context?.onSelectNode ? <Button size="small" type="link" onClick={() => context.onSelectNode?.(target)}>{target.label}</Button> : <Typography.Text copyable={{ text: ref }}>{ref}</Typography.Text>}
             {details ? <small>{details}</small> : null}
           </div>
         );
       }) : <span className="muted-line">{t("inspector.noRelations")}</span>}
     </div>
   );
+}
+
+function ResolvedReferences({ refs, context }: { refs: string[]; context: InspectorProps }) {
+  const { locale, t } = useLanguage();
+  const [artifactRef, setArtifactRef] = useState<string>();
+  const zh = locale === "zh-CN";
+  return <div className="inspector-block qx-resolved-refs"><strong>{t("inspector.evidence")}</strong>{refs.length ? [...new Set(refs)].map((ref) => {
+    const node = context.nodes?.find((item) => item.id === ref);
+    const traces = context.traceItems?.filter((item) => item.id === ref || item.eventId === ref || item.evidenceRefs.includes(ref)) ?? [];
+    const artifact = context.artifacts.find((item) => item.artifactRef === ref);
+    return <div key={ref}><Typography.Text copyable={{ text: ref }}>{ref}</Typography.Text>
+      {node && context.onSelectNode ? <Button type="link" size="small" onClick={() => context.onSelectNode?.(node)}>{node.label}</Button> : null}
+      {traces.map((item) => <Button type="link" size="small" key={item.id} onClick={() => context.onSelectTrace?.(item.id)}>{item.title || item.id}</Button>)}
+      {artifact ? <Button type="link" size="small" onClick={() => setArtifactRef(ref)}>{artifact.path?.split("/").at(-1) || artifact.artifactRef}</Button> : null}
+      {!node && !traces.length && !artifact ? <small>{zh ? "引用未加载或已不存在" : "Reference is not loaded or no longer exists"}</small> : null}
+    </div>;
+  }) : <span className="muted-line">{t("inspector.noRefs")}</span>}<ArtifactViewer runtimeDir={context.runtimeDir} artifactRef={artifactRef} fallback={context.artifacts.find((item) => item.artifactRef === artifactRef)} onClose={() => setArtifactRef(undefined)} /></div>;
 }
 
 function RuntimeOverview({ tasks, agents }: { tasks: TaskSummary[]; agents: Record<string, AgentEvent | undefined> }) {

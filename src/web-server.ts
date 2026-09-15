@@ -5,6 +5,7 @@ import { open, readFile, readdir, stat } from "node:fs/promises";
 import { basename, dirname, extname, join, relative, resolve, sep } from "node:path";
 import { createInterface } from "node:readline";
 import { DatabaseSync } from "node:sqlite";
+import { boundedCollection, readJsonlWithCoverage, reconstructedCoverage, unavailableCoverage, type CollectionCoverage, type CoveredCollection } from "./runtime-coverage.js";
 import { WebAuthError, WebAuthService, type WebUser } from "./web-auth.js";
 import { SecurityAgentController } from "./controller.js";
 import { createLlmRuntime, loadLocalEnvFile } from "./llm-config.js";
@@ -2077,12 +2078,14 @@ function optionalPositiveNumber(value: unknown): number | undefined {
 
 async function readRuntimeState(runtimeDirInput: string): Promise<JsonRecord> {
   const runtimeDir = await runtimePathPolicy.resolveRuntime(runtimeDirInput, "existing");
-  const [events, graphDeltas, artifacts] = await Promise.all([
-    readJsonl<WebEvent>(join(runtimeDir, "execution.jsonl"), 700),
-    readJsonl<JsonRecord>(join(runtimeDir, "graph-deltas.jsonl"), 260),
-    readJsonl<ArtifactRecord>(join(runtimeDir, "artifacts", "index.jsonl"), 240)
+  const [eventRead, deltaRead, artifactRead] = await Promise.all([
+    readJsonlWithCoverage<WebEvent>(join(runtimeDir, "execution.jsonl"), 700),
+    readJsonlWithCoverage<JsonRecord>(join(runtimeDir, "graph-deltas.jsonl"), 260),
+    readJsonlWithCoverage<ArtifactRecord>(join(runtimeDir, "artifacts", "index.jsonl"), 240)
   ]);
-  const graph = readGraph(runtimeDir, graphDeltas);
+  const events = eventRead.records;
+  const artifacts = artifactRead.records;
+  const graph = readGraph(runtimeDir, deltaRead.records, deltaRead.coverage);
   const traceItems = buildTraceItems(events);
   const outcomes = readRuntimeOutcomes(runtimeDir);
   const planningRounds = derivePlannerCheckpoints(
@@ -2096,6 +2099,15 @@ async function readRuntimeState(runtimeDirInput: string): Promise<JsonRecord> {
   return {
     runtimeDir,
     loadedAt: new Date().toISOString(),
+    coverage: {
+      nodes: graph.coverage.nodes,
+      edges: graph.coverage.edges,
+      events: eventRead.coverage,
+      artifacts: artifactRead.coverage,
+      taskOutcomes: outcomes.coverage.taskOutcomes,
+      epochOutcomes: outcomes.coverage.epochOutcomes,
+      graphDeltas: deltaRead.coverage
+    },
     overview: summarizeRuntime(events, graph.nodes, graph.edges, artifacts),
     traceItems,
     reports: {
@@ -2177,32 +2189,30 @@ function normalizeReportText(value: string): string {
 function readRuntimeOutcomes(runtimeDir: string): {
   taskOutcomes: WebTaskOutcome[];
   epochOutcomes: WebEpochOutcome[];
+  coverage: { taskOutcomes: CollectionCoverage; epochOutcomes: CollectionCoverage };
 } {
   const databasePath = join(runtimeDir, "state.sqlite");
-  if (!existsSync(databasePath)) return { taskOutcomes: [], epochOutcomes: [] };
-  const database = new DatabaseSync(databasePath);
+  const unavailable = (reason: "missing" | "read_error") => ({ taskOutcomes: [], epochOutcomes: [], coverage: {
+    taskOutcomes: unavailableCoverage("sqlite", 500, reason), epochOutcomes: unavailableCoverage("sqlite", 1000, reason)
+  } });
+  if (!existsSync(databasePath)) return unavailable("missing");
+  let database: DatabaseSync | undefined;
   try {
-    const taskOutcomes = databaseTableExists(database, "task_outcomes")
-      ? database.prepare(`
-          SELECT outcome_json
-          FROM task_outcomes
-          ORDER BY terminal_seq DESC
-          LIMIT 500
-        `).all().flatMap((row) => normalizeTaskOutcome(asRecord(row).outcome_json))
-      : [];
-    const epochOutcomes = databaseTableExists(database, "epoch_outcomes")
-      ? database.prepare(`
-          SELECT outcome_json
-          FROM epoch_outcomes
-          ORDER BY terminal_seq DESC
-          LIMIT 1000
-        `).all().flatMap((row) => normalizeEpochOutcome(asRecord(row).outcome_json))
-      : [];
-    return { taskOutcomes, epochOutcomes };
+    database = new DatabaseSync(databasePath);
+    const read = <T>(table: string, limit: number, normalize: (value: unknown) => T[]): CoveredCollection<T> => {
+      try {
+        if (!databaseTableExists(database!, table)) return { records: [], coverage: unavailableCoverage("sqlite", limit, "missing") };
+        const rows = database!.prepare(`SELECT outcome_json FROM ${table} ORDER BY terminal_seq DESC LIMIT ?`).all(limit + 1);
+        return boundedCollection(rows, limit, (row) => normalize(asRecord(row).outcome_json));
+      } catch { return { records: [], coverage: unavailableCoverage("sqlite", limit, "read_error") }; }
+    };
+    const task = read("task_outcomes", 500, normalizeTaskOutcome);
+    const epoch = read("epoch_outcomes", 1000, normalizeEpochOutcome);
+    return { taskOutcomes: task.records, epochOutcomes: epoch.records, coverage: { taskOutcomes: task.coverage, epochOutcomes: epoch.coverage } };
   } catch {
-    return { taskOutcomes: [], epochOutcomes: [] };
+    return unavailable("read_error");
   } finally {
-    database.close();
+    database?.close();
   }
 }
 
@@ -2740,47 +2750,51 @@ async function readRuntimeSessionGraphMeta(runtimeDir: string): Promise<{
   };
 }
 
-function readGraph(runtimeDir: string, graphDeltas: JsonRecord[]): {
+function readGraph(runtimeDir: string, graphDeltas: JsonRecord[], deltaCoverage?: CollectionCoverage): {
   nodes: WebNode[];
   edges: WebEdge[];
   summary: JsonRecord;
   source: string;
   sqliteError?: string;
+  coverage: { nodes: CollectionCoverage; edges: CollectionCoverage };
 } {
   const databasePath = join(runtimeDir, "state.sqlite");
   if (existsSync(databasePath)) {
     try {
       const database = new DatabaseSync(databasePath);
       try {
-        const nodes = database.prepare(`
+        const nodeRead = boundedCollection(database.prepare(`
           SELECT id, graph_kind, type, label, properties_json, evidence_refs_json, updated_at
           FROM nodes
           ORDER BY updated_at DESC
-          LIMIT 1200
-        `).all().map(normalizeNode);
-        const edges = database.prepare(`
+          LIMIT 1201
+        `).all(), 1200, (row) => [normalizeNode(row)]);
+        const edgeRead = boundedCollection(database.prepare(`
           SELECT id, from_id, to_id, type, properties_json, evidence_refs_json, updated_at
           FROM edges
           ORDER BY updated_at DESC
-          LIMIT 2400
-        `).all().map(normalizeEdge);
-        return { nodes, edges, summary: summarizeGraph(nodes, edges), source: "sqlite" };
+          LIMIT 2401
+        `).all(), 2400, (row) => [normalizeEdge(row)]);
+        const nodes = nodeRead.records;
+        const edges = edgeRead.records;
+        return { nodes, edges, summary: summarizeGraph(nodes, edges), source: "sqlite", coverage: { nodes: nodeRead.coverage, edges: edgeRead.coverage } };
       } finally {
         database.close();
       }
     } catch (error) {
-      return graphFromDeltas(graphDeltas, error instanceof Error ? error.message : String(error));
+      return graphFromDeltas(graphDeltas, error instanceof Error ? error.message : String(error), deltaCoverage);
     }
   }
-  return graphFromDeltas(graphDeltas);
+  return graphFromDeltas(graphDeltas, undefined, deltaCoverage);
 }
 
-function graphFromDeltas(graphDeltas: JsonRecord[], sqliteError?: string): {
+function graphFromDeltas(graphDeltas: JsonRecord[], sqliteError?: string, deltaCoverage?: CollectionCoverage): {
   nodes: WebNode[];
   edges: WebEdge[];
   summary: JsonRecord;
   source: string;
   sqliteError?: string;
+  coverage: { nodes: CollectionCoverage; edges: CollectionCoverage };
 } {
   const nodesById = new Map<string, WebNode>();
   const edgesById = new Map<string, WebEdge>();
@@ -2794,7 +2808,8 @@ function graphFromDeltas(graphDeltas: JsonRecord[], sqliteError?: string): {
           type: stringValue(item.type, "unknown"),
           label: stringValue(item.label, item.id),
           properties: isRecord(item.properties) ? item.properties : {},
-          evidenceRefs: stringArray(item.evidenceRefs)
+          evidenceRefs: stringArray(item.evidenceRefs),
+          updatedAt: optionalText(item.updatedAt ?? item.updated_at)
         });
       }
     }
@@ -2806,7 +2821,8 @@ function graphFromDeltas(graphDeltas: JsonRecord[], sqliteError?: string): {
           to: stringValue(item.to ?? item.to_id, ""),
           type: stringValue(item.type, "unknown"),
           properties: isRecord(item.properties) ? item.properties : {},
-          evidenceRefs: stringArray(item.evidenceRefs)
+          evidenceRefs: stringArray(item.evidenceRefs),
+          updatedAt: optionalText(item.updatedAt ?? item.updated_at)
         };
         if (edge.from && edge.to) {
           edgesById.set(edge.id || `${edge.from}::${edge.type}::${edge.to}`, edge);
@@ -2816,7 +2832,20 @@ function graphFromDeltas(graphDeltas: JsonRecord[], sqliteError?: string): {
   }
   const nodes = [...nodesById.values()];
   const edges = [...edgesById.values()];
-  return { nodes, edges, summary: summarizeGraph(nodes, edges), source: "graph-deltas", sqliteError };
+  return { nodes, edges, summary: summarizeGraph(nodes, edges), source: "graph-deltas", sqliteError,
+    coverage: { nodes: reconstructedCoverage(nodes.length, deltaCoverage, nodes), edges: reconstructedCoverage(edges.length, deltaCoverage, edges) } };
+}
+
+function parseGraphJsonFields(record: JsonRecord): Pick<WebNode, "properties" | "evidenceRefs"> {
+  if (typeof record.properties_json !== "string" || typeof record.evidence_refs_json !== "string") {
+    throw new Error("Invalid stored graph JSON fields");
+  }
+  const properties: unknown = JSON.parse(record.properties_json);
+  const evidenceRefs: unknown = JSON.parse(record.evidence_refs_json);
+  if (!isRecord(properties) || !Array.isArray(evidenceRefs) || !evidenceRefs.every((ref) => typeof ref === "string")) {
+    throw new Error("Invalid stored graph JSON types");
+  }
+  return { properties, evidenceRefs };
 }
 
 function normalizeNode(row: unknown): WebNode {
@@ -2826,8 +2855,7 @@ function normalizeNode(row: unknown): WebNode {
     graphKind: stringValue(record.graph_kind, "unknown"),
     type: stringValue(record.type, "unknown"),
     label: stringValue(record.label, ""),
-    properties: parseJsonObject(record.properties_json),
-    evidenceRefs: parseJsonArray(record.evidence_refs_json),
+    ...parseGraphJsonFields(record),
     updatedAt: stringValue(record.updated_at, "")
   };
 }
@@ -2839,8 +2867,7 @@ function normalizeEdge(row: unknown): WebEdge {
     from: stringValue(record.from_id, ""),
     to: stringValue(record.to_id, ""),
     type: stringValue(record.type, "unknown"),
-    properties: parseJsonObject(record.properties_json),
-    evidenceRefs: parseJsonArray(record.evidence_refs_json),
+    ...parseGraphJsonFields(record),
     updatedAt: stringValue(record.updated_at, "")
   };
 }

@@ -4,6 +4,7 @@ import { createServer, type Server, type Socket } from "node:net";
 import { mkdir, mkdtemp, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import test from "node:test";
+import { DatabaseSync } from "node:sqlite";
 import { ensureTrafficProxySocketDir, trafficProxyRuntimeIdentity } from "../src/connectivity/traffic-proxy-runtime.js";
 import { WebAuthService } from "../src/web-auth.js";
 import { hasCapability } from "../src/web-security.js";
@@ -161,6 +162,107 @@ test("state projects persisted outcomes and accepted Planner decisions as displa
   assert.equal(state.reports.planningRounds[0].status, "completed");
   assert.equal(state.reports.planningRounds[1].kind, "terminal");
   assert.deepEqual(state.reports.planningRounds[1].inputTaskRefs, ["task:web-report"]);
+});
+
+test("state coverage reports independent SQLite limits and malformed selected outcomes", async () => {
+  const runtime = join(fixture.root, "coverage-sqlite");
+  await mkdir(runtime);
+  const database = new DatabaseSync(join(runtime, "state.sqlite"));
+  database.exec(`
+    CREATE TABLE nodes (id TEXT, graph_kind TEXT, type TEXT, label TEXT, properties_json TEXT, evidence_refs_json TEXT, updated_at TEXT);
+    CREATE TABLE edges (id TEXT, from_id TEXT, to_id TEXT, type TEXT, properties_json TEXT, evidence_refs_json TEXT, updated_at TEXT);
+    CREATE TABLE task_outcomes (outcome_json TEXT, terminal_seq INTEGER);
+    CREATE TABLE epoch_outcomes (outcome_json TEXT, terminal_seq INTEGER);
+  `);
+  const insertNode = database.prepare("INSERT INTO nodes VALUES (?, 'operation', 'Host', 'host', '{}', '[]', '2026-01-01')");
+  const insertEdge = database.prepare("INSERT INTO edges VALUES (?, 'h0', 'h1', 'related', '{}', '[]', '2026-01-01')");
+  const insertTask = database.prepare("INSERT INTO task_outcomes VALUES (?, ?)");
+  const insertEpoch = database.prepare("INSERT INTO epoch_outcomes VALUES (?, ?)");
+  database.exec("BEGIN");
+  for (let i = 0; i < 1200; i++) insertNode.run(`h${i}`);
+  for (let i = 0; i < 2400; i++) insertEdge.run(`e${i}`);
+  const outcome = JSON.stringify({ taskRef: "t", epochRef: "e", createdAt: "2026-01-01" });
+  for (let i = 0; i < 500; i++) insertTask.run(outcome, i);
+  for (let i = 0; i < 1000; i++) insertEpoch.run(outcome, i);
+  database.exec("COMMIT");
+  const getState = async () => json(await analystGet(`/api/state?runtimeDir=${encodeURIComponent(runtime)}`));
+  try {
+    const exact = await getState();
+    for (const key of ["nodes", "edges", "taskOutcomes", "epochOutcomes"]) {
+      assert.equal(exact.coverage[key].state, "complete", key);
+      assert.equal(exact.coverage[key].truncated, false, key);
+    }
+    insertNode.run("sentinel"); insertEdge.run("sentinel");
+    insertTask.run("corrupt", 501); insertEpoch.run(outcome, 1001);
+    const extra = await getState();
+    assert.equal(extra.graph.nodes.length, 1200);
+    assert.equal(extra.graph.edges.length, 2400);
+    assert.equal(extra.reports.taskOutcomes.length, 499);
+    for (const key of ["nodes", "edges", "taskOutcomes", "epochOutcomes"]) {
+      assert.equal(extra.coverage[key].state, "partial", key);
+      assert.equal(extra.coverage[key].truncated, true, key);
+    }
+    assert.equal(extra.coverage.taskOutcomes.skippedRecords, 1);
+    assert.equal(extra.coverage.events.state, "unavailable");
+  } finally { database.close(); }
+});
+
+test("state survives corrupt database and reports delta fallback independently of raw JSONL bounds", async () => {
+  const runtime = join(fixture.root, "coverage-fallback");
+  await mkdir(join(runtime, "artifacts"), { recursive: true });
+  await writeFile(join(runtime, "state.sqlite"), "not a database");
+  await writeFile(join(runtime, "execution.jsonl"), Array.from({ length: 700 }, (_, i) => JSON.stringify({
+    id: `event:${i}`, timestamp: "2026-01-01", role: "runtime", eventType: "test", payload: {}
+  })).join("\n") + "\ncorrupt");
+  await writeFile(join(runtime, "artifacts", "index.jsonl"), "");
+  await writeFile(join(runtime, "graph-deltas.jsonl"), JSON.stringify({ nodes: Array.from({ length: 1300 }, (_, i) => ({
+    id: `h${i}`, graphKind: "operation", type: "Host", label: `h${i}`, properties: {}, evidenceRefs: []
+  })) }));
+  const response = await analystGet(`/api/state?runtimeDir=${encodeURIComponent(runtime)}`);
+  assert.equal(response.status, 200);
+  const result = await json(response);
+  assert.equal(result.coverage.nodes.source, "graph-deltas");
+  assert.equal(result.coverage.nodes.limit, null);
+  assert.equal(result.coverage.nodes.returned, 1300);
+  assert.equal(result.coverage.nodes.state, "unknown");
+  assert.equal(result.coverage.graphDeltas.limit, 260);
+  assert.equal(result.coverage.graphDeltas.state, "complete");
+  assert.equal(result.coverage.events.returned, 699);
+  assert.equal(result.coverage.events.truncated, true);
+  assert.equal(result.coverage.events.skippedRecords, 1);
+  assert.equal(result.coverage.artifacts.state, "complete");
+  assert.equal(result.coverage.taskOutcomes.state, "unavailable");
+  assert.equal(result.coverage.taskOutcomes.reason, "read_error");
+});
+
+test("state marks malformed SQLite graph JSON and wrong JSON types as skipped partial records", async () => {
+  const runtime = join(fixture.root, "coverage-malformed-graph");
+  await mkdir(runtime);
+  const database = new DatabaseSync(join(runtime, "state.sqlite"));
+  database.exec(`
+    CREATE TABLE nodes (id TEXT, graph_kind TEXT, type TEXT, label TEXT, properties_json TEXT, evidence_refs_json TEXT, updated_at TEXT);
+    CREATE TABLE edges (id TEXT, from_id TEXT, to_id TEXT, type TEXT, properties_json TEXT, evidence_refs_json TEXT, updated_at TEXT);
+  `);
+  const nodeInsert = database.prepare("INSERT INTO nodes VALUES (?, 'operation', 'Host', 'host', ?, ?, '2026-01-01')");
+  const edgeInsert = database.prepare("INSERT INTO edges VALUES (?, 'valid', 'valid', 'related', ?, ?, '2026-01-01')");
+  const values = [["valid", "{}", "[]"], ["syntax", "{bad", "[]"], ["array-properties", "[]", "[]"],
+    ["null-properties", "null", "[]"], ["object-evidence", "{}", "{}"], ["mixed-evidence", "{}", '["event:1", 2]']];
+  try {
+    database.exec("BEGIN");
+    for (const value of values) { nodeInsert.run(...value); edgeInsert.run(...value); }
+    database.exec("COMMIT");
+    const response = await analystGet(`/api/state?runtimeDir=${encodeURIComponent(runtime)}`);
+    assert.equal(response.status, 200);
+    const result = await json(response);
+    assert.equal(result.graph.source, "sqlite");
+    for (const key of ["nodes", "edges"]) {
+      assert.equal(result.graph[key].length, 1, key);
+      assert.equal(result.coverage[key].state, "partial", key);
+      assert.equal(result.coverage[key].reason, "parse_error", key);
+      assert.equal(result.coverage[key].skippedRecords, 5, key);
+      assert.equal(result.coverage[key].truncated, false, key);
+    }
+  } finally { database.close(); }
 });
 
 test("runtime query parameters enforce canonical containment including traversal and symlinks", async () => {

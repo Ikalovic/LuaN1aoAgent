@@ -3,7 +3,7 @@ export type JsonRecord = Record<string, JsonValue | undefined>;
 
 export type Role = "planner" | "executor" | "observer" | "runtime" | string;
 export type GraphKind = "reasoning" | "operation" | "task";
-export type ViewKey = "trace" | "reports" | GraphKind | "traffic" | "connections" | "skills" | "mcp" | "credentials" | "approvals";
+export type ViewKey = "overview" | "findings" | "wallboard" | "trace" | "reports" | GraphKind | "traffic" | "connections" | "skills" | "mcp" | "credentials" | "approvals";
 
 export interface AuthUser {
   id: string;
@@ -380,7 +380,30 @@ export interface PlannerCheckpoint {
   traceItemIds: string[];
 }
 
+export interface CollectionCoverage {
+  source: "sqlite" | "jsonl" | "graph-deltas";
+  state: "complete" | "partial" | "unknown" | "unavailable";
+  returned: number;
+  limit: number | null;
+  truncated: boolean | null;
+  skippedRecords: number;
+  firstTimestamp?: string;
+  lastTimestamp?: string;
+  reason?: "missing" | "read_error" | "parse_error" | "fallback";
+}
+
+export interface RuntimeCoverage {
+  nodes: CollectionCoverage;
+  edges: CollectionCoverage;
+  events: CollectionCoverage;
+  artifacts: CollectionCoverage;
+  taskOutcomes: CollectionCoverage;
+  epochOutcomes: CollectionCoverage;
+  graphDeltas?: CollectionCoverage;
+}
+
 export interface RuntimeState {
+  coverage?: RuntimeCoverage;
   runtimeDir: string;
   loadedAt: string;
   overview: {
@@ -504,6 +527,10 @@ export interface TrafficHistoryPage {
 }
 
 export interface TrafficHistoryFilters {
+  route_ref?: string;
+  session_ref?: string;
+  started_after?: string;
+  started_before?: string;
   method?: string;
   host?: string;
   status?: number;
@@ -570,7 +597,7 @@ export interface ConnectionsResponse {
   loadedAt: string;
   runtimeControl: {
     active: boolean;
-    mode: "controller" | "read_only";
+    mode: "controller" | "read_only" | "historical";
     error?: string;
   };
   connections: ConnectionItem[];

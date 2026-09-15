@@ -1,0 +1,489 @@
+@font-face {
+  font-family: "QxHomeDisplay";
+  src: url('/fonts/SmileySans-Oblique.ttf.woff2') format('woff2');
+  font-weight: 400;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: "QxHomeLatin";
+  src: url('/fonts/chakra-petch-medium.ttf') format('truetype');
+  font-weight: 500;
+  font-display: swap;
+}
+
+.qx-home {
+  width: 100%;
+  height: 100dvh;
+  min-height: 100svh;
+  overflow-y: auto;
+  background: #202729;
+  color: #eff7f4;
+  font-size: 15px;
+  line-height: 1.6;
+  color-scheme: dark;
+}
+
+.qx-home,
+.qx-home * {
+  box-sizing: border-box;
+  letter-spacing: 0;
+}
+
+.qx-home a {
+  color: inherit;
+  text-decoration: none;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.qx-home button {
+  font: inherit;
+  cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.qx-home :is(a, button, [tabindex]):focus-visible {
+  outline: 2px solid #78e0c5;
+  outline-offset: 5px;
+}
+
+.qx-home svg {
+  flex: 0 0 auto;
+}
+
+.qx-home-stage {
+  isolation: isolate;
+  position: relative;
+  min-height: calc(100svh - 148px);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.qx-home-backdrop {
+  position: absolute;
+  z-index: -1;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  object-position: center;
+}
+
+.qx-home-nav {
+  width: min(calc(100% - 96px), 1600px);
+  margin: 0 auto;
+  min-height: 90px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 24px;
+  border-bottom: 1px solid #91b6b32e;
+}
+
+.qx-home-brand {
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 9px;
+}
+
+.qx-home-brand img {
+  width: 40px;
+  height: 40px;
+}
+
+.qx-home-brand span {
+  font: 27px/1 "QxHomeDisplay", sans-serif;
+}
+
+.qx-home-links {
+  display: flex;
+  min-width: 0;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px 28px;
+  font-size: 13px;
+  color: #d1ddda;
+}
+
+.qx-home-links a {
+  display: inline-flex;
+  min-height: 40px;
+  align-items: center;
+  gap: 7px;
+}
+
+.qx-home-links a:hover {
+  color: #78e0c5;
+}
+
+.qx-home-language {
+  display: inline-flex;
+  width: 40px;
+  height: 40px;
+  flex: 0 0 auto;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  color: #d1ddda;
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 3px;
+}
+
+.qx-home-language:hover {
+  color: #b8f4e2;
+  background: #9ce8d314;
+  border-color: #91b6b32e;
+}
+
+.qx-home-hero {
+  width: min(calc(100% - 96px), 1600px);
+  margin: 0 auto;
+  flex: 1;
+  display: flex;
+  align-items: center;
+  padding: 46px 0 58px 80px;
+}
+
+.qx-home-copy {
+  width: 100%;
+  max-width: 800px;
+  text-align: left;
+}
+
+.qx-home-symbol {
+  display: block;
+  width: 76px;
+  height: 76px;
+  margin: 0 0 4px -12px;
+}
+
+.qx-home-copy h1 {
+  margin: 0;
+  color: #f0faf7;
+  font: 134px/1.08 "QxHomeDisplay", sans-serif;
+  text-shadow: 0 2px 0 #8fafa844;
+}
+
+.qx-home-product-name {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 10px;
+  margin: 8px 0 0;
+  font: 27px/1.4 "QxHomeDisplay", sans-serif;
+}
+
+.qx-home-product-name span {
+  color: #93dbc9;
+  font: 500 24px/1.4 "QxHomeLatin", sans-serif;
+}
+
+.qx-home-intro {
+  max-width: 640px;
+  margin: 24px 0 0;
+  color: #c3d0cd;
+  font-size: 16px;
+  line-height: 1.9;
+  text-wrap: pretty;
+}
+
+.qx-home-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 15px;
+  margin-top: 28px;
+}
+
+.qx-home-action {
+  display: inline-flex;
+  min-height: 50px;
+  min-width: 158px;
+  align-items: center;
+  justify-content: center;
+  gap: 18px;
+  padding: 11px 21px;
+  border: 1px solid #8bd7c260;
+  border-radius: 2px;
+  background: #283b3866;
+  font-size: 14px;
+  transition: background .16s, border-color .16s;
+}
+
+.qx-home-action:hover {
+  background: #3b63588c;
+  border-color: #c5f8eb;
+}
+
+.qx-home-action.qx-home-action-primary {
+  color: #123a31;
+  background: #9ce8d3;
+  border-color: #9ce8d3;
+}
+
+.qx-home-action.qx-home-action-primary:hover {
+  background: #c0f3e5;
+}
+
+.qx-home-capabilities {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 24px;
+  max-width: 650px;
+  margin: 40px 0 0;
+  padding: 21px 0 0;
+  border-top: 1px solid #a7c6bf42;
+  list-style: none;
+}
+
+.qx-home-capabilities li {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 10px;
+  font-size: 14px;
+  color: #c6d8d1;
+}
+
+.qx-home-overview {
+  padding: 48px 0 72px;
+  color: #23332b;
+  background: #e5ebe7;
+  color-scheme: light;
+}
+
+.qx-home-overview-inner {
+  width: min(calc(100% - 96px), 1440px);
+  margin: 0 auto;
+}
+
+.qx-home-section-heading {
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 32px;
+  margin-bottom: 30px;
+}
+
+.qx-home-eyebrow {
+  margin: 0 0 12px;
+  color: #397561;
+  font: 500 12px/1.5 "QxHomeLatin", sans-serif;
+}
+
+.qx-home-section-heading h2 {
+  margin: 0;
+  font: 36px/1.3 "QxHomeDisplay", sans-serif;
+  text-wrap: balance;
+}
+
+.qx-home-tabs {
+  display: flex;
+  flex: 0 0 auto;
+  border-bottom: 1px solid #a9bfb2;
+}
+
+.qx-home-tabs button {
+  min-height: 44px;
+  padding: 6px 18px;
+  color: #52675b;
+  background: transparent;
+  border: 0;
+  border-bottom: 2px solid transparent;
+  white-space: nowrap;
+}
+
+.qx-home-tabs button[aria-selected='true'] {
+  color: #174e38;
+  border-bottom-color: #247752;
+}
+
+.qx-home-tabs button:hover {
+  color: #174e38;
+}
+
+.qx-home-overview :is(a, button, [tabindex]):focus-visible {
+  outline-color: #247752;
+}
+
+.qx-home-product-frame {
+  position: relative;
+  width: 100%;
+  aspect-ratio: 16 / 9;
+}
+
+.qx-home-product-screen {
+  display: block;
+  width: 100%;
+  height: 100%;
+  aspect-ratio: 16 / 9;
+  object-fit: contain;
+}
+
+.qx-home-product-caption {
+  margin: 13px 0 0;
+  color: #596e61;
+  font-size: 12px;
+}
+
+.qx-home-image-fallback {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-direction: column;
+  gap: 10px;
+  padding: 16px;
+  background: #d4e0d8;
+  color: #52675b;
+  text-align: center;
+}
+
+.qx-home-image-fallback p {
+  margin: 0;
+  font-size: 14px;
+}
+
+.qx-home-image-fallback a {
+  display: inline-flex;
+  min-height: 40px;
+  align-items: center;
+  gap: 10px;
+  color: #174e38;
+  text-decoration: underline;
+  text-underline-offset: 4px;
+}
+
+.qx-home-attribution {
+  display: flex;
+  min-height: 92px;
+  align-items: center;
+  justify-content: space-between;
+  gap: 24px;
+  padding: 24px 48px;
+  border-top: 1px solid #9fbcb32e;
+  background: #1e2924;
+}
+
+.qx-home-attribution p {
+  margin: 0;
+  color: #9cb0aa;
+  font-size: 12px;
+}
+
+.qx-home-attribution a {
+  color: #c7d6d0;
+  text-decoration: underline;
+  text-decoration-color: #6a8e8166;
+  text-underline-offset: 5px;
+  overflow-wrap: anywhere;
+}
+
+.qx-home-attribution a:hover {
+  color: #78e0c5;
+}
+
+.qx-home-footer-name {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  color: #afc9bf;
+  font: 500 13px/1.5 "QxHomeLatin", sans-serif;
+}
+
+.qx-home-footer-name::before {
+  content: '';
+  width: 32px;
+  height: 1px;
+  background: #8ad7bb;
+}
+
+@media (min-width: 2300px) {
+  .qx-home-copy h1 { font-size: 168px; }
+  .qx-home-intro { font-size: 19px; }
+}
+
+@media (max-width: 1050px) {
+  .qx-home-nav,
+  .qx-home-hero,
+  .qx-home-overview-inner { width: calc(100% - 64px); }
+  .qx-home-hero { padding-left: 24px; }
+  .qx-home-copy h1 { font-size: 116px; }
+}
+
+@media (max-width: 760px) {
+  .qx-home-nav { min-height: 68px; width: calc(100% - 40px); gap: 16px; padding: 10px 0; }
+  .qx-home-brand { gap: 5px; }
+  .qx-home-brand img { width: 30px; height: 30px; }
+  .qx-home-brand span { font-size: 23px; }
+  .qx-home-links { gap: 0 14px; font-size: 12px; }
+  .qx-home-links a { gap: 4px; }
+  .qx-home-language { width: 32px; height: 36px; }
+  .qx-home-hero { width: calc(100% - 44px); padding: 30px 0 38px; }
+  .qx-home-symbol { width: 66px; height: 66px; margin-left: -10px; }
+  .qx-home-copy h1 { font-size: 104px; }
+  .qx-home-product-name { font-size: 23px; }
+  .qx-home-product-name span { font-size: 21px; }
+  .qx-home-intro { max-width: 370px; font-size: 14px; margin-top: 19px; }
+  .qx-home-actions { gap: 12px; }
+  .qx-home-action { min-width: 142px; min-height: 46px; padding: 9px 17px; gap: 15px; font-size: 13px; }
+  .qx-home-capabilities { margin-top: 28px; padding-top: 18px; gap: 12px; }
+  .qx-home-capabilities li { font-size: 12px; gap: 6px; }
+  .qx-home-capabilities svg { width: 15px; height: 15px; }
+  .qx-home-overview { padding: 28px 0 36px; }
+  .qx-home-overview-inner { width: calc(100% - 40px); }
+  .qx-home-section-heading { display: block; margin-bottom: 20px; }
+  .qx-home-section-heading h2 { font-size: 27px; }
+  .qx-home-eyebrow { margin-bottom: 8px; }
+  .qx-home-tabs { width: fit-content; max-width: 100%; margin-top: 18px; }
+  .qx-home-tabs button { font-size: 12px; }
+  .qx-home-attribution { padding: 20px 24px; justify-content: center; text-align: center; }
+  .qx-home-attribution p { font-size: 11px; line-height: 1.9; }
+  .qx-home-footer-name { display: none; }
+}
+
+@media (max-width: 420px) {
+  .qx-home-links { gap: 0 10px; }
+  .qx-home-links a > svg { display: none; }
+  .qx-home-actions { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .qx-home-action { min-width: 0; padding: 9px 12px; gap: 9px; }
+  .qx-home-capabilities { gap: 8px; }
+  .qx-home-capabilities li { font-size: 11px; }
+}
+
+@media (max-height: 800px) and (min-width: 761px) {
+  .qx-home-hero { padding-top: 24px; padding-bottom: 28px; }
+  .qx-home-symbol { width: 48px; height: 48px; }
+  .qx-home-copy h1 { font-size: 92px; }
+  .qx-home-intro { margin-top: 14px; }
+  .qx-home-actions { margin-top: 24px; }
+  .qx-home-capabilities { margin-top: 22px; padding-top: 14px; }
+}
+
+@media (max-height: 760px) and (max-width: 760px) {
+  .qx-home-hero { padding-top: 22px; padding-bottom: 24px; }
+  .qx-home-symbol { width: 48px; height: 48px; }
+  .qx-home-copy h1 { font-size: 82px; }
+  .qx-home-product-name { font-size: 21px; }
+  .qx-home-intro { margin-top: 14px; }
+  .qx-home-actions { margin-top: 20px; }
+}
+
+@media (max-height: 600px) {
+  .qx-home-nav { min-height: 60px; }
+  .qx-home-hero { padding-top: 16px; padding-bottom: 20px; }
+  .qx-home-symbol { display: none; }
+  .qx-home-copy h1 { font-size: 72px; }
+  .qx-home-product-name { margin-top: 4px; font-size: 21px; }
+  .qx-home-intro { margin-top: 10px; font-size: 13px; }
+  .qx-home-actions { margin-top: 16px; }
+  .qx-home-capabilities { margin-top: 20px; padding-top: 12px; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .qx-home-action { transition: none; }
+}

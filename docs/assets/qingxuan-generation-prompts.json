@@ -1,0 +1,41 @@
+{
+  "provider": "https://cdn.coderelay.cn/v1/chat/completions",
+  "model": "gpt-image-2.5-flare",
+  "request_notes": "The first wallboard, brand and login requests used model/messages only. Empty, header and deck additionally sent size/background/quality/output_format. A second wallboard request added size=3840x2160, quality=high, output_format=png; its 1672x941 output was selected. The gateway did not deliver the exact requested pixel dimensions. All response images were downloaded without forwarding the API authorization header.",
+  "assets": [
+    {
+      "id": "QX-WALL-01",
+      "name": "wallboard-surface",
+      "selected_request_parameters": {"size": "3840x2160", "quality": "high", "output_format": "png"},
+      "prompt": "Generate one finished original raster image, not a description. Use case: stylized-concept. Asset: full-bleed exhibition wallboard background for 青玄 自动渗透agent. Output 3840x2160, 16:9 landscape. Neutral near-black and graphite precision-machined metal environment, subtle layered bevels and low architectural depth concentrated at the outer edges and bottom 10 percent. Small crisp teal and ice-white edge highlights, extremely sparse amber accents. Open calm middle 60 percent and left/right reading areas with uniformly low detail. Keep the top 14 percent clear for a separately typeset brand. Powerful and sophisticated but no navy-blue wash. This is an empty environment for a live 3D asset graph and DOM panels that will be composited later, not a finished dashboard. No text, letters, numbers, logos, watermark, panels, charts, maps, computers, server racks, nodes, connection lines, radar, orbs, bokeh, particles, light tunnels or blurred photography. Keep actual illumination restrained so bright foreground data remains legible. Deliver the image itself."
+    },
+    {
+      "id": "QX-BRAND-01",
+      "name": "qingxuan-symbol",
+      "prompt": "Generate one original production-ready flat geometric brand symbol for 青玄 自动渗透agent, an autonomous security analysis workbench. Use case: logo-brand. A single coherent strong abstract geometric mark expressing an open exploration path and linked evidence, simple distinctive silhouette, broad consistent forms and deliberate negative space, readable at 24 pixels. Flat solid teal #53D6BD only, no shading, gradients, glow or 3D. Center the one symbol in a 1024x1024 square with at least 15 percent safe margin. No wordmark, no letters, no Chinese characters, numbers, caption, mockup, alternatives, watermark, shield, lock or complex circuitry. Genuine transparent background with alpha, do not draw checkerboard squares. Return one image, not prose."
+    },
+    {
+      "id": "QX-AUTH-01",
+      "name": "login-surface-dark",
+      "prompt": "Generate one finished original raster background for the login screen of 青玄 自动渗透agent. Use case: stylized-concept. 2560x1600, landscape 16:10. A precise solid neutral graphite architectural plane, refined machined surfaces with a few clear interconnected geometric cuts in the lower right third, very restrained teal material accents. Left 60 percent and top remain calm uniformly low-detail dark graphite for readable brand and form content to be added separately. Quiet, precise, modern, sharply resolved material, understated depth without cinematic blur. No text, letters, numbers, logos, watermark, UI panels, charts, maps, screenshots, orbs, halos, bokeh, particles, neon tunnels, server racks or false data. Not a monochromatic navy-blue scene. Return the image itself, not a design description."
+    },
+    {
+      "id": "QX-EMPTY-01",
+      "name": "empty-run",
+      "selected_request_parameters": {"size": "1024x768", "background": "transparent", "quality": "high", "output_format": "png"},
+      "prompt": "Generate one small product empty-state raster illustration for 青玄 自动渗透agent. Use case: illustration-story. Three simple clean geometric planes connected by very few short straight lines, an orderly workspace that is not yet unfolded. Flat style with a slight isometric view, teal, cool neutral gray and a tiny warm yellow accent. Very simple bold forms with details that remain legible at 160 pixels. Center the illustration inside the middle 60 percent of a 1024x768 canvas, 4:3 landscape. Genuine transparent alpha background, no checkerboard drawing, no cast shadow outside the subject. No text, letters, numbers, humans, characters, logos, watermarks, orbs, interface panels or data charts. Return one image, not prose."
+    },
+    {
+      "id": "QX-WALL-02",
+      "name": "wallboard-header-rail",
+      "selected_request_parameters": {"size": "3840x1280", "background": "transparent", "quality": "high", "output_format": "png"},
+      "prompt": "Generate one original horizontal ornamental header rail for the exhibition wallboard of 青玄 自动渗透agent. Use case: stylized-concept. Output a 3840x1280 landscape image with genuine transparent alpha background. The ONLY artwork occupies a very thin horizontal band centered vertically, from y=480 to y=800 (320 pixels high); everything above and below is completely transparent so this band can be cropped to 3840x320 without distortion. Two symmetric separated precision-cut graphite metal wings with a double stepped beveled outline and narrow teal/ice-white highlights, crisp and refined. Center 40 percent of the width is entirely empty and transparent for separate brand typography. All ornament stays in outer left/right 30 percent, 5 percent outer safe margins. No central plate, badge or closed rectangular frame. No text, letters, numbers, logos, buttons, charts, orbs, particles or watermark. No checkerboard pattern pretending to be transparency. Return the artwork itself, not an explanation."
+    },
+    {
+      "id": "QX-WALL-03",
+      "name": "wallboard-deck-albedo",
+      "selected_request_parameters": {"size": "1024x1024", "background": "opaque", "quality": "high", "output_format": "png"},
+      "prompt": "Generate one original 1024x1024 seamless tileable albedo texture for a precision-machined low platform in a real-time 3D security exhibition scene. Use case: stylized-concept. Neutral dark graphite metal, extremely fine uniform brushed surface and very low-contrast microscopic etching, nearly a flat neutral dark gray when viewed from a distance. Orthographic straight-on texture scan filling the entire square, constant illumination. All four edges must tile seamlessly. No perspective, baked lighting, shadows, reflections, highlights, vignettes, cyan glow, scales, numbers, letters, nodes, circuit traces, symbols, grid, logos or watermark. Not a picture of an object or room. Produce the texture image itself, not prose."
+    }
+  ]
+}

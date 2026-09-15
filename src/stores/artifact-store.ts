@@ -30,7 +30,7 @@ export class ArtifactStore {
     this.databasePath = databasePath;
     mkdirSync(dirname(databasePath), { recursive: true });
     this.database = new DatabaseSync(databasePath);
-    this.database.exec("PRAGMA journal_mode = WAL; PRAGMA busy_timeout = 5000;");
+    this.database.exec("PRAGMA busy_timeout = 5000; PRAGMA journal_mode = WAL;");
     this.initialize();
     this.importLegacyIndex();
   }

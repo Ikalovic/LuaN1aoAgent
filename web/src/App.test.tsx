@@ -29,6 +29,10 @@ vi.mock("./components/SkillsView", () => ({
   SkillsView: () => <div>skill registry content</div>
 }));
 
+vi.mock("./components/CredentialsView", () => ({
+  CredentialsView: ({ runtimeDir }: { runtimeDir: string }) => <div>credentials for {runtimeDir}</div>
+}));
+
 const admin: AuthUser = {
   id: "admin-1",
   username: "admin",
@@ -48,5 +52,33 @@ describe("App Skills route", () => {
     render(<LanguageProvider><App user={admin} onLogout={vi.fn()} /></LanguageProvider>);
 
     expect(screen.getByText("skill registry content")).toBeInTheDocument();
+  });
+
+  it("defaults to overview with unavailable metrics and contextual detail only", () => {
+    window.history.replaceState({}, "", "/");
+    render(<LanguageProvider><App user={{ ...admin, role: "analyst" }} onLogout={vi.fn()} /></LanguageProvider>);
+    expect(screen.getByRole("navigation", { name: "Workbench" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /Hosts/ })).toHaveTextContent("--");
+    expect(screen.queryByText("INSPECTOR")).not.toBeInTheDocument();
+  });
+  it("does not mount approvals for an analyst direct URL", () => {
+    window.history.replaceState({}, "", "/?view=approvals");
+    render(<LanguageProvider><App user={{ ...admin, role: "analyst" }} onLogout={vi.fn()} /></LanguageProvider>);
+    expect(screen.getByText("Administrator access required")).toBeInTheDocument();
+  });
+
+  it("keeps the upstream credentials route and administrator navigation", () => {
+    window.history.replaceState({}, "", "/?view=credentials&runtimeDir=runtime-a");
+    render(<LanguageProvider><App user={admin} onLogout={vi.fn()} /></LanguageProvider>);
+    expect(screen.getByText("credentials for runtime-a")).toBeInTheDocument();
+    expect(screen.getByRole("tab", { name: "Credentials", selected: true })).toBeInTheDocument();
+  });
+
+  it("does not expose credential management to an analyst", () => {
+    window.history.replaceState({}, "", "/?view=credentials&runtimeDir=runtime-a");
+    render(<LanguageProvider><App user={{ ...admin, role: "analyst" }} onLogout={vi.fn()} /></LanguageProvider>);
+    expect(screen.getByText("Administrator access required")).toBeInTheDocument();
+    expect(screen.queryByText("credentials for runtime-a")).not.toBeInTheDocument();
+    expect(screen.queryByRole("tab", { name: "Credentials" })).not.toBeInTheDocument();
   });
 });

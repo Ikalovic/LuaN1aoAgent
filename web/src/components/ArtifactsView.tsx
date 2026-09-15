@@ -12,6 +12,7 @@ type ReportTab = "final" | "tasks" | "artifacts";
 
 export function ArtifactsView(props: {
   runtimeDir: string;
+  taskId?: string;
   artifacts: ArtifactRecord[];
   taskOutcomes: TaskOutcome[];
   epochOutcomes: EpochOutcome[];
@@ -22,7 +23,8 @@ export function ArtifactsView(props: {
 }) {
   const { locale } = useLanguage();
   const zh = locale === "zh-CN";
-  const [tab, setTab] = useState<ReportTab>("final");
+  const [tab, setTab] = useState<ReportTab>(props.taskId ? "tasks" : "final");
+  useEffect(() => { if (props.taskId) setTab("tasks"); }, [props.taskId]);
   const [selectedRef, setSelectedRef] = useState<string>();
   const artifactMap = useMemo(() => new Map(props.artifacts.map((artifact) => [artifact.artifactRef, artifact])), [props.artifacts]);
   const taskMap = useMemo(() => new Map(props.tasks.map((task) => [task.id, task])), [props.tasks]);
@@ -54,15 +56,15 @@ export function ArtifactsView(props: {
         />
       ) : tab === "tasks" ? (
         <TaskResults
-          taskOutcomes={props.taskOutcomes}
-          epochOutcomes={props.epochOutcomes}
+          taskOutcomes={props.taskOutcomes.filter((item) => !props.taskId || item.taskRef === props.taskId)}
+          epochOutcomes={props.epochOutcomes.filter((item) => !props.taskId || item.taskRef === props.taskId)}
           taskMap={taskMap}
           onOpenArtifact={setSelectedRef}
           artifactMap={artifactMap}
           zh={zh}
         />
       ) : (
-        <ArtifactList artifacts={props.artifacts} onOpenArtifact={setSelectedRef} zh={zh} />
+        <ArtifactList artifacts={props.artifacts.filter((item) => !props.taskId || item.taskId === props.taskId)} onOpenArtifact={setSelectedRef} zh={zh} />
       )}
 
       <ArtifactPreview
@@ -290,6 +292,7 @@ function ArtifactPreview({ runtimeDir, artifactRef, artifact, onClose, zh }: {
       </div>
       {loading ? <Skeleton active paragraph={{ rows: 8 }} /> : null}
       {error ? <Alert type="error" showIcon message={error} /> : null}
+      {content?.truncated ? <Alert type="warning" showIcon title={zh ? "内容已截断；下载仅包含当前返回部分，并非完整文件。" : "Content is truncated. The download contains only the returned portion, not the complete file."} /> : null}
       {content ? <ParsedArtifact content={content} mediaType={mediaType} zh={zh} /> : null}
     </div>
   );
