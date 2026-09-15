@@ -1,0 +1,98 @@
+@font-face {
+  font-family: "Qingxuan Entry Display";
+  src: url("/fonts/SmileySans-Oblique.ttf.woff2") format("woff2");
+  font-display: swap;
+}
+
+.auth-shell.qx-auth {
+  display: flex;
+  flex-direction: column;
+  min-height: 100dvh;
+  height: 100dvh;
+  overflow-y: auto;
+  overflow-x: hidden;
+  background: #252a2c url("/art/login-surface-dark.webp") center / cover no-repeat;
+}
+
+.qx-entry-header {
+  width: min(100% - 80px, 1600px);
+  min-height: 88px;
+  flex: 0 0 auto;
+  margin: 0 auto;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 24px;
+  border-bottom: 1px solid #91b6b32e;
+}
+
+.qx-entry-home {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  min-height: 44px;
+  color: #e3f3ed;
+  font-size: 14px;
+}
+
+.qx-entry-home:hover { color: #9ce8d3; }
+.qx-entry-home:focus-visible { outline: 2px solid #9ce8d3; outline-offset: 5px; }
+.qx-auth .auth-preferences { position: static; }
+.qx-auth .auth-preferences .ant-btn { background: transparent; border-color: #8eb6a83b; }
+.qx-auth .auth-preferences .ant-btn:hover { background: #9ce8d310 !important; }
+
+.qx-auth .auth-access {
+  display: grid;
+  place-items: center;
+  min-height: 0;
+  flex: 1 0 auto;
+  padding: 48px 24px;
+  background: transparent;
+}
+
+.qx-auth .auth-panel {
+  width: min(100%, 400px);
+  padding: 32px;
+  border-radius: 4px;
+  border: 1px solid #849e9252;
+  box-shadow: none;
+  background: #222c28ed;
+}
+
+[data-theme="light"] .qx-auth .auth-panel { background: #f1f5f1f5; border-color: #e8f3ec80; }
+.qx-auth .auth-panel-brand { justify-content: center; margin-bottom: 24px; }
+.qx-auth .auth-panel-brand .qingxuan-brand-copy strong { font: 38px/1.2 "Qingxuan Entry Display", sans-serif; }
+.qx-auth .auth-panel-brand .qingxuan-brand-symbol { height: 60px; width: 60px; flex-basis: 60px; }
+.qx-auth .auth-panel-brand .qingxuan-brand-copy span { font-size: 12px; }
+.qx-auth .qx-entry-title { color: var(--text); font-size: 20px; line-height: 1.5; margin: 0 0 16px; font-weight: 500; }
+.qx-auth .ant-input-affix-wrapper { min-height: 44px; border-radius: 3px; }
+.qx-auth .ant-btn-primary { min-height: 44px; border-radius: 3px; font-weight: 500; }
+
+.qx-entry-footer {
+  padding: 20px 24px;
+  font-size: 12px;
+  color: #bdccc5;
+  text-align: center;
+  overflow-wrap: anywhere;
+}
+.qx-entry-footer a { color: #d9e9e2; text-decoration: underline; text-underline-offset: 4px; }
+.qx-entry-footer a:hover { color: #9ce8d3; }
+.qx-entry-loading { min-height: 100dvh; display: flex; align-items: center; justify-content: center; gap: 14px; color: var(--text-secondary); background: var(--bg); }
+.qx-rail .qx-rail-home { margin-bottom: 16px; padding-top: 0; padding-bottom: 0; }
+.qx-rail .qx-rail-home .qingxuan-brand { margin: 0; }
+
+@media (max-width: 760px) {
+  .qx-entry-header { width: calc(100% - 40px); min-height: 72px; gap: 16px; }
+  .qx-entry-home { font-size: 13px; gap: 8px; }
+  .qx-auth .auth-preferences { gap: 4px; }
+  .qx-auth .auth-preferences .ant-btn { width: 40px; height: 40px; }
+  .qx-auth .auth-access { padding: 28px 20px; }
+  .qx-auth .auth-panel { padding: 28px 24px; }
+  .qx-entry-footer { font-size: 11px; }
+}
+
+@media (max-width: 360px) {
+  .qx-auth .auth-access { padding: 24px 16px; }
+  .qx-auth .auth-panel { padding: 24px 20px; }
+  .qx-auth .auth-panel-brand .qingxuan-brand-copy strong { font-size: 32px; }
+}

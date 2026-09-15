@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { Alert, Button, Empty, Input, InputNumber, Select, Skeleton, Tag } from "antd";
 import { ChevronLeft, ChevronRight, Filter, RefreshCw } from "lucide-react";
 import { fetchTrafficExchange, fetchTrafficHistory } from "../api";
@@ -10,6 +10,9 @@ interface TrafficViewProps {
   runtimeDir: string;
   selectedExchangeId?: TrafficFlowRef;
   refreshToken?: number;
+  taskId?: string;
+  startedAfter?: string;
+  startedBefore?: string;
   onSelectExchange: (exchangeId: TrafficFlowRef | undefined) => void;
   onExchangeLoaded: (exchange: TrafficExchange | undefined) => void;
 }
@@ -19,8 +22,8 @@ const PAGE_SIZE = 50;
 export function TrafficView(props: TrafficViewProps) {
   const { t } = useLanguage();
   const [items, setItems] = useState<TrafficExchange[]>([]);
-  const [filters, setFilters] = useState<TrafficHistoryFilters>({});
-  const [draft, setDraft] = useState<TrafficHistoryFilters>({});
+  const [filters, setFilters] = useState<TrafficHistoryFilters>({ task_ref: props.taskId, started_after: props.startedAfter, started_before: props.startedBefore });
+  const [draft, setDraft] = useState<TrafficHistoryFilters>({ task_ref: props.taskId, started_after: props.startedAfter, started_before: props.startedBefore });
   const [cursor, setCursor] = useState<string>();
   const [cursorStack, setCursorStack] = useState<Array<string | undefined>>([]);
   const [nextCursor, setNextCursor] = useState<string>();
@@ -28,15 +31,19 @@ export function TrafficView(props: TrafficViewProps) {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string>();
   const [reload, setReload] = useState(0);
+  const previousRuntime = useRef(props.runtimeDir);
+  const invalidatedSelection = useRef<string | undefined>(undefined);
+  const latestSelection = useRef(props.selectedExchangeId);
+  latestSelection.current = props.selectedExchangeId;
 
   useEffect(() => {
+    if (previousRuntime.current !== props.runtimeDir) { invalidatedSelection.current = props.selectedExchangeId; props.onSelectExchange(undefined); }
+    previousRuntime.current = props.runtimeDir;
     setCursor(undefined);
     setCursorStack([]);
-    setFilters({});
-    setDraft({});
-    props.onSelectExchange(undefined);
-    props.onExchangeLoaded(undefined);
-  }, [props.runtimeDir]);
+    setFilters((current) => ({ ...current, task_ref: props.taskId, started_after: props.startedAfter, started_before: props.startedBefore }));
+    setDraft((current) => ({ ...current, task_ref: props.taskId, started_after: props.startedAfter, started_before: props.startedBefore }));
+  }, [props.runtimeDir, props.taskId, props.startedAfter, props.startedBefore]);
 
   useEffect(() => {
     const controller = new AbortController();
@@ -45,16 +52,13 @@ export function TrafficView(props: TrafficViewProps) {
     setItems([]);
     setHasMore(false);
     setNextCursor(undefined);
-    props.onExchangeLoaded(undefined);
     fetchTrafficHistory(props.runtimeDir, { cursor, limit: PAGE_SIZE, filters }, controller.signal)
       .then((page) => {
         if (controller.signal.aborted) return;
         setItems(page.items);
         setHasMore(page.has_more);
         setNextCursor(page.next_cursor);
-        const selectedStillVisible = props.selectedExchangeId !== undefined
-          && page.items.some((item) => item.id === props.selectedExchangeId);
-        if (!selectedStillVisible) props.onSelectExchange(page.items[0]?.id);
+        if (latestSelection.current === undefined) props.onSelectExchange(page.items[0]?.id);
       })
       .catch((cause) => {
         if (controller.signal.aborted) return;
@@ -67,7 +71,9 @@ export function TrafficView(props: TrafficViewProps) {
 
   useEffect(() => {
     props.onExchangeLoaded(undefined);
-    if (props.selectedExchangeId === undefined || !items.some((item) => item.id === props.selectedExchangeId)) return;
+    if (props.selectedExchangeId === undefined) { invalidatedSelection.current = undefined; return; }
+    if (props.selectedExchangeId === invalidatedSelection.current) return;
+    invalidatedSelection.current = undefined;
     const controller = new AbortController();
     fetchTrafficExchange(props.runtimeDir, props.selectedExchangeId, controller.signal)
       .then((exchange) => { if (!controller.signal.aborted) props.onExchangeLoaded(exchange); })
@@ -77,7 +83,7 @@ export function TrafficView(props: TrafficViewProps) {
         setError(cause instanceof Error ? cause.message : String(cause));
       });
     return () => controller.abort();
-  }, [props.runtimeDir, props.selectedExchangeId, props.refreshToken, items]);
+  }, [props.runtimeDir, props.selectedExchangeId, props.refreshToken]);
 
   const activeFilterCount = useMemo(() => Object.values(filters).filter((value) => value !== undefined && value !== "").length, [filters]);
   const applyFilters = () => {
@@ -112,6 +118,10 @@ export function TrafficView(props: TrafficViewProps) {
         <InputNumber aria-label={t("traffic.statusFilter")} placeholder="Status" min={0} max={999} value={draft.status} onChange={(value) => setDraft((current) => ({ ...current, status: value ?? undefined }))} />
         <Input aria-label={t("traffic.taskRefFilter")} placeholder="Task ref" value={draft.task_ref} onChange={(event) => setDraft((value) => ({ ...value, task_ref: event.target.value }))} />
         <Input aria-label={t("traffic.runRefFilter")} placeholder="Run ref" value={draft.run_ref} onChange={(event) => setDraft((value) => ({ ...value, run_ref: event.target.value }))} />
+        <Input aria-label="Route ref" placeholder="Route ref" value={draft.route_ref} onChange={(event) => setDraft((value) => ({ ...value, route_ref: event.target.value }))} />
+        <Input aria-label="Session ref" placeholder="Session ref" value={draft.session_ref} onChange={(event) => setDraft((value) => ({ ...value, session_ref: event.target.value }))} />
+        <Input type="datetime-local" aria-label="Started after UTC" value={draft.started_after?.slice(0, 16)} onChange={(event) => setDraft((value) => ({ ...value, started_after: event.target.value ? event.target.value + ":00Z" : undefined }))} />
+        <Input type="datetime-local" aria-label="Started before UTC" value={draft.started_before?.slice(0, 16)} onChange={(event) => setDraft((value) => ({ ...value, started_before: event.target.value ? event.target.value + ":00Z" : undefined }))} />
         <Select aria-label={t("traffic.modeFilter")} placeholder="Mode" allowClear value={draft.mode} options={[{ value: "mitm", label: "MITM" }, { value: "passthrough", label: "Passthrough" }, { value: "forward", label: "Forward" }, { value: "replay", label: "Replay" }]} onChange={(value) => setDraft((current) => ({ ...current, mode: value }))} />
         <Select aria-label={t("traffic.errorFilter")} placeholder="Error" allowClear value={draft.error} options={[{ value: "true", label: t("traffic.onlyErrors") }, { value: "false", label: t("traffic.noErrors") }]} onChange={(value) => setDraft((current) => ({ ...current, error: value }))} />
         <Button icon={<Filter size={15} />} type="primary" onClick={applyFilters}>{t("common.apply")}{activeFilterCount ? ` (${activeFilterCount})` : ""}</Button>

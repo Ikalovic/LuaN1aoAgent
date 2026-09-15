@@ -13,6 +13,7 @@ interface TrafficInspectorProps {
   user: AuthUser;
   onSelectExchange: (exchangeId: TrafficFlowRef) => void;
   onReplayed: (exchangeId: TrafficFlowRef) => void;
+  onDirtyChange?: (dirty: boolean) => void;
 }
 
 type BodySide = "request" | "response";
@@ -81,6 +82,7 @@ export function TrafficInspector(props: TrafficInspectorProps) {
           requestBody={bodies.request.value}
           loadRequestBody={() => loadBody("request")}
           onReplayed={props.onReplayed}
+          onDirtyChange={props.onDirtyChange}
         />}
       </section>
     </div>
@@ -137,13 +139,14 @@ function BodySection({ side, exchange, state, onLoad }: { side: BodySide; exchan
   );
 }
 
-function ReplayEditor({ runtimeDir, exchange, user, requestBody, loadRequestBody, onReplayed }: {
+function ReplayEditor({ runtimeDir, exchange, user, requestBody, loadRequestBody, onReplayed, onDirtyChange }: {
   runtimeDir: string;
   exchange: TrafficExchange;
   user: AuthUser;
   requestBody?: TrafficHistoryBody;
   loadRequestBody: () => Promise<TrafficHistoryBody | undefined>;
   onReplayed: (exchangeId: TrafficFlowRef) => void;
+  onDirtyChange?: (dirty: boolean) => void;
 }) {
   const { t } = useLanguage();
   const [open, setOpen] = useState(false);
@@ -156,6 +159,15 @@ function ReplayEditor({ runtimeDir, exchange, user, requestBody, loadRequestBody
   const [bodyOverride, setBodyOverride] = useState(false);
   const [sending, setSending] = useState(false);
   const [error, setError] = useState<string>();
+  const isDirty = open && (method !== exchange.method || url !== exchange.url || bodyOverride || !sameHeaders(headers, exchange.request_headers));
+  const dirtyCallback = useRef(onDirtyChange);
+  dirtyCallback.current = onDirtyChange;
+  useEffect(() => { dirtyCallback.current?.(isDirty); return () => dirtyCallback.current?.(false); }, [isDirty]);
+  useEffect(() => {
+    const beforeUnload = (event: BeforeUnloadEvent) => { if (isDirty) { event.preventDefault(); event.returnValue = ""; } };
+    window.addEventListener("beforeunload", beforeUnload);
+    return () => window.removeEventListener("beforeunload", beforeUnload);
+  }, [isDirty]);
 
   useEffect(() => {
     setOpen(false);

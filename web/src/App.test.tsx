@@ -49,4 +49,17 @@ describe("App Skills route", () => {
 
     expect(screen.getByText("skill registry content")).toBeInTheDocument();
   });
+
+  it("defaults to overview with unavailable metrics and contextual detail only", () => {
+    window.history.replaceState({}, "", "/");
+    render(<LanguageProvider><App user={{ ...admin, role: "analyst" }} onLogout={vi.fn()} /></LanguageProvider>);
+    expect(screen.getByRole("navigation", { name: "Workbench" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /Hosts/ })).toHaveTextContent("--");
+    expect(screen.queryByText("INSPECTOR")).not.toBeInTheDocument();
+  });
+  it("does not mount approvals for an analyst direct URL", () => {
+    window.history.replaceState({}, "", "/?view=approvals");
+    render(<LanguageProvider><App user={{ ...admin, role: "analyst" }} onLogout={vi.fn()} /></LanguageProvider>);
+    expect(screen.getByText("Administrator access required")).toBeInTheDocument();
+  });
 });

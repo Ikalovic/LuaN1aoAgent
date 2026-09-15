@@ -46,7 +46,7 @@ describe("LanguageProvider", () => {
     expect(localStorage.getItem("luanniao-locale")).toBe("en-US");
     await waitFor(() => {
       expect(document.documentElement.lang).toBe("en-US");
-      expect(document.title).toBe("LuaNiao Agent Workbench");
+      expect(document.title).toBe("青玄 | Autonomous Pentest Agent");
     });
   });
 });

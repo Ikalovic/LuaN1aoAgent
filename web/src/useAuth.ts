@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from "react";
-import { ApiError, fetchCurrentUser, loginUser, logoutUser, registerUser } from "./api";
+import { ApiError, fetchCurrentUser, loginUser, logoutUser, registerUser, UNAUTHORIZED_EVENT } from "./api";
 import type { AuthUser } from "./types";
 
 export interface AuthState {
@@ -21,8 +21,14 @@ export function useAuth(): AuthState {
 
   useEffect(() => {
     const controller = new AbortController();
+    const onUnauthorized = () => {
+      controller.abort();
+      setUser(undefined);
+      setLoading(false);
+    };
+    window.addEventListener(UNAUTHORIZED_EVENT, onUnauthorized);
     void fetchCurrentUser(controller.signal)
-      .then((response) => setUser(response.user))
+      .then((response) => { if (!controller.signal.aborted) setUser(response.user); })
       .catch((requestError) => {
         if (!controller.signal.aborted && (!(requestError instanceof ApiError) || requestError.status !== 401)) {
           setError(errorText(requestError));
@@ -31,7 +37,10 @@ export function useAuth(): AuthState {
       .finally(() => {
         if (!controller.signal.aborted) setLoading(false);
       });
-    return () => controller.abort();
+    return () => {
+      controller.abort();
+      window.removeEventListener(UNAUTHORIZED_EVENT, onUnauthorized);
+    };
   }, []);
 
   const login = useCallback(async (input: { username: string; password: string }) => {

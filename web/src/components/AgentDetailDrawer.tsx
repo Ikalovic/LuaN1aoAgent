@@ -43,11 +43,11 @@ export function AgentDetailDrawer(props: AgentDetailDrawerProps) {
   return (
     <Drawer
       className="agent-detail-drawer"
-      width={540}
+      size="large"
       open={props.open}
       onClose={props.onClose}
       title={t("agent.detailTitle")}
-      styles={{ body: { paddingTop: 12 } }}
+      styles={{ body: { paddingTop: 12 }, wrapper: { width: "min(540px, 100vw)" } }}
     >
       <div className="agent-detail-body">
         <div className="agent-detail-hero">
@@ -56,7 +56,7 @@ export function AgentDetailDrawer(props: AgentDetailDrawerProps) {
             <Typography.Title level={5}>{roleLabel(role)}</Typography.Title>
             <p>{descriptionKey ? t(descriptionKey) : ""}</p>
           </div>
-          <span className={`agent-detail-state${active ? " active" : ""}`}>{active ? t("agent.activeNow") : t("agent.idle")}</span>
+          <span className={`agent-detail-state${active ? " active" : ""}`}>{active ? (locale === "zh-CN" ? "最近有活动" : "Recent activity") : (locale === "zh-CN" ? "最近活动" : "Last activity")}</span>
         </div>
         <div className="agent-detail-meta">
           <span>{t("agent.eventCount", { value: props.eventCount ?? 0 })}</span>

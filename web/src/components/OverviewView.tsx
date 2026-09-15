@@ -1,0 +1,33 @@
+import { lazy, Suspense } from "react";
+import { Button, Empty, Progress, Skeleton } from "antd";
+import { ArrowUpRight, CircleCheck, ListTodo, Server, ShieldAlert, Workflow } from "lucide-react";
+import type { Situation, CountMetric } from "../situation";
+import type { RuntimeState } from "../types";
+import type { NavigationState } from "../navigation";
+import { useLanguage } from "../language";
+import { FindingsView } from "./FindingsView";
+import { ActivityChart, activityOptions } from "./ActivityChart";
+const GraphView = lazy(() => import("./GraphView").then((module) => ({ default: module.GraphView })));
+export function metricText(metric: CountMetric, zh: boolean) {
+  if (metric.value === null) return "--";
+  return metric.state === "complete" ? String(metric.value) : `${zh ? "已加载" : "Loaded"} ${metric.value}`;
+}
+export function OverviewView({ situation, data, navigation, onNavigate, onSelectNode, onAgent, pendingApprovals }: { situation: Situation; data?: RuntimeState; navigation: NavigationState; onNavigate: (patch: Partial<NavigationState>) => void; onSelectNode: (id?: string) => void; onAgent: (role: string) => void; pendingApprovals?: CountMetric }) {
+  const { locale, formatDate } = useLanguage();
+  const zh = locale === "zh-CN";
+  const time = activityOptions(navigation, data?.loadedAt);
+  const from = time.start ? Date.parse(time.start) : time.relativeMs !== undefined && data ? Date.parse(data.loadedAt) - time.relativeMs : -Infinity;
+  const to = time.end ? Date.parse(time.end) : data ? Date.parse(data.loadedAt) : Infinity;
+  const recent = (data?.traceItems ?? []).filter((item) => Date.parse(item.timestamp) >= from && Date.parse(item.timestamp) <= to).sort((a, b) => Date.parse(b.timestamp) - Date.parse(a.timestamp)).slice(0, 6);
+  const metrics = [
+    { label: zh ? "主机" : "Hosts", metric: situation.assets.hosts, icon: Server, target: { view: "operation", nodeType: "Host" } },
+    { label: zh ? "服务" : "Services", metric: situation.assets.services, icon: Workflow, target: { view: "operation", nodeType: "Service" } },
+    { label: zh ? "漏洞" : "Vulnerabilities", metric: situation.findings.vulnerabilities, icon: ShieldAlert, target: { view: "findings", findingType: "Vulnerability" } },
+    { label: zh ? "成功利用" : "Successful exploits", metric: situation.findings.exploits, icon: CircleCheck, target: { view: "findings", findingType: "Exploit" } },
+    { label: zh ? "待执行任务" : "Pending tasks", metric: situation.tasks.byStatus.open, icon: ListTodo, target: { view: "task", taskStatus: "open" } }
+  ] as const;
+  return <div className="qx-overview"><section className="qx-metrics">{metrics.map((item) => <button type="button" key={item.label} onClick={() => onNavigate(item.target)}><span><item.icon size={16} />{item.label}</span><strong>{metricText(item.metric, zh)}</strong><small>{item.metric.state === "unavailable" ? (zh ? "数据不可用" : "Unavailable") : item.metric.state === "complete" ? (zh ? "当前快照" : "Current snapshot") : item.metric.state === "partial" ? (zh ? "部分已加载" : "Partial coverage") : (zh ? "覆盖未知" : "Coverage unknown")}</small></button>)}</section><section className="qx-attention-strip"><span>{zh ? "待办" : "Attention"}</span><Button size="small" type="text" onClick={() => onNavigate({ view: "task", taskStatus: "blocked" })}>{zh ? "阻塞" : "Blocked"} {metricText(situation.tasks.byStatus.blocked, zh)}</Button><Button size="small" type="text" onClick={() => onNavigate({ view: "task", taskStatus: "failed" })}>{zh ? "失败" : "Failed"} {metricText(situation.tasks.byStatus.failed, zh)}</Button>{pendingApprovals ? <Button size="small" type="text" onClick={() => onNavigate({ view: "approvals" })}>{zh ? "当前运行待审批" : "Pending approvals in this run"} {metricText(pendingApprovals, zh)}</Button> : null}</section><div className="qx-overview-primary"><section className="qx-asset-section"><header><h3>{zh ? "资产拓扑" : "Asset topology"}</h3><Button type="text" icon={<ArrowUpRight size={16} />} aria-label={zh ? "打开资产" : "Open assets"} onClick={() => onNavigate({ view: "operation" })} /></header><div className="qx-overview-graph"><Suspense fallback={<Skeleton active />}><GraphView compact runtimeDir={navigation.runtimeDir} kind="operation" nodes={situation.nodes} edges={situation.edges} selectedNodeId={navigation.nodeId} linkedNodeIds={[]} onSelectNode={onSelectNode} /></Suspense></div></section><section className="qx-findings-section"><header><h3>{zh ? "近期发现" : "Recent findings"}</h3><Button type="text" icon={<ArrowUpRight size={16} />} aria-label={zh ? "打开发现" : "Open findings"} onClick={() => onNavigate({ view: "findings" })} /></header><FindingsView compact situation={situation} onSelect={onSelectNode} onTypeChange={() => {}} onGraph={(id) => onNavigate({ view: "reasoning", nodeId: id })} /></section></div><div className="qx-overview-secondary"><section className="qx-task-status"><header><h3>{zh ? "任务状态" : "Task status"}</h3><span>{situation.tasks.completion === null ? "--" : `${Math.round(situation.tasks.completion * 100)}%`}</span></header><Progress percent={situation.tasks.completion === null ? 0 : Math.round(situation.tasks.completion * 100)} showInfo={false} strokeColor="var(--accent)" /><div className="qx-status-counts">{["open", "completed", "blocked", "failed", "archived", "unknown"].map((status) => <button key={status} onClick={() => onNavigate({ view: "task", taskStatus: status })}><span>{status}</span><strong>{metricText(situation.tasks.byStatus[status as keyof typeof situation.tasks.byStatus], zh)}</strong></button>)}</div><div className="qx-agent-activity">{["planner", "executor", "observer", "runtime"].map((role) => {
+    const latest = data?.traceItems.filter((item) => item.role === role).sort((a, b) => Date.parse(b.timestamp) - Date.parse(a.timestamp))[0];
+    return <button key={role} onClick={() => onAgent(role)}><strong>{role}</strong><span>{latest?.title || (zh ? "暂无活动记录" : "No recorded activity")}</span><small>{zh ? "最近活动" : "Last activity"} · {latest ? formatDate(latest.timestamp) : "--"}</small></button>;
+  })}</div></section><div><ActivityChart events={data?.events ?? []} coverage={data?.coverage?.events} now={data?.loadedAt} range={navigation} onRange={(from, to) => onNavigate({ view: "trace", range: "custom", from, to, traceId: undefined })} /><section className="qx-event-column"><header><h3>{zh ? "最近事件" : "Recent events"}</h3></header>{recent.map((item) => <button key={item.id} onClick={() => onNavigate({ view: "trace", traceId: item.id, role: item.role })}><strong>{item.title}</strong><span>{item.eventType} · {item.role}</span><time>{formatDate(item.timestamp)}</time></button>)}{!recent.length ? <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} /> : null}</section></div></div></div>;
+}

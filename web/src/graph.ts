@@ -1,4 +1,5 @@
 import type { GraphEdge, GraphKind, GraphNode, JsonValue } from "./types";
+import { themeColors, type ThemeMode } from "./theme";
 
 export interface FilteredGraph {
   nodes: GraphNode[];
@@ -45,7 +46,12 @@ const PALETTES: Record<string, NodePalette> = {
   Session: { color: "#047857", background: "#ecfdf5" }
 };
 
-export function nodePalette(type: string): NodePalette {
+export function nodePalette(type: string, mode?: ThemeMode): NodePalette {
+  if (mode === "dark") {
+    const colors = themeColors.dark;
+    const color = ["Vulnerability", "Credential", "Blocker"].includes(type) ? colors.error : ["Hypothesis", "WebEndpoint", "Milestone"].includes(type) ? colors.warning : ["Host", "Task", "Evidence"].includes(type) ? colors.info : colors.primary;
+    return { color, background: colors.elevated };
+  }
   return PALETTES[type] || { color: "#64748b", background: "#f8fafc" };
 }
 

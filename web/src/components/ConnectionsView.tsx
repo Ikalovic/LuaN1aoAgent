@@ -3,7 +3,7 @@ import { Alert, Badge, Button, Card, Empty, Popconfirm, Space, Tag, Tooltip, Typ
 import { ExternalLink, Pause, RefreshCw, Trash2 } from "lucide-react";
 import { fetchConnections, mutateRoute } from "../api";
 import { useLanguage } from "../language";
-import type { AuthUser, ConnectionItem } from "../types";
+import type { AuthUser, ConnectionItem, ConnectionsResponse } from "../types";
 import { statusLabel } from "../utils";
 
 export function ConnectionsView({ runtimeDir, user }: { runtimeDir: string; user: AuthUser }) {
@@ -12,14 +12,16 @@ export function ConnectionsView({ runtimeDir, user }: { runtimeDir: string; user
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string>();
   const [mutating, setMutating] = useState<string>();
+  const [runtimeControl, setRuntimeControl] = useState<ConnectionsResponse["runtimeControl"]>();
 
   const load = useCallback(async (signal?: AbortSignal) => {
     setLoading(true);
     setError(undefined);
     setItems([]);
+    setRuntimeControl(undefined);
     try {
       const response = await fetchConnections(runtimeDir, signal);
-      if (!signal?.aborted) setItems(response.connections);
+      if (!signal?.aborted) { setItems(response.connections); setRuntimeControl(response.runtimeControl); }
     } catch (cause) {
       if (!signal?.aborted) {
         setItems([]);
@@ -59,6 +61,8 @@ export function ConnectionsView({ runtimeDir, user }: { runtimeDir: string; user
         <Button icon={<RefreshCw size={15} />} loading={loading} onClick={() => void load()}>{t("common.refresh")}</Button>
       </div>
       {error ? <Alert type="error" showIcon message={error} /> : null}
+      {runtimeControl ? <Tag>{runtimeControl.mode === "historical" ? (locale === "zh-CN" ? "历史运行" : "Historical run") : runtimeControl.mode === "read_only" ? (locale === "zh-CN" ? "只读" : "Read only") : (locale === "zh-CN" ? "控制器" : "Controller")}</Tag> : null}
+      {runtimeControl?.error ? <Alert type="warning" title={runtimeControl.error} /> : null}
       {!loading && !items.length ? <Empty description={t("connections.empty")} /> : null}
       <div className="connection-grid">
         {items.map((item) => (

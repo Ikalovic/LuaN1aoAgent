@@ -1,16 +1,15 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { Button, Empty, Input, Select, Tag, Tooltip } from "antd";
-import cytoscape, { type Core, type EdgeSingular, type ElementDefinition, type LayoutOptions, type Position, type StylesheetJson } from "cytoscape";
-import elk from "cytoscape-elk";
-import { Focus, ListFilter, Minus, Plus, RefreshCw, Search, X } from "lucide-react";
-import { edgePresentation, elkLayout, filterGraph, graphSignature, nodeDisplayLabel, nodePalette, taskProgressSummary } from "../graph";
+import { Alert, Button, Empty, Input, Segmented, Select, Tag, Tooltip } from "antd";
+import cytoscape, { type Core, type EdgeSingular, type ElementDefinition, type StylesheetJson } from "cytoscape";
+import { Focus, List, ListFilter, Minus, Plus, RefreshCw, Search, X } from "lucide-react";
+import { edgePresentation, filterGraph, nodeDisplayLabel, nodePalette, taskProgressSummary } from "../graph";
+import { layoutGraph, layoutStructureKey } from "../graphLayout";
+import { projectGraph } from "../situation";
+import { useTheme } from "../ThemeProvider";
+import { themeColors, type ThemeMode } from "../theme";
 import { useLanguage } from "../language";
 import type { GraphEdge, GraphKind, GraphNode } from "../types";
 import { shortRef } from "../utils";
-
-cytoscape.use(elk);
-
-const positionCache = new Map<string, Record<string, Position>>();
 
 interface GraphViewProps {
   runtimeDir: string;
@@ -20,10 +19,15 @@ interface GraphViewProps {
   selectedNodeId?: string;
   linkedNodeIds: string[];
   onSelectNode: (nodeId?: string) => void;
+  nodeType?: string;
+  compact?: boolean;
+  presentation?: boolean;
+  onClearFilters?: () => void;
 }
 
 export function GraphView(props: GraphViewProps) {
   const { t } = useLanguage();
+  const { mode } = useTheme();
   const containerRef = useRef<HTMLDivElement>(null);
   const cyRef = useRef<Core | undefined>(undefined);
   const onSelectNodeRef = useRef(props.onSelectNode);
@@ -32,25 +36,35 @@ export function GraphView(props: GraphViewProps) {
   const [edgeTypes, setEdgeTypes] = useState<string[]>([]);
   const [zoom, setZoom] = useState(1);
   const [layoutNonce, setLayoutNonce] = useState(0);
+  const [showIndex, setShowIndex] = useState(false);
+  const [display, setDisplay] = useState("topology");
+  const [allLoaded, setAllLoaded] = useState(false);
+  const [layoutError, setLayoutError] = useState<string>();
+  const lastStructure = useRef("");
+  const fitted = useRef(false);
 
   useEffect(() => { onSelectNodeRef.current = props.onSelectNode; }, [props.onSelectNode]);
 
   useEffect(() => {
     setQuery("");
-    setNodeTypes([]);
+    setNodeTypes(props.nodeType ? [props.nodeType] : []);
     setEdgeTypes([]);
-  }, [props.kind, props.runtimeDir]);
+    setAllLoaded(false);
+  }, [props.kind, props.runtimeDir, props.nodeType]);
 
   const allKindNodes = useMemo(
     () => props.nodes.filter((node) => node.graphKind === props.kind),
     [props.kind, props.nodes]
   );
-  const visibleGraph = useMemo(
+  const filteredGraph = useMemo(
     () => filterGraph(props.nodes, props.edges, props.kind, query, nodeTypes, edgeTypes),
     [edgeTypes, nodeTypes, props.edges, props.kind, props.nodes, query]
   );
+  const projection = useMemo(() => projectGraph(props.compact ? { nodes: props.nodes, edges: props.edges } : filteredGraph, { kind: props.kind, selectedId: props.selectedNodeId }), [filteredGraph, props.kind, props.selectedNodeId, props.compact, props.nodes, props.edges]);
+  const unloadedEdges = useMemo(() => { const ids = new Set(props.nodes.map((node) => node.id)); return props.edges.filter((edge) => !ids.has(edge.from) || !ids.has(edge.to)).length; }, [props.nodes, props.edges]);
+  const visibleGraph = !props.compact && (allLoaded || filteredGraph.nodes.length <= 200) ? filteredGraph : projection;
   const signature = useMemo(
-    () => `${graphSignature(props.runtimeDir, props.kind, visibleGraph)}|${layoutNonce}`,
+    () => `${props.runtimeDir}|${layoutStructureKey(visibleGraph.nodes, visibleGraph.edges, props.kind)}|${layoutNonce}`,
     [layoutNonce, props.kind, props.runtimeDir, visibleGraph]
   );
   const nodeTypeOptions = useMemo(
@@ -68,12 +82,24 @@ export function GraphView(props: GraphViewProps) {
 
   useEffect(() => {
     if (!containerRef.current) return undefined;
-    cyRef.current?.destroy();
-    if (!visibleGraph.nodes.length) return undefined;
+    const cy = cytoscape({ container: containerRef.current, elements: [], style: graphStyles(0, props.kind, mode, props.presentation), minZoom: 0.08, maxZoom: 3.2, boxSelectionEnabled: false, selectionType: "single" });
+    cyRef.current = cy;
+    fitted.current = false;
+    lastStructure.current = "";
+    cy.on("tap", "node", (event) => onSelectNodeRef.current(event.target.id()));
+    cy.on("tap", (event) => { if (event.target === cy) onSelectNodeRef.current(undefined); });
+    cy.on("zoom", () => { setZoom(cy.zoom()); updateLabelVisibility(cy, cy.nodes().length, cy.zoom(), props.presentation); });
+    const observer = typeof ResizeObserver !== "undefined" ? new ResizeObserver(() => { if (!cy.destroyed()) cy.resize(); }) : undefined;
+    observer?.observe(containerRef.current);
+    return () => { observer?.disconnect(); cy.destroy(); if (cyRef.current === cy) cyRef.current = undefined; };
+  }, [props.runtimeDir, props.kind]);
 
+  useEffect(() => {
+    const cy = cyRef.current;
+    if (!cy || cy.destroyed()) return;
     const elements: ElementDefinition[] = [
       ...visibleGraph.nodes.map((node) => {
-        const palette = nodePalette(node.type);
+        const palette = nodePalette(node.type, mode);
         return {
           group: "nodes" as const,
           data: {
@@ -105,47 +131,32 @@ export function GraphView(props: GraphViewProps) {
       })
     ];
 
-    const cy = cytoscape({
-      container: containerRef.current,
-      elements,
-      style: graphStyles(visibleGraph.nodes.length, props.kind),
-      minZoom: 0.08,
-      maxZoom: 3.2,
-      boxSelectionEnabled: false,
-      selectionType: "single"
+    const ids = new Set(elements.map((element) => element.data.id));
+    cy.batch(() => {
+      cy.elements().filter((element) => !ids.has(element.id())).remove();
+      for (const element of elements) {
+        const current = cy.getElementById(element.data.id!);
+        if (current.length) current.data(element.data); else cy.add(element);
+      }
+      cy.style(graphStyles(visibleGraph.nodes.length, props.kind, mode, props.presentation));
+      updateLabelVisibility(cy, visibleGraph.nodes.length, cy.zoom(), props.presentation);
     });
-    cyRef.current = cy;
+  }, [visibleGraph, props.kind, mode, props.presentation]);
 
-    cy.on("tap", "node", (event) => onSelectNodeRef.current(event.target.id()));
-    cy.on("tap", (event) => {
-      if (event.target === cy) onSelectNodeRef.current(undefined);
-    });
-    cy.on("zoom", () => {
-      const nextZoom = cy.zoom();
-      setZoom(nextZoom);
-      updateLabelVisibility(cy, visibleGraph.nodes.length, nextZoom);
-    });
-
-    const cached = positionCache.get(signature);
-    const hasAllPositions = cached && visibleGraph.nodes.every((node) => cached[node.id]);
-    if (hasAllPositions && cached) {
-      cy.layout({ name: "preset", positions: cached, fit: true, padding: 42 }).run();
-    } else {
-      const layout = cy.layout(elkLayout(props.kind, visibleGraph.nodes.length) as unknown as LayoutOptions);
-      layout.on("layoutstop", () => {
-        const positions: Record<string, Position> = {};
-        cy.nodes().forEach((node) => { positions[node.id()] = node.position(); });
-        positionCache.set(signature, positions);
-        cy.fit(undefined, 42);
-        setZoom(cy.zoom());
-      });
-      layout.run();
-    }
-
-    return () => {
-      cy.destroy();
-      if (cyRef.current === cy) cyRef.current = undefined;
-    };
+  useEffect(() => {
+    const cy = cyRef.current;
+    if (!cy || cy.destroyed() || !visibleGraph.nodes.length || lastStructure.current === signature) return;
+    const controller = new AbortController();
+    const existing = new Set(cy.nodes().filter((node) => node.hasClass("positioned")).map((node) => node.id()));
+    const explicit = lastStructure.current.split("|").at(-1) !== String(layoutNonce);
+    void layoutGraph(visibleGraph.nodes, visibleGraph.edges, props.kind, controller.signal, props.runtimeDir).then((positions) => {
+      if (!positions || controller.signal.aborted || cy.destroyed() || cyRef.current !== cy) return;
+      cy.batch(() => cy.nodes().forEach((node) => { if (positions[node.id()] && (!existing.has(node.id()) || explicit)) node.position(positions[node.id()]); node.addClass("positioned"); }));
+      if (!fitted.current || explicit) { cy.resize(); cy.fit(undefined, props.presentation ? 60 : 42); const limit = props.presentation ? 2.2 : 1.3; if (cy.zoom() > limit) { cy.zoom(limit); cy.center(); } fitted.current = true; }
+      lastStructure.current = signature;
+      setLayoutError(undefined);
+    }).catch((error) => { if (!controller.signal.aborted && !cy.destroyed()) setLayoutError(String(error)); });
+    return () => controller.abort();
   }, [signature]);
 
   useEffect(() => {
@@ -167,6 +178,7 @@ export function GraphView(props: GraphViewProps) {
     selected.addClass("is-selected");
     selected.neighborhood("node").addClass("is-neighbor");
     selected.connectedEdges().addClass("is-active-edge");
+    updateLabelVisibility(cy, cy.nodes().length, cy.zoom(), props.presentation);
   }, [props.selectedNodeId, signature]);
 
   const zoomBy = (factor: number) => {
@@ -177,13 +189,13 @@ export function GraphView(props: GraphViewProps) {
 
   const fit = () => cyRef.current?.fit(undefined, 42);
   const relayout = () => {
-    positionCache.delete(signature);
     setLayoutNonce((value) => value + 1);
   };
 
   return (
     <div className="graph-workspace">
       <div className="graph-toolbar">
+        {!props.compact ? <Segmented value={display} onChange={setDisplay} options={[{ value: "topology", label: "拓扑" }, { value: "list", label: "列表" }]} /> : null}
         <Input
           allowClear
           prefix={<Search size={15} />}
@@ -211,6 +223,7 @@ export function GraphView(props: GraphViewProps) {
           onChange={setEdgeTypes}
         />
         <div className="graph-toolbar-actions">
+          <Tooltip title={t("graph.nodeList")}><Button icon={<List size={16} />} aria-label={t("graph.nodeList")} onClick={() => setShowIndex((value) => !value)} /></Tooltip>
           <Tooltip title={t("graph.zoomOut")}><Button icon={<Minus size={16} />} onClick={() => zoomBy(1 / 1.18)} aria-label={t("graph.zoomOut")} /></Tooltip>
           <span className="zoom-readout">{Math.round(zoom * 100)}%</span>
           <Tooltip title={t("graph.zoomIn")}><Button icon={<Plus size={16} />} onClick={() => zoomBy(1.18)} aria-label={t("graph.zoomIn")} /></Tooltip>
@@ -220,15 +233,18 @@ export function GraphView(props: GraphViewProps) {
         </div>
       </div>
 
-      <div className="graph-body">
-        <aside className="graph-node-index" aria-label={t("graph.nodeList")}>
+      {layoutError ? <Alert type="error" message={layoutError} /> : null}
+      {!props.compact && props.selectedNodeId && !visibleGraph.nodes.some((node) => node.id === props.selectedNodeId) ? <Alert type="info" title="所选节点不在当前图中" action={<Button size="small" onClick={() => { setQuery(""); setNodeTypes([]); setEdgeTypes([]); setAllLoaded(true); props.onClearFilters?.(); }}>清除筛选并定位</Button>} /> : null}
+      {!props.compact && filteredGraph.nodes.length > 200 ? <Button type="link" onClick={() => setAllLoaded((value) => !value)}>{allLoaded ? "局部投影" : `全部已加载 ${filteredGraph.nodes.length}`}</Button> : null}
+      <div className={`graph-body ${display === "list" ? "graph-list-mode" : ""}`}>
+        {showIndex || display === "list" ? <aside className="graph-node-index" aria-label={t("graph.nodeList")}>
           <div className="graph-index-head">
             <strong>{t("graph.nodes")}</strong>
             <span>{visibleGraph.nodes.length}</span>
           </div>
           <div className="graph-index-list">
-            {visibleGraph.nodes.length ? visibleGraph.nodes.slice(0, 300).map((node) => {
-              const palette = nodePalette(node.type);
+            {visibleGraph.nodes.length ? visibleGraph.nodes.map((node) => {
+              const palette = nodePalette(node.type, mode);
               const progress = props.kind === "task" ? taskProgressSummary(node) : undefined;
               return (
                 <button
@@ -247,31 +263,36 @@ export function GraphView(props: GraphViewProps) {
               );
             }) : <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description={t("graph.noMatchingNodes")} />}
           </div>
-        </aside>
+        </aside> : null}
         <div className="graph-canvas-wrap">
-          {visibleGraph.nodes.length ? <div ref={containerRef} className="graph-canvas" /> : (
-            <Empty description={t("graph.noVisibleNodes")} />
-          )}
+          <div ref={containerRef} className="graph-canvas" />
+          {!visibleGraph.nodes.length ? <div className="graph-empty"><Empty description={t("graph.noVisibleNodes")} /></div> : null}
           <div className="graph-legend">
             {[...new Set(visibleGraph.nodes.map((node) => node.type))].slice(0, 8).map((type) => {
-              const palette = nodePalette(type);
-              return <Tag key={type} color={palette.background} style={{ color: palette.color, borderColor: palette.color }}>{type}</Tag>;
+              const palette = nodePalette(type, mode);
+              return <Tag key={type} style={{ color: palette.color, background: palette.background, borderColor: palette.color }}>{type}</Tag>;
             })}
           </div>
-          <div className="graph-counts">{t("graph.counts", { nodes: visibleGraph.nodes.length, edges: visibleGraph.edges.length, relations: t(props.kind === "task" ? "graph.treeRelations" : "graph.relations") })}</div>
+          <div className="graph-counts">{t("graph.counts", { nodes: visibleGraph.nodes.length, edges: visibleGraph.edges.length, relations: t(props.kind === "task" ? "graph.treeRelations" : "graph.relations") })}{visibleGraph === projection && projection.omittedNodes ? ` · 未显示 ${projection.omittedNodes} 节点 / ${projection.omittedEdges} 关系` : ""}{unloadedEdges ? ` · 端点未加载 ${unloadedEdges}` : ""}</div>
         </div>
       </div>
     </div>
   );
 }
 
-function updateLabelVisibility(cy: Core, nodeCount: number, zoom: number) {
-  if (nodeCount <= 300) return;
-  cy.nodes().style("label", zoom < 0.58 ? "" : "data(label)");
+function updateLabelVisibility(cy: Core, nodeCount: number, zoom: number, presentation = false) {
+  if (presentation) {
+    cy.nodes().style({ label: zoom < .3 ? "" : "data(label)", "font-size": Math.min(28, Math.max(16, 14 / zoom)) });
+    cy.nodes(".is-selected").style("label", "data(label)");
+    return;
+  }
+  cy.nodes().not(".is-selected").style("label", zoom < 0.58 ? "" : "data(label)");
+  cy.nodes(".is-selected").style("label", "data(label)");
 }
 
-function graphStyles(nodeCount: number, kind: GraphKind): StylesheetJson {
+function graphStyles(nodeCount: number, kind: GraphKind, mode: ThemeMode, presentation = false): StylesheetJson {
   const taskTree = kind === "task";
+  const colors = themeColors[mode];
   return [
     {
       selector: "node",
@@ -280,12 +301,14 @@ function graphStyles(nodeCount: number, kind: GraphKind): StylesheetJson {
         width: nodeCount > 300 ? 138 : taskTree ? 230 : 172,
         height: nodeCount > 300 ? 52 : taskTree ? 96 : 68,
         "background-color": "data(background)",
+        "background-opacity": presentation ? 0 : 1,
         "border-color": "data(color)",
-        "border-width": 2,
+        "border-width": presentation ? 2.5 : 2,
         label: "data(label)",
-        color: "#172033",
-        "font-size": nodeCount > 300 ? 10 : taskTree ? 11 : 12,
+        color: colors.text,
+        "font-size": presentation ? 22 : nodeCount > 300 ? 10 : taskTree ? 11 : 12,
         "font-weight": 600,
+        "font-family": presentation ? '"Chakra Petch", "Microsoft YaHei", sans-serif' : "sans-serif",
         "text-wrap": "wrap",
         "text-max-width": `${nodeCount > 300 ? 122 : taskTree ? 204 : 154}px`,
         "text-valign": "center",
@@ -293,13 +316,17 @@ function graphStyles(nodeCount: number, kind: GraphKind): StylesheetJson {
         "overlay-opacity": 0
       }
     },
+    { selector: 'node[type="Host"]', style: { shape: "hexagon" } },
+    { selector: 'node[type="Service"]', style: { shape: "round-rectangle" } },
+    { selector: 'node[type="WebEndpoint"]', style: { shape: "ellipse" } },
+    { selector: 'node[type="Vulnerability"]', style: { shape: "diamond" } },
     {
       selector: "node.trace-linked",
       style: { "border-width": 4, "underlay-color": "#93c5fd", "underlay-opacity": 0.38, "underlay-padding": 7 }
     },
     {
       selector: "node.is-selected",
-      style: { "border-width": 4, "border-color": "#1d4ed8", "underlay-color": "#60a5fa", "underlay-opacity": 0.5, "underlay-padding": 10 }
+      style: { "border-width": 4, "border-color": colors.primary, "underlay-color": colors.primary, "underlay-opacity": 0.25, "underlay-padding": 10 }
     },
     {
       selector: "node.is-neighbor",
@@ -312,7 +339,7 @@ function graphStyles(nodeCount: number, kind: GraphKind): StylesheetJson {
     {
       selector: "edge",
       style: {
-        width: 1.4,
+        width: presentation ? 2 : 1.4,
         "line-color": "data(statusColor)",
         "target-arrow-color": "data(statusColor)",
         "line-style": (element) => element.data("lineStyle"),
@@ -330,10 +357,10 @@ function graphStyles(nodeCount: number, kind: GraphKind): StylesheetJson {
       style: {
         width: 2.8,
         label: "data(label)",
-        color: "#1e3a8a",
+        color: colors.text,
         "font-size": 10,
         "font-weight": 600,
-        "text-background-color": "#ffffff",
+        "text-background-color": colors.surface,
         "text-background-opacity": 0.9,
         "text-background-padding": "3px",
         "text-rotation": "autorotate",

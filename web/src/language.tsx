@@ -6,7 +6,7 @@ import zhCN from "antd/locale/zh_CN";
 export type Locale = "zh-CN" | "en-US";
 
 export const zh = {
-  "app.title": "鸾鸟智能体工作台",
+  "app.title": "青玄 | 自动渗透agent",
   "language.switchToEnglish": "切换到英文",
   "language.switchToChinese": "切换到中文",
   "language.english": "English",
@@ -30,7 +30,7 @@ export const zh = {
   "common.active": "活跃",
   "common.idle": "空闲",
   "common.items": "{value} 项",
-  "auth.brand": "鸾鸟渗透智能体",
+  "auth.brand": "青玄",
   "auth.tagline": "统一观察智能体的判断、行动与证据。",
   "auth.description": "面向安全研究与授权评测的多 Agent 运行工作台，集中管理实时轨迹、三图状态、任务队列和证据产物。",
   "auth.capability.trace": "实时轨迹",
@@ -45,7 +45,7 @@ export const zh = {
   "auth.sessionProtected": "会话已保护",
   "auth.sqlitePersistence": "SQLite 持久化",
   "auth.access": "工作台访问",
-  "auth.enterWorkbench": "进入鸾鸟工作台",
+  "auth.enterWorkbench": "进入青玄工作台",
   "auth.accessDescription": "使用团队账号登录，或注册一个新的分析员账号。",
   "auth.login": "登录",
   "auth.register": "注册",
@@ -65,7 +65,7 @@ export const zh = {
   "auth.displayNamePlaceholder": "安全分析员",
   "auth.passwordMinPlaceholder": "至少 8 位",
   "auth.confirmPasswordPlaceholder": "再次输入密码",
-  "auth.loginWorkbench": "登录工作台",
+  "auth.loginWorkbench": "登录并继续",
   "auth.createAccount": "创建账号并进入",
   "nav.close": "关闭导航",
   "nav.open": "打开导航",
@@ -465,7 +465,7 @@ export const zh = {
 } as const;
 
 export const en = {
-  "app.title": "LuaNiao Agent Workbench",
+  "app.title": "青玄 | Autonomous Pentest Agent",
   "language.switchToEnglish": "Switch to English",
   "language.switchToChinese": "Switch to Chinese",
   "language.english": "English",
@@ -489,7 +489,7 @@ export const en = {
   "common.active": "active",
   "common.idle": "idle",
   "common.items": "{value} items",
-  "auth.brand": "LuaNiao Security Agent",
+  "auth.brand": "青玄",
   "auth.tagline": "Observe agent reasoning, actions, and evidence in one place.",
   "auth.description": "A multi-agent operations workbench for security research and authorized assessment, bringing live traces, tri-graph state, task queues, and evidence artifacts together.",
   "auth.capability.trace": "Live Trace",
@@ -504,7 +504,7 @@ export const en = {
   "auth.sessionProtected": "Session protected",
   "auth.sqlitePersistence": "SQLite persistence",
   "auth.access": "WORKSPACE ACCESS",
-  "auth.enterWorkbench": "Enter LuaNiao Workbench",
+  "auth.enterWorkbench": "Enter Qingxuan Workbench",
   "auth.accessDescription": "Sign in with a team account or register a new analyst account.",
   "auth.login": "Sign in",
   "auth.register": "Register",
@@ -524,7 +524,7 @@ export const en = {
   "auth.displayNamePlaceholder": "Security analyst",
   "auth.passwordMinPlaceholder": "At least 8 characters",
   "auth.confirmPasswordPlaceholder": "Enter password again",
-  "auth.loginWorkbench": "Enter workbench",
+  "auth.loginWorkbench": "Sign in and continue",
   "auth.createAccount": "Create account and continue",
   "nav.close": "Close navigation",
   "nav.open": "Open navigation",
@@ -934,9 +934,12 @@ function navigatorLocale(): Locale {
 }
 
 export function readStoredLocale(): Locale {
-  if (typeof localStorage === "undefined") return navigatorLocale();
-  const stored = localStorage.getItem(STORAGE_KEY);
-  return stored === "zh-CN" || stored === "en-US" ? stored : navigatorLocale();
+  try {
+    const stored = localStorage.getItem(STORAGE_KEY);
+    return stored === "zh-CN" || stored === "en-US" ? stored : navigatorLocale();
+  } catch {
+    return navigatorLocale();
+  }
 }
 
 export function getLocale(): Locale {
@@ -1010,7 +1013,11 @@ export function LanguageProvider({ children }: { children: ReactNode }) {
 
   const setLocale = useCallback((next: Locale) => {
     currentLocale = next;
-    localStorage.setItem(STORAGE_KEY, next);
+    try {
+      localStorage.setItem(STORAGE_KEY, next);
+    } catch {
+      // Keep language switching available when browser storage is blocked.
+    }
     setLocaleState(next);
   }, []);
   const toggleLocale = useCallback(() => setLocale(locale === "zh-CN" ? "en-US" : "zh-CN"), [locale, setLocale]);
@@ -1033,28 +1040,9 @@ export function LanguageProvider({ children }: { children: ReactNode }) {
     formatDuration: (input) => formatDuration(input, locale)
   }), [locale, setLocale, toggleLocale]);
 
-  return <LanguageContext.Provider value={value}><ConfigProvider locale={locale === "zh-CN" ? zhCN : enUS} theme={appTheme}>{children}</ConfigProvider></LanguageContext.Provider>;
+  return <LanguageContext.Provider value={value}><ConfigProvider locale={locale === "zh-CN" ? zhCN : enUS}>{children}</ConfigProvider></LanguageContext.Provider>;
 }
 
 export function useLanguage(): LanguageContextValue {
   return useContext(LanguageContext);
 }
-
-export const appTheme = {
-  token: {
-    colorPrimary: "#2563eb",
-    colorInfo: "#2563eb",
-    colorBgLayout: "#f5f7fb",
-    colorBgContainer: "#ffffff",
-    colorText: "#172033",
-    colorTextSecondary: "#657187",
-    colorBorder: "#dfe5ee",
-    borderRadius: 8,
-    fontFamily: '"Avenir Next", "PingFang SC", "Microsoft YaHei", sans-serif'
-  },
-  components: {
-    Button: { controlHeight: 34 },
-    Input: { controlHeight: 34 },
-    Menu: { itemBorderRadius: 5, itemHeight: 42, itemMarginInline: 10 }
-  }
-};

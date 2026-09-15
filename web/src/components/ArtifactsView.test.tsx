@@ -1,8 +1,17 @@
-import { render, screen } from "@testing-library/react";
-import { describe, expect, it } from "vitest";
+import { fireEvent, render, screen } from "@testing-library/react";
+import { describe, expect, it, vi } from "vitest";
+import { fetchArtifact } from "../api";
+vi.mock("../api", () => ({ fetchArtifact: vi.fn() }));
 import { ArtifactsView } from "./ArtifactsView";
 
 describe("ArtifactsView", () => {
+  it("warns that a truncated download contains only the returned portion", async () => {
+    vi.mocked(fetchArtifact).mockResolvedValue({ artifactRef: "artifact:part", encoding: "utf8", content: "partial evidence", truncated: true, byteLength: 2000 });
+    render(<ArtifactsView runtimeDir="run" artifacts={[{ artifactRef: "artifact:part", path: "part.txt" }]} taskOutcomes={[]} epochOutcomes={[]} tasks={[]} />);
+    fireEvent.click(screen.getByText("全部产物"));
+    fireEvent.click(screen.getByRole("button", { name: /part.txt/ }));
+    expect(await screen.findByText("内容已截断；下载仅包含当前返回部分，并非完整文件。")).toBeInTheDocument();
+  });
   it("prefers a persisted report Artifact over the Planner summary and latest TaskOutcome", () => {
     render(
       <ArtifactsView

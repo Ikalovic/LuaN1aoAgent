@@ -7,6 +7,31 @@ afterEach(() => {
 });
 
 describe("useAuth", () => {
+  it("clears the current user on session expiry without changing navigation or form errors", async () => {
+    const user = { id: "user:1", username: "analyst" };
+    vi.stubGlobal("fetch", vi.fn((input: RequestInfo | URL) => Promise.resolve(new Response(JSON.stringify(
+      String(input).endsWith("/me") ? { user } : String(input).endsWith("/csrf") ? { csrfToken: "test" } : { error: "bad password" }
+    ), { status: String(input).endsWith("/login") ? 401 : 200 }))));
+    const { result } = renderHook(() => useAuth());
+    await waitFor(() => expect(result.current.user).toEqual(user));
+    await act(async () => { await result.current.login({ username: "analyst", password: "wrong" }).catch(() => undefined); });
+    const location = window.location.href;
+    act(() => window.dispatchEvent(new Event("qingxuan:unauthorized")));
+    expect(result.current.user).toBeUndefined();
+    expect(result.current.error).toBe("bad password");
+    expect(window.location.href).toBe(location);
+  });
+
+  it("ignores a late current-user response after session expiry", async () => {
+    let resolve!: (response: Response) => void;
+    vi.stubGlobal("fetch", vi.fn(() => new Promise<Response>((done) => { resolve = done; })));
+    const { result } = renderHook(() => useAuth());
+    act(() => window.dispatchEvent(new Event("qingxuan:unauthorized")));
+    await act(async () => resolve(new Response(JSON.stringify({ user: { id: "stale" } }), { status: 200 })));
+    expect(result.current.user).toBeUndefined();
+    expect(result.current.loading).toBe(false);
+  });
+
   it("moves from an unauthorized gate into an authenticated session and logs out", async () => {
     const user = {
       id: "user:1",

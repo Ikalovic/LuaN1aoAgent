@@ -1,115 +1,167 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { fetchRuns, fetchRuntimeState, fetchSessions } from "./api";
+import { ApiError, fetchRuns, fetchRuntimeState, fetchSessions, UNAUTHORIZED_EVENT } from "./api";
 import { translate } from "./language";
 import type { ActiveRun, RuntimeSession, RuntimeState } from "./types";
 
 export interface RuntimeDashboardState {
   data?: RuntimeState;
-  /** The runtimeDir input the current data was fetched for. The server returns a
-   * canonical absolute path in data.runtimeDir, so it cannot be compared with the
-   * (usually relative) input directly. */
+  /** Requested directory, which may differ from the server's canonical path. */
   loadedRuntimeDir?: string;
   sessions: RuntimeSession[];
   activeRuns: ActiveRun[];
+  runsKnown: boolean;
   loading: boolean;
   refreshing: boolean;
   error?: string;
   autoRefresh: boolean;
+  visible: boolean;
+  /** Client receipt time of the last successful state response. */
+  lastSuccessAt?: number;
+  delayed: boolean;
   setAutoRefresh: (enabled: boolean) => void;
   refresh: () => Promise<void>;
 }
 
+type Snapshot = Pick<RuntimeDashboardState, "data" | "loadedRuntimeDir" | "sessions" | "activeRuns" | "runsKnown" | "lastSuccessAt" | "error" | "loading" | "refreshing"> & { runtimeDir: string };
+
+function emptySnapshot(runtimeDir: string): Snapshot {
+  return { runtimeDir, sessions: [], activeRuns: [], runsKnown: false, loading: false, refreshing: false };
+}
+
 export function useRuntimeDashboard(runtimeDir: string): RuntimeDashboardState {
-  const [data, setData] = useState<RuntimeState>();
-  const [loadedRuntimeDir, setLoadedRuntimeDir] = useState<string>();
-  const [sessions, setSessions] = useState<RuntimeSession[]>([]);
-  const [activeRuns, setActiveRuns] = useState<ActiveRun[]>([]);
-  const [loading, setLoading] = useState(true);
-  const [refreshing, setRefreshing] = useState(false);
-  const [error, setError] = useState<string>();
-  const [autoRefresh, setAutoRefresh] = useState(true);
-  const requestSequence = useRef(0);
-  const controllerRef = useRef<AbortController | undefined>(undefined);
-  const sessionsControllerRef = useRef<AbortController | undefined>(undefined);
+  const [snapshot, setSnapshot] = useState<Snapshot>(() => ({ ...emptySnapshot(runtimeDir), loading: !document.hidden }));
+  const [autoRefresh, setAutomaticState] = useState(true);
+  const automatic = useRef(true);
+  const [visible, setVisible] = useState(() => !document.hidden);
+  const [delayed, setDelayed] = useState(false);
+  const commands = useRef<{ refresh: () => Promise<void>; setAutomatic: (enabled: boolean) => void } | undefined>(undefined);
 
-  const loadSessions = useCallback(async () => {
-    sessionsControllerRef.current?.abort();
-    const controller = new AbortController();
-    sessionsControllerRef.current = controller;
-    try {
-      const response = await fetchSessions(runtimeDir, controller.signal);
-      if (!controller.signal.aborted) setSessions(response.sessions || []);
-    } catch (requestError) {
-      if (!controller.signal.aborted) setError((current) => current || translate("dashboard.sessionsFailed", { error: errorText(requestError) }));
-    }
-  }, [runtimeDir]);
-
-  const refresh = useCallback(async () => {
-    const requestId = ++requestSequence.current;
-    controllerRef.current?.abort();
-    const controller = new AbortController();
-    controllerRef.current = controller;
-    setRefreshing(true);
-    try {
-      const stateResult = await fetchRuntimeState(runtimeDir, controller.signal);
-      if (requestId !== requestSequence.current) return;
-      setData(stateResult);
-      setLoadedRuntimeDir(runtimeDir);
-      setError(undefined);
-      void fetchRuns()
-        .then((runsResult) => setActiveRuns(runsResult.runs || []))
-        .catch(() => undefined);
-    } catch (requestError) {
-      if (controller.signal.aborted) return;
-      if (requestId === requestSequence.current) {
-        setError(translate("dashboard.runtimeFailed", { error: errorText(requestError) }));
-      }
-    } finally {
-      if (requestId === requestSequence.current) {
-        setLoading(false);
-        setRefreshing(false);
-      }
-    }
-  }, [runtimeDir]);
+  const refresh = useCallback(() => commands.current?.refresh() ?? Promise.resolve(), []);
+  const setAutoRefresh = useCallback((enabled: boolean) => commands.current?.setAutomatic(enabled), []);
 
   useEffect(() => {
-    let cancelled = false;
-    setLoading(true);
-    void refresh().finally(() => { if (!cancelled) void loadSessions(); });
-    return () => {
-      cancelled = true;
-      controllerRef.current?.abort();
-      sessionsControllerRef.current?.abort();
-    };
-  }, [loadSessions, refresh]);
+    let active = true;
+    let foreground = !document.hidden;
+    let needsBaseline = true;
+    let sequence = 0;
+    let controller: AbortController | undefined;
+    let pollTimer: number | undefined;
+    let freshnessTimer: number | undefined;
 
-  useEffect(() => {
-    if (!autoRefresh) return undefined;
-    let timer: number | undefined;
-    const schedule = () => {
-      window.clearTimeout(timer);
-      if (document.hidden) return;
-      timer = window.setTimeout(async () => {
-        await refresh();
-        schedule();
-      }, 5000);
-    };
-    const onVisibilityChange = () => {
-      if (document.hidden) {
-        window.clearTimeout(timer);
-      } else {
-        void refresh().finally(schedule);
+    function resetFreshness() {
+      window.clearTimeout(freshnessTimer);
+      setDelayed(false);
+      if (automatic.current && foreground) {
+        freshnessTimer = window.setTimeout(() => {
+          if (active && automatic.current && foreground) setDelayed(true);
+        }, 20001);
       }
-    };
+    }
+
+    function cancel() {
+      ++sequence;
+      controller?.abort();
+      window.clearTimeout(pollTimer);
+    }
+
+    function setAutomatic(enabled: boolean) {
+      if (!active || enabled === automatic.current) return;
+      automatic.current = enabled;
+      if (!enabled) needsBaseline = false;
+      setAutomaticState(enabled);
+      cancel();
+      resetFreshness();
+      setSnapshot((current) => ({ ...current, loading: false, refreshing: false }));
+      if (enabled && foreground) void load();
+    }
+
+    function onUnauthorized() {
+      if (!active) return;
+      cancel();
+      automatic.current = false;
+      needsBaseline = false;
+      setAutomaticState(false);
+      resetFreshness();
+      setSnapshot(emptySnapshot(runtimeDir));
+    }
+
+    async function load() {
+      if (!active || !foreground) return;
+      cancel();
+      const requestId = sequence;
+      const requestController = new AbortController();
+      controller = requestController;
+      const current = () => active && requestId === sequence && !requestController.signal.aborted;
+      setSnapshot((previous) => ({ ...previous, loading: !previous.data, refreshing: true }));
+      let successAt: number | undefined;
+
+      const results = await Promise.allSettled([
+        fetchRuntimeState(runtimeDir, requestController.signal).then((data) => {
+          if (current()) {
+            successAt = Date.now();
+            resetFreshness();
+          }
+          return data;
+        }),
+        fetchRuns(requestController.signal),
+        fetchSessions(runtimeDir, requestController.signal)
+      ]);
+      if (!current()) return;
+      needsBaseline = false;
+      const [stateResult, runsResult, sessionsResult] = results;
+      const failures = results.filter((result) => result.status === "rejected");
+      if (failures.some((result) => result.reason instanceof ApiError && result.reason.status === 401)) {
+        onUnauthorized();
+        return;
+      }
+      if (failures.some((result) => result.reason instanceof ApiError && result.reason.status === 403)) {
+        automatic.current = false;
+        setAutomaticState(false);
+        resetFreshness();
+      }
+      setSnapshot((previous) => ({
+        ...previous,
+        ...(stateResult.status === "fulfilled" ? { data: stateResult.value, loadedRuntimeDir: runtimeDir, lastSuccessAt: successAt } : {}),
+        sessions: sessionsResult.status === "fulfilled" ? sessionsResult.value.sessions || [] : previous.sessions,
+        activeRuns: runsResult.status === "fulfilled" ? runsResult.value.runs || [] : [],
+        runsKnown: runsResult.status === "fulfilled",
+        loading: false,
+        refreshing: false,
+        error: stateResult.status === "rejected" ? translate("dashboard.runtimeFailed", { error: errorText(stateResult.reason) })
+          : sessionsResult.status === "rejected" ? translate("dashboard.sessionsFailed", { error: errorText(sessionsResult.reason) })
+            : runsResult.status === "rejected" ? errorText(runsResult.reason) : undefined
+      }));
+      if (automatic.current && foreground) pollTimer = window.setTimeout(() => { void load(); }, 5000);
+    }
+
+    function onVisibilityChange() {
+      foreground = !document.hidden;
+      setVisible(foreground);
+      cancel();
+      resetFreshness();
+      setSnapshot((current) => ({ ...current, loading: false, refreshing: false }));
+      if (foreground && (automatic.current || needsBaseline)) void load();
+    }
+
+    setSnapshot(emptySnapshot(runtimeDir));
+    setVisible(foreground);
+    commands.current = { refresh: load, setAutomatic };
     document.addEventListener("visibilitychange", onVisibilityChange);
-    schedule();
+    window.addEventListener(UNAUTHORIZED_EVENT, onUnauthorized);
+    resetFreshness();
+    if (foreground) void load();
     return () => {
-      window.clearTimeout(timer);
+      active = false;
+      cancel();
+      window.clearTimeout(freshnessTimer);
+      commands.current = undefined;
       document.removeEventListener("visibilitychange", onVisibilityChange);
+      window.removeEventListener(UNAUTHORIZED_EVENT, onUnauthorized);
     };
-  }, [autoRefresh, refresh]);
+  }, [runtimeDir]);
 
-  return { data, loadedRuntimeDir, sessions, activeRuns, loading, refreshing, error, autoRefresh, setAutoRefresh, refresh };
+  const currentSnapshot = snapshot.runtimeDir === runtimeDir ? snapshot : emptySnapshot(runtimeDir);
+  return { ...currentSnapshot, autoRefresh, visible, delayed, setAutoRefresh, refresh };
 }
 
 function errorText(error: unknown): string {

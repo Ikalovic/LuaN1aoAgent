@@ -44,6 +44,24 @@ beforeEach(() => {
 });
 
 describe("TrafficView", () => {
+  it("can select the same opaque ID again after runtime selection has cleared", async () => {
+    const base = { onSelectExchange: vi.fn(), onExchangeLoaded: vi.fn() };
+    const { rerender } = render(<TrafficView {...base} runtimeDir="a" selectedExchangeId={exchange.id} />);
+    await waitFor(() => expect(mockedExchange).toHaveBeenCalledWith("a", exchange.id, expect.any(AbortSignal)));
+    rerender(<TrafficView {...base} runtimeDir="b" selectedExchangeId={exchange.id} />);
+    rerender(<TrafficView {...base} runtimeDir="b" />);
+    rerender(<TrafficView {...base} runtimeDir="b" selectedExchangeId={exchange.id} />);
+    await waitFor(() => expect(mockedExchange).toHaveBeenCalledWith("b", exchange.id, expect.any(AbortSignal)));
+  });
+  it("loads an off-page direct selection without clearing or replacing it", async () => {
+    const selected = { ...exchange, id: "off/page:opaque" };
+    mockedExchange.mockResolvedValue(selected);
+    const onSelectExchange = vi.fn();
+    const onExchangeLoaded = vi.fn();
+    render(<TrafficView runtimeDir="runtime/a" selectedExchangeId={selected.id} onSelectExchange={onSelectExchange} onExchangeLoaded={onExchangeLoaded} />);
+    await waitFor(() => expect(onExchangeLoaded).toHaveBeenCalledWith(selected));
+    expect(onSelectExchange).not.toHaveBeenCalled();
+  });
   it("applies filters and navigates cursor pages", async () => {
     const onSelectExchange = vi.fn();
     render(

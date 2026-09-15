@@ -1,0 +1,98 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>青玄 · 美术素材</title>
+  <link rel="icon" href="../../web/public/brand/favicon.ico">
+  <style>
+    * { box-sizing: border-box; letter-spacing: 0; }
+    body { margin: 0; background: #141618; color: #f1f3f5; font: 16px/1.6 system-ui, sans-serif; }
+    main { max-width: 1440px; margin: auto; padding: 36px 32px 64px; }
+    header { display: flex; align-items: center; gap: 18px; padding-bottom: 28px; border-bottom: 1px solid #363c42; }
+    header img { width: 72px; height: 72px; }
+    h1 { margin: 0; font-size: 40px; line-height: 1.2; }
+    header p { margin: 6px 0 0; color: #aab4bf; }
+    h2 { font-size: 22px; margin: 30px 0 14px; }
+    .row { display: grid; grid-template-columns: repeat(2,minmax(0,1fr)); gap: 20px; }
+    figure { margin: 0; min-width: 0; }
+    figcaption { margin: 10px 0 18px; color: #aab4bf; font-size: 14px; overflow-wrap: anywhere; }
+    .swatch { display: flex; align-items: center; justify-content: center; min-height: 220px; gap: 20px; padding: 28px; }
+    .dark { background: #090d10; }
+    .light { background: #f5f6f8; color: #182026; }
+    .swatch .symbol { width: 144px; height: 144px; object-fit: contain; }
+    .wordmark { font-size: 30px; font-weight: 650; white-space: nowrap; }
+    .wordmark small { display: block; font-size: 15px; font-weight: 400; }
+    .icons { display: flex; gap: 22px; align-items: end; padding: 24px; min-height: 104px; flex-wrap: wrap; background: #1c1f22; }
+    .icons img { object-fit: contain; }
+    .surface { width: 100%; height: auto; aspect-ratio: 16/9; display: block; object-fit: cover; }
+    .login { width: 100%; height: auto; aspect-ratio: 16/10; display: block; object-fit: cover; }
+    .rail { width: 100%; aspect-ratio: 12/1; object-fit: contain; display: block; }
+    .rail-surface { background: #090d10; padding: 22px 0; }
+    .empty { width: 100%; height: auto; aspect-ratio: 4/3; object-fit: contain; display: block; }
+    .texture { min-height: 280px; background: #161c21 url('../../web/public/art/wallboard-deck-albedo.webp') repeat; background-size: 256px 256px; }
+    a { color: #53d6bd; text-underline-offset: 4px; overflow-wrap: anywhere; }
+    footer { border-top: 1px solid #363c42; margin-top: 26px; padding-top: 20px; color: #aab4bf; font-size: 14px; }
+    @media (max-width: 720px) {
+      main { padding: 24px 16px 40px; }
+      .row { grid-template-columns: minmax(0,1fr); }
+      h1 { font-size: 32px; }
+      header { gap: 12px; }
+      header img { width: 56px; height: 56px; }
+      .swatch { padding: 16px; gap: 10px; }
+      .swatch .symbol { width: 96px; height: 96px; }
+      .wordmark { font-size: 26px; }
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <header>
+      <img src="../../web/public/brand/qingxuan-symbol.png" alt="" width="72" height="72">
+      <div><h1>青玄</h1><p>自动渗透agent · 美术素材</p></div>
+    </header>
+
+    <h2>品牌图形</h2>
+    <div class="row">
+      <figure>
+        <div class="swatch dark"><img class="symbol" src="../../web/public/brand/qingxuan-symbol-on-dark.png" alt="青玄深色背景标志" width="144" height="144"><div class="wordmark">青玄<small>自动渗透agent</small></div></div>
+        <figcaption>QX-BRAND-01 · 深色背景版 · 同源透明轮廓</figcaption>
+      </figure>
+      <figure>
+        <div class="swatch light"><img class="symbol" src="../../web/public/brand/qingxuan-symbol-on-light.png" alt="青玄浅色背景标志" width="144" height="144"><div class="wordmark">青玄<small>自动渗透agent</small></div></div>
+        <figcaption>QX-BRAND-01 · 浅色背景版 · 同源透明轮廓</figcaption>
+      </figure>
+    </div>
+    <figure>
+      <div class="icons">
+        <img src="../../web/public/brand/favicon-32.png" alt="24像素品牌预览" width="24" height="24">
+        <img src="../../web/public/brand/favicon-32.png" alt="32像素品牌预览" width="32" height="32">
+        <img src="../../web/public/brand/favicon-48.png" alt="48像素品牌预览" width="48" height="48">
+        <img src="../../web/public/brand/apple-touch-icon.png" alt="应用图标预览" width="64" height="64">
+      </div>
+      <figcaption>QX-BRAND-02 · 24 / 32 / 48px 轮廓与应用图标</figcaption>
+    </figure>
+
+    <h2>态势大屏</h2>
+    <figure>
+      <a href="../../web/public/art/wallboard-surface-v3-4k.webp"><img class="surface" src="../../web/public/art/wallboard-surface-v3-1080.webp" alt="平面石墨灰技术底图，细线边缘与低对比刻度，无舱室或地板透视" width="1920" height="1080"></a>
+      <figcaption>QX-WALL-01 · V3 平面底图 · <a href="../../web/public/art/wallboard-surface-v3-4k.webp">3840×2160 版本</a> · 用户提供的 4K 源图，无本地放大 · <a href="../../web/public/art/wallboard-surface-v2-4k.webp">V2 舱室背景保留</a></figcaption>
+    </figure>
+    <figure>
+      <div class="rail-surface"><img class="rail" src="../../web/public/art/wallboard-header-rail.webp" alt="对称切角页头装饰，中央40%完全透明" width="1920" height="160"></div>
+      <figcaption>QX-WALL-02 · 1920×160 · 透明页头两翼</figcaption>
+    </figure>
+    <figure>
+      <div class="texture" role="img" aria-label="地台金属纹理平铺预览"></div>
+      <figcaption>QX-WALL-03 · 1024×1024 · 256px 重复平铺预览</figcaption>
+    </figure>
+
+    <h2>登录与空状态</h2>
+    <div class="row">
+      <figure><img class="login" src="../../web/public/art/login-surface-dark.webp" alt="左上留白、右下几何切面的登录背景" width="1600" height="1000"><figcaption>QX-AUTH-01 · 1600×1000 · 从原图裁切并派生</figcaption></figure>
+      <figure><div class="light"><img class="empty" src="../../web/public/art/empty-run.webp" alt="三块等距几何平面构成的空状态插画" width="384" height="288"></div><figcaption>QX-EMPTY-01 · 384×288 · 透明插画</figcaption></figure>
+    </div>
+    <footer>素材审阅页，尚未接入业务界面。<a href="../qingxuan-art-delivery.md">交付说明</a> · <a href="qingxuan-generation-prompts.json">生成提示词</a> · <a href="qingxuan-art-manifest.json">尺寸与校验清单</a></footer>
+  </main>
+</body>
+</html>

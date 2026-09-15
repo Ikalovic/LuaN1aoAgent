@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { fetchConnections, fetchTrafficBody, fetchTrafficHistory, mutateRoute, replayTrafficExchange, runtimeRoot, startRun } from "./api";
+import { fetchConnections, fetchCurrentUser, fetchRuntimeState, fetchTrafficBody, fetchTrafficHistory, mutateRoute, replayTrafficExchange, runtimeRoot, startRun } from "./api";
 
 afterEach(() => {
   vi.unstubAllGlobals();
@@ -13,6 +13,39 @@ describe("runtimeRoot", () => {
 
   it("uses external runtime directories as their own root", () => {
     expect(runtimeRoot("/tmp/agent-run")).toBe("/tmp/agent-run");
+  });
+});
+
+describe("expired session notifications", () => {
+  it("notifies on business API 401 but leaves auth errors local", async () => {
+    const unauthorized = vi.fn();
+    window.addEventListener("qingxuan:unauthorized", unauthorized);
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: false, status: 401, json: async () => ({ error: "expired" }) }));
+    try {
+      await expect(fetchRuntimeState("test")).rejects.toMatchObject({ status: 401 });
+      expect(unauthorized).toHaveBeenCalledTimes(1);
+      await expect(fetchCurrentUser()).rejects.toMatchObject({ status: 401 });
+      expect(unauthorized).toHaveBeenCalledTimes(1);
+    } finally {
+      window.removeEventListener("qingxuan:unauthorized", unauthorized);
+    }
+  });
+
+  it("does not expire a session from an aborted request with a late 401", async () => {
+    const unauthorized = vi.fn();
+    window.addEventListener("qingxuan:unauthorized", unauthorized);
+    let resolve!: (response: Response) => void;
+    vi.stubGlobal("fetch", vi.fn(() => new Promise<Response>((done) => { resolve = done; })));
+    const controller = new AbortController();
+    const pending = fetchRuntimeState("test", controller.signal);
+    controller.abort();
+    resolve(new Response(JSON.stringify({ error: "expired" }), { status: 401 }));
+    try {
+      await expect(pending).rejects.toMatchObject({ status: 401 });
+      expect(unauthorized).not.toHaveBeenCalled();
+    } finally {
+      window.removeEventListener("qingxuan:unauthorized", unauthorized);
+    }
   });
 });
 

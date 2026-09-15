@@ -1,0 +1,498 @@
+{
+  "initial_generation_model": "gpt-image-2.5-flare",
+  "exports": [
+    {
+      "path": "web/public/brand/qingxuan-symbol-on-dark-128.png",
+      "width": 128,
+      "height": 128,
+      "bytes": 9707,
+      "sha256": "b13de2833e3ec1d0151db6f547a06495918e475d9fd457e6577c5ee8d1ecef10",
+      "has_transparency": true,
+      "source": "qingxuan-symbol.png",
+      "source_size": [
+        1254,
+        1254
+      ],
+      "transformation": "Shared alpha silhouette; solid theme color; 15% padding; downsample"
+    },
+    {
+      "path": "web/public/brand/qingxuan-symbol-on-dark.png",
+      "width": 256,
+      "height": 256,
+      "bytes": 21686,
+      "sha256": "cd0e1a1fb15f2f410e85458e64c996dbf73e0c68fe2c00dfbbd88e86d1e1bcc7",
+      "has_transparency": true,
+      "source": "qingxuan-symbol.png",
+      "source_size": [
+        1254,
+        1254
+      ],
+      "transformation": "Shared alpha silhouette; solid theme color; 15% padding; downsample"
+    },
+    {
+      "path": "web/public/brand/qingxuan-symbol-on-light-128.png",
+      "width": 128,
+      "height": 128,
+      "bytes": 8608,
+      "sha256": "d9e342e586650577c01e3018a7b270ba7031fd52efc673325c2455ad55a7ced1",
+      "has_transparency": true,
+      "source": "qingxuan-symbol.png",
+      "source_size": [
+        1254,
+        1254
+      ],
+      "transformation": "Shared alpha silhouette; solid theme color; 15% padding; downsample"
+    },
+    {
+      "path": "web/public/brand/qingxuan-symbol-on-light.png",
+      "width": 256,
+      "height": 256,
+      "bytes": 19336,
+      "sha256": "5e13ed3214c3c6c756869534fa53069f7e05205d05a647bd9609cfe7c244b2be",
+      "has_transparency": true,
+      "source": "qingxuan-symbol.png",
+      "source_size": [
+        1254,
+        1254
+      ],
+      "transformation": "Shared alpha silhouette; solid theme color; 15% padding; downsample"
+    },
+    {
+      "path": "web/public/brand/qingxuan-symbol.png",
+      "width": 256,
+      "height": 256,
+      "bytes": 21686,
+      "sha256": "cd0e1a1fb15f2f410e85458e64c996dbf73e0c68fe2c00dfbbd88e86d1e1bcc7",
+      "has_transparency": true,
+      "source": "qingxuan-symbol.png",
+      "source_size": [
+        1254,
+        1254
+      ],
+      "transformation": "Same as on-dark 256px"
+    },
+    {
+      "path": "web/public/brand/favicon-32.png",
+      "width": 32,
+      "height": 32,
+      "bytes": 1777,
+      "sha256": "bbafd3679a6e40d7808b4b08d38843a72665915857ce449e54672201d81a8624",
+      "has_transparency": true,
+      "source": "qingxuan-symbol.png",
+      "source_size": [
+        1254,
+        1254
+      ],
+      "transformation": "Shared brand alpha; downsample"
+    },
+    {
+      "path": "web/public/brand/favicon-48.png",
+      "width": 48,
+      "height": 48,
+      "bytes": 3088,
+      "sha256": "9712e613820b5a2900e0a397d5d8a274641c3a3f80762bfafe7fbed71304afdc",
+      "has_transparency": true,
+      "source": "qingxuan-symbol.png",
+      "source_size": [
+        1254,
+        1254
+      ],
+      "transformation": "Shared brand alpha; downsample"
+    },
+    {
+      "path": "web/public/brand/icon-192.png",
+      "width": 192,
+      "height": 192,
+      "bytes": 15590,
+      "sha256": "3ab07395cd2a90b952366cb31914ad95eb9498c17c0b4b3809cbbc70996893d3",
+      "has_transparency": true,
+      "source": "qingxuan-symbol.png",
+      "source_size": [
+        1254,
+        1254
+      ],
+      "transformation": "Shared brand alpha; downsample"
+    },
+    {
+      "path": "web/public/brand/icon-512.png",
+      "width": 512,
+      "height": 512,
+      "bytes": 48574,
+      "sha256": "7f5cfe5d69657b9732b32dd1f315322ac8ca87d52be495d7dd3244f253047294",
+      "has_transparency": true,
+      "source": "qingxuan-symbol.png",
+      "source_size": [
+        1254,
+        1254
+      ],
+      "transformation": "Shared brand alpha; downsample"
+    },
+    {
+      "path": "web/public/brand/apple-touch-icon.png",
+      "width": 180,
+      "height": 180,
+      "bytes": 12045,
+      "sha256": "baf8aae7ab6c25d1995b00efbaece6e7852de6f19c43f9ed40c5aef5cd1dca6c",
+      "has_transparency": false,
+      "source": "qingxuan-symbol.png",
+      "source_size": [
+        1254,
+        1254
+      ],
+      "transformation": "Shared brand on opaque graphite tile"
+    },
+    {
+      "path": "web/public/brand/favicon.ico",
+      "width": 48,
+      "height": 48,
+      "bytes": 5734,
+      "sha256": "815254f80a35fa1930b616b330a30394aefd99a88c64ecb7fe79df168cccec5f",
+      "has_transparency": true,
+      "source": "qingxuan-symbol.png",
+      "source_size": [
+        1254,
+        1254
+      ],
+      "transformation": "ICO with 16/32/48px frames"
+    },
+    {
+      "path": "web/public/art/wallboard-surface-1080.webp",
+      "width": 1920,
+      "height": 1080,
+      "bytes": 32098,
+      "sha256": "f62eb78958048bc0cb8cc138ab919e2ef2d76625ac112bee5789272bcd7daa0d",
+      "has_transparency": false,
+      "source": "wallboard-surface-sized.png",
+      "source_size": [
+        1672,
+        941
+      ],
+      "transformation": "Lanczos upscale from 1672x941; not native 4K"
+    },
+    {
+      "path": "web/public/art/wallboard-surface-1080.png",
+      "width": 1920,
+      "height": 1080,
+      "bytes": 1536661,
+      "sha256": "689f92e2cd5fa14dc432bd06bbe1b7962e1c8eccb8e77f3ed1f9fb2620219d01",
+      "has_transparency": false,
+      "source": "wallboard-surface-sized.png",
+      "source_size": [
+        1672,
+        941
+      ],
+      "transformation": "Lanczos upscale from 1672x941; not native 4K; PNG fallback"
+    },
+    {
+      "path": "web/public/art/wallboard-surface-4k.webp",
+      "width": 3840,
+      "height": 2160,
+      "bytes": 85108,
+      "sha256": "d109f0556a27a59f801dc3ea5200c6da52703e5cfb780265ae3128635b18eb64",
+      "has_transparency": false,
+      "source": "wallboard-surface-sized.png",
+      "source_size": [
+        1672,
+        941
+      ],
+      "transformation": "Lanczos upscale from 1672x941; not native 4K"
+    },
+    {
+      "path": "web/public/art/wallboard-surface-4k.png",
+      "width": 3840,
+      "height": 2160,
+      "bytes": 3213340,
+      "sha256": "c3bda06ee462cca73cc116808f03284da7019d51bd0548ba9ba8cb73c60abfe5",
+      "has_transparency": false,
+      "source": "wallboard-surface-sized.png",
+      "source_size": [
+        1672,
+        941
+      ],
+      "transformation": "Lanczos upscale from 1672x941; not native 4K; PNG fallback"
+    },
+    {
+      "path": "web/public/art/wallboard-surface-v2-1080.webp",
+      "width": 1920,
+      "height": 1080,
+      "bytes": 77946,
+      "sha256": "1b930c762e313e7ed86ad33bcbb353e0311e44700b02890680e6a16667c92e9c",
+      "has_transparency": false,
+      "source": "qingxuan-background-user-4k.png",
+      "source_size": [
+        3840,
+        2160
+      ],
+      "transformation": "User-provided 3840x2160 source; Lanczos downsample"
+    },
+    {
+      "path": "web/public/art/wallboard-surface-v2-1080.png",
+      "width": 1920,
+      "height": 1080,
+      "bytes": 1718492,
+      "sha256": "1b0c6798cf37bd0122707943491582aaaf042a575a8f523c7ffd29e0b8611c3d",
+      "has_transparency": false,
+      "source": "qingxuan-background-user-4k.png",
+      "source_size": [
+        3840,
+        2160
+      ],
+      "transformation": "User-provided 3840x2160 source; Lanczos downsample; lossless PNG fallback"
+    },
+    {
+      "path": "web/public/art/wallboard-surface-v2-4k.webp",
+      "width": 3840,
+      "height": 2160,
+      "bytes": 249718,
+      "sha256": "66c96b827504fe5eacd28479682b9646300b9cb2886d33c9319aae7edabf2ee3",
+      "has_transparency": false,
+      "source": "qingxuan-background-user-4k.png",
+      "source_size": [
+        3840,
+        2160
+      ],
+      "transformation": "User-provided 3840x2160 source; same-resolution export, no upscaling"
+    },
+    {
+      "path": "web/public/art/wallboard-surface-v2-4k.png",
+      "width": 3840,
+      "height": 2160,
+      "bytes": 6479026,
+      "sha256": "cc0f7a3bfd1209f706dc009029d56206ce60154b2dc2aecc3f23113d9a9f1a14",
+      "has_transparency": false,
+      "source": "qingxuan-background-user-4k.png",
+      "source_size": [
+        3840,
+        2160
+      ],
+      "transformation": "User-provided 3840x2160 source; same-resolution export, no upscaling; lossless PNG fallback"
+    },
+    {
+      "path": "web/public/art/login-surface-dark.webp",
+      "width": 1600,
+      "height": 1000,
+      "bytes": 32322,
+      "sha256": "2eb0073c826fb77eff6dfd97bb783557a7a37cfde1587f1f323fd171942bdea0",
+      "has_transparency": false,
+      "source": "login-surface-dark.png",
+      "source_size": [
+        1277,
+        1231
+      ],
+      "transformation": "Crop to 16:10 anchored lower right; upscale from source crop"
+    },
+    {
+      "path": "web/public/art/login-surface-dark.png",
+      "width": 1600,
+      "height": 1000,
+      "bytes": 1737432,
+      "sha256": "efff430d0120ae9ac76e0eab43869bced4124e1441fe065fcb0eeaf6f292127d",
+      "has_transparency": false,
+      "source": "login-surface-dark.png",
+      "source_size": [
+        1277,
+        1231
+      ],
+      "transformation": "Crop to 16:10 anchored lower right; upscale from source crop"
+    },
+    {
+      "path": "web/public/art/empty-run.webp",
+      "width": 384,
+      "height": 288,
+      "bytes": 21540,
+      "sha256": "fe44567810efa0fe287e5269427427307e6857e2a13b15e4ec011f219eca81c8",
+      "has_transparency": true,
+      "source": "empty-run.png",
+      "source_size": [
+        1254,
+        1254
+      ],
+      "transformation": "Visible alpha crop; centered 4:3 canvas; downsample"
+    },
+    {
+      "path": "web/public/art/empty-run.png",
+      "width": 384,
+      "height": 288,
+      "bytes": 30454,
+      "sha256": "99f17bc414955d393a0cbaad5fc82910af4b571699f7968dfc9f600d0f53b57c",
+      "has_transparency": true,
+      "source": "empty-run.png",
+      "source_size": [
+        1254,
+        1254
+      ],
+      "transformation": "Visible alpha crop; centered 4:3 canvas; downsample"
+    },
+    {
+      "path": "web/public/art/wallboard-header-rail.webp",
+      "width": 1920,
+      "height": 160,
+      "bytes": 78136,
+      "sha256": "8879bd4a27aaea490fe1eccb09090c3277287a359c411552ebd6519924ee22ec",
+      "has_transparency": true,
+      "source": "wallboard-header-rail-a.png",
+      "source_size": [
+        2116,
+        743
+      ],
+      "transformation": "Two original wings independently contained; center 40% fully transparent"
+    },
+    {
+      "path": "web/public/art/wallboard-header-rail.png",
+      "width": 1920,
+      "height": 160,
+      "bytes": 113111,
+      "sha256": "d47e1e18136e8eada11c96499f2ac0c46894f91edd164541a50deebe37335119",
+      "has_transparency": true,
+      "source": "wallboard-header-rail-a.png",
+      "source_size": [
+        2116,
+        743
+      ],
+      "transformation": "Two original wings independently contained; center 40% fully transparent"
+    },
+    {
+      "path": "web/public/art/wallboard-deck-albedo.webp",
+      "width": 1024,
+      "height": 1024,
+      "bytes": 50900,
+      "sha256": "312ff360c2809beb69af5840fce3d8601414e8fbc16fd0f4f9311e8ae35c8562",
+      "has_transparency": false,
+      "source": "wallboard-deck-albedo.png",
+      "source_size": [
+        1254,
+        1254
+      ],
+      "transformation": "Downsample to 512px; mirrored 2x2 tile for matching opposite edges"
+    },
+    {
+      "path": "web/public/art/wallboard-deck-albedo.png",
+      "width": 1024,
+      "height": 1024,
+      "bytes": 1060203,
+      "sha256": "6f2d90f97d8630610ceca8a578e240eb4c83d286e39d798a9e4c803e67efa9cf",
+      "has_transparency": false,
+      "source": "wallboard-deck-albedo.png",
+      "source_size": [
+        1254,
+        1254
+      ],
+      "transformation": "Downsample to 512px; mirrored 2x2 tile for matching opposite edges"
+    },
+    {
+      "path": "web/public/art/wallboard-surface-v3-1080.webp",
+      "width": 1920,
+      "height": 1080,
+      "bytes": 21290,
+      "sha256": "bacdaec7bfd736107e70ce07bcd7155fc54e6e134a2efcc0f24748edf83097ba",
+      "has_transparency": false,
+      "source": "qingxuan-background-flat-user-4k.png",
+      "source_size": [
+        3840,
+        2160
+      ],
+      "transformation": "User-provided flat 3840x2160 background; Lanczos downsample"
+    },
+    {
+      "path": "web/public/art/wallboard-surface-v3-1080.png",
+      "width": 1920,
+      "height": 1080,
+      "bytes": 1328580,
+      "sha256": "a2dcaf432a9a4486bb18aeb4a35353552e3a0697301062ee54cb0307d12b882a",
+      "has_transparency": false,
+      "source": "qingxuan-background-flat-user-4k.png",
+      "source_size": [
+        3840,
+        2160
+      ],
+      "transformation": "User-provided flat 3840x2160 background; Lanczos downsample; lossless PNG fallback"
+    },
+    {
+      "path": "web/public/art/wallboard-surface-v3-4k.webp",
+      "width": 3840,
+      "height": 2160,
+      "bytes": 62510,
+      "sha256": "879ae0eaa357d9c6f677de5be8fd13f82b651f823ae8487acdb97ec653921c5f",
+      "has_transparency": false,
+      "source": "qingxuan-background-flat-user-4k.png",
+      "source_size": [
+        3840,
+        2160
+      ],
+      "transformation": "User-provided flat 3840x2160 background; same-resolution export, no upscaling"
+    },
+    {
+      "path": "web/public/art/wallboard-surface-v3-4k.png",
+      "width": 3840,
+      "height": 2160,
+      "bytes": 5109469,
+      "sha256": "e4fbc17b56dcae3593d6f1acacc2316112c65161210ca007014b764031e0b9cd",
+      "has_transparency": false,
+      "source": "qingxuan-background-flat-user-4k.png",
+      "source_size": [
+        3840,
+        2160
+      ],
+      "transformation": "User-provided flat 3840x2160 background; same-resolution export, no upscaling; lossless PNG fallback"
+    },
+    {
+      "path": "web/public/art/home-workbench.webp",
+      "width": 1920,
+      "height": 1080,
+      "bytes": 53118,
+      "sha256": "1e278678a2b40d5c6cf25df3e84da7583dbe595697fb662454e2e45f16304445",
+      "has_transparency": false,
+      "source": "home-workbench-fixture.png",
+      "source_size": [
+        1920,
+        1080
+      ],
+      "transformation": "Actual product screenshot with browser-only lab.example fixtures; same-resolution lossless export",
+      "source_origin": "browser_fixture_screenshot",
+      "source_sha256": "d5a3044e196ac85ccd7f8d393402a65a6a34feb4400ee2ad276952a383daecc1",
+      "contains_live_runtime_data": false
+    },
+    {
+      "path": "web/public/art/home-wallboard.webp",
+      "width": 1920,
+      "height": 1080,
+      "bytes": 319930,
+      "sha256": "af500e0c5ae821b3ba50aab8a0b14cb84c1273a32f41f8ade7029ec3558191f0",
+      "has_transparency": false,
+      "source": "home-wallboard-fixture.png",
+      "source_size": [
+        1920,
+        1080
+      ],
+      "transformation": "Actual product screenshot with browser-only lab.example fixtures; same-resolution lossless export",
+      "source_origin": "browser_fixture_screenshot",
+      "source_sha256": "fc00df90e4f82e61be7c2111ec1bbd2e3f172ce7b76906ec86b9f111a268f6a4",
+      "contains_live_runtime_data": false
+    }
+  ],
+  "deck_edge_mean_absolute_rgb_difference": {
+    "x": [
+      0.0,
+      0.0,
+      0.0
+    ],
+    "y": [
+      0.0,
+      0.0,
+      0.0
+    ]
+  },
+  "current_wallboard": {
+    "version": "v3",
+    "source": "qingxuan-background-flat-user-4k.png",
+    "source_origin": "user_provided",
+    "source_sha256": "d63fdaa630299bb440361f10fc447bbd64ff6a39787c8612ba135ea4e58baeae",
+    "source_size": [
+      3840,
+      2160
+    ],
+    "locally_upscaled": false,
+    "generation_provenance_verified": false,
+    "composition": "flat technical display background; no room or floor perspective"
+  }
+}

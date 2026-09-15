@@ -14,6 +14,8 @@ __pycache__/
 *.pyc
 AGENTS.md
 .playwright-cli/
+.superpowers/
+web/.preview/
 output/
 benchmarks/
 .runtime/

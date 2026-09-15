@@ -8,6 +8,7 @@ export class ApiError extends Error {
 }
 
 let csrfTokenPromise: Promise<string> | undefined;
+export const UNAUTHORIZED_EVENT = "qingxuan:unauthorized";
 
 async function requestJson<T>(url: string, options: RequestInit = {}): Promise<T> {
   const requestOptions = { cache: "no-store" as RequestCache, credentials: "same-origin" as RequestCredentials, ...options };
@@ -19,6 +20,10 @@ async function requestJson<T>(url: string, options: RequestInit = {}): Promise<T
   const response = await fetch(url, requestOptions);
   const body = await response.json().catch(() => ({})) as { error?: string | { code?: string; message?: string } };
   if (!response.ok) {
+    if (response.status === 401 && !url.startsWith("/api/auth/") && !options.signal?.aborted) {
+      csrfTokenPromise = undefined;
+      window.dispatchEvent(new Event(UNAUTHORIZED_EVENT));
+    }
     const message = typeof body.error === "string" ? body.error : body.error?.message;
     const code = typeof body.error === "object" ? body.error?.code : undefined;
     throw new ApiError(message || `HTTP ${response.status}`, response.status, code);

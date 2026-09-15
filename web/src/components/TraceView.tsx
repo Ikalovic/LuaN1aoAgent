@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { Alert, Button, Collapse, Empty, Segmented, Tag, Typography } from "antd";
 import { Activity, ArrowDownUp, BrainCircuit, Check, CheckCircle2, ChevronDown, Clock3, ListChecks, ListTree, LoaderCircle, PlayCircle, Rows3, TerminalSquare, XCircle } from "lucide-react";
 import { Virtuoso } from "react-virtuoso";
@@ -23,14 +23,18 @@ interface TraceViewProps {
 export function TraceView(props: TraceViewProps) {
   const { t } = useLanguage();
   const [mode, setMode] = useState<"plan" | "timeline">("plan");
+  useEffect(() => {
+    if (props.roleFilter === "runtime" || props.items.some((item) => item.id === props.selectedTraceId && item.role === "runtime")) setMode("timeline");
+  }, [props.roleFilter, props.selectedTraceId, props.items]);
   const roleOptions = [
     { label: t("trace.all"), value: "all" },
     { label: "Planner", value: "planner" },
     { label: "Executor", value: "executor" },
-    { label: "Observer", value: "observer" }
+    { label: "Observer", value: "observer" },
+    ...(props.roleFilter === "runtime" ? [{ label: "系统事件", value: "runtime" }] : [])
   ];
   const filtered = props.items
-    .filter((item) => item.role !== "runtime")
+    .filter((item) => item.role !== "runtime" || props.roleFilter === "runtime" || item.id === props.selectedTraceId)
     .filter((item) => props.roleFilter === "all" || item.role === props.roleFilter)
     .sort((left, right) => {
       const diff = new Date(left.timestamp).getTime() - new Date(right.timestamp).getTime();
