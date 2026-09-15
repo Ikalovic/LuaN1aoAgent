@@ -2,6 +2,7 @@ import { lazy, Suspense, useEffect, useMemo, useState } from "react";
 import { Alert, Avatar, Badge, Button, Drawer, Dropdown, Input, Popconfirm, Skeleton, Spin, Statistic, Switch, Tag, Tooltip, Typography } from "antd";
 import { Activity, ChevronDown, Database, FileBox, LogOut, Menu, PanelRight, Play, RefreshCw, Share2, Square } from "lucide-react";
 import { stopRun, fetchApprovals } from "./api";
+import { AgentDetailDrawer } from "./components/AgentDetailDrawer";
 import { Inspector } from "./components/Inspector";
 import { ConnectionsView } from "./components/ConnectionsView";
 import { ApprovalsView } from "./components/ApprovalsView";
@@ -39,6 +40,7 @@ export default function App({ user, onLogout }: { user: AuthUser; onLogout: () =
   const [newestFirst, setNewestFirst] = useState(false);
   const [mobileSidebarOpen, setMobileSidebarOpen] = useState(false);
   const [mobileInspectorOpen, setMobileInspectorOpen] = useState(false);
+  const [agentDetailRole, setAgentDetailRole] = useState<string>();
   const [startRunOpen, setStartRunOpen] = useState(false);
   const [continueTarget, setContinueTarget] = useState<RuntimeSession>();
   const [stopping, setStopping] = useState(false);
@@ -156,6 +158,8 @@ export default function App({ user, onLogout }: { user: AuthUser; onLogout: () =
       onRuntimeChange={(value) => { setRuntimeDraft(value); applyRuntime(value); }}
       onContinue={setContinueTarget}
       onClose={mobileSidebarOpen ? () => setMobileSidebarOpen(false) : undefined}
+      onAgentSelect={(role) => { setAgentDetailRole(role); setMobileSidebarOpen(false); }}
+      selectedAgentRole={agentDetailRole}
       canApprove={isAdmin}
       pendingApprovalCount={approvalPendingCount}
     />
@@ -365,6 +369,21 @@ export default function App({ user, onLogout }: { user: AuthUser; onLogout: () =
 
       <Drawer placement="left" width={286} open={mobileSidebarOpen} onClose={() => setMobileSidebarOpen(false)} closable={false} styles={{ body: { padding: 0 } }}>{sidebar}</Drawer>
       <Drawer placement="right" width={380} open={mobileInspectorOpen} onClose={() => setMobileInspectorOpen(false)} title={t("app.inspectorDrawer")}>{inspector}</Drawer>
+      <AgentDetailDrawer
+        open={Boolean(agentDetailRole)}
+        role={agentDetailRole}
+        agent={agentDetailRole ? data?.overview.agents[agentDetailRole] : undefined}
+        eventCount={agentDetailRole ? data?.overview.events.byRole[agentDetailRole] ?? 0 : 0}
+        traceItems={data?.traceItems || []}
+        onClose={() => setAgentDetailRole(undefined)}
+        onSelectTrace={(traceId) => {
+          const target = data?.traceItems.find((item) => item.id === traceId);
+          setAgentDetailRole(undefined);
+          setSelectedTraceId(traceId);
+          if (target) setRoleFilter(target.role === "runtime" ? "all" : target.role);
+          setView("trace");
+        }}
+      />
       <StartRunModal
         open={startRunOpen || Boolean(continueTarget)}
         continueFrom={continueTarget ? {

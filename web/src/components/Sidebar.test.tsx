@@ -102,4 +102,22 @@ describe("Sidebar", () => {
     );
     expect(screen.queryByRole("button", { name: /继续渗透/ })).not.toBeInTheDocument();
   });
+
+  it("opens the agent detail drawer from the agent status rows", () => {
+    const onAgentSelect = vi.fn();
+    render(
+      <Sidebar
+        activeView="trace"
+        runtimeDir="runtime/a"
+        sessions={[]}
+        agents={{ planner: { eventType: "planning_decision", summary: "规划中", timestamp: new Date().toISOString() } }}
+        onViewChange={vi.fn()}
+        onRuntimeChange={vi.fn()}
+        onAgentSelect={onAgentSelect}
+      />
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: /^Planner/ }));
+    expect(onAgentSelect).toHaveBeenCalledWith("planner");
+  });
 });
