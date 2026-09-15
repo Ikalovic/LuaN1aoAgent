@@ -3,7 +3,7 @@ export type JsonRecord = Record<string, JsonValue | undefined>;
 
 export type Role = "planner" | "executor" | "observer" | "runtime" | string;
 export type GraphKind = "reasoning" | "operation" | "task";
-export type ViewKey = "trace" | "reports" | GraphKind | "traffic" | "connections" | "skills" | "approvals";
+export type ViewKey = "trace" | "reports" | GraphKind | "traffic" | "connections" | "skills" | "mcp" | "approvals";
 
 export interface AuthUser {
   id: string;
@@ -74,6 +74,44 @@ export interface SkillRegistrySnapshot {
   scannedAt: string;
   skills: RegisteredSkill[];
   diagnostics: SkillRegistryDiagnostic[];
+}
+
+export interface RegisteredMcpServer {
+  name: string;
+  description: string;
+  tools: string[];
+  configured: boolean;
+  enabled: boolean;
+}
+
+export interface McpRegistryDiagnostic {
+  code: string;
+  message: string;
+  serverName?: string;
+}
+
+export interface McpRegistrySnapshot {
+  scannedAt: string;
+  servers: RegisteredMcpServer[];
+  diagnostics: McpRegistryDiagnostic[];
+}
+
+export interface EnvConfigEntry {
+  key: string;
+  sensitive: boolean;
+  value?: string;
+  preview?: string;
+}
+
+export interface EnvConfigView {
+  path: string;
+  entries: EnvConfigEntry[];
+  updatedAt: string | null;
+}
+
+export interface EnvConfigChanges {
+  set: Record<string, string>;
+  remove: string[];
 }
 
 export interface GraphNode {

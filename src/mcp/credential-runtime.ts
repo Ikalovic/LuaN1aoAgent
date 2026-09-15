@@ -4,7 +4,7 @@ import { StdioClientTransport } from "@modelcontextprotocol/client/stdio";
 import type { ExecutionLog } from "../stores/execution-log.js";
 import type { CredentialToolName } from "./credential-server.js";
 
-const EXPECTED_TOOLS: CredentialToolName[] = [
+export const EXPECTED_CREDENTIAL_TOOLS: CredentialToolName[] = [
   "credential_query",
   "credential_read",
   "credential_store",
@@ -124,7 +124,7 @@ export class CredentialMcpRuntime {
     try {
       const listed = await connection.listTools();
       const names = listed.tools.map((tool) => tool.name).sort();
-      if (JSON.stringify(names) !== JSON.stringify([...EXPECTED_TOOLS].sort())) {
+      if (JSON.stringify(names) !== JSON.stringify([...EXPECTED_CREDENTIAL_TOOLS].sort())) {
         throw new Error("Credential MCP exposed an unexpected tool set");
       }
       this.client = connection;

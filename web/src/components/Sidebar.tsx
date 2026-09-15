@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { Badge, Button, Empty, Menu, Tooltip } from "antd";
-import { Activity, BrainCircuit, Cable, ChevronRight, FileText, Folder, FolderOpen, GitBranch, ListTree, Network, PanelLeftClose, Play, ShieldAlert, Wrench } from "lucide-react";
+import { Activity, BrainCircuit, Cable, ChevronRight, FileText, Folder, FolderOpen, GitBranch, ListTree, Network, PanelLeftClose, Play, Plug, ShieldAlert, Wrench } from "lucide-react";
 import { useLanguage } from "../language";
 import { buildSessionTree, sessionRelativePath, type SessionFolderNode } from "../sessions";
 import type { AgentEvent, RuntimeSession, ViewKey } from "../types";
@@ -15,6 +15,8 @@ interface SidebarProps {
   onRuntimeChange: (runtimeDir: string) => void;
   onContinue?: (session: RuntimeSession) => void;
   onClose?: () => void;
+  onAgentSelect?: (role: string) => void;
+  selectedAgentRole?: string;
   canApprove?: boolean;
   pendingApprovalCount?: number;
 }
@@ -29,6 +31,7 @@ export function Sidebar(props: SidebarProps) {
     { key: "traffic", icon: <Network size={17} />, label: t("nav.traffic") },
     { key: "connections", icon: <Cable size={17} />, label: t("nav.connections") },
     { key: "skills", icon: <Wrench size={17} />, label: t("nav.skills") },
+    { key: "mcp", icon: <Plug size={17} />, label: t("nav.mcp") },
     { key: "reasoning", icon: <BrainCircuit size={17} />, label: t("nav.reasoning") },
     { key: "operation", icon: <GitBranch size={17} />, label: t("nav.operation") },
     { key: "task", icon: <ListTree size={17} />, label: t("nav.task") },
@@ -88,11 +91,17 @@ export function Sidebar(props: SidebarProps) {
         {["planner", "executor", "observer", "runtime"].map((role) => {
           const event = props.agents[role];
           const active = isRecent(event?.timestamp);
-          return <div className="agent-status" key={role}>
+          return <button
+            className={`agent-status${props.onAgentSelect ? " clickable" : ""}${props.selectedAgentRole === role ? " active" : ""}`}
+            key={role}
+            type="button"
+            onClick={() => props.onAgentSelect?.(role)}
+            aria-label={`${roleLabel(role)} · ${t("agent.viewDetail")}`}
+          >
             <Badge status={active ? "processing" : event ? "default" : "warning"} />
             <div><strong>{roleLabel(role)}</strong><span>{event ? shortRef(event.summary || event.eventType, 26) : t("sidebar.noEvents")}</span></div>
-            <time>{active ? t("common.active") : formatRelative(event?.timestamp)}</time>
-          </div>;
+            <span className="agent-status-tail"><time>{active ? t("common.active") : formatRelative(event?.timestamp)}</time>{props.onAgentSelect ? <ChevronRight size={13} /> : null}</span>
+          </button>;
         })}
       </section>
     </div>

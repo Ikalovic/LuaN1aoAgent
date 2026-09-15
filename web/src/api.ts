@@ -1,5 +1,5 @@
 import { translate } from "./language";
-import type { ActiveRunsResponse, ApprovalDecisionResponse, ApprovalMode, ApprovalModeUpdateResponse, ApprovalsResponse, ArtifactContent, AuthResponse, ConnectionItem, ConnectionsResponse, ParsedScopeDocument, RegisteredSkill, RuntimeState, SessionsResponse, SkillRegistrySnapshot, StartRunInput, StartRunResponse, StopRunResponse, TrafficExchange, TrafficFlowRef, TrafficHistoryBody, TrafficHistoryFilters, TrafficHistoryPage, TrafficReplayInput, TrafficReplayResponse } from "./types";
+import type { ActiveRunsResponse, ApprovalDecisionResponse, ApprovalMode, ApprovalModeUpdateResponse, ApprovalsResponse, ArtifactContent, AuthResponse, ConnectionItem, ConnectionsResponse, EnvConfigChanges, EnvConfigView, McpRegistrySnapshot, ParsedScopeDocument, RegisteredMcpServer, RegisteredSkill, RuntimeState, SessionsResponse, SkillRegistrySnapshot, StartRunInput, StartRunResponse, StopRunResponse, TrafficExchange, TrafficFlowRef, TrafficHistoryBody, TrafficHistoryFilters, TrafficHistoryPage, TrafficReplayInput, TrafficReplayResponse } from "./types";
 
 export class ApiError extends Error {
   constructor(message: string, readonly status: number, readonly code?: string) {
@@ -68,6 +68,30 @@ export function setSkillEnabled(name: string, enabled: boolean): Promise<Registe
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ enabled })
+  });
+}
+
+export function fetchMcpServers(signal?: AbortSignal): Promise<McpRegistrySnapshot> {
+  return requestJson("/api/mcp", { signal });
+}
+
+export function setMcpEnabled(name: string, enabled: boolean): Promise<RegisteredMcpServer> {
+  return requestJson(`/api/mcp/${encodeURIComponent(name)}/state`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ enabled })
+  });
+}
+
+export function fetchEnvConfig(signal?: AbortSignal): Promise<EnvConfigView> {
+  return requestJson("/api/env", { signal });
+}
+
+export function updateEnvConfig(changes: EnvConfigChanges): Promise<EnvConfigView> {
+  return requestJson("/api/env", {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(changes)
   });
 }
 

@@ -19,6 +19,8 @@ export default defineConfig({
   test: {
     environment: "jsdom",
     setupFiles: ["./src/test-setup.ts"],
-    include: ["src/**/*.test.{ts,tsx}"]
+    include: ["src/**/*.test.{ts,tsx}"],
+    // antd-heavy interaction tests exceed the 5s default when the full suite runs in parallel.
+    testTimeout: 15000
   }
 });

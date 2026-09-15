@@ -41,6 +41,7 @@ test("admin has all capabilities while analyst cannot perform admin operations",
     "operator:mutate",
     "admin:credential",
     "admin:delete",
+    "admin:env",
     "admin:export"
   ] as const) {
     assert.equal(hasCapability(admin, capability), true);
@@ -50,7 +51,7 @@ test("admin has all capabilities while analyst cannot perform admin operations",
   assert.equal(hasCapability(analyst, "operator:mutate"), true);
   assert.equal(hasCapability(analyst, "connectivity:manage"), false);
   assert.throws(() => requireCapability(analyst, "connectivity:manage"), securityCode("authorization_forbidden"));
-  for (const capability of ["admin:credential", "admin:delete", "admin:export"] as const) {
+  for (const capability of ["admin:credential", "admin:delete", "admin:env", "admin:export"] as const) {
     assert.equal(hasCapability(analyst, capability), false);
     assert.throws(() => requireCapability(analyst, capability), securityCode("authorization_forbidden"));
   }

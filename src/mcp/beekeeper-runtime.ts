@@ -4,7 +4,7 @@ import { beekeeperChildEnvironment, type BeekeeperConfig } from "../beekeeper/be
 import type { BeekeeperToolName, BeekeeperToolResult } from "../beekeeper/beekeeper-types.js";
 import type { ExecutionLog } from "../stores/execution-log.js";
 
-const EXPECTED_TOOLS: BeekeeperToolName[] = [
+export const EXPECTED_BEEKEEPER_TOOLS: BeekeeperToolName[] = [
   "query_credentials",
   "store_credential",
   "mark_credential_invalid"
@@ -110,7 +110,7 @@ export class BeekeeperMcpRuntime {
     try {
       const listed = await connection.listTools();
       const names = listed.tools.map((tool) => tool.name).sort();
-      if (JSON.stringify(names) !== JSON.stringify([...EXPECTED_TOOLS].sort())) {
+      if (JSON.stringify(names) !== JSON.stringify([...EXPECTED_BEEKEEPER_TOOLS].sort())) {
         throw new Error("Beekeeper MCP exposed an unexpected tool set");
       }
       this.client = connection;

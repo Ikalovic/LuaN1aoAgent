@@ -461,7 +461,7 @@ function ToolRun({ item }: { item: TraceItem }) {
   );
 }
 
-function localizeTracePresentation(value: string | undefined, locale: Locale): string | undefined {
+export function localizeTracePresentation(value: string | undefined, locale: Locale): string | undefined {
   if (!value || locale === "zh-CN") return value;
   const exact: Record<string, string> = {
     "执行动作": "Execution action",

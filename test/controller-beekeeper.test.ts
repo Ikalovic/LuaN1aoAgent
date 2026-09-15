@@ -33,6 +33,7 @@ test("Controller starts Beekeeper MCP and injects unrestricted credential tools"
     return fake as never;
   });
   const harness = controller as unknown as ControllerBeekeeperHarness;
+  await controller.initialize();
 
   assert.deepEqual(
     harness.createTaskRuntimeTools(taskEnvelope()).map((tool) => tool.name).filter((name) => name.includes("credential")).sort(),
@@ -72,6 +73,7 @@ test("Controller reports Beekeeper disabled or malformed without losing normal t
       return fakeRuntime() as never;
     });
     const harness = controller as unknown as ControllerBeekeeperHarness;
+    await controller.initialize();
     await harness.configureBeekeeperRuntime();
     const names = harness.createTaskRuntimeTools(taskEnvelope()).map((tool) => tool.name);
     assert.ok(names.includes("evidence_list"));
@@ -104,10 +106,48 @@ test("Controller requestStop closes Beekeeper MCP", async () => {
   await controller.close({ drainProjectionJobs: false });
 });
 
+test("Controller honors operator-disabled Beekeeper without starting the runtime", async () => {
+  const runtimeDir = mkdtempSync(join(tmpdir(), "controller-beekeeper-operator-disabled-"));
+  let factoryCalls = 0;
+  const controller = createController(runtimeDir, {
+    BEEKEEPER_MCP_ENABLED: "1",
+    BEEKEEPER_ROOT: resolve("vendor/Beekeeper"),
+    BEEKEEPER_MCP_PYTHON: resolve(".beekeeper-mcp-venv/bin/python")
+  }, () => {
+    factoryCalls += 1;
+    return fakeRuntime() as never;
+  }, { isEnabled: (name) => name !== "beekeeper" });
+  const harness = controller as unknown as ControllerBeekeeperHarness;
+
+  await harness.configureBeekeeperRuntime();
+
+  assert.equal(factoryCalls, 0);
+  const names = harness.createTaskRuntimeTools(taskEnvelope()).map((tool) => tool.name);
+  assert.ok(!names.includes("query_credentials"));
+  assert.ok(!names.includes("store_credential"));
+  const events = (await controller.executionLog.window({ limit: 20 })).events;
+  assert.ok(events.some((event) => event.eventType === "beekeeper_mcp_disabled" && String(event.summary).includes("operator")));
+  await controller.close({ drainProjectionJobs: false });
+});
+
+test("Controller skips credential MCP when disabled by operator", async () => {
+  const runtimeDir = mkdtempSync(join(tmpdir(), "controller-credential-operator-disabled-"));
+  const controller = createController(runtimeDir, {}, () => fakeRuntime() as never, { isEnabled: () => false });
+  await controller.initialize();
+  const harness = controller as unknown as ControllerBeekeeperHarness;
+
+  const names = harness.createTaskRuntimeTools(taskEnvelope()).map((tool) => tool.name);
+  assert.ok(!names.includes("credential_query"));
+  const events = (await controller.executionLog.window({ limit: 40 })).events;
+  assert.ok(events.some((event) => event.eventType === "credential_mcp_disabled"));
+  await controller.close({ drainProjectionJobs: false });
+});
+
 function createController(
   runtimeDir: string,
   environment: NodeJS.ProcessEnv,
-  factory: (input: BeekeeperMcpRuntimeOptions) => never
+  factory: (input: BeekeeperMcpRuntimeOptions) => never,
+  mcpRegistry: { isEnabled(name: string): boolean } = { isEnabled: () => true }
 ): SecurityAgentController {
   const previous = {
     LLM_API_BASE_URL: process.env.LLM_API_BASE_URL,
@@ -123,7 +163,8 @@ function createController(
       runtimeDir,
       executorSandboxMode: "workspace",
       environment,
-      beekeeperRuntimeFactory: factory
+      beekeeperRuntimeFactory: factory,
+      mcpRegistry
     });
   } finally {
     restore("LLM_API_BASE_URL", previous.LLM_API_BASE_URL);

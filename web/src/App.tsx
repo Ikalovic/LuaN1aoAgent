@@ -2,6 +2,7 @@ import { lazy, Suspense, useEffect, useMemo, useState } from "react";
 import { Alert, Avatar, Badge, Button, Drawer, Dropdown, Input, Popconfirm, Skeleton, Spin, Statistic, Switch, Tag, Tooltip, Typography } from "antd";
 import { Activity, ChevronDown, Database, FileBox, LogOut, Menu, PanelRight, Play, RefreshCw, Share2, Square } from "lucide-react";
 import { stopRun, fetchApprovals } from "./api";
+import { AgentDetailDrawer } from "./components/AgentDetailDrawer";
 import { Inspector } from "./components/Inspector";
 import { ConnectionsView } from "./components/ConnectionsView";
 import { ApprovalsView } from "./components/ApprovalsView";
@@ -9,6 +10,7 @@ import { ArtifactsView } from "./components/ArtifactsView";
 import { ResizableWorkspace } from "./components/ResizableWorkspace";
 import { Sidebar } from "./components/Sidebar";
 import { SkillsView } from "./components/SkillsView";
+import { McpView } from "./components/McpView";
 import { StartRunModal } from "./components/StartRunModal";
 import { TraceView } from "./components/TraceView";
 import { TrafficInspector } from "./components/TrafficInspector";
@@ -38,6 +40,7 @@ export default function App({ user, onLogout }: { user: AuthUser; onLogout: () =
   const [newestFirst, setNewestFirst] = useState(false);
   const [mobileSidebarOpen, setMobileSidebarOpen] = useState(false);
   const [mobileInspectorOpen, setMobileInspectorOpen] = useState(false);
+  const [agentDetailRole, setAgentDetailRole] = useState<string>();
   const [startRunOpen, setStartRunOpen] = useState(false);
   const [continueTarget, setContinueTarget] = useState<RuntimeSession>();
   const [stopping, setStopping] = useState(false);
@@ -78,7 +81,7 @@ export default function App({ user, onLogout }: { user: AuthUser; onLogout: () =
   }, [data?.traceItems, selectedTraceId]);
 
   useEffect(() => {
-    if (activeView === "trace" || activeView === "reports" || activeView === "traffic" || activeView === "connections" || activeView === "skills" || activeView === "approvals") setSelectedNodeId(undefined);
+    if (activeView === "trace" || activeView === "reports" || activeView === "traffic" || activeView === "connections" || activeView === "skills" || activeView === "mcp" || activeView === "approvals") setSelectedNodeId(undefined);
     if (activeView !== "traffic") {
       setSelectedExchangeId(undefined);
       setSelectedExchange(undefined);
@@ -155,6 +158,8 @@ export default function App({ user, onLogout }: { user: AuthUser; onLogout: () =
       onRuntimeChange={(value) => { setRuntimeDraft(value); applyRuntime(value); }}
       onContinue={setContinueTarget}
       onClose={mobileSidebarOpen ? () => setMobileSidebarOpen(false) : undefined}
+      onAgentSelect={(role) => { setAgentDetailRole(role); setMobileSidebarOpen(false); }}
+      selectedAgentRole={agentDetailRole}
       canApprove={isAdmin}
       pendingApprovalCount={approvalPendingCount}
     />
@@ -163,6 +168,11 @@ export default function App({ user, onLogout }: { user: AuthUser; onLogout: () =
     <div className="skills-inspector">
       <Typography.Title level={5}>{t("skills.inspectorTitle")}</Typography.Title>
       <p>{t("skills.inspectorDescription")}</p>
+    </div>
+  ) : activeView === "mcp" ? (
+    <div className="mcp-inspector">
+      <Typography.Title level={5}>{t("mcp.inspectorTitle")}</Typography.Title>
+      <p>{t("mcp.inspectorDescription")}</p>
     </div>
   ) : activeView === "traffic" ? (
     <TrafficInspector
@@ -205,7 +215,7 @@ export default function App({ user, onLogout }: { user: AuthUser; onLogout: () =
     />
   );
 
-  const viewEyebrow = activeView === "trace" ? "LIVE TRACE" : activeView === "reports" ? "RUN OUTPUT" : activeView === "traffic" ? "WEB TRAFFIC" : activeView === "connections" ? "CONNECTIVITY" : activeView === "skills" ? "SKILL REGISTRY" : activeView === "approvals" ? "APPROVALS" : "TRI-GRAPH";
+  const viewEyebrow = activeView === "trace" ? "LIVE TRACE" : activeView === "reports" ? "RUN OUTPUT" : activeView === "traffic" ? "WEB TRAFFIC" : activeView === "connections" ? "CONNECTIVITY" : activeView === "skills" ? "SKILL REGISTRY" : activeView === "mcp" ? "MCP SERVERS" : activeView === "approvals" ? "APPROVALS" : "TRI-GRAPH";
 
   return (
     <>
@@ -299,6 +309,8 @@ export default function App({ user, onLogout }: { user: AuthUser; onLogout: () =
                 <ApprovalsView user={user} onPendingChange={setApprovalPendingCount} />
               ) : activeView === "skills" ? (
                 <SkillsView user={user} />
+              ) : activeView === "mcp" ? (
+                <McpView user={user} />
               ) : activeView === "connections" ? (
                 <ConnectionsView runtimeDir={runtimeDir} user={user} />
               ) : activeView === "traffic" ? (
@@ -357,6 +369,21 @@ export default function App({ user, onLogout }: { user: AuthUser; onLogout: () =
 
       <Drawer placement="left" width={286} open={mobileSidebarOpen} onClose={() => setMobileSidebarOpen(false)} closable={false} styles={{ body: { padding: 0 } }}>{sidebar}</Drawer>
       <Drawer placement="right" width={380} open={mobileInspectorOpen} onClose={() => setMobileInspectorOpen(false)} title={t("app.inspectorDrawer")}>{inspector}</Drawer>
+      <AgentDetailDrawer
+        open={Boolean(agentDetailRole)}
+        role={agentDetailRole}
+        agent={agentDetailRole ? data?.overview.agents[agentDetailRole] : undefined}
+        eventCount={agentDetailRole ? data?.overview.events.byRole[agentDetailRole] ?? 0 : 0}
+        traceItems={data?.traceItems || []}
+        onClose={() => setAgentDetailRole(undefined)}
+        onSelectTrace={(traceId) => {
+          const target = data?.traceItems.find((item) => item.id === traceId);
+          setAgentDetailRole(undefined);
+          setSelectedTraceId(traceId);
+          if (target) setRoleFilter(target.role === "runtime" ? "all" : target.role);
+          setView("trace");
+        }}
+      />
       <StartRunModal
         open={startRunOpen || Boolean(continueTarget)}
         continueFrom={continueTarget ? {
@@ -408,6 +435,7 @@ function viewTitle(view: ViewKey, locale: Locale, t: Translate): string {
   if (view === "traffic") return "Web Traffic";
   if (view === "connections") return "Connections";
   if (view === "skills") return t("nav.skills");
+  if (view === "mcp") return t("nav.mcp");
   if (view === "approvals") return t("nav.approvals");
   return graphLabel(view, locale);
 }
@@ -418,6 +446,7 @@ function viewStageTitle(view: ViewKey, locale: Locale, t: Translate): string {
   if (view === "traffic") return t("app.trafficStageTitle");
   if (view === "connections") return t("app.connectionsStageTitle");
   if (view === "skills") return t("app.skillsStageTitle");
+  if (view === "mcp") return t("app.mcpStageTitle");
   if (view === "approvals") return t("app.approvalsStageTitle");
   return graphLabel(view, locale);
 }
@@ -428,6 +457,7 @@ function viewStageSubtitle(view: ViewKey, t: Translate): string {
   if (view === "traffic") return t("app.trafficStageSubtitle");
   if (view === "connections") return t("app.connectionsStageSubtitle");
   if (view === "skills") return t("app.skillsStageSubtitle");
+  if (view === "mcp") return t("app.mcpStageSubtitle");
   if (view === "approvals") return t("app.approvalsStageSubtitle");
   if (view === "reasoning") return t("graph.reasoningSubtitle");
   if (view === "operation") return t("graph.operationSubtitle");
@@ -438,7 +468,7 @@ function readInitialState(): { runtimeDir: string; view: ViewKey } {
   const params = new URLSearchParams(window.location.search);
   const runtimeDir = params.get("runtimeDir") || localStorage.getItem("luanniao-runtime-dir") || DEFAULT_RUNTIME;
   const candidate = params.get("view");
-  const view = candidate && ["trace", "reports", "reasoning", "operation", "task", "traffic", "connections", "skills", "approvals"].includes(candidate) ? candidate as ViewKey : "trace";
+  const view = candidate && ["trace", "reports", "reasoning", "operation", "task", "traffic", "connections", "skills", "mcp", "approvals"].includes(candidate) ? candidate as ViewKey : "trace";
   return { runtimeDir, view };
 }
 
