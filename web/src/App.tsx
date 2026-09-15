@@ -10,6 +10,7 @@ import { ArtifactsView } from "./components/ArtifactsView";
 import { SkillsView } from "./components/SkillsView";
 import { McpView } from "./components/McpView";
 import { CredentialsView } from "./components/CredentialsView";
+import { EnvConfigEditor } from "./components/EnvConfigEditor";
 import { StartRunModal } from "./components/StartRunModal";
 import { TraceView } from "./components/TraceView";
 import { TrafficInspector } from "./components/TrafficInspector";
@@ -35,7 +36,12 @@ export default function App({ user, onLogout, onHome }: { user: AuthUser; onLogo
   const zh = locale === "zh-CN";
   const { mode, toggleTheme } = useTheme();
   const dirty = useRef(false);
-  const allowLeave = useCallback(() => !dirty.current || window.confirm(zh ? "放弃未提交的重放修改？" : "Discard unsent replay changes?"), [zh]);
+  const envDirty = useRef(false);
+  const onEnvDirtyChange = useCallback((value: boolean) => { envDirty.current = value; }, []);
+  const allowLeave = useCallback(() => {
+    if (envDirty.current) return window.confirm(t("env.unsavedConfirm"));
+    return !dirty.current || window.confirm(zh ? "放弃未提交的重放修改？" : "Discard unsent replay changes?");
+  }, [zh, t]);
   const { state: navigation, navigate } = useWorkbenchNavigation(allowLeave);
   const { runtimeDir, view: activeView, nodeId: selectedNodeId, traceId: selectedTraceId, exchangeId: selectedExchangeId } = navigation;
   const [selectedExchange, setSelectedExchange] = useState<TrafficExchange>();
@@ -51,7 +57,7 @@ export default function App({ user, onLogout, onHome }: { user: AuthUser; onLogo
   const [approvalPendingCount, setApprovalPendingCount] = useState(0);
   const [approvalSnapshot, setApprovalSnapshot] = useState<PendingApproval[]>();
   const isAdmin = user.role === "admin";
-  const globalView = ["skills", "mcp", "approvals"].includes(activeView);
+  const globalView = ["skills", "mcp", "env", "approvals"].includes(activeView);
   const dashboard = useRuntimeDashboard(runtimeDir);
   const dataMatchesDir = dashboard.loadedRuntimeDir !== undefined && normalizeDir(dashboard.loadedRuntimeDir) === normalizeDir(runtimeDir);
   const data = dataMatchesDir ? dashboard.data : undefined;
@@ -119,6 +125,7 @@ export default function App({ user, onLogout, onHome }: { user: AuthUser; onLogo
   if (activeView === "approvals") content = isAdmin ? <ApprovalsView user={user} onPendingChange={setApprovalPendingCount} /> : <Alert type="warning" title={zh ? "需要管理员权限" : "Administrator access required"} action={<Button onClick={() => navigate({ view: "overview" })}>{zh ? "返回总览" : "Back to overview"}</Button>} />;
   else if (activeView === "skills") content = <SkillsView user={user} />;
   else if (activeView === "mcp") content = <McpView user={user} />;
+  else if (activeView === "env") content = isAdmin ? <EnvConfigEditor onDirtyChange={onEnvDirtyChange} /> : <Alert type="warning" title={zh ? "需要管理员权限" : "Administrator access required"} action={<Button onClick={() => navigate({ view: "overview" })}>{zh ? "返回总览" : "Back to overview"}</Button>} />;
   else if (activeView === "credentials") content = isAdmin ? <CredentialsView key={runtimeDir} runtimeDir={runtimeDir} /> : <Alert type="warning" title={zh ? "需要管理员权限" : "Administrator access required"} action={<Button onClick={() => navigate({ view: "overview" })}>{zh ? "返回总览" : "Back to overview"}</Button>} />;
   else if (activeView === "connections") content = <ConnectionsView runtimeDir={runtimeDir} user={user} />;
   else if (activeView === "traffic") content = <TrafficView key={runtimeDir} runtimeDir={runtimeDir} {...trafficTime} taskId={navigation.taskId} selectedExchangeId={selectedExchangeId} refreshToken={trafficRefreshToken} onSelectExchange={selectExchange} onExchangeLoaded={onExchangeLoaded} />;
@@ -127,7 +134,7 @@ export default function App({ user, onLogout, onHome }: { user: AuthUser; onLogo
   else if (activeView === "reports") content = <ArtifactsView runtimeDir={runtimeDir} taskId={navigation.taskId} artifacts={data?.artifacts.records ?? []} taskOutcomes={data?.reports?.taskOutcomes ?? []} epochOutcomes={data?.reports?.epochOutcomes ?? []} latestTaskOutcome={data?.reports?.latestTaskOutcome} finalResult={data?.reports?.finalResult} finalReport={data?.reports?.finalReport} tasks={data?.overview.tasks.items ?? []} />;
   else if (activeView === "trace") content = <TraceView items={traceItems} planningCheckpoints={data?.reports?.planningRounds ?? []} taskOutcomes={data?.reports?.taskOutcomes ?? []} epochOutcomes={data?.reports?.epochOutcomes ?? []} tasks={data?.overview.tasks.items ?? []} selectedTraceId={selectedTraceId} roleFilter={roleFilter} newestFirst={newestFirst} onRoleFilterChange={(role) => navigate({ role }, "replace")} onOrderChange={() => setNewestFirst((value) => !value)} onSelectTrace={(traceId) => navigate({ traceId }, "replace")} />;
   else content = <Suspense fallback={<Skeleton active />}><GraphView onClearFilters={() => navigate({ taskStatus: undefined, nodeType: undefined }, "replace")} runtimeDir={runtimeDir} kind={activeView as GraphKind} nodes={navigation.taskStatus && activeView === "task" ? situation.nodes.filter((node) => node.type !== "Task" || (TASK_STATUSES.includes(node.properties.status as typeof TASK_STATUSES[number]) ? node.properties.status : "unknown") === navigation.taskStatus) : situation.nodes} edges={situation.edges} nodeType={navigation.nodeType} selectedNodeId={selectedNodeId ?? navigation.taskId} linkedNodeIds={selectedTrace?.graphNodeRefs ?? []} onSelectNode={selectNode} /></Suspense>;
-  return <><WorkbenchShell view={activeView} onHome={onHome ? () => { if (allowLeave()) onHome(); } : undefined} wallboardUrl={navigationUrl({ runtimeDir, view: "wallboard" })} onViewChange={(view) => navigate({ view })} canApprove={isAdmin} canManageCredentials={isAdmin} pendingCount={approvalPendingCount} toolbar={toolbar} inspector={inspector} onCloseInspector={closeInspector}>
+  return <><WorkbenchShell view={activeView} onHome={onHome ? () => { if (allowLeave()) onHome(); } : undefined} wallboardUrl={navigationUrl({ runtimeDir, view: "wallboard" })} onViewChange={(view) => navigate({ view })} canApprove={isAdmin} canManageCredentials={isAdmin} canManageEnvironment={isAdmin} pendingCount={approvalPendingCount} toolbar={toolbar} inspector={inspector} onCloseInspector={closeInspector}>
     {!globalView && dashboard.error ? <Alert type="error" showIcon title={dashboard.error} /> : null}
     {actionError ? <Alert closable type="error" showIcon title={actionError} onClose={() => setActionError(undefined)} /> : null}
     {!globalView ? <section className="qx-run-context"><div><strong>{data?.overview.goal?.label || (initializing ? t("app.initializingGoal") : t("app.waitingRuntime"))}</strong>{data?.overview.scope ? <details><summary>{zh ? "范围与上下文" : "Scope & context"}</summary><p>{String(data.overview.scope.summary || data.overview.scope.label)}</p></details> : null}</div><span>{stopAccepted ? (zh ? "正在停止" : "Stopping") : runningNow ? t("app.running") : ""}{dashboard.delayed ? (zh ? " · 数据延迟" : " · Delayed") : ""}{data?.loadedAt ? " · " + formatDate(data.loadedAt) : ""}</span></section> : null}

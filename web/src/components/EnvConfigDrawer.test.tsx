@@ -124,5 +124,49 @@ describe("EnvConfigDrawer", () => {
     fireEvent.click(screen.getByRole("button", { name: "保存更改" }));
 
     expect(await screen.findByText("write denied")).toBeInTheDocument();
+    expect(screen.getByText("待删除")).toBeInTheDocument();
+  });
+
+  it("keeps a staged sensitive edit masked", async () => {
+    render(<EnvConfigDrawer open onClose={() => {}} />);
+    await screen.findByText("LLM_API_KEY");
+    fireEvent.click(screen.getAllByRole("button", { name: /编\s*辑/ })[0]);
+    const input = screen.getByPlaceholderText("输入新值");
+    expect(input).toHaveAttribute("type", "password");
+    expect(input).toHaveValue("");
+    fireEvent.change(input, { target: { value: "replacement-secret" } });
+    fireEvent.click(screen.getByRole("button", { name: /应\s*用/ }));
+    expect(screen.queryByText("replacement-secret")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "保存更改" }));
+    await waitFor(() => expect(mockedUpdate).toHaveBeenCalledWith({ set: { LLM_API_KEY: "replacement-secret" }, remove: [] }));
+  });
+
+  it("discards unsubmitted input and masks new variables", async () => {
+    render(<EnvConfigDrawer open onClose={() => {}} />);
+    await screen.findByText("LLM_API_KEY");
+    const key = screen.getByPlaceholderText("变量名，如 FOFA_API_KEY");
+    const value = screen.getByPlaceholderText("变量值");
+    fireEvent.change(key, { target: { value: "NEW_TOKEN" } });
+    fireEvent.change(value, { target: { value: "new-secret" } });
+    expect(value).toHaveAttribute("type", "password");
+    expect(screen.getByRole("button", { name: "放弃更改" })).toBeEnabled();
+    fireEvent.click(screen.getByRole("button", { name: "放弃更改" }));
+    expect(key).toHaveValue("");
+    expect(value).toHaveValue("");
+    fireEvent.change(key, { target: { value: "NEW_TOKEN" } });
+    fireEvent.change(value, { target: { value: "new-secret" } });
+    fireEvent.click(screen.getByRole("button", { name: /添\s*加/ }));
+    expect(screen.queryByText("new-secret")).not.toBeInTheDocument();
+  });
+
+  it("filters by variable name without changing the staged batch", async () => {
+    render(<EnvConfigDrawer open onClose={() => {}} />);
+    await screen.findByText("LLM_API_KEY");
+    fireEvent.click(screen.getAllByRole("button", { name: /删\s*除/ })[0]);
+    fireEvent.change(screen.getByPlaceholderText("搜索变量名"), { target: { value: "fofa" } });
+    expect(screen.queryByText("LLM_API_KEY")).not.toBeInTheDocument();
+    expect(screen.getByText("FOFA_EMAIL")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "保存更改" }));
+    await waitFor(() => expect(mockedUpdate).toHaveBeenCalledWith({ set: {}, remove: ["LLM_API_KEY"] }));
   });
 });

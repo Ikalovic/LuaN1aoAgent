@@ -7,7 +7,7 @@ export interface NavigationState {
   nodeType?: string; findingType?: string; taskStatus?: string; role?: string;
   wallGraph?: string; wallSize?: string;
 }
-export const VIEWS = ["overview", "operation", "trace", "task", "findings", "reasoning", "traffic", "connections", "reports", "skills", "mcp", "credentials", "approvals", "wallboard"] as const;
+export const VIEWS = ["overview", "operation", "trace", "task", "findings", "reasoning", "traffic", "connections", "reports", "skills", "mcp", "env", "credentials", "approvals", "wallboard"] as const;
 const entities = ["nodeId", "traceId", "taskId", "exchangeId"] as const;
 const enums = {
   wallGraph: ["operation", "reasoning", "task"],

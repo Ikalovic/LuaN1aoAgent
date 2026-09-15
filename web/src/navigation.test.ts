@@ -13,6 +13,11 @@ describe("workbench navigation", () => {
     expect(navigationUrl(state)).not.toMatch(/query|secret|evil/);
     expect(state.from).toBe("2026-09-15T00:00:00.000Z");
   });
+  it("preserves the environment management route", () => {
+    const state = parseNavigation("?view=env", () => null);
+    expect(state.view).toBe("env");
+    expect(navigationUrl(state)).toContain("view=env");
+  });
   it("clears entity state immediately when switching runtime", () => {
     const state = parseNavigation("?runtimeDir=A&view=traffic&exchangeId=opaque&taskId=T", () => null);
     const next = transitionNavigation(state, { runtimeDir: "B" });
