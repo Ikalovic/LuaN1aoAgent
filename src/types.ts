@@ -490,7 +490,7 @@ export interface CredentialAccessLogRecord {
   id: string;
   credentialRef: string;
   taskId?: string;
-  action: "read" | "use" | "inject" | "invalidate" | "store";
+  action: "read" | "use" | "inject" | "invalidate" | "store" | "delete";
   actor: string;
   details?: string;
   createdAt: string;

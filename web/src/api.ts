@@ -1,5 +1,5 @@
 import { translate } from "./language";
-import type { ActiveRunsResponse, ApprovalDecisionResponse, ApprovalMode, ApprovalModeUpdateResponse, ApprovalsResponse, ArtifactContent, AuthResponse, ConnectionItem, ConnectionsResponse, EnvConfigChanges, EnvConfigView, McpRegistrySnapshot, ParsedScopeDocument, RegisteredMcpServer, RegisteredSkill, RuntimeState, SessionsResponse, SkillRegistrySnapshot, StartRunInput, StartRunResponse, StopRunResponse, TrafficExchange, TrafficFlowRef, TrafficHistoryBody, TrafficHistoryFilters, TrafficHistoryPage, TrafficReplayInput, TrafficReplayResponse } from "./types";
+import type { ActiveRunsResponse, ApprovalDecisionResponse, ApprovalMode, ApprovalModeUpdateResponse, ApprovalsResponse, ArtifactContent, AuthResponse, ConnectionItem, ConnectionsResponse, CredentialCreateInput, CredentialRecord, CredentialsResponse, EnvConfigChanges, EnvConfigView, McpRegistrySnapshot, ParsedScopeDocument, RegisteredMcpServer, RegisteredSkill, RuntimeState, SessionsResponse, SkillRegistrySnapshot, StartRunInput, StartRunResponse, StopRunResponse, TrafficExchange, TrafficFlowRef, TrafficHistoryBody, TrafficHistoryFilters, TrafficHistoryPage, TrafficReplayInput, TrafficReplayResponse } from "./types";
 
 export class ApiError extends Error {
   constructor(message: string, readonly status: number, readonly code?: string) {
@@ -73,6 +73,39 @@ export function setSkillEnabled(name: string, enabled: boolean): Promise<Registe
 
 export function fetchMcpServers(signal?: AbortSignal): Promise<McpRegistrySnapshot> {
   return requestJson("/api/mcp", { signal });
+}
+
+export function fetchCredentials(runtimeDir: string, signal?: AbortSignal): Promise<CredentialsResponse> {
+  return requestJson(`/api/credentials?runtimeDir=${encodeURIComponent(runtimeDir)}`, { signal });
+}
+
+export function createCredential(runtimeDir: string, input: CredentialCreateInput): Promise<{ ok: boolean; record: CredentialRecord }> {
+  return requestJson(`/api/credentials?runtimeDir=${encodeURIComponent(runtimeDir)}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(input)
+  });
+}
+
+export function invalidateCredential(runtimeDir: string, artifactRef: string): Promise<{ ok: boolean }> {
+  return requestJson(`/api/credentials/${encodeURIComponent(artifactRef)}/invalidate?runtimeDir=${encodeURIComponent(runtimeDir)}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" }
+  });
+}
+
+export function revealCredential(runtimeDir: string, artifactRef: string): Promise<{ ok: boolean; value: string }> {
+  return requestJson(`/api/credentials/${encodeURIComponent(artifactRef)}/reveal?runtimeDir=${encodeURIComponent(runtimeDir)}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" }
+  });
+}
+
+export function deleteCredential(runtimeDir: string, artifactRef: string): Promise<{ ok: boolean }> {
+  return requestJson(`/api/credentials/${encodeURIComponent(artifactRef)}?runtimeDir=${encodeURIComponent(runtimeDir)}`, {
+    method: "DELETE",
+    headers: { "Content-Type": "application/json" }
+  });
 }
 
 export function setMcpEnabled(name: string, enabled: boolean): Promise<RegisteredMcpServer> {

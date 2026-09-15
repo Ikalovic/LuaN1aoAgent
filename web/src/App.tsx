@@ -11,6 +11,7 @@ import { ResizableWorkspace } from "./components/ResizableWorkspace";
 import { Sidebar } from "./components/Sidebar";
 import { SkillsView } from "./components/SkillsView";
 import { McpView } from "./components/McpView";
+import { CredentialsView } from "./components/CredentialsView";
 import { StartRunModal } from "./components/StartRunModal";
 import { TraceView } from "./components/TraceView";
 import { TrafficInspector } from "./components/TrafficInspector";
@@ -81,7 +82,7 @@ export default function App({ user, onLogout }: { user: AuthUser; onLogout: () =
   }, [data?.traceItems, selectedTraceId]);
 
   useEffect(() => {
-    if (activeView === "trace" || activeView === "reports" || activeView === "traffic" || activeView === "connections" || activeView === "skills" || activeView === "mcp" || activeView === "approvals") setSelectedNodeId(undefined);
+    if (activeView === "trace" || activeView === "reports" || activeView === "traffic" || activeView === "connections" || activeView === "skills" || activeView === "mcp" || activeView === "credentials" || activeView === "approvals") setSelectedNodeId(undefined);
     if (activeView !== "traffic") {
       setSelectedExchangeId(undefined);
       setSelectedExchange(undefined);
@@ -162,6 +163,7 @@ export default function App({ user, onLogout }: { user: AuthUser; onLogout: () =
       selectedAgentRole={agentDetailRole}
       canApprove={isAdmin}
       pendingApprovalCount={approvalPendingCount}
+      canManageCredentials={isAdmin}
     />
   );
   const inspector = activeView === "skills" ? (
@@ -173,6 +175,11 @@ export default function App({ user, onLogout }: { user: AuthUser; onLogout: () =
     <div className="mcp-inspector">
       <Typography.Title level={5}>{t("mcp.inspectorTitle")}</Typography.Title>
       <p>{t("mcp.inspectorDescription")}</p>
+    </div>
+  ) : activeView === "credentials" ? (
+    <div className="credentials-inspector">
+      <Typography.Title level={5}>{t("nav.credentials")}</Typography.Title>
+      <p>{t("credentials.description")}</p>
     </div>
   ) : activeView === "traffic" ? (
     <TrafficInspector
@@ -215,7 +222,7 @@ export default function App({ user, onLogout }: { user: AuthUser; onLogout: () =
     />
   );
 
-  const viewEyebrow = activeView === "trace" ? "LIVE TRACE" : activeView === "reports" ? "RUN OUTPUT" : activeView === "traffic" ? "WEB TRAFFIC" : activeView === "connections" ? "CONNECTIVITY" : activeView === "skills" ? "SKILL REGISTRY" : activeView === "mcp" ? "MCP SERVERS" : activeView === "approvals" ? "APPROVALS" : "TRI-GRAPH";
+  const viewEyebrow = activeView === "trace" ? "LIVE TRACE" : activeView === "reports" ? "RUN OUTPUT" : activeView === "traffic" ? "WEB TRAFFIC" : activeView === "connections" ? "CONNECTIVITY" : activeView === "skills" ? "SKILL REGISTRY" : activeView === "mcp" ? "MCP SERVERS" : activeView === "credentials" ? "CREDENTIALS" : activeView === "approvals" ? "APPROVALS" : "TRI-GRAPH";
 
   return (
     <>
@@ -311,6 +318,8 @@ export default function App({ user, onLogout }: { user: AuthUser; onLogout: () =
                 <SkillsView user={user} />
               ) : activeView === "mcp" ? (
                 <McpView user={user} />
+              ) : activeView === "credentials" ? (
+                <CredentialsView runtimeDir={runtimeDir} />
               ) : activeView === "connections" ? (
                 <ConnectionsView runtimeDir={runtimeDir} user={user} />
               ) : activeView === "traffic" ? (
@@ -436,6 +445,7 @@ function viewTitle(view: ViewKey, locale: Locale, t: Translate): string {
   if (view === "connections") return "Connections";
   if (view === "skills") return t("nav.skills");
   if (view === "mcp") return t("nav.mcp");
+  if (view === "credentials") return t("nav.credentials");
   if (view === "approvals") return t("nav.approvals");
   return graphLabel(view, locale);
 }
@@ -447,6 +457,7 @@ function viewStageTitle(view: ViewKey, locale: Locale, t: Translate): string {
   if (view === "connections") return t("app.connectionsStageTitle");
   if (view === "skills") return t("app.skillsStageTitle");
   if (view === "mcp") return t("app.mcpStageTitle");
+  if (view === "credentials") return t("app.credentialsStageTitle");
   if (view === "approvals") return t("app.approvalsStageTitle");
   return graphLabel(view, locale);
 }
@@ -458,6 +469,7 @@ function viewStageSubtitle(view: ViewKey, t: Translate): string {
   if (view === "connections") return t("app.connectionsStageSubtitle");
   if (view === "skills") return t("app.skillsStageSubtitle");
   if (view === "mcp") return t("app.mcpStageSubtitle");
+  if (view === "credentials") return t("app.credentialsStageSubtitle");
   if (view === "approvals") return t("app.approvalsStageSubtitle");
   if (view === "reasoning") return t("graph.reasoningSubtitle");
   if (view === "operation") return t("graph.operationSubtitle");
@@ -468,7 +480,7 @@ function readInitialState(): { runtimeDir: string; view: ViewKey } {
   const params = new URLSearchParams(window.location.search);
   const runtimeDir = params.get("runtimeDir") || localStorage.getItem("luanniao-runtime-dir") || DEFAULT_RUNTIME;
   const candidate = params.get("view");
-  const view = candidate && ["trace", "reports", "reasoning", "operation", "task", "traffic", "connections", "skills", "mcp", "approvals"].includes(candidate) ? candidate as ViewKey : "trace";
+  const view = candidate && ["trace", "reports", "reasoning", "operation", "task", "traffic", "connections", "skills", "mcp", "credentials", "approvals"].includes(candidate) ? candidate as ViewKey : "trace";
   return { runtimeDir, view };
 }
 
