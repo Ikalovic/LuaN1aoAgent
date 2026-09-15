@@ -360,3 +360,33 @@ test("rejects unknown or ambiguous non-Artifact basedOnRefs", async () => {
     referenceCandidates: () => ["projected:f6918853-a", "projected:f6918853-b"]
   }), /ambiguous, candidates:/);
 });
+
+test("keeps acceptPartialOutcomeReason only with status=completed and trims it", () => {
+  const decision = normalizePlannerDecision({
+    commands: [{
+      kind: "set_task_status",
+      taskId: "task:unreachable",
+      status: "completed",
+      acceptPartialOutcomeReason: "  范围内已无推进路径：认证入口统一 401，且无可控收件邮箱  ",
+      basedOnRefs: ["event:blocked"]
+    }],
+    reason: "Accept the partial conclusion as the Task's final result"
+  });
+
+  const command = decision.commands?.[0];
+  assert.equal(command?.kind, "set_task_status");
+  assert.equal(
+    command?.kind === "set_task_status" ? command.acceptPartialOutcomeReason : undefined,
+    "范围内已无推进路径：认证入口统一 401，且无可控收件邮箱"
+  );
+
+  assert.throws(() => normalizePlannerDecision({
+    commands: [{
+      kind: "set_task_status",
+      taskId: "task:unreachable",
+      status: "archived",
+      acceptPartialOutcomeReason: "not applicable to archival"
+    }],
+    reason: "Archive the obsolete Task instead"
+  }), /acceptPartialOutcomeReason is only valid with status=completed/);
+});

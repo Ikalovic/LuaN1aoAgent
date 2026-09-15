@@ -864,7 +864,7 @@ export class SecurityAgentController {
           ? "上一版 Planner 决策留下了不明确终态：Root Goal 仍为 open，commands 为空，并且当前没有 active、pending 或 runnable Task。请明确选择一种结果：用 set_node_status 将 goal:root 设置为 completed 或 blocked；或者创建、恢复能继续推进 Root Goal 的 Task。不得只在 reason 中声明目标已经完成。"
           : error instanceof PlannerDecisionConflict
           ? `上一版 Planner 决策因任务版本冲突被拒绝：${error.message}。请基于刷新后的任务状态重新规划。`
-          : `上一版 Planner 决策未修改任务图，因图语义校验失败被拒绝：${error.message}。请修正命令；若新证据来自当前 Task 的后继 Task，不要反转依赖，应创建同时依赖相关前驱的新后继 Task。`;
+          : `上一版 Planner 决策未修改任务图，因图语义校验失败被拒绝：${error.message}。请按该要求修正这一版 commands 后重新提交；不要重复提交同一组被拒命令。`;
         await this.executionLog.append({
           role: "runtime",
           eventType: error instanceof PlannerDecisionConflict
@@ -1702,6 +1702,9 @@ export class SecurityAgentController {
             kind: command.kind,
             taskId: command.taskId,
             status: command.status,
+            ...(command.acceptPartialOutcomeReason
+              ? { acceptPartialOutcomeReason: command.acceptPartialOutcomeReason }
+              : {}),
             expectedVersion: versionSnapshot[command.taskId],
             sourceEventIds: [plannerEventId],
             reason: commandReason
@@ -1881,12 +1884,20 @@ export class SecurityAgentController {
     for (const command of commands) {
       if (command.kind !== "set_task_status" || command.status !== "completed") continue;
       const outcome = this.runtimeStore.getTaskOutcome(command.taskId);
-      if (!this.taskOutcomeCompletesCurrentObjectives(command.taskId, outcome, commands)) {
-        throw new GraphValidationError(
-          `Task ${command.taskId} requires a completed TaskOutcome for its current objective definition `
-          + "before Planner can set completed"
-        );
-      }
+      if (this.taskOutcomeCompletesCurrentObjectives(command.taskId, outcome, commands)) continue;
+      if (this.acceptsPartialOutcomeForCompletion(command, outcome, commands)) continue;
+      throw new GraphValidationError(
+        `Task ${command.taskId} requires a completed TaskOutcome for its current objective definition `
+        + "before Planner can set completed"
+        + ` (current TaskOutcome status: ${outcome?.status ?? "missing"}`
+        + `${outcome?.objectiveRevision !== undefined ? `, objectiveRevision=${outcome.objectiveRevision}` : ""}). `
+        + "Resolve this in one of three ways: (1) patch_task with patch.additionalTurns to give the Executor more turns so it "
+        + "can submit a completed TaskOutcome; (2) when the causal goal genuinely changed, set_task_status with "
+        + "status=archived and create a genuinely distinct successor Task instead of reusing this one; (3) when every "
+        + "remaining success criterion is unreachable inside the authorized scope and the latest partial TaskOutcome already "
+        + "covers the Task's current objectives, repeat set_task_status with status=completed and acceptPartialOutcomeReason "
+        + "stating that conclusion and citing its persisted evidence."
+      );
     }
     const maxTurnsByTaskId = new Map<string, number>();
     for (const resolution of budgetPatchByCommandIndex.values()) {
@@ -1980,6 +1991,34 @@ export class SecurityAgentController {
     if (outcome?.status !== "completed") {
       return false;
     }
+    return this.taskOutcomeCoversCurrentObjectives(taskId, outcome, pendingCommands);
+  }
+
+  /**
+   * Closes a Task as completed while explicitly accepting its latest partial
+   * outcome. The Planner must justify the acceptance, and the outcome must still
+   * describe the Task's current objective definition, so a stale or failed
+   * conclusion can never be converted into a completed Task.
+   */
+  private acceptsPartialOutcomeForCompletion(
+    command: Extract<PlannerCommand, { kind: "set_task_status" }>,
+    outcome: TaskOutcome | undefined,
+    pendingCommands: PlannerCommand[]
+  ): boolean {
+    if (!command.acceptPartialOutcomeReason?.trim()) {
+      return false;
+    }
+    if (outcome?.status !== "partial") {
+      return false;
+    }
+    return this.taskOutcomeCoversCurrentObjectives(command.taskId, outcome, pendingCommands);
+  }
+
+  private taskOutcomeCoversCurrentObjectives(
+    taskId: string,
+    outcome: TaskOutcome | undefined,
+    pendingCommands: PlannerCommand[] = []
+  ): boolean {
     const task = this.graphStore.getTaskNode(taskId);
     if (!task) {
       return false;
@@ -1994,7 +2033,7 @@ export class SecurityAgentController {
     const currentRevision = typeof revision === "number" && Number.isFinite(revision) && revision >= 1
       ? Math.floor(revision)
       : 1;
-    if (outcome.objectiveRevision !== undefined) {
+    if (outcome?.objectiveRevision !== undefined) {
       return outcome.objectiveRevision === currentRevision;
     }
     return currentRevision === 1 && (task.properties.goalAdditions === undefined

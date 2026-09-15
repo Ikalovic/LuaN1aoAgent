@@ -160,13 +160,22 @@ function normalizePlannerCommand(value: unknown): PlannerCommand {
         dependencyTaskIds: stringArray(value.dependencyTaskIds).map(requireTaskId),
         basedOnRefs
       };
-    case "set_task_status":
+    case "set_task_status": {
+      const status = requireTaskStatus(value.status);
+      const acceptPartialOutcomeReason = nonEmptyString(value.acceptPartialOutcomeReason)?.trim();
+      if (acceptPartialOutcomeReason && status !== "completed") {
+        throw new PlannerProtocolError(
+          "acceptPartialOutcomeReason is only valid with status=completed"
+        );
+      }
       return {
         kind: "set_task_status",
         taskId: requireTaskId(value.taskId),
-        status: requireTaskStatus(value.status),
+        status,
+        ...(acceptPartialOutcomeReason ? { acceptPartialOutcomeReason } : {}),
         basedOnRefs
       };
+    }
     case "set_node_status":
       return {
         kind: "set_node_status",

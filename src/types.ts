@@ -225,6 +225,15 @@ export type PlannerCommand =
       kind: "set_task_status";
       taskId: string;
       status: TaskGraphStatus;
+      /**
+       * Planner-facing only. Lets the Planner close a Task as completed while
+       * explicitly accepting its existing `partial` TaskOutcome, for the case
+       * where every remaining success criterion is unreachable inside the
+       * authorized scope. Requires a non-empty justification; the Runtime records
+       * it on the Task so the closure stays auditable as accepted-on-partial
+       * rather than cleanly satisfied.
+       */
+      acceptPartialOutcomeReason?: string;
     } & PlannerCommandBasis)
   | ({
       kind: "set_node_status";

@@ -138,7 +138,9 @@ test("planner prompt teaches evidence-aware planning without an intermediate con
   assert.match(PLANNER_SYSTEM_PROMPT, /默认只根据 Planner State.*TaskOutcome.*EpochOutcome/s);
   assert.match(PLANNER_SYSTEM_PROMPT, /不要求你重演调查/);
   assert.match(PLANNER_SYSTEM_PROMPT, /priority 数字越小优先级越高，1 是最高优先级/);
-  assert.match(PLANNER_SYSTEM_PROMPT, /TaskOutcome=partial 表示本次执行有阶段结果/);
+  assert.match(PLANNER_SYSTEM_PROMPT, /TaskOutcome=partial 表示本次执行仍有 successCriteria 未满足/);
+  assert.match(PLANNER_SYSTEM_PROMPT, /acceptPartialOutcomeReason/);
+  assert.match(PLANNER_SYSTEM_PROMPT, /不以“是否取得正向成果”为准/);
   assert.match(PLANNER_SYSTEM_PROMPT, /partial 阶段成果通过 create_tasks\.basedOnRefs 继承/);
   assert.match(PLANNER_SYSTEM_PROMPT, /awaiting_planner Task 保持 open 且 remainingTurns>0 时，空 commands 会恢复同一 Task/);
   assert.match(PLANNER_SYSTEM_PROMPT, /budget\.maxTurns 是 Task 已累计分配的 turns，不是生命周期硬上限/);

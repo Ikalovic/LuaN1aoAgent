@@ -84,6 +84,7 @@ export type PlannerTaskBatchCommand =
       kind: "set_task_status";
       taskId: string;
       status: TaskGraphStatus;
+      acceptPartialOutcomeReason?: string;
       expectedVersion?: number;
       sourceEventIds?: string[];
       reason?: string;
@@ -1154,12 +1155,16 @@ export class SQLiteGraphStore {
       if (command.kind === "patch_task") {
         workingById.set(command.taskId, applyPlannerTaskPatch(current, command.patch, command.reason));
       } else if (command.kind === "set_task_status") {
+        const acceptedOnPartial = command.status === "completed"
+          ? command.acceptPartialOutcomeReason?.trim() || undefined
+          : undefined;
         workingById.set(command.taskId, {
           ...current,
           properties: {
-            ...withoutTaskDependencyProperty(current.properties),
+            ...withoutAcceptedPartialOutcomeProperty(withoutTaskDependencyProperty(current.properties)),
             status: command.status,
-            ...(command.reason ? { plannerReason: command.reason } : {})
+            ...(command.reason ? { plannerReason: command.reason } : {}),
+            ...(acceptedOnPartial ? { closedByAcceptingPartialOutcome: acceptedOnPartial } : {})
           }
         });
       } else {
@@ -1471,12 +1476,16 @@ export class SQLiteGraphStore {
         continue;
       }
       if (command.kind === "set_task_status") {
+        const acceptedOnPartial = command.status === "completed"
+          ? command.acceptPartialOutcomeReason?.trim() || undefined
+          : undefined;
         workingByTaskId.set(command.taskId, {
           ...current,
           properties: {
-            ...withoutTaskDependencyProperty(current.properties),
+            ...withoutAcceptedPartialOutcomeProperty(withoutTaskDependencyProperty(current.properties)),
             status: command.status,
-            ...(command.reason ? { plannerReason: command.reason } : {})
+            ...(command.reason ? { plannerReason: command.reason } : {}),
+            ...(acceptedOnPartial ? { closedByAcceptingPartialOutcome: acceptedOnPartial } : {})
           }
         });
         continue;
@@ -2436,6 +2445,11 @@ function withDerivedTaskDependencies(nodes: GraphNode[], edges: GraphEdge[]): Gr
 
 function withoutTaskDependencyProperty(properties: Record<string, unknown>): Record<string, unknown> {
   const { dependsOnTaskRefs: _ignored, ...rest } = properties;
+  return rest;
+}
+
+function withoutAcceptedPartialOutcomeProperty(properties: Record<string, unknown>): Record<string, unknown> {
+  const { closedByAcceptingPartialOutcome: _ignored, ...rest } = properties;
   return rest;
 }
 

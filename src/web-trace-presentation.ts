@@ -214,8 +214,14 @@ function summarizePlannerCommand(command: Record<string, unknown>): string | und
       const deps = stringList(command.dependencyTaskIds);
       return `调整依赖 ${textValue(command.taskId) || "task:?"} → ${deps.join("、") || "（清空）"}`;
     }
-    case "set_task_status":
-      return `标记任务 ${textValue(command.taskId) || "task:?"} 为 ${textValue(command.status) || "unknown"}`;
+    case "set_task_status": {
+      const taskLabel = textValue(command.taskId) || "task:?";
+      const status = textValue(command.status) || "unknown";
+      const acceptedOnPartial = textValue(command.acceptPartialOutcomeReason);
+      return acceptedOnPartial
+        ? `标记任务 ${taskLabel} 为 ${status}（接受 partial 结果：${acceptedOnPartial}）`
+        : `标记任务 ${taskLabel} 为 ${status}`;
+    }
     case "set_node_status":
       return `更新节点 ${textValue(command.nodeId) || "node:?"} 状态为 ${textValue(command.status) || "unknown"}`;
     default:

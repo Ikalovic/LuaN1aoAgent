@@ -144,6 +144,11 @@ const PlannerCommandSchema = Type.Union([
     kind: Type.Literal("set_task_status"),
     taskId: PlannerTaskIdSchema,
     status: PlannerTaskStatusSchema,
+    acceptPartialOutcomeReason: Type.Optional(Type.String({
+      minLength: 1,
+      maxLength: 600,
+      description: "Only with status=completed, and only when the Task's latest TaskOutcome is partial whose conclusion already covers the Task's current objectives: explain which remaining success criteria are unreachable inside the authorized scope and cite the persisted evidence. The Runtime then accepts that partial outcome as the Task's final result and records this justification on the Task. Omit in every other case."
+    })),
     ...PlannerCommandBasisProperties
   }, { additionalProperties: false }),
   Type.Object({

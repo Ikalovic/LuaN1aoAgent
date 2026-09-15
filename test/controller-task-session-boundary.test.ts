@@ -379,6 +379,125 @@ test("Planner cannot complete or transfer context from a Task with a partial lat
   await controller.close({ drainProjectionJobs: false });
 });
 
+test("Planner can close a Task by explicitly accepting its latest partial outcome", async () => {
+  const runtimeDir = mkdtempSync(join(tmpdir(), "luanniao-session-boundary-"));
+  const { controller, harness } = createHarness(runtimeDir);
+  await controller.initialize();
+  await harness.ensureRootGraph({ userGoal: "Obtain result", scopeSummary: "authorized target" });
+  const source = makeTaskEnvelope({
+    taskId: "task:source",
+    successCriteria: ["authentication boundary determined"]
+  });
+  harness.graphStore.createTask({ ...source, priority: 1 });
+  harness.runtimeStore.upsertTaskOutcome({
+    taskRef: source.taskId,
+    epochRef: "epoch:source",
+    status: "partial",
+    summary: "Authentication entry points are uniformly 401; activation needs an email inbox out of scope",
+    evidenceRefs: ["event:source"],
+    artifactRefs: [],
+    capabilityRefs: [],
+    terminalSeq: 1,
+    createdAt: new Date(0).toISOString()
+  });
+
+  const acceptance = "范围内已无剩余可推进路径：认证入口全部 401，且无可控收件邮箱完成激活";
+  const commands: NonNullable<PlannerDecision["commands"]> = [{
+    kind: "set_task_status",
+    taskId: source.taskId,
+    status: "completed",
+    acceptPartialOutcomeReason: acceptance,
+    basedOnRefs: ["event:source"]
+  }];
+  assert.doesNotThrow(() => harness.assertPlannerRuntimeTransitions(commands));
+
+  await harness.applyPlannerCommands({
+    commands,
+    reason: "Accept the partial conclusion as the Task's final result"
+  }, "authorized target", "event:planner", { [source.taskId]: 1 });
+
+  const closed = harness.graphStore.getTaskNode(source.taskId);
+  assert.equal(closed?.properties.status, "completed");
+  assert.equal(closed?.properties.closedByAcceptingPartialOutcome, acceptance);
+
+  await controller.close({ drainProjectionJobs: false });
+});
+
+test("accepting a partial outcome still requires coverage of the Task's current objectives", async () => {
+  const runtimeDir = mkdtempSync(join(tmpdir(), "luanniao-session-boundary-"));
+  const { controller, harness } = createHarness(runtimeDir);
+  await controller.initialize();
+  await harness.ensureRootGraph({ userGoal: "Obtain result", scopeSummary: "authorized target" });
+  const source = makeTaskEnvelope({ taskId: "task:source", successCriteria: ["boundary determined"] });
+  harness.graphStore.createTask({ ...source, priority: 1 });
+  harness.runtimeStore.upsertTaskOutcome({
+    taskRef: source.taskId,
+    epochRef: "epoch:source",
+    objectiveRevision: 1,
+    status: "partial",
+    summary: "Conclusion covers objective revision 1 only",
+    evidenceRefs: ["event:source"],
+    artifactRefs: [],
+    capabilityRefs: [],
+    terminalSeq: 1,
+    createdAt: new Date(0).toISOString()
+  });
+  harness.graphStore.markTaskStatus({
+    taskId: source.taskId,
+    status: "open",
+    properties: { objectiveRevision: 2 }
+  });
+
+  assert.throws(() => harness.assertPlannerRuntimeTransitions([{
+    kind: "set_task_status",
+    taskId: source.taskId,
+    status: "completed",
+    acceptPartialOutcomeReason: "A stale conclusion must not close the Task"
+  }]), /requires a completed TaskOutcome/);
+
+  assert.throws(() => harness.assertPlannerRuntimeTransitions([{
+    kind: "set_task_status",
+    taskId: source.taskId,
+    status: "completed",
+    acceptPartialOutcomeReason: "Pending objectives invalidate the acceptance"
+  }, {
+    kind: "patch_task",
+    taskId: source.taskId,
+    patch: { appendObjectives: [{ goal: "Newly discovered result", successCriteria: ["recorded"] }] }
+  }]), /requires a completed TaskOutcome/);
+
+  await controller.close({ drainProjectionJobs: false });
+});
+
+test("accepting a partial outcome cannot bypass a failed TaskOutcome", async () => {
+  const runtimeDir = mkdtempSync(join(tmpdir(), "luanniao-session-boundary-"));
+  const { controller, harness } = createHarness(runtimeDir);
+  await controller.initialize();
+  await harness.ensureRootGraph({ userGoal: "Obtain result", scopeSummary: "authorized target" });
+  const source = makeTaskEnvelope({ taskId: "task:source", successCriteria: ["boundary determined"] });
+  harness.graphStore.createTask({ ...source, priority: 1 });
+  harness.runtimeStore.upsertTaskOutcome({
+    taskRef: source.taskId,
+    epochRef: "epoch:source",
+    status: "failed",
+    summary: "Execution failed before any conclusion",
+    evidenceRefs: ["event:source"],
+    artifactRefs: [],
+    capabilityRefs: [],
+    terminalSeq: 1,
+    createdAt: new Date(0).toISOString()
+  });
+
+  assert.throws(() => harness.assertPlannerRuntimeTransitions([{
+    kind: "set_task_status",
+    taskId: source.taskId,
+    status: "completed",
+    acceptPartialOutcomeReason: "A failed outcome is not an acceptable final result"
+  }]), /requires a completed TaskOutcome/);
+
+  await controller.close({ drainProjectionJobs: false });
+});
+
 test("Planner cannot reuse a completed outcome after Task objectives are appended", async () => {
   const runtimeDir = mkdtempSync(join(tmpdir(), "luanniao-session-boundary-"));
   const { controller, harness } = createHarness(runtimeDir);
