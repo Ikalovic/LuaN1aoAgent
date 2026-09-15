@@ -16,7 +16,7 @@ import {
   type FofaTrustedContext
 } from "../fofa/fofa-types.js";
 
-const EXPECTED_TOOLS: FofaToolName[] = [
+export const EXPECTED_FOFA_TOOLS: FofaToolName[] = [
   "fofa_account_info",
   "fofa_host_aggregate",
   "fofa_search",
@@ -228,7 +228,7 @@ export class FofaMcpRuntime {
     try {
       const listed = await connection.listTools();
       const names = listed.tools.map((tool) => tool.name).sort();
-      if (JSON.stringify(names) !== JSON.stringify([...EXPECTED_TOOLS].sort())) {
+      if (JSON.stringify(names) !== JSON.stringify([...EXPECTED_FOFA_TOOLS].sort())) {
         throw unavailable("FOFA MCP exposed an unexpected tool set");
       }
       this.client = connection;

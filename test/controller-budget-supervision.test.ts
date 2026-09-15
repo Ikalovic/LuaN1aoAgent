@@ -8146,7 +8146,7 @@ function createControllerWithTestLlmEnv(runtimeDir: string): SecurityAgentContro
   process.env.LLM_API_KEY = previousEnv.LLM_API_KEY ?? "test-key";
   process.env.LLM_DEFAULT_MODEL = previousEnv.LLM_DEFAULT_MODEL ?? "test-model";
   try {
-    const controller = new SecurityAgentController({ cwd: process.cwd(), runtimeDir, executorSandboxMode: "workspace" });
+    const controller = new SecurityAgentController({ cwd: process.cwd(), runtimeDir, executorSandboxMode: "workspace", mcpRegistry: { isEnabled: () => true } });
     const controllerHarness = controller as unknown as ControllerHarness;
     controllerHarness.createObserverSessionForMode = async () => ({
       session: createAbortableMockTextSession(observerProjectionJson()),

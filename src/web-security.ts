@@ -14,6 +14,7 @@ export type WebCapability =
   | "approval:decide"
   | "admin:credential"
   | "admin:delete"
+  | "admin:env"
   | "admin:export";
 
 const roleCapabilities: Record<WebUser["role"], ReadonlySet<WebCapability>> = {
@@ -26,6 +27,7 @@ const roleCapabilities: Record<WebUser["role"], ReadonlySet<WebCapability>> = {
     "approval:decide",
     "admin:credential",
     "admin:delete",
+    "admin:env",
     "admin:export"
   ]),
   analyst: new Set<WebCapability>([

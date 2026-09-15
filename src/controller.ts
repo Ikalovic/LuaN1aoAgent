@@ -106,6 +106,7 @@ import { createExecutorBeekeeperTools } from "./tools/beekeeper-mcp-tools.js";
 import { createExecutorFofaTools } from "./tools/fofa-mcp-tools.js";
 import { createExecutorCredentialTools } from "./tools/credential-tools.js";
 import { CredentialMcpRuntime } from "./mcp/credential-runtime.js";
+import { McpRegistry } from "./mcp/mcp-registry.js";
 import { createTopologyValidationTool } from "./tools/topology-validation-tool.js";
 import type {
   AgentRole,
@@ -425,6 +426,7 @@ export class SecurityAgentController {
   private readonly beekeeperConfigInvalid: boolean;
   private readonly beekeeperRuntimeFactory: (input: BeekeeperMcpRuntimeOptions) => BeekeeperMcpRuntime;
   private readonly skillRegistry: { scan(): SkillRegistrySnapshot };
+  private readonly mcpRegistry: { isEnabled(name: string): boolean };
   private readonly skillSelector: (input: {
     taskGoal: string;
     snapshot: SkillRegistrySnapshot;
@@ -497,6 +499,7 @@ export class SecurityAgentController {
     fofaRuntimeFactory?: (input: FofaMcpRuntimeOptions) => FofaMcpRuntime;
     beekeeperRuntimeFactory?: (input: BeekeeperMcpRuntimeOptions) => BeekeeperMcpRuntime;
     skillRegistry?: { scan(): SkillRegistrySnapshot };
+    mcpRegistry?: { isEnabled(name: string): boolean };
     skillSelector?: (input: { taskGoal: string; snapshot: SkillRegistrySnapshot }) => Promise<SkillSelectionResult>;
     toolApproval?: {
       mode: ApprovalMode | (() => ApprovalMode);
@@ -512,6 +515,10 @@ export class SecurityAgentController {
     this.beekeeperRuntimeFactory = input.beekeeperRuntimeFactory
       ?? ((options) => new BeekeeperMcpRuntime(options));
     this.skillRegistry = input.skillRegistry ?? new SkillRegistry(join(input.cwd, ".agents", "skills"));
+    this.mcpRegistry = input.mcpRegistry ?? new McpRegistry({
+      cwd: input.cwd,
+      environment: input.environment ?? process.env
+    });
     this.approvalMode = input.toolApproval?.mode ?? "off";
     this.approvalRegistry = input.toolApproval?.registry;
     this.terminalApprover = input.toolApproval?.terminalApprover;
@@ -685,18 +692,27 @@ export class SecurityAgentController {
       });
     }
     this.projectorCoordinator.start();
-    this.credentialMcpRuntime = new CredentialMcpRuntime({
-      artifactStoreRoot: this.artifactStore.rootDir,
-      artifactStoreDb: this.artifactStore.databasePath,
-      executionLog: this.executionLog
-    });
-    await this.credentialMcpRuntime.configure();
-    await this.executionLog.append({
-      role: "runtime",
-      eventType: "credential_mcp_ready",
-      summary: "Credential MCP Runtime ready",
-      payload: { enabled: true }
-    });
+    if (this.mcpRegistry.isEnabled("credential")) {
+      this.credentialMcpRuntime = new CredentialMcpRuntime({
+        artifactStoreRoot: this.artifactStore.rootDir,
+        artifactStoreDb: this.artifactStore.databasePath,
+        executionLog: this.executionLog
+      });
+      await this.credentialMcpRuntime.configure();
+      await this.executionLog.append({
+        role: "runtime",
+        eventType: "credential_mcp_ready",
+        summary: "Credential MCP Runtime ready",
+        payload: { enabled: true }
+      });
+    } else {
+      await this.executionLog.append({
+        role: "runtime",
+        eventType: "credential_mcp_disabled",
+        summary: "Credential MCP disabled by operator",
+        payload: { enabled: false }
+      });
+    }
   }
 
   hasConnectivityRuntime(): boolean {
@@ -2900,7 +2916,9 @@ export class SecurityAgentController {
       ...(this.beekeeperRuntime
         ? createExecutorBeekeeperTools(this.beekeeperRuntime, taskEnvelope.taskId)
         : []),
-      ...createExecutorCredentialTools(this.credentialMcpRuntime!, taskEnvelope.taskId),
+      ...(this.credentialMcpRuntime
+        ? createExecutorCredentialTools(this.credentialMcpRuntime, taskEnvelope.taskId)
+        : []),
       createEvidenceListTool(this.executionLog),
       createEvidenceReadTool(this.executionLog)
     ];
@@ -2931,6 +2949,18 @@ export class SecurityAgentController {
 
   private async configureBeekeeperRuntime(): Promise<void> {
     if (this.beekeeperRuntime) {
+      return;
+    }
+    if (!this.mcpRegistry.isEnabled("beekeeper")) {
+      if (!this.beekeeperCapabilityReported) {
+        this.beekeeperCapabilityReported = true;
+        await this.executionLog.append({
+          role: "runtime",
+          eventType: "beekeeper_mcp_disabled",
+          summary: "Beekeeper MCP disabled by operator",
+          payload: { enabled: false }
+        });
+      }
       return;
     }
     if (this.beekeeperConfigInvalid) {
@@ -2988,6 +3018,18 @@ export class SecurityAgentController {
       const fingerprint = new FofaScopePolicy(parseAuthorizedScope(scopeSummary)).fingerprint();
       if (fingerprint !== this.fofaScopeFingerprint) {
         throw new Error("FOFA Runtime Scope cannot change within one Controller Run");
+      }
+      return;
+    }
+    if (!this.mcpRegistry.isEnabled("fofa")) {
+      if (!this.fofaCapabilityReported) {
+        this.fofaCapabilityReported = true;
+        await this.executionLog.append({
+          role: "runtime",
+          eventType: "fofa_mcp_disabled",
+          summary: "FOFA MCP disabled by operator",
+          payload: { enabled: false }
+        });
       }
       return;
     }

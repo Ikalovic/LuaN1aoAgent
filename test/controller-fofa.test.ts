@@ -105,10 +105,29 @@ test("Controller stop closes FOFA and terminal Task states invalidate cursors", 
   await controller.close({ drainProjectionJobs: false });
 });
 
+test("Controller honors operator-disabled FOFA without starting the runtime", async () => {
+  const runtimeDir = mkdtempSync(join(tmpdir(), "controller-fofa-operator-disabled-"));
+  let factoryCalls = 0;
+  const controller = createController(runtimeDir, { FOFA_API_KEY: "sentinel-secret" }, () => {
+    factoryCalls += 1;
+    return fakeRuntime() as never;
+  }, { isEnabled: (name) => name !== "fofa" });
+  const harness = controller as unknown as ControllerFofaHarness;
+
+  await harness.configureFofaRuntime("example.com");
+
+  assert.equal(factoryCalls, 0);
+  assert.ok(harness.createTaskRuntimeTools(taskEnvelope()).every((tool) => !tool.name.startsWith("fofa_")));
+  const events = (await controller.executionLog.window({ limit: 20 })).events;
+  assert.ok(events.some((event) => event.eventType === "fofa_mcp_disabled" && String(event.summary).includes("operator")));
+  await controller.close({ drainProjectionJobs: false });
+});
+
 function createController(
   runtimeDir: string,
   environment: NodeJS.ProcessEnv,
-  factory: (input: FofaMcpRuntimeOptions) => never
+  factory: (input: FofaMcpRuntimeOptions) => never,
+  mcpRegistry: { isEnabled(name: string): boolean } = { isEnabled: () => true }
 ): SecurityAgentController {
   const previous = {
     LLM_API_BASE_URL: process.env.LLM_API_BASE_URL,
@@ -124,7 +143,8 @@ function createController(
       runtimeDir,
       executorSandboxMode: "workspace",
       environment,
-      fofaRuntimeFactory: factory
+      fofaRuntimeFactory: factory,
+      mcpRegistry
     });
   } finally {
     restore("LLM_API_BASE_URL", previous.LLM_API_BASE_URL);

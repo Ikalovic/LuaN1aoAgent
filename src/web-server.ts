@@ -43,6 +43,8 @@ import { resolveDocumentScopeWithLlm } from "./scope-documents/scope-document-re
 import { ScopeDocumentService, ScopeDocumentServiceError } from "./scope-documents/scope-document-service.js";
 import { ScopeDocumentStore } from "./scope-documents/scope-document-store.js";
 import { SkillRegistry } from "./skills/skill-registry.js";
+import { McpRegistry } from "./mcp/mcp-registry.js";
+import { EnvConfigInputError, EnvConfigStore, type EnvConfigChanges } from "./env-config-store.js";
 import { loadPentestTemplates, normalizeTaskType, type ReportingContext, type TaskType } from "./reporting/task-reporting.js";
 import {
   clearCsrfCookie,
@@ -265,6 +267,10 @@ const authService = new WebAuthService(resolve(cwd, args["auth-db"] ?? ".agent-r
 const runtimePathPolicy = await RuntimePathPolicy.create(defaultRuntimeDir, { baseDir: cwd });
 const scopeDocumentStore = new ScopeDocumentStore(join(runtimePathPolicy.rootDir, "scope-documents"));
 const skillRegistry = new SkillRegistry(join(cwd, ".agents", "skills"));
+const mcpRegistry = new McpRegistry({ cwd, environment: process.env });
+// Admin-managed .env editing: writes also refresh process.env so registry
+// scans and later runs observe new values without a restart.
+const envConfigStore = new EnvConfigStore({ cwd });
 await reapStaleManagedDockerResources({
   roots: [runtimePathPolicy.rootDir],
   runner: defaultDockerRunner
@@ -361,6 +367,57 @@ const server = createServer(async (request, response) => {
       }
       const skill = skillRegistry.snapshot().skills.find((item) => item.name === name)!;
       await sendJson(response, skill);
+      return;
+    }
+    if (url.pathname === "/api/mcp") {
+      if (request.method !== "GET") {
+        await sendJson(response, { error: { code: "method_not_allowed", message: "仅支持 GET" } }, 405);
+        return;
+      }
+      requireRuntimeAccess(user!, "viewer:metadata");
+      await sendJson(response, mcpRegistry.scan());
+      return;
+    }
+    const mcpStateRoute = /^\/api\/mcp\/([^/]+)\/state$/.exec(url.pathname);
+    if (mcpStateRoute) {
+      if (request.method !== "POST") {
+        await sendJson(response, { error: { code: "method_not_allowed", message: "仅支持 POST" } }, 405);
+        return;
+      }
+      requireRuntimeAccess(user!, "operator:mutate");
+      const body = await readJsonBody(request);
+      assertOnlyKeys(body, ["enabled"]);
+      if (typeof body.enabled !== "boolean") throw new HttpError(400, "invalid_request", "enabled 必须是布尔值");
+      const name = decodeURIComponent(mcpStateRoute[1]);
+      if (!/^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(name)) throw new HttpError(400, "invalid_request", "MCP 服务器名称无效");
+      try {
+        mcpRegistry.setEnabled(name, body.enabled);
+      } catch {
+        throw new HttpError(404, "mcp_not_found", "MCP 服务器不存在");
+      }
+      const server = mcpRegistry.snapshot().servers.find((item) => item.name === name)!;
+      await sendJson(response, server);
+      return;
+    }
+    if (url.pathname === "/api/env") {
+      if (request.method === "GET") {
+        requireRuntimeAccess(user!, "admin:env");
+        await sendJson(response, envConfigStore.view());
+        return;
+      }
+      if (request.method === "PUT") {
+        requireRuntimeAccess(user!, "admin:env");
+        const body = await readJsonBody(request);
+        assertOnlyKeys(body, ["set", "remove"]);
+        try {
+          await sendJson(response, envConfigStore.applyChanges(body as unknown as EnvConfigChanges));
+        } catch (error) {
+          if (error instanceof EnvConfigInputError) throw new HttpError(400, "invalid_request", error.message);
+          throw error;
+        }
+        return;
+      }
+      await sendJson(response, { error: { code: "method_not_allowed", message: "仅支持 GET/PUT" } }, 405);
       return;
     }
     const scopeDocumentRoute = /^\/api\/scope-documents\/([^/]+)$/.exec(url.pathname);

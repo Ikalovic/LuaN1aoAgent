@@ -103,7 +103,7 @@ function createControllerWithTestLlmEnv(runtimeDir: string): SecurityAgentContro
   process.env.LLM_API_KEY = previousEnv.LLM_API_KEY ?? "test-key";
   process.env.LLM_DEFAULT_MODEL = previousEnv.LLM_DEFAULT_MODEL ?? "test-model";
   try {
-    return new SecurityAgentController({ cwd: process.cwd(), runtimeDir, executorSandboxMode: "workspace" });
+    return new SecurityAgentController({ cwd: process.cwd(), runtimeDir, executorSandboxMode: "workspace", mcpRegistry: { isEnabled: () => true } });
   } finally {
     restoreEnv("LLM_API_BASE_URL", previousEnv.LLM_API_BASE_URL);
     restoreEnv("LLM_API_KEY", previousEnv.LLM_API_KEY);
