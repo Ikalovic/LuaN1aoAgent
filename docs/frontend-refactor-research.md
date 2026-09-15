@@ -6,6 +6,8 @@
 
 追加更新：已通过 git pull 合入远端 `60a1753`，新增 MCP 管理、环境配置和 Agent 详情。用户要求增加独立展示页面，见 [态势大屏设计](superpowers/specs/2026-09-15-qingxuan-wallboard-design.md)；前期对大屏的候选讨论不再代表最终范围。
 
+第二次视觉修订：用户认为初版大屏不够炫酷，指定 FlyFish 和春秋 CCB2026 观赛页作为参考。本轮查阅公开实际画面并修订大屏规格，不改应用代码、不生成图片。
+
 ## 1. 项目定位与当前基础
 
 LuaN1aoAgent 是自主安全研究工作台，核心为 Planner、Executor、Observer 协作，以及任务图、推理图、作战图。适合围绕“目标、发现、证据、执行、人工介入”建立态势感知。
@@ -117,6 +119,24 @@ LuaN1aoAgent 是自主安全研究工作台，核心为 Planner、Executor、Obs
 6. 布局与交互可以借鉴；具体视觉仍需按项目设计。实访是浅色界面，不构成暗色方案已验证的依据。
 
 本次已结束浏览器会话；只执行页面浏览、读取与时间弹层展开，没有主动创建规则、生成攻击分析或修改项目设置。
+
+### 展示大屏视觉补充：FlyFish 与春秋 CCB2026
+
+以下区分“实际看到的画面”和“用户期望的方向”，不将访问失败的页面写成已验证参考。
+
+| 来源 | 实际查看内容 | 可借鉴与边界 |
+| --- | --- | --- |
+| [FlyFish 官方仓库](https://github.com/CloudWise-OpenSource/FlyFish) 中 [IT 基础设施大屏 GIF](https://github.com/CloudWise-OpenSource/FlyFish/blob/master/doc/images/IT监控设施概览.gif) 与 [基础监控 GIF](https://github.com/CloudWise-OpenSource/FlyFish/blob/master/doc/images/基础监控.gif) | 查看每张 GIF 多个时刻：居中切角页头、中央立体地图/机房与地台、两翼状态及下方图表；时钟和告警行有变化 | 采用中央空间舞台与外围信息分工；不搬地图、假数据、商标或整屏蓝色调 |
+| [地图路线图组件缩略图](https://github.com/CloudWise-OpenSource/FlyFishComponents/blob/main/components/地图路线图/thumbnail/icon.png) | 多层边界、厚度和阴影 | 转化为青玄地台与节点层次，不引入无来源地理数据 |
+| [旋转组件缩略图](https://github.com/CloudWise-OpenSource/FlyFishComponents/blob/main/components/旋转组件/thumbnail/icon.png) 及 [动效源码](https://github.com/CloudWise-OpenSource/FlyFishComponents/blob/main/components/旋转组件/src/total/index.less) | 中心刻度环与六角指标，源码确认内外环正反旋转 | 提炼动静层次；青玄改成缓慢环境刻线与真实事件反馈，不照搬环形仪表 |
+| FlyFish 在线 demo 与旧模板中心 | demo 浏览器访问返回 502；模板中心链接目前指向其他产品 | 未验证在线编辑器操作、悬停或实时数据；不声称进入完整在线产品 |
+| [春秋 CCB2026](https://match.ichunqiu.com/ccb2026) 与公开脚本支持的 [观赛入口](https://match.ichunqiu.com/ccb2026-views) | Chromium 实际截图仅深蓝背景，标题“比赛平台”，无文字、链接或 Canvas 主体；重试也未取得完整画面 | 用户指定参考保留；暂不能确认其排名、场景、攻击动效或交互。后续需用户截图/录屏或可正常加载的观赛页面再补充 |
+
+另通过公开脚本发现 `/situation` 路由，但 `?k=` 与直达路径使用不同参数编码，尝试 `/situation?k=ccb2026` 返回的接口错误不能用于断言原入口相同故障。没有改写响应、注入登录状态或绕过访问控制，也没有使用此前的 Elastic 抓包凭据。
+
+实际观察的临时截图在 `/tmp/qingxuan-flyfish-it-t1.png`、`/tmp/qingxuan-flyfish-basic-t1.png`、`/tmp/qingxuan-flyfish-basic-t3.png`、`/tmp/qingxuan-flyfish-map.png`、`/tmp/qingxuan-flyfish-ccb-public.png` 与 `/tmp/qingxuan-flyfish-ccb-views.png`，不进入发布资源。该目录非持久设计资产，长期依据以上公开链接及本文观察记录为准。
+
+转化为青玄的本版方案：醒目的居中品牌页头、Three.js 斜俯视真实资产舞台、侧翼信息区、底部事件焦点和分层动效。保留二维工作台与低性能回退；不新增比赛计分、战队排名、地理定位或随机攻击特效。素材清单增加舞台环境、透明页头两翼与地台材质，尺寸/路径/提示词见 [大屏规格第 9 节](superpowers/specs/2026-09-15-qingxuan-wallboard-design.md#9-图片与美术资源)。这是青玄的设计提案，不是对未加载春秋画面的描述。
 
 ## 5. 三种候选方向
 
