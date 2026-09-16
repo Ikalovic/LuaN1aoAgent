@@ -1,5 +1,5 @@
 import { translate } from "./language";
-import type { ActiveRunsResponse, ApprovalDecisionResponse, ApprovalMode, ApprovalModeUpdateResponse, ApprovalsResponse, ArtifactContent, AuthResponse, ConnectionItem, ConnectionsResponse, CredentialCreateInput, CredentialRecord, CredentialsResponse, EnvConfigChanges, EnvConfigView, McpRegistrySnapshot, ParsedScopeDocument, RegisteredMcpServer, RegisteredSkill, RuntimeState, SessionsResponse, SkillRegistrySnapshot, StartRunInput, StartRunResponse, StopRunResponse, TrafficExchange, TrafficFlowRef, TrafficHistoryBody, TrafficHistoryFilters, TrafficHistoryPage, TrafficReplayInput, TrafficReplayResponse } from "./types";
+import type { ActiveRunsResponse, ApprovalDecisionResponse, ApprovalMode, ApprovalModeUpdateResponse, ApprovalsResponse, ArtifactContent, AuthResponse, ConnectionItem, ConnectionsResponse, CredentialCreateInput, CredentialRecord, CredentialsResponse, EnvConfigChanges, EnvConfigView, McpRegistrySnapshot, ParsedScopeDocument, RegisteredMcpServer, RegisteredSkill, RegisteredSpecialist, RuntimeState, SessionsResponse, SkillRegistrySnapshot, SpecialistOptionsMode, SpecialistRegistrySnapshot, StartRunInput, StartRunResponse, StopRunResponse, TrafficExchange, TrafficFlowRef, TrafficHistoryBody, TrafficHistoryFilters, TrafficHistoryPage, TrafficReplayInput, TrafficReplayResponse } from "./types";
 
 export class ApiError extends Error {
   constructor(message: string, readonly status: number, readonly code?: string) {
@@ -113,6 +113,41 @@ export function setMcpEnabled(name: string, enabled: boolean): Promise<Registere
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ enabled })
+  });
+}
+
+export function fetchSpecialists(signal?: AbortSignal): Promise<SpecialistRegistrySnapshot> {
+  return requestJson("/api/agents", { signal });
+}
+
+export function setSpecialistEnabled(id: string, enabled: boolean): Promise<RegisteredSpecialist> {
+  return requestJson(`/api/agents/${encodeURIComponent(id)}/state`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ enabled })
+  });
+}
+
+export function updateSpecialistOptions(
+  id: string,
+  options: Record<string, string | number | boolean | string[]>
+): Promise<RegisteredSpecialist> {
+  return requestJson(`/api/agents/${encodeURIComponent(id)}/options`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ options })
+  });
+}
+
+/** Switches the Agent-wide option authority mode; `null` resets to the author default. */
+export function setSpecialistOptionsMode(
+  id: string,
+  mode: SpecialistOptionsMode | null
+): Promise<RegisteredSpecialist> {
+  return requestJson(`/api/agents/${encodeURIComponent(id)}/options-mode`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ mode })
   });
 }
 

@@ -6,6 +6,7 @@ import {
   type ApprovalDecision
 } from "../src/approval/tool-approval-registry.js";
 import {
+  createStdinApprover,
   createToolApprovalExtension,
   type TerminalApprover
 } from "../src/approval/tool-approval-extension.js";
@@ -227,4 +228,31 @@ test("a lazy judge getter defers judge creation until a mode needs it", async ()
   assert.equal(await invoke(handlers, "bash", {}), undefined);
   assert.equal(judgeRequests, 1);
   assert.equal(submissions.length, 0);
+});
+
+test("the terminal approver fails closed instead of hanging on a non-interactive stdin", async () => {
+  const originalIsTTY = process.stdin.isTTY;
+  const originalWrite = process.stderr.write.bind(process.stderr);
+  const written: string[] = [];
+  // A headless run cannot answer the y/N prompt. The approver must deny rather
+  // than leave the Executor suspended forever — a credential-attack Agent hits
+  // this on its first brute-force command.
+  Object.defineProperty(process.stdin, "isTTY", { value: false, configurable: true });
+  process.stderr.write = ((chunk: string | Uint8Array) => {
+    written.push(String(chunk));
+    return true;
+  }) as typeof process.stderr.write;
+  try {
+    const approver = createStdinApprover();
+    const decision = await Promise.race([
+      approver({ toolName: "bash", toolArgs: "{}", riskLevel: "high" }),
+      new Promise<string>((resolve) => setTimeout(() => resolve("timeout"), 2_000))
+    ]);
+    assert.equal(decision, "deny");
+    assert.equal(written.some((line) => /stdin is not interactive/.test(line)), true);
+    assert.equal(written.some((line) => /APPROVAL_MODE=off/.test(line)), true);
+  } finally {
+    process.stderr.write = originalWrite;
+    Object.defineProperty(process.stdin, "isTTY", { value: originalIsTTY, configurable: true });
+  }
 });

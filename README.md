@@ -177,6 +177,17 @@ Every Pi event is normalized before it enters the runtime ledger:
 - Retryable provider failure classification and bounded fresh-session retries.
 - Explicit Planner conflict detection and atomic command batches.
 
+### Specialist Agents
+
+Beyond Skills and MCP, a **Specialist Agent** is a specialized Executor that the Planner selects per Task. Each Specialist owns its system prompt, model profile, tool surface, Skill policy, budget and concurrency cap, and is registered explicitly through a TypeScript SDK (`defineSpecialist`) or a project-level `.agents/specialists/<id>/` manifest, optionally with a JavaScript module that contributes custom tools.
+
+- The Planner sees an `<available_specialists>` catalog and names the owner through `create_tasks.specialist`; omitting it uses the `general` Executor, whose parameters match the historical behavior.
+- Unknown, disabled, or invalid ids are rejected with repair feedback instead of persisting an unrunnable Task; a Specialist disabled mid-run parks its Task for a Planner decision instead of silently degrading.
+- Tool policies are subtractive only: groups are dropped, then an optional name allow/deny narrows further, while `task_result_submit` can never be removed.
+- Budgets differ per Agent: `defaultMaxTurns`, a `maxTurnsCeiling` (which may sit below the global minimum so cheap Agents stay cheap), an epoch turn slice and an epoch time share.
+- The Web workbench manages all of it under one **Capabilities** page (Skills / MCP / Specialist Agents) with enable switches and schema-generated option forms.
+- Authoring guide: [`docs/create_agent.md`](docs/create_agent.md); concept overview: [`docs/specialist-agent-sdk.md`](docs/specialist-agent-sdk.md); scaffolds live in `templates/specialists/`.
+
 ### Tool Runtime
 
 Executors use Pi coding tools inside the configured sandbox boundary:
@@ -538,6 +549,7 @@ LuaN1aoAgent/
 │   │   ├── graph-store.ts        # Tri-graph persistence and atomic mutation
 │   │   ├── runtime-store.ts      # Execution and projector runtime state
 │   │   └── artifact-store.ts     # Content-addressed artifacts
+│   ├── specialists/              # Specialist Agent SDK, registry, and built-in Agents
 │   ├── tools/                    # Pi graph, artifact, and runtime tools
 │   ├── tui/                      # Interactive terminal workbench
 │   ├── cli.ts                    # CLI entry point

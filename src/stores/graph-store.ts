@@ -17,6 +17,7 @@ import type {
   PlannerDigestItem,
   PlannerTaskLedgerItem,
   PlannerTaskPatch,
+  PlannerSpecialistOptionValues,
   TaskBudget,
   TaskEnvelope,
   TaskGoalAddition,
@@ -58,6 +59,10 @@ export type TaskCreateInput = {
   continueFromTaskRef?: string;
   budget?: TaskBudget;
   priority: number;
+  /** Specialist Agent id owning this Task; absent means the general Executor. */
+  specialist?: string;
+  /** Planner-chosen Specialist option values, already validated by the controller. */
+  specialistOptions?: PlannerSpecialistOptionValues;
 };
 
 export type PlannerTaskBatchCommand =
@@ -917,7 +922,9 @@ export class SQLiteGraphStore {
         parentTaskId: input.parentTaskId,
         continueFromTaskRef: input.continueFromTaskRef,
         budget: input.budget,
-        priority: input.priority
+        priority: input.priority,
+        ...(input.specialist ? { specialist: input.specialist } : {}),
+        ...(input.specialistOptions ? { specialistOptions: input.specialistOptions } : {})
       }
     }));
     const edges: GraphEdge[] = inputs.flatMap((input) => {
@@ -1122,7 +1129,9 @@ export class SQLiteGraphStore {
         parentTaskId: task.parentTaskId,
         continueFromTaskRef: task.continueFromTaskRef,
         budget: task.budget,
-        priority: task.priority
+        priority: task.priority,
+        ...(task.specialist ? { specialist: task.specialist } : {}),
+        ...(task.specialistOptions ? { specialistOptions: task.specialistOptions } : {})
       },
       evidenceRefs: input.sourceEventIds
     }));
@@ -2418,8 +2427,30 @@ function taskNodeToEnvelope(
     continueFromTaskRef: typeof node.properties.continueFromTaskRef === "string"
       ? node.properties.continueFromTaskRef
       : undefined,
-    budget: isRecord(node.properties.budget) ? node.properties.budget as TaskBudget : undefined
+    budget: isRecord(node.properties.budget) ? node.properties.budget as TaskBudget : undefined,
+    specialist: typeof node.properties.specialist === "string" ? node.properties.specialist : undefined,
+    specialistOptions: plannerSpecialistOptionValues(node.properties.specialistOptions)
   };
+}
+
+/**
+ * Reads Task-level Specialist option values back from a graph node. Malformed
+ * entries are dropped rather than coerced: the runtime re-validates and clamps
+ * every value against the live definition before it is applied.
+ */
+function plannerSpecialistOptionValues(value: unknown): PlannerSpecialistOptionValues | undefined {
+  if (!isRecord(value)) return undefined;
+  const entries: PlannerSpecialistOptionValues = {};
+  for (const [key, entry] of Object.entries(value)) {
+    if (typeof entry === "string" || typeof entry === "number" || typeof entry === "boolean") {
+      entries[key] = entry;
+      continue;
+    }
+    if (Array.isArray(entry) && entry.every((item) => typeof item === "string")) {
+      entries[key] = [...entry] as string[];
+    }
+  }
+  return Object.keys(entries).length > 0 ? entries : undefined;
 }
 
 function withDerivedTaskDependencies(nodes: GraphNode[], edges: GraphEdge[]): GraphNode[] {

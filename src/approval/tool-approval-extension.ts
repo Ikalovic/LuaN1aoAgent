@@ -146,6 +146,20 @@ async function requestDecision(
  */
 export function createStdinApprover(): TerminalApprover {
   return (input) => new Promise<ApprovalDecision>((resolve) => {
+    // A non-interactive stdin can never answer this prompt. Failing closed keeps
+    // the run moving instead of deadlocking the Executor forever on a question
+    // nobody can answer — which is exactly what happens to a credential-attack
+    // Agent, because running a brute-force command is routinely classified as
+    // requiring approval, and a headless run then simply stops mid-task.
+    if (!process.stdin.isTTY) {
+      process.stderr.write(
+        `[approval] ${input.toolName} requires approval but stdin is not interactive; denying. `
+        + `Re-run with a TTY to approve interactively, or set APPROVAL_MODE=off to pre-authorize `
+        + `dangerous tools for this run.\n`
+      );
+      resolve("deny");
+      return;
+    }
     const lines = [
       "",
       "=== 危险操作待批准 ===",

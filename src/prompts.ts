@@ -1,4 +1,5 @@
 import type { PlannerDecisionView, TaskEnvelope } from "./types.js";
+import type { SpecialistCatalogEntry } from "./specialists/types.js";
 
 
 
@@ -20,7 +21,7 @@ Task Graph 是这些规划决定的持久表达，不是规划目的。你决定
 8. 已确认产品或版本但漏洞情报覆盖为空时，可以规划研究与目标验证 Task；情报检索和适用性验证由 Executor 完成，检索命中本身不是目标漏洞事实。
 
 # Task Semantics
-- Task 必须包含稳定 id、goal、targetRefs、scopeRef、successCriteria、priority，可选 budget.maxTurns、parentTaskId、dependsOnTaskRefs、continueFromTaskRef。
+- Task 必须包含稳定 id、goal、targetRefs、scopeRef、successCriteria、priority，可选 budget.maxTurns、parentTaskId、dependsOnTaskRefs、continueFromTaskRef、specialist、specialistOptions。
 - goal 是可判定问题或结果；successCriteria 是证明结果的可观察信号。具体技术事实必须来自 Planner State 或 basedOnRefs，候选方法不得成为强制行动序列。
 - goal 和 successCriteria 是创建时的原始定义，永久保留。新事实使同一工作流必须多完成一个结果时，使用 patch_task.appendObjectives 追加目标及其 successCriteria；不得覆盖历史目标，也不得用追加目标表达技术步骤。Executor 每个 Epoch 都会收到完整原始定义和累计追加目标。
 - priority 数字越小优先级越高，1 是最高优先级。dependsOnTaskRefs 只表示必须 completed 的硬前置；partial 阶段成果通过 create_tasks.basedOnRefs 继承。只有 Planner 用 set_task_status 接受前置 Task completed 后，Controller 才释放后继。
@@ -38,6 +39,17 @@ Task Graph 是这些规划决定的持久表达，不是规划目的。你决定
 - Root Goal 的全部验收条件满足时，必须使用 set_node_status 将 goal:root 设置为 completed，并在 basedOnRefs 中引用支持该判断的持久 TaskOutcome、Artifact 或 Evidence。不得只在 reason 中声明完成。Root Goal 仍为 open 且没有 ready、running 或可恢复的 awaiting_planner Task 时，commands 不得为空：必须将 goal:root 设置为 completed 或 blocked，或者创建、恢复能继续推进目标的 Task。
 - 网络观察中的地址不自动扩展授权。只有持久 Evidence、Session 或 Route 能证明资产由根入口派生且属于授权环境时，才能为其创建操作 Task。
 - FOFA topology 中 classification=candidate_only 且 validationStatus=pending 的子站、旁站、CNAME、证书关联主机必须先创建一次低风险验证 Task；验证仅限 DNS、HTTP、TLS、CNAME 和 redirect，不得直接漏洞扫描、目录枚举、登录或利用。验证结果由 Observer 以 evidenceRefs 更新现有 Operation Graph，不能扩大授权 Scope。
+
+# Specialist Selection
+- available_specialists 列出当前可用的专精 Agent（id、用途、适用边界、默认预算、被裁剪的工具组、并发上限）。创建 Task 时用 create_tasks 的 specialist 字段指定拥有者；省略表示 general（通用 Executor）。
+- 选择依据是 Task 的因果工作流本身，不是技术阶段或关键词。只有某个 Agent 的 whenToUse 明显覆盖该 Task 的主要工作、且它的工具与预算更适合时才指定；不确定时省略，不要为了"看起来更专业"而指派。
+- 只能使用 available_specialists 中出现的 id。未知、已禁用或无效的 id 会被 Runtime 拒绝，浪费一个决策周期。
+- Agent 的预算字段是默认值与上限，不是承诺：你可以给出更小的 budget.maxTurns，但会被该 Agent 的 maxTurnsCeiling 收窄；不会因为换了 Agent 就突破运行级预算。
+- Task 的拥有者创建后固定。需要换 Agent 时，按 Task Semantics 完成或归档当前 Task，创建后继 Task 承载新工作流。
+- 被裁剪的工具组表示该 Agent 看不到这些工具。不要给需要信息搜集能力的 Task 指定工具面被裁剪到无法完成它的 Agent。
+- available_specialists 中该 Agent 的 tunableOptions 列出**本 Task 可以指定**的参数：只有这些 key 能出现在 create_tasks 的 specialistOptions 中，其它 key 属于 Agent 作者固定的能力边界或运行前已确定的配置，会出现被拒绝并浪费一个决策周期。
+- specialistOptions 的取值必须落在 tunableOptions 给出的边界内；越界值会被 Runtime 收窄并记录诊断，所以宁可保守取值。省略某个 key 表示采用当前生效值，这通常是正确选择——只在目标特征明确要求更小强度（例如服务脆弱、锁定策略严格）时才收窄。
+- 不要用 specialistOptions 表达任务目标或目标资产：目标、材料与 scope 通过 goal、targetRefs、successCriteria 与 dependsOnTaskRefs 表达。
 
 # Retrieval
 Planner State 是默认且应当足够的规划输入。检索只服务于全局任务选择，不服务于目标侧技术调查。
@@ -245,6 +257,8 @@ export function renderPlannerInput(input: {
   deliverySeq?: number;
   repairFeedback?: string;
   continuationContext?: string;
+  /** Enabled Specialists beyond the general Executor; empty means no catalog section. */
+  specialistCatalog?: SpecialistCatalogEntry[];
 }): string {
   const compactDecisionView = compactPlannerDecisionViewForPrompt(input.plannerDecisionView);
   const previousCompactDecisionView = input.previousPlannerDecisionView
@@ -268,7 +282,10 @@ export function renderPlannerInput(input: {
   const continuationContext = input.continuationContext?.trim()
     ? `<continuation_context>\n${truncatePromptText(input.continuationContext, 8_000)}\n</continuation_context>\n\n`
     : "";
-  return `${fixedContext}${continuationContext}<planner_state format="compact-json">
+  const specialistCatalog = input.specialistCatalog && input.specialistCatalog.length > 0
+    ? `<available_specialists format="compact-json">\n${stableCompactJson(input.specialistCatalog)}\n</available_specialists>\n\n`
+    : "";
+  return `${fixedContext}${specialistCatalog}${continuationContext}<planner_state format="compact-json">
 ${stableCompactJson(statePayload)}
 </planner_state>
 ${repairFeedback}
@@ -303,6 +320,8 @@ export function compactPlannerDecisionViewForPrompt(view: PlannerDecisionView): 
       consumedTurns: task.consumedTurns,
       remainingTurns: task.remainingTurns,
       dependsOnTaskRefs: task.dependsOnTaskRefs?.slice(0, 4),
+      specialist: task.specialist,
+      specialistOptions: task.specialistOptions,
       projection: task.projection
     };
   });
@@ -453,6 +472,7 @@ ${input.rootGoal}
 - 约束：${input.taskEnvelope.constraints.join("；") || "无"}
 - 成功条件：${input.taskEnvelope.successCriteria.join("；") || "无"}
 - 累计新增目标：${addedObjectives}
+- 专精 Agent：${input.taskEnvelope.specialist ?? "general"}
 </current_task>
 
 <environment_facts>
@@ -516,6 +536,7 @@ ${input.rootGoal}
 - 约束：${input.taskEnvelope.constraints.join("；") || "无"}
 - 成功条件：${input.taskEnvelope.successCriteria.join("；") || "无"}
 - 累计新增目标：${addedObjectives}
+- 专精 Agent：${input.taskEnvelope.specialist ?? "general"}
 </updated_task>
 
 <environment_facts>

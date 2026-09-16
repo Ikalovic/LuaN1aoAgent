@@ -9,8 +9,7 @@ import { ApprovalsView } from "./components/ApprovalsView";
 import { ArtifactsView } from "./components/ArtifactsView";
 import { ResizableWorkspace } from "./components/ResizableWorkspace";
 import { Sidebar } from "./components/Sidebar";
-import { SkillsView } from "./components/SkillsView";
-import { McpView } from "./components/McpView";
+import { CapabilitiesView } from "./components/CapabilitiesView";
 import { CredentialsView } from "./components/CredentialsView";
 import { StartRunModal } from "./components/StartRunModal";
 import { TraceView } from "./components/TraceView";
@@ -18,7 +17,7 @@ import { TrafficInspector } from "./components/TrafficInspector";
 import { TrafficView } from "./components/TrafficView";
 import { projectTaskTree } from "./graph";
 import { useLanguage, type Locale, type TranslationKey } from "./language";
-import type { AuthUser, RuntimeSession, TrafficExchange, TrafficFlowRef, ViewKey } from "./types";
+import type { AuthUser, CapabilityTab, RuntimeSession, TrafficExchange, TrafficFlowRef, ViewKey } from "./types";
 import { graphLabel } from "./utils";
 import { useRuntimeDashboard } from "./useRuntimeDashboard";
 
@@ -32,6 +31,7 @@ export default function App({ user, onLogout }: { user: AuthUser; onLogout: () =
   const [runtimeDir, setRuntimeDir] = useState(initial.runtimeDir);
   const [runtimeDraft, setRuntimeDraft] = useState(initial.runtimeDir);
   const [activeView, setActiveView] = useState<ViewKey>(initial.view);
+  const [capabilityTab, setCapabilityTab] = useState<CapabilityTab>(initial.capabilityTab);
   const [selectedTraceId, setSelectedTraceId] = useState<string>();
   const [selectedNodeId, setSelectedNodeId] = useState<string>();
   const [selectedExchangeId, setSelectedExchangeId] = useState<TrafficFlowRef>();
@@ -82,7 +82,7 @@ export default function App({ user, onLogout }: { user: AuthUser; onLogout: () =
   }, [data?.traceItems, selectedTraceId]);
 
   useEffect(() => {
-    if (activeView === "trace" || activeView === "reports" || activeView === "traffic" || activeView === "connections" || activeView === "skills" || activeView === "mcp" || activeView === "credentials" || activeView === "approvals") setSelectedNodeId(undefined);
+    if (activeView === "trace" || activeView === "reports" || activeView === "traffic" || activeView === "connections" || activeView === "capabilities" || activeView === "credentials" || activeView === "approvals") setSelectedNodeId(undefined);
     if (activeView !== "traffic") {
       setSelectedExchangeId(undefined);
       setSelectedExchange(undefined);
@@ -134,7 +134,11 @@ export default function App({ user, onLogout }: { user: AuthUser; onLogout: () =
   const setView = (view: ViewKey) => {
     setActiveView(view);
     setMobileSidebarOpen(false);
-    updateUrl(runtimeDir, view);
+    updateUrl(runtimeDir, view, capabilityTab);
+  };
+  const setCapabilitiesTab = (tab: CapabilityTab) => {
+    setCapabilityTab(tab);
+    updateUrl(runtimeDir, "capabilities", tab);
   };
   const applyRuntime = (value = runtimeDraft) => {
     const next = value.trim() || DEFAULT_RUNTIME;
@@ -146,7 +150,7 @@ export default function App({ user, onLogout }: { user: AuthUser; onLogout: () =
     setSelectedExchange(undefined);
     setMobileSidebarOpen(false);
     localStorage.setItem("luanniao-runtime-dir", next);
-    updateUrl(next, activeView);
+    updateUrl(next, activeView, capabilityTab);
   };
 
   const sidebar = (
@@ -166,15 +170,14 @@ export default function App({ user, onLogout }: { user: AuthUser; onLogout: () =
       canManageCredentials={isAdmin}
     />
   );
-  const inspector = activeView === "skills" ? (
-    <div className="skills-inspector">
-      <Typography.Title level={5}>{t("skills.inspectorTitle")}</Typography.Title>
-      <p>{t("skills.inspectorDescription")}</p>
-    </div>
-  ) : activeView === "mcp" ? (
-    <div className="mcp-inspector">
-      <Typography.Title level={5}>{t("mcp.inspectorTitle")}</Typography.Title>
-      <p>{t("mcp.inspectorDescription")}</p>
+  const inspector = activeView === "capabilities" ? (
+    <div className="capabilities-inspector">
+      <Typography.Title level={5}>{capabilityTab === "agents"
+        ? t("agents.inspectorTitle")
+        : capabilityTab === "mcp" ? t("mcp.inspectorTitle") : t("skills.inspectorTitle")}</Typography.Title>
+      <p>{capabilityTab === "agents"
+        ? t("agents.inspectorDescription")
+        : capabilityTab === "mcp" ? t("mcp.inspectorDescription") : t("skills.inspectorDescription")}</p>
     </div>
   ) : activeView === "credentials" ? (
     <div className="credentials-inspector">
@@ -222,7 +225,7 @@ export default function App({ user, onLogout }: { user: AuthUser; onLogout: () =
     />
   );
 
-  const viewEyebrow = activeView === "trace" ? "LIVE TRACE" : activeView === "reports" ? "RUN OUTPUT" : activeView === "traffic" ? "WEB TRAFFIC" : activeView === "connections" ? "CONNECTIVITY" : activeView === "skills" ? "SKILL REGISTRY" : activeView === "mcp" ? "MCP SERVERS" : activeView === "credentials" ? "CREDENTIALS" : activeView === "approvals" ? "APPROVALS" : "TRI-GRAPH";
+  const viewEyebrow = activeView === "trace" ? "LIVE TRACE" : activeView === "reports" ? "RUN OUTPUT" : activeView === "traffic" ? "WEB TRAFFIC" : activeView === "connections" ? "CONNECTIVITY" : activeView === "capabilities" ? "CAPABILITIES" : activeView === "credentials" ? "CREDENTIALS" : activeView === "approvals" ? "APPROVALS" : "TRI-GRAPH";
 
   return (
     <>
@@ -314,10 +317,8 @@ export default function App({ user, onLogout }: { user: AuthUser; onLogout: () =
             <section className="stage-body">
               {activeView === "approvals" ? (
                 <ApprovalsView user={user} onPendingChange={setApprovalPendingCount} />
-              ) : activeView === "skills" ? (
-                <SkillsView user={user} />
-              ) : activeView === "mcp" ? (
-                <McpView user={user} />
+              ) : activeView === "capabilities" ? (
+                <CapabilitiesView user={user} tab={capabilityTab} onTabChange={setCapabilitiesTab} />
               ) : activeView === "credentials" ? (
                 <CredentialsView runtimeDir={runtimeDir} />
               ) : activeView === "connections" ? (
@@ -443,8 +444,7 @@ function viewTitle(view: ViewKey, locale: Locale, t: Translate): string {
   if (view === "reports") return locale === "zh-CN" ? "产物与报告" : "Artifacts & Reports";
   if (view === "traffic") return "Web Traffic";
   if (view === "connections") return "Connections";
-  if (view === "skills") return t("nav.skills");
-  if (view === "mcp") return t("nav.mcp");
+  if (view === "capabilities") return t("nav.capabilities");
   if (view === "credentials") return t("nav.credentials");
   if (view === "approvals") return t("nav.approvals");
   return graphLabel(view, locale);
@@ -455,8 +455,7 @@ function viewStageTitle(view: ViewKey, locale: Locale, t: Translate): string {
   if (view === "reports") return locale === "zh-CN" ? "查看任务结论、最终结果与运行产物" : "Review task conclusions, final results, and run artifacts";
   if (view === "traffic") return t("app.trafficStageTitle");
   if (view === "connections") return t("app.connectionsStageTitle");
-  if (view === "skills") return t("app.skillsStageTitle");
-  if (view === "mcp") return t("app.mcpStageTitle");
+  if (view === "capabilities") return t("app.capabilitiesStageTitle");
   if (view === "credentials") return t("app.credentialsStageTitle");
   if (view === "approvals") return t("app.approvalsStageTitle");
   return graphLabel(view, locale);
@@ -467,8 +466,7 @@ function viewStageSubtitle(view: ViewKey, t: Translate): string {
   if (view === "reports") return "TaskOutcome / EpochOutcome / Artifact";
   if (view === "traffic") return t("app.trafficStageSubtitle");
   if (view === "connections") return t("app.connectionsStageSubtitle");
-  if (view === "skills") return t("app.skillsStageSubtitle");
-  if (view === "mcp") return t("app.mcpStageSubtitle");
+  if (view === "capabilities") return t("app.capabilitiesStageSubtitle");
   if (view === "credentials") return t("app.credentialsStageSubtitle");
   if (view === "approvals") return t("app.approvalsStageSubtitle");
   if (view === "reasoning") return t("graph.reasoningSubtitle");
@@ -476,18 +474,29 @@ function viewStageSubtitle(view: ViewKey, t: Translate): string {
   return t("graph.taskSubtitle");
 }
 
-function readInitialState(): { runtimeDir: string; view: ViewKey } {
+function readInitialState(): { runtimeDir: string; view: ViewKey; capabilityTab: CapabilityTab } {
   const params = new URLSearchParams(window.location.search);
   const runtimeDir = params.get("runtimeDir") || localStorage.getItem("luanniao-runtime-dir") || DEFAULT_RUNTIME;
   const candidate = params.get("view");
-  const view = candidate && ["trace", "reports", "reasoning", "operation", "task", "traffic", "connections", "skills", "mcp", "credentials", "approvals"].includes(candidate) ? candidate as ViewKey : "trace";
-  return { runtimeDir, view };
+  const capabilityTab = readCapabilityTab(params.get("tab"));
+  // Legacy deep links (?view=skills|mcp|agents) resolve to the capabilities page.
+  if (candidate === "skills" || candidate === "mcp" || candidate === "agents") {
+    return { runtimeDir, view: "capabilities", capabilityTab: candidate };
+  }
+  const view = candidate && ["trace", "reports", "reasoning", "operation", "task", "traffic", "connections", "capabilities", "credentials", "approvals"].includes(candidate) ? candidate as ViewKey : "trace";
+  return { runtimeDir, view, capabilityTab };
 }
 
-function updateUrl(runtimeDir: string, view: ViewKey) {
+function readCapabilityTab(value: string | null): CapabilityTab {
+  return value === "mcp" || value === "agents" ? value : "skills";
+}
+
+function updateUrl(runtimeDir: string, view: ViewKey, capabilityTab: CapabilityTab = "skills") {
   const url = new URL(window.location.href);
   url.searchParams.set("runtimeDir", runtimeDir);
   url.searchParams.set("view", view);
+  if (view === "capabilities") url.searchParams.set("tab", capabilityTab);
+  else url.searchParams.delete("tab");
   window.history.replaceState({}, "", url);
 }
 

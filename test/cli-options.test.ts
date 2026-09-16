@@ -1,6 +1,10 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { parseCliOptions, shouldUseTui } from "../src/cli-options.js";
+import {
+  parseCliOptions,
+  resolveApprovalMode,
+  shouldUseTui
+} from "../src/cli-options.js";
 
 test("uses TUI only for an interactive terminal without machine output flags", () => {
   const options = parseCliOptions(["--goal", "inspect", "--max-cycles", "3", "--proxy", "socks5://user:pass@proxy.test:1080"]);
@@ -34,4 +38,14 @@ test("forbids scope files when resuming a stored runtime", () => {
     () => parseCliOptions(["--resume", "runtime-a", "--scope-file", "scope.txt"]),
     /--scope-file cannot be used with --resume/
   );
+});
+
+test("approval mode resolution prefers the flag, then APPROVAL_MODE, then auto", () => {
+  assert.equal(resolveApprovalMode("off", {}), "off");
+  assert.equal(resolveApprovalMode("strict", { APPROVAL_MODE: "off" }), "strict");
+  assert.equal(resolveApprovalMode(undefined, { APPROVAL_MODE: "off" }), "off");
+  assert.equal(resolveApprovalMode(undefined, { APPROVAL_MODE: "strict" }), "strict");
+  assert.equal(resolveApprovalMode(undefined, {}), "auto");
+  assert.equal(resolveApprovalMode(undefined, { APPROVAL_MODE: "" }), "auto");
+  assert.throws(() => resolveApprovalMode(undefined, { APPROVAL_MODE: "sometimes" }), /off, auto or strict/);
 });

@@ -124,7 +124,24 @@ export type TaskDefinition = {
   constraints: string[];
   successCriteria: string[];
   goalAdditions?: TaskGoalAddition[];
+  /**
+   * Specialist Agent that owns this Task. Absent means the default `general`
+   * Executor profile. The owner is fixed for the Task's lifetime; changing it
+   * requires the Planner to create a successor Task.
+   */
+  specialist?: string;
+  /**
+   * Planner-chosen values for the owning Specialist's planner-tunable options.
+   * The runtime clamps every value into the boundary the author and the
+   * operator declared, so a Task can only ever narrow a Specialist's envelope.
+   */
+  specialistOptions?: PlannerSpecialistOptionValues;
 };
+
+/** Structurally identical to the Specialist option value union. */
+export type PlannerSpecialistOptionValue = string | number | boolean | string[];
+
+export type PlannerSpecialistOptionValues = Record<string, PlannerSpecialistOptionValue>;
 
 export type TaskGoalAddition = {
   goal: string;
@@ -189,6 +206,14 @@ export type PlannerTaskSpec = {
   parentTaskId?: string;
   dependsOnTaskRefs?: string[];
   continueFromTaskRef?: string;
+  /** Specialist Agent id from the Planner catalog; omit for the general Executor. */
+  specialist?: string;
+  /**
+   * Values for the chosen Specialist's `tunableOptions`, as published in
+   * `available_specialists`. Any other key is rejected and every value is
+   * clamped into the published boundary.
+   */
+  specialistOptions?: PlannerSpecialistOptionValues;
 };
 
 export type PlannerTaskPatch = {
@@ -407,6 +432,8 @@ export type GraphSnapshot = {
   summary: JsonObject;
 };
 
+export type SpecialistTaskStatus = "ready" | "disabled" | "invalid" | "unknown";
+
 export type PlannerTaskLedgerItem = {
   taskId: string;
   status: string;
@@ -426,6 +453,13 @@ export type PlannerTaskLedgerItem = {
   dependencyStatuses?: Record<string, string>;
   priority?: number;
   dependsOnTaskRefs?: string[];
+  /** Owning Specialist Agent and whether the runtime can currently execute it. */
+  specialist?: {
+    id: string;
+    status: SpecialistTaskStatus;
+  };
+  /** Task-level Specialist option values as persisted, so the Planner sees its own choice. */
+  specialistOptions?: PlannerSpecialistOptionValues;
   projection?: {
     committedSeq: number;
     desiredSeq: number;

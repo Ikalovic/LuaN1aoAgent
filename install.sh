@@ -59,7 +59,25 @@ for REPO in "${SKILLS_REPOS[@]}"; do
   install_skills "${REPO}"
 done
 
-# 2. Dependencies and build.
+# 2. Skills that ship with this repository. The built-in Specialists declare an
+#    allowlist over these names, so a run without them has an empty knowledge
+#    surface. They live under templates/skills/ (tracked) because .agents/ is
+#    project-local and git-ignored.
+install_bundled_skills() {
+  local source_dir="${PROJECT_ROOT}/templates/skills"
+  [ -d "${source_dir}" ] || return 0
+  local count=0 skill_dir skill_name
+  while IFS= read -r skill_dir; do
+    skill_name="$(basename "${skill_dir}")"
+    rm -rf "${AGENTS_SKILLS_DIR:?}/${skill_name}"
+    cp -R "${skill_dir}" "${AGENTS_SKILLS_DIR}/${skill_name}"
+    count=$((count + 1))
+  done < <(find "${source_dir}" -mindepth 1 -maxdepth 1 -type d)
+  log "Installed ${count} bundled skills into .agents/skills/"
+}
+install_bundled_skills
+
+# 3. Dependencies and build.
 log "Running npm ci"
 npm ci --prefix "${PROJECT_ROOT}"
 log "Running npm run build"

@@ -39,6 +39,7 @@ test("admin has all capabilities while analyst cannot perform admin operations",
     "traffic:read-sensitive",
     "connectivity:manage",
     "operator:mutate",
+    "admin:capability",
     "admin:credential",
     "admin:delete",
     "admin:env",
@@ -51,7 +52,11 @@ test("admin has all capabilities while analyst cannot perform admin operations",
   assert.equal(hasCapability(analyst, "operator:mutate"), true);
   assert.equal(hasCapability(analyst, "connectivity:manage"), false);
   assert.throws(() => requireCapability(analyst, "connectivity:manage"), securityCode("authorization_forbidden"));
-  for (const capability of ["admin:credential", "admin:delete", "admin:env", "admin:export"] as const) {
+  // The capability surface (which Agents, Skills and MCP servers exist, and what
+  // their pinned parameters are) is an administrative decision, not an operator
+  // action, so an analyst may read it but never rewrite it.
+  assert.equal(hasCapability(analyst, "admin:capability"), false);
+  for (const capability of ["admin:capability", "admin:credential", "admin:delete", "admin:env", "admin:export"] as const) {
     assert.equal(hasCapability(analyst, capability), false);
     assert.throws(() => requireCapability(analyst, capability), securityCode("authorization_forbidden"));
   }

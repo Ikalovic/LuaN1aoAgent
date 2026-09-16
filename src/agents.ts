@@ -15,10 +15,19 @@ import {
   OBSERVER_SUPERVISOR_SYSTEM_PROMPT,
   PLANNER_SYSTEM_PROMPT
 } from "./prompts.js";
+import { renderSpecialistSystemPrompt } from "./specialists/prompt.js";
+import { applySpecialistToolPolicy, validateSpecialistTools, type SpecialistToolSelection } from "./specialists/tools.js";
+import type {
+  SpecialistAgentDefinition,
+  SpecialistOptionValues,
+  SpecialistRegistryDiagnostic,
+  SpecialistToolBinding,
+  SpecialistToolGroup
+} from "./specialists/types.js";
 import { ArtifactStore } from "./stores/artifact-store.js";
 import { ExecutionLog } from "./stores/execution-log.js";
 import { SQLiteGraphStore } from "./stores/graph-store.js";
-import type { LlmRuntime } from "./llm-config.js";
+import type { LlmRuntime, LlmThinkingLevel } from "./llm-config.js";
 import { normalizePlannerDecision, validatePlannerBasedOnRefs } from "./planner-commands.js";
 import type {
   ProjectionDraftValidationOptions,
@@ -143,10 +152,11 @@ export async function createSecurityAgentRuntime(input: {
     artifactStore: input.artifactStore,
     llmRuntime: input.llmRuntime,
     skillsDirs,
-    additionalTools: [
+    executionLog: input.executionLog,
+    additionalToolBindings: [
       createEvidenceListTool(input.executionLog),
       createEvidenceReadTool(input.executionLog)
-    ],
+    ].map((tool) => ({ group: "evidence" as const, tool })),
     providerAdmission: input.providerAdmissions?.executor
   });
 
@@ -167,15 +177,32 @@ export async function createSecurityAgentRuntime(input: {
   };
 }
 
+/**
+ * Runtime-facing Specialist payload for one Executor session. Tool assembly is
+ * the only place the Executor's capability surface is decided, so a Specialist
+ * can narrow it here and nowhere else.
+ */
+export type ExecutorSpecialistInput = {
+  id: string;
+  taskId: string;
+  definition: SpecialistAgentDefinition;
+  options: SpecialistOptionValues;
+};
+
 export async function createExecutorAgentSession(input: {
   cwd: string;
   sandbox?: ExecutorSandbox;
   artifactStore: ArtifactStore;
   llmRuntime: LlmRuntime;
+  executionLog?: ExecutionLog;
   executorLoader?: DefaultResourceLoader;
   sessionManager?: SessionManager;
   skillsDirs?: string[];
-  additionalTools?: ToolDefinition<any, any, any>[];
+  /** Task runtime tools tagged with their capability group. */
+  additionalToolBindings?: SpecialistToolBinding[];
+  specialist?: ExecutorSpecialistInput;
+  /** Receives per-session Specialist diagnostics (tool policy, contributed tools). */
+  onSpecialistDiagnostic?: (diagnostic: SpecialistRegistryDiagnostic) => void;
   providerAdmission?: ProviderAdmissionOptions;
   toolApproval?: ToolApprovalExtensionOptions;
 }): Promise<CreateAgentSessionResult> {
@@ -184,47 +211,147 @@ export async function createExecutorAgentSession(input: {
     runId: `standalone-${process.pid}`,
     additionalReadRoots: input.skillsDirs ?? []
   });
+  const specialistDiagnostics: SpecialistRegistryDiagnostic[] = [];
+  const specialistSelection = applySpecialistToolPolicy(
+    executorToolBindings({ sandbox, artifactStore: input.artifactStore, additionalToolBindings: input.additionalToolBindings }),
+    input.specialist?.definition.tools
+  );
+  specialistDiagnostics.push(...specialistSelection.diagnostics);
   const executorLoader = input.executorLoader ?? await createPromptLoader(
     sandbox.hostRoot,
-    EXECUTOR_SYSTEM_PROMPT,
+    input.specialist
+      ? renderSpecialistSystemPrompt({
+        definition: input.specialist.definition,
+        options: input.specialist.options,
+        basePrompt: EXECUTOR_SYSTEM_PROMPT,
+        enabledGroups: specialistSelection.enabledGroups,
+        disabledGroups: specialistSelection.disabledGroups
+      }).systemPrompt
+      : EXECUTOR_SYSTEM_PROMPT,
     input.skillsDirs ?? [],
     input.providerAdmission,
     input.toolApproval ? [createToolApprovalExtension(input.toolApproval)] : undefined
   );
   rejectUnmanagedProviderAdmission(input.executorLoader, input.providerAdmission);
-  const customTools: ToolDefinition<any, any, any>[] = [
-    ...createExecutorResearchTools(),
-    createBrowserRenderTool({ runtime: sandbox.browserRuntime, allowHostFallback: false }),
-    createArtifactReadTool(input.artifactStore, {
-      workspace: sandbox.workspaceDir
-        ? {
-            hostDir: sandbox.workspaceDir,
-            visibleRoot: sandbox.root,
-            sharedWithContainer: sandbox.mode === "docker"
-          }
-        : undefined
-    }),
-    createArtifactWriteTool(input.artifactStore, {
-      workspace: sandbox.workspaceDir
-        ? { hostDir: sandbox.workspaceDir, visibleRoot: sandbox.root }
-        : undefined,
-      readExecutorFile: (visiblePath) => sandbox.readExecutorFile(visiblePath)
-    }),
-    ...(input.additionalTools ?? []),
-    createTaskResultSubmitTool()
-  ];
+  const contributed = input.specialist?.definition.createTools
+    ? contributeSpecialistTools({
+      specialist: input.specialist,
+      sandbox,
+      artifactStore: input.artifactStore,
+      executionLog: input.executionLog,
+      selection: specialistSelection
+    })
+    : { tools: [], diagnostics: [] };
+  specialistDiagnostics.push(...contributed.diagnostics);
+  for (const diagnostic of specialistDiagnostics) {
+    input.onSpecialistDiagnostic?.(diagnostic);
+  }
+  const model = input.specialist ? specialistModel(input.llmRuntime, input.specialist) : undefined;
   return createAgentSession({
     cwd: sandbox.root,
     noTools: "builtin",
-    customTools: [...sandbox.createTools(), ...customTools] as ToolDefinition<any, any, any>[],
+    customTools: [...specialistSelection.tools, ...contributed.tools] as ToolDefinition<any, any, any>[],
     authStorage: input.llmRuntime.authStorage,
     modelRegistry: input.llmRuntime.modelRegistry,
-    model: input.llmRuntime.models.executor,
-    thinkingLevel: input.llmRuntime.roleConfig.executor.thinkingLevel,
+    model: model?.model ?? input.llmRuntime.models.executor,
+    thinkingLevel: model?.thinkingLevel ?? input.llmRuntime.roleConfig.executor.thinkingLevel,
     resourceLoader: executorLoader,
-    settingsManager: createRuntimeSettingsManager(input.llmRuntime.roleConfig.executor.contextWindow),
+    settingsManager: createRuntimeSettingsManager(model?.contextWindow ?? input.llmRuntime.roleConfig.executor.contextWindow),
     sessionManager: input.sessionManager ?? SessionManager.inMemory(sandbox.root)
   });
+}
+
+/** Full Executor tool surface, tagged by capability group. */
+export function executorToolBindings(input: {
+  sandbox: ExecutorSandbox;
+  artifactStore: ArtifactStore;
+  additionalToolBindings?: SpecialistToolBinding[];
+}): SpecialistToolBinding[] {
+  const group = (group: SpecialistToolGroup, tools: ToolDefinition<any, any, any>[]): SpecialistToolBinding[] =>
+    tools.map((tool) => ({ group, tool }));
+  return [
+    ...group("sandbox", input.sandbox.createTools()),
+    ...group("research", createExecutorResearchTools()),
+    { group: "browser", tool: createBrowserRenderTool({ runtime: input.sandbox.browserRuntime, allowHostFallback: false }) },
+    {
+      group: "artifact",
+      tool: createArtifactReadTool(input.artifactStore, {
+        workspace: input.sandbox.workspaceDir
+          ? {
+              hostDir: input.sandbox.workspaceDir,
+              visibleRoot: input.sandbox.root,
+              sharedWithContainer: input.sandbox.mode === "docker"
+            }
+          : undefined
+      })
+    },
+    {
+      group: "artifact",
+      tool: createArtifactWriteTool(input.artifactStore, {
+        workspace: input.sandbox.workspaceDir
+          ? { hostDir: input.sandbox.workspaceDir, visibleRoot: input.sandbox.root }
+          : undefined,
+        readExecutorFile: (visiblePath) => input.sandbox.readExecutorFile(visiblePath)
+      })
+    },
+    ...(input.additionalToolBindings ?? []),
+    { group: "submit", tool: createTaskResultSubmitTool() }
+  ];
+}
+
+function contributeSpecialistTools(input: {
+  specialist: ExecutorSpecialistInput;
+  sandbox: ExecutorSandbox;
+  artifactStore: ArtifactStore;
+  executionLog?: ExecutionLog;
+  selection: SpecialistToolSelection;
+}): { tools: ToolDefinition<any, any, any>[]; diagnostics: SpecialistRegistryDiagnostic[] } {
+  const createTools = input.specialist.definition.createTools;
+  if (!createTools) return { tools: [], diagnostics: [] };
+  const executionLog = input.executionLog;
+  let produced: unknown;
+  try {
+    produced = createTools({
+      taskId: input.specialist.taskId,
+      specialistId: input.specialist.id,
+      options: input.specialist.options,
+      cwd: input.sandbox.hostRoot,
+      workspaceDir: input.sandbox.workspaceDir,
+      artifactStore: input.artifactStore,
+      executionLog,
+      enabledGroups: input.selection.enabledGroups,
+      disabledGroups: input.selection.disabledGroups
+    });
+  } catch (error) {
+    return {
+      tools: [],
+      diagnostics: [{
+        code: "specialist_tool_factory_failed",
+        message: `Specialist ${input.specialist.id} createTools threw: ${error instanceof Error ? error.message : String(error)}`,
+        specialistId: input.specialist.id
+      }]
+    };
+  }
+  return validateSpecialistTools(produced, {
+    specialistId: input.specialist.id,
+    reservedNames: input.selection.tools.map((tool) => tool.name)
+  });
+}
+
+function specialistModel(
+  llmRuntime: LlmRuntime,
+  specialist: ExecutorSpecialistInput
+): { model?: NonNullable<ReturnType<LlmRuntime["modelRegistry"]["find"]>>; thinkingLevel?: LlmThinkingLevel; contextWindow?: number } {
+  const profile = specialist.definition.model;
+  if (!profile) return {};
+  const model = profile.model
+    ? llmRuntime.modelRegistry.find(llmRuntime.metadata.provider, profile.model)
+    : undefined;
+  return {
+    ...(model ? { model } : {}),
+    ...(profile.thinkingLevel ? { thinkingLevel: profile.thinkingLevel } : {}),
+    ...(profile.contextWindow ? { contextWindow: profile.contextWindow } : {})
+  };
 }
 
 export async function createPlannerAgentSession(input: {

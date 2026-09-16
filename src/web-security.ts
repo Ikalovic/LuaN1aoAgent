@@ -12,6 +12,7 @@ export type WebCapability =
   | "connectivity:manage"
   | "operator:mutate"
   | "approval:decide"
+  | "admin:capability"
   | "admin:credential"
   | "admin:delete"
   | "admin:env"
@@ -25,6 +26,7 @@ const roleCapabilities: Record<WebUser["role"], ReadonlySet<WebCapability>> = {
     "connectivity:manage",
     "operator:mutate",
     "approval:decide",
+    "admin:capability",
     "admin:credential",
     "admin:delete",
     "admin:env",

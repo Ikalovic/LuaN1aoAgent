@@ -45,6 +45,7 @@ import { ScopeDocumentService, ScopeDocumentServiceError } from "./scope-documen
 import { ScopeDocumentStore } from "./scope-documents/scope-document-store.js";
 import { SkillRegistry } from "./skills/skill-registry.js";
 import { McpRegistry } from "./mcp/mcp-registry.js";
+import { SpecialistOptionError, SpecialistRegistry } from "./specialists/registry.js";
 import { EnvConfigInputError, EnvConfigStore, type EnvConfigChanges } from "./env-config-store.js";
 import { loadPentestTemplates, normalizeTaskType, type ReportingContext, type TaskType } from "./reporting/task-reporting.js";
 import {
@@ -269,6 +270,7 @@ const runtimePathPolicy = await RuntimePathPolicy.create(defaultRuntimeDir, { ba
 const scopeDocumentStore = new ScopeDocumentStore(join(runtimePathPolicy.rootDir, "scope-documents"));
 const skillRegistry = new SkillRegistry(join(cwd, ".agents", "skills"));
 const mcpRegistry = new McpRegistry({ cwd, environment: process.env });
+const specialistRegistry = new SpecialistRegistry({ cwd });
 // Admin-managed .env editing: writes also refresh process.env so registry
 // scans and later runs observe new values without a restart.
 const envConfigStore = new EnvConfigStore({ cwd });
@@ -355,7 +357,7 @@ const server = createServer(async (request, response) => {
         await sendJson(response, { error: { code: "method_not_allowed", message: "仅支持 POST" } }, 405);
         return;
       }
-      requireRuntimeAccess(user!, "operator:mutate");
+      requireRuntimeAccess(user!, "admin:capability");
       const body = await readJsonBody(request);
       assertOnlyKeys(body, ["enabled"]);
       if (typeof body.enabled !== "boolean") throw new HttpError(400, "invalid_request", "enabled 必须是布尔值");
@@ -385,7 +387,7 @@ const server = createServer(async (request, response) => {
         await sendJson(response, { error: { code: "method_not_allowed", message: "仅支持 POST" } }, 405);
         return;
       }
-      requireRuntimeAccess(user!, "operator:mutate");
+      requireRuntimeAccess(user!, "admin:capability");
       const body = await readJsonBody(request);
       assertOnlyKeys(body, ["enabled"]);
       if (typeof body.enabled !== "boolean") throw new HttpError(400, "invalid_request", "enabled 必须是布尔值");
@@ -398,6 +400,80 @@ const server = createServer(async (request, response) => {
       }
       const server = mcpRegistry.snapshot().servers.find((item) => item.name === name)!;
       await sendJson(response, server);
+      return;
+    }
+    if (url.pathname === "/api/agents") {
+      if (request.method !== "GET") {
+        await sendJson(response, { error: { code: "method_not_allowed", message: "仅支持 GET" } }, 405);
+        return;
+      }
+      requireRuntimeAccess(user!, "viewer:metadata");
+      await sendJson(response, await specialistRegistry.describeAll());
+      return;
+    }
+    const specialistStateRoute = /^\/api\/agents\/([^/]+)\/state$/.exec(url.pathname);
+    if (specialistStateRoute) {
+      if (request.method !== "POST") {
+        await sendJson(response, { error: { code: "method_not_allowed", message: "仅支持 POST" } }, 405);
+        return;
+      }
+      requireRuntimeAccess(user!, "admin:capability");
+      const body = await readJsonBody(request);
+      assertOnlyKeys(body, ["enabled"]);
+      if (typeof body.enabled !== "boolean") throw new HttpError(400, "invalid_request", "enabled 必须是布尔值");
+      const id = decodeURIComponent(specialistStateRoute[1]);
+      assertSpecialistId(id);
+      try {
+        await sendJson(response, await specialistRegistry.setEnabled(id, body.enabled));
+      } catch (error) {
+        if (error instanceof SpecialistOptionError) throw new HttpError(400, "invalid_request", error.message);
+        throw new HttpError(404, "specialist_not_found", "专精 Agent 不存在");
+      }
+      return;
+    }
+    const specialistOptionsRoute = /^\/api\/agents\/([^/]+)\/options$/.exec(url.pathname);
+    if (specialistOptionsRoute) {
+      if (request.method !== "PUT") {
+        await sendJson(response, { error: { code: "method_not_allowed", message: "仅支持 PUT" } }, 405);
+        return;
+      }
+      requireRuntimeAccess(user!, "admin:capability");
+      const body = await readJsonBody(request);
+      assertOnlyKeys(body, ["options"]);
+      if (!body.options || typeof body.options !== "object" || Array.isArray(body.options)) {
+        throw new HttpError(400, "invalid_request", "options 必须是对象");
+      }
+      const id = decodeURIComponent(specialistOptionsRoute[1]);
+      assertSpecialistId(id);
+      try {
+        await sendJson(response, await specialistRegistry.setOptions(id, body.options));
+      } catch (error) {
+        if (error instanceof SpecialistOptionError) throw new HttpError(400, "invalid_request", error.message);
+        throw new HttpError(404, "specialist_not_found", "专精 Agent 不存在");
+      }
+      return;
+    }
+    const specialistOptionsModeRoute = /^\/api\/agents\/([^/]+)\/options-mode$/.exec(url.pathname);
+    if (specialistOptionsModeRoute) {
+      if (request.method !== "POST") {
+        await sendJson(response, { error: { code: "method_not_allowed", message: "仅支持 POST" } }, 405);
+        return;
+      }
+      requireRuntimeAccess(user!, "admin:capability");
+      const body = await readJsonBody(request);
+      assertOnlyKeys(body, ["mode"]);
+      const mode = body.mode === null ? undefined : body.mode;
+      if (mode !== undefined && mode !== "planner" && mode !== "user") {
+        throw new HttpError(400, "invalid_request", "mode 必须是 planner、user 或 null");
+      }
+      const id = decodeURIComponent(specialistOptionsModeRoute[1]);
+      assertSpecialistId(id);
+      try {
+        await sendJson(response, await specialistRegistry.setOptionsMode(id, mode ?? null));
+      } catch (error) {
+        if (error instanceof SpecialistOptionError) throw new HttpError(400, "invalid_request", error.message);
+        throw new HttpError(404, "specialist_not_found", "专精 Agent 不存在");
+      }
       return;
     }
     if (url.pathname === "/api/env") {
@@ -1533,6 +1609,12 @@ function validateReplayBody(body: JsonRecord): WebReplayOverrides {
     ...(taskRef === undefined ? {} : { taskRef }),
     ...(runRef === undefined ? {} : { runRef })
   };
+}
+
+function assertSpecialistId(id: string): void {
+  if (!/^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(id) || id.length > 64) {
+    throw new HttpError(400, "invalid_request", "专精 Agent 名称无效");
+  }
 }
 
 function assertOnlyKeys(record: JsonRecord, allowed: readonly string[]): void {

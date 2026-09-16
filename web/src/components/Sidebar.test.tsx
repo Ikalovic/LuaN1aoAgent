@@ -40,7 +40,7 @@ describe("Sidebar", () => {
     expect(onViewChange).toHaveBeenCalledWith("traffic");
   });
 
-  it("opens the Skills management view", () => {
+  it("opens the unified capabilities view", () => {
     const onViewChange = vi.fn();
     render(
       <Sidebar
@@ -53,8 +53,8 @@ describe("Sidebar", () => {
       />
     );
 
-    fireEvent.click(screen.getByText("Skills"));
-    expect(onViewChange).toHaveBeenCalledWith("skills");
+    fireEvent.click(screen.getByText("Capabilities"));
+    expect(onViewChange).toHaveBeenCalledWith("capabilities");
   });
 
   it("offers a continue action for idle sessions", () => {

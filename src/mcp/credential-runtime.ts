@@ -28,10 +28,27 @@ export type CredentialMcpClientFactory = (input: {
   onStderr: (line: string) => void;
 }) => Promise<CredentialMcpClientConnection>;
 
+/**
+ * Trusted context the credential MCP server requires on every call. It is
+ * runtime-owned: the Executor never supplies or sees it, and the server schema
+ * rejects a call that arrives without it.
+ */
+export type CredentialTrustedContext = {
+  runRef: string;
+  scope: { cidrs: string[]; domains: string[] };
+  scopeFingerprint: string;
+  derivedRefs: string[];
+};
+
 export type CredentialMcpRuntimeOptions = {
   artifactStoreRoot: string;
   artifactStoreDb?: string;
   executionLog: ExecutionLog;
+  /**
+   * Builds the trusted context for a call. Resolved per call because the
+   * authorized scope is only known once the run starts.
+   */
+  trustedContext: (taskRef: string) => CredentialTrustedContext;
   clientFactory?: CredentialMcpClientFactory;
   now?: () => number;
 };
@@ -82,7 +99,14 @@ export class CredentialMcpRuntime {
     }
     const startedAt = this.now();
     try {
-      const response = await client.callTool({ name: toolName, arguments: args }, signal);
+      // The server schema is strict and requires `_runtime`; forwarding the
+      // caller's arguments verbatim made every credential call fail validation,
+      // which silently broke the hit-credential handoff of every Agent that
+      // stores what it found.
+      const response = await client.callTool({
+        name: toolName,
+        arguments: { ...args, _runtime: { ...this.options.trustedContext(taskRef), taskRef } }
+      }, signal);
       const result = parseToolResponse(response);
       if (response.isError) {
         throw new Error(typeof result === "string" ? result : JSON.stringify(result));

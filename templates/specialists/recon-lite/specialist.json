@@ -1,0 +1,27 @@
+{
+  "id": "recon-lite",
+  "name": "轻量信息搜集 Agent",
+  "description": "只做小范围、低风险的信息搜集与资产确认，产出可复核的资产与边界结论。",
+  "whenToUse": "适用于资产、端口、服务与目录结构尚未确认，需要先建立可判定基线的 Task；不适用于已经确认入口后的利用工作。",
+  "prompt": { "mode": "extend", "file": "prompt.md" },
+  "tools": { "disableGroups": ["fofa", "beekeeper", "credentials", "connectivity", "network_diagnostics"] },
+  "skills": { "mode": "allowlist", "allow": ["port-scan", "subdomain-enum", "fingerprint"] },
+  "budget": {
+    "defaultMaxTurns": 6,
+    "maxTurnsCeiling": 10,
+    "epochTurnSlice": 5,
+    "epochTimeShare": 0.15
+  },
+  "concurrency": { "maxParallelTasks": 2 },
+  "optionsMode": "planner",
+  "options": {
+    "scopeNote": {
+      "type": "text",
+      "title": "补充说明",
+      "description": "会以 {{options.scopeNote}} 的形式注入提示词。任务目标类参数，显式交给用户填写。",
+      "default": "",
+      "maxLength": 2000,
+      "authority": "user"
+    }
+  }
+}

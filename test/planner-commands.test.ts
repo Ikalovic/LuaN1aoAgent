@@ -96,6 +96,86 @@ test("preserves explicit sequential Executor context continuation", () => {
     "task:foothold");
 });
 
+test("preserves the Planner-assigned Specialist and its Task-level options", () => {
+  const decision = normalizePlannerDecision({
+    commands: [{
+      kind: "create_tasks",
+      tasks: [{
+        id: "task:brute",
+        goal: "Obtain valid credentials for the confirmed login endpoint",
+        targetRefs: ["goal:root"],
+        scopeRef: "scope:root",
+        successCriteria: ["A working credential is persisted with evidence"],
+        priority: 1,
+        specialist: "bruteforce",
+        specialistOptions: { threads: 2, maxAttemptsPerAccount: 10, protocols: ["http", "ssh"] }
+      }]
+    }],
+    reason: "The credential attack belongs to the brute-force Specialist"
+  });
+
+  const command = decision.commands?.[0];
+  assert.equal(command?.kind, "create_tasks");
+  if (command?.kind !== "create_tasks") return;
+  // Dropping ownership here silently downgraded every assigned Task to the
+  // general Executor, so the Planner's selection never reached the graph.
+  assert.equal(command.tasks[0]?.specialist, "bruteforce");
+  assert.deepEqual(command.tasks[0]?.specialistOptions, {
+    threads: 2,
+    maxAttemptsPerAccount: 10,
+    protocols: ["http", "ssh"]
+  });
+
+  // A Task without an owner stays owner-less rather than defaulting to anything.
+  const general = normalizePlannerDecision({
+    commands: [{
+      kind: "create_tasks",
+      tasks: [{
+        id: "task:plain",
+        goal: "Do the default work",
+        targetRefs: ["goal:root"],
+        scopeRef: "scope:root",
+        successCriteria: ["Done"],
+        priority: 1
+      }]
+    }],
+    reason: "No Specialist fits"
+  });
+  const plainCommand = general.commands?.[0];
+  assert.equal(plainCommand?.kind === "create_tasks" ? plainCommand.tasks[0]?.specialist : "x", undefined);
+  assert.equal(plainCommand?.kind === "create_tasks" ? plainCommand.tasks[0]?.specialistOptions : "x", undefined);
+});
+
+test("rejects a malformed Specialist id or option value instead of dropping it", () => {
+  const task = (extra: Record<string, unknown>) => ({
+    commands: [{
+      kind: "create_tasks",
+      tasks: [{
+        id: "task:brute",
+        goal: "Obtain valid credentials",
+        targetRefs: ["goal:root"],
+        scopeRef: "scope:root",
+        successCriteria: ["Credential persisted"],
+        priority: 1,
+        ...extra
+      }]
+    }],
+    reason: "Credential attack"
+  });
+  assert.throws(
+    () => normalizePlannerDecision(task({ specialist: "Brute_Force" })),
+    /not a valid Specialist id/
+  );
+  assert.throws(
+    () => normalizePlannerDecision(task({ specialist: "bruteforce", specialistOptions: "threads=2" })),
+    /specialistOptions must be an object/
+  );
+  assert.throws(
+    () => normalizePlannerDecision(task({ specialist: "bruteforce", specialistOptions: { threads: { n: 2 } } })),
+    /must be a string, number, boolean or array of strings/
+  );
+});
+
 test("drops legacy Planner-authored constraints from task definitions", () => {
   const decision = normalizePlannerDecision({
     decision: "apply_commands",

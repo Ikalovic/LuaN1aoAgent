@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { mkdir } from "node:fs/promises";
 import { join } from "node:path";
-import { SessionManager } from "@earendil-works/pi-coding-agent";
+import { SessionManager, type ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { createExecutorAgentSession, createObserverAgentSession, createPlannerAgentSession, createScopeResolverAgentSession, createApprovalJudgeAgentSession, projectSkillsDirs, type SecurityAgentRuntime, type SecurityAgentSession } from "./agents.js";
 import type { ApprovalMode } from "./approval/dangerous-tool-policy.js";
 import { LlmRiskJudge } from "./approval/llm-risk-judge.js";
@@ -9,6 +9,18 @@ import type { TerminalApprover } from "./approval/tool-approval-extension.js";
 import type { ToolApprovalRegistry } from "./approval/tool-approval-registry.js";
 import { SkillRegistry, type SkillRegistrySnapshot } from "./skills/skill-registry.js";
 import { selectSkillsForTask, type SkillSelectionResult } from "./skills/skill-selector.js";
+import { GENERAL_SPECIALIST_ID, SpecialistRegistry } from "./specialists/registry.js";
+import { resolveTaskSpecialistOptions } from "./specialists/options.js";
+import {
+  isSpecialistId,
+  type SpecialistAgentDefinition,
+  type SpecialistBudgetProfile,
+  type SpecialistCatalogEntry,
+  type SpecialistRegistrySnapshot,
+  type SpecialistResolution,
+  type SpecialistToolBinding,
+  type SpecialistToolGroup
+} from "./specialists/types.js";
 import { extractJsonObject } from "./json.js";
 import { normalizeInferredScopeCidrs, parseAuthorizedScope, type ScopeResolution } from "./scope.js";
 import {
@@ -105,7 +117,7 @@ import { createEvidenceListTool, createEvidenceReadTool } from "./tools/pi-tools
 import { createExecutorBeekeeperTools } from "./tools/beekeeper-mcp-tools.js";
 import { createExecutorFofaTools } from "./tools/fofa-mcp-tools.js";
 import { createExecutorCredentialTools } from "./tools/credential-tools.js";
-import { CredentialMcpRuntime } from "./mcp/credential-runtime.js";
+import { CredentialMcpRuntime, type CredentialTrustedContext } from "./mcp/credential-runtime.js";
 import { McpRegistry } from "./mcp/mcp-registry.js";
 import { createTopologyValidationTool } from "./tools/topology-validation-tool.js";
 import type {
@@ -130,7 +142,8 @@ import type {
   TaskEnvelope,
   TaskOutcome,
   TaskResult,
-  TaskResultStatus
+  TaskResultStatus,
+  SpecialistTaskStatus
 } from "./types.js";
 
 type PlannerTaskCommand = Extract<PlannerCommand, { kind: "patch_task" | "replace_dependencies" | "set_task_status" }>;
@@ -334,6 +347,8 @@ type ActiveTaskState = {
   invocationAbortController: AbortController;
   runDeadlineAt?: number;
   supervisionState: TaskSupervisionState;
+  /** Specialist profile applied to this epoch; absent only for legacy call paths. */
+  specialist?: ResolvedSpecialist;
 };
 
 type TaskExecution = {
@@ -348,12 +363,24 @@ type TaskExecution = {
 type ActiveTaskRun = {
   taskEnvelope: TaskEnvelope;
   promise: Promise<TaskExecution>;
+  specialistId?: string;
 };
 
 type TaskCompletion = {
   taskId: string;
   execution?: TaskExecution;
   error?: unknown;
+};
+
+export type ResolvedSpecialist = Extract<SpecialistResolution, { ok: true }>;
+
+/** Narrow registry surface the controller depends on, injectable in tests. */
+export type SpecialistRegistryLike = {
+  resolve(id: string): Promise<SpecialistResolution>;
+  catalog(): Promise<SpecialistCatalogEntry[]>;
+  describeAll(): Promise<SpecialistRegistrySnapshot>;
+  statusIndex(): Record<string, "ready" | "disabled" | "invalid">;
+  budgetProfile(id: string): SpecialistBudgetProfile | undefined;
 };
 
 type ExecutorSessionLease = {
@@ -427,9 +454,12 @@ export class SecurityAgentController {
   private readonly beekeeperRuntimeFactory: (input: BeekeeperMcpRuntimeOptions) => BeekeeperMcpRuntime;
   private readonly skillRegistry: { scan(): SkillRegistrySnapshot };
   private readonly mcpRegistry: { isEnabled(name: string): boolean };
+  private readonly specialistRegistry: SpecialistRegistryLike;
   private readonly skillSelector: (input: {
     taskGoal: string;
     snapshot: SkillRegistrySnapshot;
+    allowlist?: string[];
+    denylist?: string[];
   }) => Promise<SkillSelectionResult>;
   private skillSnapshot?: SkillRegistrySnapshot;
   private beekeeperRuntime?: BeekeeperMcpRuntime;
@@ -500,7 +530,13 @@ export class SecurityAgentController {
     beekeeperRuntimeFactory?: (input: BeekeeperMcpRuntimeOptions) => BeekeeperMcpRuntime;
     skillRegistry?: { scan(): SkillRegistrySnapshot };
     mcpRegistry?: { isEnabled(name: string): boolean };
-    skillSelector?: (input: { taskGoal: string; snapshot: SkillRegistrySnapshot }) => Promise<SkillSelectionResult>;
+    specialistRegistry?: SpecialistRegistryLike;
+    skillSelector?: (input: {
+      taskGoal: string;
+      snapshot: SkillRegistrySnapshot;
+      allowlist?: string[];
+      denylist?: string[];
+    }) => Promise<SkillSelectionResult>;
     toolApproval?: {
       mode: ApprovalMode | (() => ApprovalMode);
       registry?: ToolApprovalRegistry;
@@ -519,6 +555,7 @@ export class SecurityAgentController {
       cwd: input.cwd,
       environment: input.environment ?? process.env
     });
+    this.specialistRegistry = input.specialistRegistry ?? new SpecialistRegistry({ cwd: input.cwd });
     this.approvalMode = input.toolApproval?.mode ?? "off";
     this.approvalRegistry = input.toolApproval?.registry;
     this.terminalApprover = input.toolApproval?.terminalApprover;
@@ -602,6 +639,31 @@ export class SecurityAgentController {
       await this.executionLog.append({
         role: "runtime",
         eventType: "skill_registry_failed",
+        summary: error instanceof Error ? error.message : String(error),
+        payload: {}
+      });
+    }
+    try {
+      const specialistSnapshot = await this.specialistRegistry.describeAll();
+      await this.executionLog.append({
+        role: "runtime",
+        eventType: "specialist_registry_scanned",
+        summary: `Discovered ${specialistSnapshot.specialists.length} Specialist Agent(s)`,
+        payload: {
+          specialists: specialistSnapshot.specialists.map((specialist) => ({
+            id: specialist.id,
+            source: specialist.source,
+            enabled: specialist.enabled,
+            valid: specialist.valid,
+            executability: specialist.executability
+          })),
+          diagnostics: specialistSnapshot.diagnostics
+        }
+      });
+    } catch (error) {
+      await this.executionLog.append({
+        role: "runtime",
+        eventType: "specialist_registry_failed",
         summary: error instanceof Error ? error.message : String(error),
         payload: {}
       });
@@ -696,7 +758,8 @@ export class SecurityAgentController {
       this.credentialMcpRuntime = new CredentialMcpRuntime({
         artifactStoreRoot: this.artifactStore.rootDir,
         artifactStoreDb: this.artifactStore.databasePath,
-        executionLog: this.executionLog
+        executionLog: this.executionLog,
+        trustedContext: (taskRef) => this.credentialTrustedContext(taskRef)
       });
       await this.credentialMcpRuntime.configure();
       await this.executionLog.append({
@@ -1437,6 +1500,7 @@ export class SecurityAgentController {
 
   private buildPlannerDecisionView(): PlannerDecisionView {
     const view = this.graphStore.plannerDecisionView();
+    const specialistStatus = this.specialistStatusIndex();
     const taskOutcomes = this.runtimeStore.listTaskOutcomes(Number.MAX_SAFE_INTEGER);
     const statusByTaskId = new Map(view.taskLedger.map((task) => [task.taskId, task.status]));
     const taskLedger = view.taskLedger.map((task) => {
@@ -1479,6 +1543,11 @@ export class SecurityAgentController {
         maxTurns,
         consumedTurns,
         remainingTurns: remainingTaskTurns,
+        specialist: {
+          id: taskEnvelope?.specialist ?? GENERAL_SPECIALIST_ID,
+          status: specialistStatus.get(taskEnvelope?.specialist ?? GENERAL_SPECIALIST_ID) ?? "unknown"
+        },
+        ...(taskEnvelope?.specialistOptions ? { specialistOptions: taskEnvelope.specialistOptions } : {}),
         ...readiness,
         projection: {
           committedSeq: projectionState.committedSeq,
@@ -1584,9 +1653,13 @@ export class SecurityAgentController {
     });
   }
 
-  private taskEnvelopeFromSpec(taskSpec: PlannerTaskSpec, scopeSummary: string): TaskEnvelope {
+  private taskEnvelopeFromSpec(
+    taskSpec: PlannerTaskSpec,
+    scopeSummary: string,
+    specialist?: ResolvedSpecialist
+  ): TaskEnvelope {
     const taskId = taskSpec.id;
-    const budget = normalizeInitialTaskBudget(taskSpec.budget);
+    const budget = normalizeInitialTaskBudget(taskSpec.budget, specialist?.definition);
     const constraints = [`授权范围原文：${scopeSummary}`];
     const dependsOnTaskRefs = dedupeStrings(taskSpec.dependsOnTaskRefs ?? []);
     const parentTaskId = taskSpec.parentTaskId ?? "goal:root";
@@ -1601,7 +1674,9 @@ export class SecurityAgentController {
       dependsOnTaskRefs,
       continueFromTaskRef: taskSpec.continueFromTaskRef,
       parentTaskId,
-      budget
+      budget,
+      ...(taskSpec.specialist ? { specialist: taskSpec.specialist } : {}),
+      ...(taskSpec.specialistOptions ? { specialistOptions: taskSpec.specialistOptions } : {})
     };
   }
 
@@ -1639,6 +1714,7 @@ export class SecurityAgentController {
     let rejectedCommand: unknown;
     try {
       const budgetPatchByCommandIndex = this.resolvePlannerBudgetPatches(commands);
+      const specialistByTaskId = await this.resolveCreatedTaskSpecialists(commands);
       const taskCreateInputs: Array<{
         command: PlannerCreateTasksCommand;
         taskEnvelope: TaskEnvelope;
@@ -1648,7 +1724,7 @@ export class SecurityAgentController {
         if (command.kind === "create_tasks") {
           const basisRefs = dedupeStrings(command.basedOnRefs ?? []);
           const taskEnvelopes = command.tasks.map((taskSpec) => ({
-            ...this.taskEnvelopeFromSpec(taskSpec, scopeSummary),
+            ...this.taskEnvelopeFromSpec(taskSpec, scopeSummary, specialistByTaskId.get(taskSpec.id)),
             basisRefs
           }));
           taskEnvelopes.forEach((taskEnvelope, taskIndex) => {
@@ -1682,7 +1758,9 @@ export class SecurityAgentController {
           dependsOnTaskRefs: taskEnvelope.dependsOnTaskRefs,
           continueFromTaskRef: taskEnvelope.continueFromTaskRef,
           budget: taskEnvelope.budget,
-          priority
+          priority,
+          ...(taskEnvelope.specialist ? { specialist: taskEnvelope.specialist } : {}),
+          ...(taskEnvelope.specialistOptions ? { specialistOptions: taskEnvelope.specialistOptions } : {})
         })),
         taskCommands: taskCommands.map(({ command, commandIndex }): PlannerTaskBatchCommand => {
           const commandReason = plannerDecision.reason;
@@ -1837,6 +1915,61 @@ export class SecurityAgentController {
     return createdTaskEnvelopes;
   }
 
+  /** Resolves the owning Specialist of every Task a decision creates. */
+  private async resolveCreatedTaskSpecialists(commands: PlannerCommand[]): Promise<Map<string, ResolvedSpecialist>> {
+    const resolutions = new Map<string, ResolvedSpecialist>();
+    for (const command of commands) {
+      if (command.kind !== "create_tasks") continue;
+      for (const taskSpec of command.tasks) {
+        const resolution = await this.specialistRegistry.resolve(taskSpec.specialist ?? GENERAL_SPECIALIST_ID);
+        if (resolution.ok) resolutions.set(taskSpec.id, this.applyTaskSpecialistOptions(taskSpec, resolution));
+      }
+    }
+    return resolutions;
+  }
+
+  /**
+   * Clamps the Task's Planner-chosen Specialist options into the boundary the
+   * author and the operator declared. This is the single place a Task-level
+   * value becomes effective, so a Planner cannot exceed the Specialist's
+   * envelope by any path.
+   */
+  private applyTaskSpecialistOptions(
+    task: Pick<TaskEnvelope, "specialistOptions"> | PlannerTaskSpec,
+    resolution: Extract<SpecialistResolution, { ok: true }>
+  ): ResolvedSpecialist {
+    const requested = task.specialistOptions;
+    if (!requested || Object.keys(requested).length === 0) return resolution;
+    const applied = resolveTaskSpecialistOptions(resolution.optionPolicies, requested);
+    return {
+      ...resolution,
+      options: applied.values,
+      diagnostics: [...resolution.diagnostics, ...applied.diagnostics]
+    };
+  }
+
+  /**
+   * Upper bound a Specialist places on its own Task turns. Specialist ceilings
+   * may sit below the global minimum so cheap Agents stay cheap.
+   */
+  private specialistTurnCeiling(specialistId: string): number {
+    let ceiling: number | undefined;
+    try {
+      ceiling = this.specialistRegistry.budgetProfile(specialistId)?.maxTurnsCeiling;
+    } catch {
+      ceiling = undefined;
+    }
+    return Math.max(1, Math.min(ceiling ?? MAX_TASK_BUDGET.maxTurns, MAX_TASK_BUDGET.maxTurns));
+  }
+
+  private epochTurnSlice(state?: ActiveTaskState): number {
+    return state?.specialist?.definition.budget.epochTurnSlice ?? DEFAULT_EPOCH_TURN_SLICE;
+  }
+
+  private epochTimeShare(state?: ActiveTaskState): number {
+    return state?.specialist?.definition.budget.epochTimeShare ?? TASK_EPOCH_RUN_TIME_SHARE;
+  }
+
   private resolvePlannerBudgetPatches(commands: PlannerCommand[]): Map<number, {
     taskId: string;
     consumedTurns: number;
@@ -1879,6 +2012,17 @@ export class SecurityAgentController {
         additionalTurns = newMaxTurns - previousMaxTurns;
       } else {
         continue;
+      }
+      // Only a Task that explicitly names a Specialist is bounded by that
+      // Agent's ceiling; unnamed Tasks keep the historical cumulative growth.
+      if (taskEnvelope.specialist) {
+        const turnCeiling = this.specialistTurnCeiling(taskEnvelope.specialist);
+        if (newMaxTurns > turnCeiling) {
+          // The ceiling narrows the allocation but never shrinks it below what the
+          // Task already holds, so an extension attempt cannot reduce remaining turns.
+          newMaxTurns = Math.max(previousMaxTurns, turnCeiling);
+          additionalTurns = newMaxTurns - previousMaxTurns;
+        }
       }
       currentMaxTurnsByTaskId.set(command.taskId, newMaxTurns);
       resolutions.set(commandIndex, {
@@ -2168,6 +2312,88 @@ export class SecurityAgentController {
     });
   }
 
+  /**
+   * Resolves the owning Specialist for every admission candidate. An unusable
+   * Specialist never degrades silently to another Agent: the Task is parked for
+   * a Planner decision and the exact reason is persisted.
+   */
+  private async resolveSpecialistCandidates(candidates: TaskEnvelope[]): Promise<{
+    runnable: TaskEnvelope[];
+    resolutions: Map<string, ResolvedSpecialist>;
+    caps: Map<string, number>;
+  }> {
+    const runnable: TaskEnvelope[] = [];
+    const resolutions = new Map<string, ResolvedSpecialist>();
+    const caps = new Map<string, number>();
+    for (const task of candidates) {
+      const specialistId = task.specialist ?? GENERAL_SPECIALIST_ID;
+      let resolution: SpecialistResolution;
+      try {
+        resolution = await this.specialistRegistry.resolve(specialistId);
+      } catch (error) {
+        resolution = {
+          ok: false,
+          id: specialistId,
+          reason: "load_failed",
+          message: error instanceof Error ? error.message : String(error)
+        };
+      }
+      if (!resolution.ok) {
+        if (!this.awaitingPlannerTaskIds.has(task.taskId)) {
+          this.awaitingPlannerTaskIds.add(task.taskId);
+          await this.executionLog.append({
+            taskId: task.taskId,
+            role: "runtime",
+            eventType: "specialist_unavailable",
+            summary: `Specialist ${specialistId} is ${resolution.reason}: ${resolution.message}`,
+            payload: {
+              specialistId,
+              reason: resolution.reason,
+              message: resolution.message,
+              specialistStatus: this.specialistStatusIndex().get(specialistId) ?? "unknown"
+            }
+          });
+        }
+        continue;
+      }
+      runnable.push(task);
+      resolutions.set(task.taskId, this.applyTaskSpecialistOptions(task, resolution));
+      const declaredCap = resolution.definition.concurrency?.maxParallelTasks;
+      if (declaredCap !== undefined) {
+        caps.set(resolution.id, Math.min(declaredCap, 16));
+      }
+    }
+    return { runnable, resolutions, caps };
+  }
+
+  private async logSpecialistSelection(taskEnvelope: TaskEnvelope, specialist: ResolvedSpecialist): Promise<void> {
+    await this.executionLog.append({
+      taskId: taskEnvelope.taskId,
+      role: "runtime",
+      eventType: "specialist_selected",
+      summary: `${taskEnvelope.taskId} -> ${specialist.id}`,
+      payload: {
+        specialistId: specialist.id,
+        source: specialist.entry.source,
+        promptMode: specialist.definition.prompt.mode,
+        disabledToolGroups: specialist.entry.disabledGroups,
+        skillMode: specialist.definition.skills?.mode ?? "auto",
+        budget: specialist.definition.budget,
+        concurrency: specialist.definition.concurrency,
+        options: specialist.options
+      }
+    });
+    for (const diagnostic of specialist.diagnostics) {
+      await this.executionLog.append({
+        taskId: taskEnvelope.taskId,
+        role: "runtime",
+        eventType: "specialist_diagnostic",
+        summary: diagnostic.message,
+        payload: { specialistId: specialist.id, code: diagnostic.code }
+      });
+    }
+  }
+
   private reconcileReadyTasks(maxParallelTasks: number): Promise<void> {
     const reconcile = this.taskReconcileChain.then(async () => {
       const capacity = Math.max(0, maxParallelTasks - this.activeTaskRuns.size);
@@ -2175,12 +2401,25 @@ export class SecurityAgentController {
         return;
       }
       const candidates = this.listRunnableTaskCandidates();
+      const { runnable, resolutions, caps } = await this.resolveSpecialistCandidates(candidates);
       const occupiedSessionRefs = new Set(
         [...this.activeTaskRuns.values()].flatMap((run) => run.taskEnvelope.availableSessionRefs ?? [])
       );
-      const readyTasks = admitReadyTasks(candidates, capacity, occupiedSessionRefs);
+      const activeBySpecialist = new Map<string, number>();
+      for (const run of this.activeTaskRuns.values()) {
+        if (!run.specialistId) continue;
+        activeBySpecialist.set(run.specialistId, (activeBySpecialist.get(run.specialistId) ?? 0) + 1);
+      }
+      const readyTasks = admitReadyTasks(runnable, capacity, occupiedSessionRefs, {
+        caps,
+        active: activeBySpecialist
+      });
       if (readyTasks.length === 0) {
         return;
+      }
+      for (const taskEnvelope of readyTasks) {
+        const specialist = resolutions.get(taskEnvelope.taskId);
+        if (specialist) await this.logSpecialistSelection(taskEnvelope, specialist);
       }
       await this.executionLog.append({
         role: "runtime",
@@ -2197,10 +2436,13 @@ export class SecurityAgentController {
         || this.activeTaskRuns.size > 0
         || readyTasks.length > 1;
       for (const taskEnvelope of readyTasks) {
+        const specialist = resolutions.get(taskEnvelope.taskId);
+        if (!specialist) continue;
         const promise = this.runExecutorTask(taskEnvelope, {
-          useDynamicExecutor
+          useDynamicExecutor,
+          specialist
         });
-        const run = { taskEnvelope, promise };
+        const run = { taskEnvelope, promise, specialistId: specialist.id };
         this.activeTaskRuns.set(taskEnvelope.taskId, run);
         void promise.then(
           (execution) => this.recordTaskCompletion(run, { taskId: taskEnvelope.taskId, execution }, maxParallelTasks),
@@ -2324,10 +2566,10 @@ export class SecurityAgentController {
 
   private async runExecutorTask(
     taskEnvelope: TaskEnvelope,
-    options: { useDynamicExecutor: boolean }
+    options: { useDynamicExecutor: boolean; specialist: ResolvedSpecialist }
   ): Promise<TaskExecution> {
     for (let providerAttempt = 1; providerAttempt <= EXECUTOR_PROVIDER_RETRY_ATTEMPTS + 1; providerAttempt += 1) {
-      const state = this.beginTaskExecution(taskEnvelope);
+      const state = this.beginTaskExecution(taskEnvelope, options.specialist);
       const maxTurns = taskEnvelope.budget?.maxTurns ?? DEFAULT_TASK_BUDGET.maxTurns;
       if (state.taskTurnCount >= maxTurns) {
         const persisted = await this.persistEpochOutcome(state, {
@@ -2347,7 +2589,11 @@ export class SecurityAgentController {
       try {
         const executorContext = await this.claimExecutorContextForTask(taskEnvelope);
         await this.prepareExecutorSandboxForEpoch(state, executorContext.workspaceKey);
-        executorSession = await this.createExecutorSessionForTask(taskEnvelope, options.useDynamicExecutor);
+        executorSession = await this.createExecutorSessionForTask(
+          taskEnvelope,
+          options.useDynamicExecutor,
+          options.specialist
+        );
       } catch (error) {
         await this.endExecutorNetworkEpoch(state);
         await this.persistEpochOutcome(state, {
@@ -2457,6 +2703,7 @@ export class SecurityAgentController {
             inputBytes: executorInputBytes,
             details: {
               providerAttempt,
+              specialistId: options.specialist.id,
               dynamicSession: executorSession.dynamicExecutor,
               resumedSession: executorSession.resumed,
               resumeCount: executorSession.resumeCount,
@@ -2903,25 +3150,66 @@ export class SecurityAgentController {
     return createExecutorConnectivityTools(executorRuntime, taskId);
   }
 
-  private createTaskRuntimeTools(taskEnvelope: TaskEnvelope) {
+  /** Flattened view of the task runtime tools, without capability grouping. */
+  private createTaskRuntimeTools(taskEnvelope: TaskEnvelope): ToolDefinition<any, any, any>[] {
+    return this.createTaskRuntimeToolBindings(taskEnvelope).map((binding) => binding.tool);
+  }
+
+  /**
+   * Task runtime tools tagged with their Specialist capability group. This is
+   * the single place where runtime-provided Executor capabilities are listed,
+   * so a Specialist tool policy can only ever narrow this set.
+   */
+  private createTaskRuntimeToolBindings(taskEnvelope: TaskEnvelope): SpecialistToolBinding[] {
+    const bind = (
+      group: SpecialistToolGroup,
+      tools: ToolDefinition<any, any, any>[]
+    ): SpecialistToolBinding[] => tools.map((tool) => ({ group, tool }));
     return [
-      ...this.createTaskConnectivityTools(taskEnvelope.taskId),
-      ...(this.connectivityRuntime
+      ...bind("connectivity", this.createTaskConnectivityTools(taskEnvelope.taskId)),
+      ...bind("network_diagnostics", this.connectivityRuntime
         ? createNetworkDiagnosticsTools(this.connectivityRuntime, taskEnvelope.taskId)
         : []),
-      ...(this.fofaRuntime
+      ...bind("fofa", this.fofaRuntime
         ? createExecutorFofaTools(this.fofaRuntime, this.artifactStore, taskEnvelope.taskId)
         : []),
-      ...(this.fofaRuntime ? [createTopologyValidationTool()] : []),
-      ...(this.beekeeperRuntime
+      ...bind("fofa", this.fofaRuntime ? [createTopologyValidationTool()] : []),
+      ...bind("beekeeper", this.beekeeperRuntime
         ? createExecutorBeekeeperTools(this.beekeeperRuntime, taskEnvelope.taskId)
         : []),
-      ...(this.credentialMcpRuntime
+      ...bind("credentials", this.credentialMcpRuntime
         ? createExecutorCredentialTools(this.credentialMcpRuntime, taskEnvelope.taskId)
         : []),
-      createEvidenceListTool(this.executionLog),
-      createEvidenceReadTool(this.executionLog)
+      ...bind("evidence", [
+        createEvidenceListTool(this.executionLog),
+        createEvidenceReadTool(this.executionLog)
+      ])
     ];
+  }
+
+  /**
+   * Runtime-owned trusted context for the credential MCP server. Scope data is
+   * read at call time because the authorized scope is only known once the run
+   * has started; an empty scope still satisfies the server schema and keeps the
+   * store isolated per run through `runRef`.
+   */
+  private credentialTrustedContext(_taskRef: string): CredentialTrustedContext {
+    const summary = this.activeScopeSummary;
+    let scope: { cidrs: string[]; domains: string[] } = { cidrs: [], domains: [] };
+    if (summary) {
+      try {
+        const parsed = parseAuthorizedScope(summary);
+        scope = { cidrs: [...parsed.cidrs], domains: [...parsed.domains] };
+      } catch {
+        scope = { cidrs: [], domains: [] };
+      }
+    }
+    return {
+      runRef: this.runId,
+      scope,
+      scopeFingerprint: createHash("sha256").update(summary ?? "").digest("hex"),
+      derivedRefs: []
+    };
   }
 
   private async buildCredentialSummary(scopeSummary: string): Promise<string> {
@@ -3233,7 +3521,8 @@ export class SecurityAgentController {
 
   private async createExecutorSessionForTask(
     taskEnvelope: TaskEnvelope,
-    useDynamicExecutor: boolean
+    useDynamicExecutor: boolean,
+    specialist?: ResolvedSpecialist
   ): Promise<ExecutorSessionLease> {
     if (!this.isolatedSessionsEnabled && !useDynamicExecutor) {
       return { session: this.requireAgents().executor, dynamicExecutor: false, resumed: false, resumeCount: 0 };
@@ -3241,16 +3530,19 @@ export class SecurityAgentController {
     const sandbox = this.requireExecutorSandbox(taskEnvelope.taskId);
     const persisted = this.runtimeStore.getExecutorSession(taskEnvelope.taskId);
     if (persisted) {
-      const selectedSkillDirs = await this.selectTaskSkillDirs(taskEnvelope.goal, taskEnvelope.taskId);
+      const selectedSkillDirs = await this.selectTaskSkillDirs(taskEnvelope.goal, taskEnvelope.taskId, specialist);
       const sessionManager = SessionManager.open(persisted.sessionFile, undefined, sandbox.root);
       const executor = await createExecutorAgentSession({
         cwd: sandbox.root,
         sandbox,
         artifactStore: this.artifactStore,
         llmRuntime: this.llmRuntime,
+        executionLog: this.executionLog,
         sessionManager,
         skillsDirs: selectedSkillDirs,
-        additionalTools: this.createTaskRuntimeTools(taskEnvelope),
+        additionalToolBindings: this.createTaskRuntimeToolBindings(taskEnvelope),
+        ...(specialist ? { specialist: this.executorSpecialistInput(taskEnvelope, specialist) } : {}),
+        onSpecialistDiagnostic: this.specialistDiagnosticSink(taskEnvelope, specialist),
         providerAdmission: this.providerAdmission("executor"),
         toolApproval: await this.executorToolApproval(taskEnvelope)
       });
@@ -3279,18 +3571,42 @@ export class SecurityAgentController {
       });
       return lease;
     }
-    return this.createNewExecutorSessionForTask(taskEnvelope, useDynamicExecutor);
+    return this.createNewExecutorSessionForTask(taskEnvelope, useDynamicExecutor, specialist);
+  }
+
+  /** Surfaces runtime tool-policy diagnostics for one Specialist session. */
+  private specialistDiagnosticSink(taskEnvelope: TaskEnvelope, specialist?: ResolvedSpecialist) {
+    return (diagnostic: { code: string; message: string }): void => {
+      void this.executionLog.append({
+        taskId: taskEnvelope.taskId,
+        role: "runtime",
+        eventType: "specialist_diagnostic",
+        summary: diagnostic.message,
+        payload: { specialistId: specialist?.id ?? GENERAL_SPECIALIST_ID, code: diagnostic.code }
+      }).catch(() => undefined);
+    };
+  }
+
+  private executorSpecialistInput(taskEnvelope: TaskEnvelope, specialist: ResolvedSpecialist) {
+    // Callers without a resolved Specialist keep the baseline Executor profile.
+    return {
+      id: specialist.id,
+      taskId: taskEnvelope.taskId,
+      definition: specialist.definition,
+      options: specialist.options
+    };
   }
 
   private async createNewExecutorSessionForTask(
     taskEnvelope: TaskEnvelope,
-    useDynamicExecutor: boolean
+    useDynamicExecutor: boolean,
+    specialist?: ResolvedSpecialist
   ): Promise<ExecutorSessionLease> {
     if (!this.isolatedSessionsEnabled && !useDynamicExecutor) {
       return { session: this.requireAgents().executor, dynamicExecutor: false, resumed: false, resumeCount: 0 };
     }
     const sandbox = this.requireExecutorSandbox(taskEnvelope.taskId);
-    const selectedSkillDirs = await this.selectTaskSkillDirs(taskEnvelope.goal, taskEnvelope.taskId);
+    const selectedSkillDirs = await this.selectTaskSkillDirs(taskEnvelope.goal, taskEnvelope.taskId, specialist);
     const sessionDir = join(this.runtimeDir, EXECUTOR_SESSION_DIR);
     const sessionManager = SessionManager.create(sandbox.root, sessionDir);
     const executor = await createExecutorAgentSession({
@@ -3298,9 +3614,12 @@ export class SecurityAgentController {
       sandbox,
       artifactStore: this.artifactStore,
       llmRuntime: this.llmRuntime,
+      executionLog: this.executionLog,
       sessionManager,
       skillsDirs: selectedSkillDirs,
-      additionalTools: this.createTaskRuntimeTools(taskEnvelope),
+      additionalToolBindings: this.createTaskRuntimeToolBindings(taskEnvelope),
+      ...(specialist ? { specialist: this.executorSpecialistInput(taskEnvelope, specialist) } : {}),
+      onSpecialistDiagnostic: this.specialistDiagnosticSink(taskEnvelope, specialist),
       providerAdmission: this.providerAdmission("executor"),
       toolApproval: await this.executorToolApproval(taskEnvelope)
     });
@@ -3316,12 +3635,94 @@ export class SecurityAgentController {
     return { session: executor.session, dynamicExecutor: true, resumed: false, resumeCount: 0 };
   }
 
-  private async selectTaskSkillDirs(taskGoal: string, taskId: string): Promise<string[]> {
+  /**
+   * Resolves the Skill directories for one Task under the owning Specialist's
+   * Skill policy: off (none), pinned (fixed set, no LLM call), allowlist
+   * (LLM selection over a candidate subset) or auto (unchanged behaviour).
+   */
+  private async selectTaskSkillDirs(
+    taskGoal: string,
+    taskId: string,
+    specialist?: ResolvedSpecialist
+  ): Promise<string[]> {
     try {
+      const policy = specialist?.definition.skills;
       const snapshot = this.skillSnapshot ?? this.skillRegistry.scan();
       this.skillSnapshot = snapshot;
       if (snapshot.skills.length === 0) return [];
-      const result = await this.skillSelector({ taskGoal, snapshot });
+      if (policy?.mode === "off") {
+        await this.executionLog.append({
+          taskId,
+          role: "runtime",
+          eventType: "skill_selection_skipped",
+          summary: `Specialist ${specialist?.id ?? "general"} disables Skill selection`,
+          payload: { specialistId: specialist?.id, reason: "specialist_skills_off" }
+        });
+        return [];
+      }
+      if (policy?.mode === "pinned") {
+        const wanted = new Set(policy.pinned ?? []);
+        const pinned = snapshot.skills.filter((skill) => wanted.has(skill.name)
+          && skill.valid
+          && skill.enabled
+          && skill.modelInvocable);
+        for (const skill of pinned) {
+          await this.executionLog.append({
+            taskId,
+            role: "runtime",
+            eventType: "skill_selected",
+            summary: skill.name,
+            payload: { skillName: skill.name, baseDir: skill.baseDir, reason: `pinned by Specialist ${specialist?.id}` }
+          });
+        }
+        const missing = (policy.pinned ?? []).filter((name) => !pinned.some((skill) => skill.name === name));
+        for (const name of missing) {
+          await this.executionLog.append({
+            taskId,
+            role: "runtime",
+            eventType: "skill_skipped",
+            summary: `Pinned Skill ${name} is unavailable`,
+            payload: { code: "pinned_skill_unavailable", skillName: name, specialistId: specialist?.id }
+          });
+        }
+        return [...new Set(pinned.map((skill) => skill.baseDir))];
+      }
+      const allowlist = policy?.mode === "allowlist" ? policy.allow : undefined;
+      if (allowlist && allowlist.length > 0) {
+        // An allowlist that names Skills nothing on disk provides leaves the
+        // Agent with an empty knowledge surface. That failure used to be silent,
+        // so it is reported explicitly instead of looking like a picky selector.
+        const byName = new Map(snapshot.skills.map((skill) => [skill.name, skill]));
+        for (const name of allowlist) {
+          const skill = byName.get(name);
+          if (skill && skill.valid && skill.enabled && skill.modelInvocable) continue;
+          await this.executionLog.append({
+            taskId,
+            role: "runtime",
+            eventType: "skill_skipped",
+            summary: `Specialist ${specialist?.id ?? "general"} allowlists unusable Skill ${name}`,
+            payload: {
+              code: skill ? "allowlist_skill_unusable" : "allowlist_skill_unknown",
+              skillName: name,
+              specialistId: specialist?.id
+            }
+          });
+        }
+        const usable = allowlist.filter((name) => {
+          const skill = byName.get(name);
+          return Boolean(skill && skill.valid && skill.enabled && skill.modelInvocable);
+        });
+        if (usable.length === 0) {
+          await this.executionLog.append({
+            taskId,
+            role: "runtime",
+            eventType: "skill_selection_failed",
+            summary: `Specialist ${specialist?.id ?? "general"} Skill allowlist matches no usable Skill; continuing without Skills`,
+            payload: { code: "allowlist_skill_empty", specialistId: specialist?.id, allowlist }
+          });
+        }
+      }
+      const result = await this.skillSelector({ taskGoal, snapshot, ...(allowlist ? { allowlist } : {}) });
       for (const skill of result.selected) {
         await this.executionLog.append({
           taskId,
@@ -3573,6 +3974,7 @@ export class SecurityAgentController {
       }
       const versionSnapshot = this.graphStore.plannerVersionSnapshot();
       const plannerDecisionView = await this.buildPlannerDecisionView();
+      const specialistCatalog = await this.plannerSpecialistCatalog();
       const plannerSessionResult = await this.createPlannerSessionForCycle(attempt > 1, versionSnapshot);
       const deliverySeq = this.executionLog.latestSeq();
       const plannerStateDelivery = plannerSessionResult.isolated || !this.lastPlannerDecisionView
@@ -3582,6 +3984,7 @@ export class SecurityAgentController {
         ...input,
         repairFeedback: attemptFeedback,
         plannerDecisionView,
+        specialistCatalog,
         ...(plannerStateDelivery === "snapshot"
           ? this.continuationDigest
             ? { continuationContext: this.continuationDigest }
@@ -3771,8 +4174,9 @@ export class SecurityAgentController {
       providerAdmission: this.providerAdmission("planner"),
       ...(versionSnapshot
         ? {
-          validatePlannerCommands: (decision: PlannerDecision) => {
+          validatePlannerCommands: async (decision: PlannerDecision) => {
             this.validatePlannerRuntimeBoundary(decision);
+            await this.validatePlannerSpecialists(decision);
           }
         }
         : {})
@@ -3802,6 +4206,102 @@ export class SecurityAgentController {
       }
     }
     this.normalizePlannerDecisionBoundary(decision);
+  }
+
+  /**
+   * Rejects create_tasks commands that name an unusable Specialist before the
+   * decision reaches the task graph, so the Planner repairs it in-conversation
+   * instead of the runtime persisting an unrunnable Task.
+   */
+  private async validatePlannerSpecialists(decision: PlannerDecision): Promise<void> {
+    const requested = new Map<string, Set<string>>();
+    for (const command of decision.commands ?? []) {
+      if (command.kind !== "create_tasks") continue;
+      for (const task of command.tasks) {
+        const specialist = (task as { specialist?: unknown }).specialist;
+        const requestedOptions = (task as { specialistOptions?: unknown }).specialistOptions;
+        const optionKeys = requestedOptions && typeof requestedOptions === "object" && !Array.isArray(requestedOptions)
+          ? Object.keys(requestedOptions as Record<string, unknown>)
+          : [];
+        if (specialist === undefined) {
+          if (optionKeys.length > 0) {
+            throw new Error(
+              "create_tasks specialistOptions requires the specialist field; omit both to use the general Executor."
+            );
+          }
+          continue;
+        }
+        if (!isSpecialistId(specialist)) {
+          throw new Error(
+            `create_tasks specialist ${JSON.stringify(specialist)} is not a valid Specialist id; omit the field to use the general Executor.`
+          );
+        }
+        const keys = requested.get(specialist) ?? new Set<string>();
+        for (const key of optionKeys) keys.add(key);
+        requested.set(specialist, keys);
+      }
+    }
+    if (requested.size === 0) return;
+    const catalog = await this.specialistRegistry.catalog();
+    const problems: string[] = [];
+    for (const [id, keys] of requested) {
+      const resolution = await this.specialistRegistry.resolve(id);
+      if (!resolution.ok) {
+        problems.push(`${id} (${resolution.reason}): ${resolution.message}`);
+        continue;
+      }
+      if (keys.size === 0) continue;
+      // Only the options published in the catalog are writable per Task. Every
+      // other key belongs to the author's capability envelope or to the
+      // operator, so the Planner is told to repair the decision instead of the
+      // runtime quietly dropping the value.
+      const allowed = new Set(
+        (catalog.find((entry) => entry.id === id)?.tunableOptions ?? []).map((option) => option.key)
+      );
+      const rejected = [...keys].filter((key) => !allowed.has(key));
+      if (rejected.length > 0) {
+        problems.push(
+          `${id} does not accept Task-level option(s) ${rejected.join(", ")}; `
+          + `its tunable options are ${[...allowed].join(", ") || "none"}`
+        );
+      }
+    }
+    if (problems.length > 0) {
+      const available = catalog
+        .map((entry) => entry.id)
+        .filter((id) => id !== GENERAL_SPECIALIST_ID);
+      throw new Error(
+        `create_tasks selected an unusable Specialist: ${problems.join("; ")}. ` +
+        `Available Specialists: ${available.join(", ") || "none"}; omit the specialist field to use the general Executor.`
+      );
+    }
+  }
+
+  /** Planner-facing catalogue, excluding the implicit general Executor. */
+  private async plannerSpecialistCatalog(): Promise<SpecialistCatalogEntry[]> {
+    try {
+      return (await this.specialistRegistry.catalog()).filter((entry) => entry.id !== GENERAL_SPECIALIST_ID);
+    } catch (error) {
+      await this.executionLog.append({
+        role: "runtime",
+        eventType: "specialist_catalog_failed",
+        summary: error instanceof Error ? error.message : String(error),
+        payload: {}
+      }).catch(() => undefined);
+      return [];
+    }
+  }
+
+  /**
+   * Fresh Specialist availability per Task. Reads registry state from disk and
+   * never executes project module code, so it is safe inside sync view builds.
+   */
+  private specialistStatusIndex(): Map<string, SpecialistTaskStatus> {
+    try {
+      return new Map(Object.entries(this.specialistRegistry.statusIndex()));
+    } catch {
+      return new Map([[GENERAL_SPECIALIST_ID, "ready"]]);
+    }
   }
 
   private async validateTextPlannerSubmission(value: unknown): Promise<PlannerDecision> {
@@ -3861,7 +4361,7 @@ export class SecurityAgentController {
     return { session: observer.session, dynamicObserver: true, logging };
   }
 
-  private beginTaskExecution(taskEnvelope: TaskEnvelope): ActiveTaskState {
+  private beginTaskExecution(taskEnvelope: TaskEnvelope, specialist?: ResolvedSpecialist): ActiveTaskState {
     const epochId = `epoch:${randomUUID()}`;
     const attempt = this.nextTaskAttempt(taskEnvelope.taskId);
     const state: ActiveTaskState = {
@@ -3875,6 +4375,7 @@ export class SecurityAgentController {
       checkpointFinalizationActive: false,
       dynamicExecutor: false,
       attempt,
+      ...(specialist ? { specialist } : {}),
       budgetStatusSteerKeys: new Set(),
       invocationAbortController: new AbortController(),
       supervisionState: restoreTaskSupervisionState(
@@ -4090,7 +4591,7 @@ export class SecurityAgentController {
       });
       if (state.taskTurnCount >= (taskEnvelope.budget?.maxTurns ?? DEFAULT_TASK_BUDGET.maxTurns)) {
         this.requestBudgetCheckpoint(taskEnvelope, event, "maxTurns", state);
-      } else if (state.epochTurnCount >= DEFAULT_EPOCH_TURN_SLICE) {
+      } else if (state.epochTurnCount >= this.epochTurnSlice(state)) {
         this.requestBudgetCheckpoint(taskEnvelope, event, "epochTurns", state);
       } else if (state.epochTurnCount % SUPERVISOR_TURN_WINDOW_SIZE === 0) {
         void this.enqueueSupervisorCheck({
@@ -5442,7 +5943,7 @@ export class SecurityAgentController {
       return;
     }
     const reason = budgetKey === "epochTurns"
-      ? `Epoch turn slice reached: maxTurns=${DEFAULT_EPOCH_TURN_SLICE}`
+      ? `Epoch turn slice reached: maxTurns=${this.epochTurnSlice(state)}`
       : `Task budget reached: maxTurns=${taskEnvelope.budget?.maxTurns ?? DEFAULT_TASK_BUDGET.maxTurns}`;
     const budgetSignal: ControlSignal = {
       decision: "handoff",
@@ -5955,8 +6456,9 @@ export class SecurityAgentController {
     }
     const now = Date.now();
     const remainingRunMs = Math.max(0, activeRun.deadlineAt - now);
+    const epochTimeShare = this.epochTimeShare(state);
     const epochTimeLimitMs = Math.max(1, Math.min(
-      Math.floor(activeRun.maxRunTimeMs * TASK_EPOCH_RUN_TIME_SHARE),
+      Math.floor(activeRun.maxRunTimeMs * epochTimeShare),
       remainingRunMs
     ));
     state.runDeadlineAt = activeRun.deadlineAt;
@@ -5968,7 +6470,8 @@ export class SecurityAgentController {
         if (!this.isActiveEpoch(state)) return;
         const signal: ControlSignal = {
           decision: "handoff",
-          reason: `Epoch time slice reached: ${epochTimeLimitMs}ms of ${this.activeRun?.maxRunTimeMs ?? "unknown"}ms global run budget`,
+          reason: `Epoch time slice reached: ${epochTimeLimitMs}ms of ${this.activeRun?.maxRunTimeMs ?? "unknown"}ms global run budget`
+            + ` (specialist ${state.specialist?.id ?? "general"}, share ${Math.round(epochTimeShare * 100)}%)`,
           evidenceRefs: []
         };
         void this.requestEpochStop(taskEnvelope, signal, state, "executor_checkpoint_requested", "budget_abort");
@@ -6146,21 +6649,32 @@ function deriveTaskDefinitionReadiness(
   };
 }
 
-function admitReadyTasks(
+export function admitReadyTasks(
   candidates: TaskEnvelope[],
   maxParallelTasks: number,
-  occupiedSessionRefs: Set<string> = new Set()
+  occupiedSessionRefs: Set<string> = new Set(),
+  specialistConcurrency: {
+    caps?: Map<string, number>;
+    active?: Map<string, number>;
+  } = {}
 ): TaskEnvelope[] {
   const admitted: TaskEnvelope[] = [];
   const occupiedSessions = new Set(occupiedSessionRefs);
+  const activeBySpecialist = new Map(specialistConcurrency.active ?? []);
   for (const candidate of candidates) {
     const sessionRefs = candidate.availableSessionRefs ?? [];
     const conflicts = sessionRefs.some((sessionRef) => occupiedSessions.has(sessionRef));
     if (conflicts) {
       continue;
     }
+    const specialistId = candidate.specialist ?? GENERAL_SPECIALIST_ID;
+    const cap = specialistConcurrency.caps?.get(specialistId);
+    if (cap !== undefined && (activeBySpecialist.get(specialistId) ?? 0) >= cap) {
+      continue;
+    }
     admitted.push(candidate);
     sessionRefs.forEach((sessionRef) => occupiedSessions.add(sessionRef));
+    activeBySpecialist.set(specialistId, (activeBySpecialist.get(specialistId) ?? 0) + 1);
     if (admitted.length >= maxParallelTasks) {
       break;
     }
@@ -6324,14 +6838,26 @@ export function normalizeTaskBudget(input?: TaskBudget): Required<TaskBudget> {
   };
 }
 
-function normalizeInitialTaskBudget(input?: TaskBudget): Required<TaskBudget> {
+/**
+ * Initial turn allocation for one Task. A Specialist supplies its own default
+ * and ceiling; its ceiling may sit below the global minimum so cheap Agents stay
+ * cheap, while unnamed Tasks keep the historical bounds.
+ */
+function normalizeInitialTaskBudget(
+  input?: TaskBudget,
+  specialist?: SpecialistAgentDefinition
+): Required<TaskBudget> {
+  const ceiling = Math.max(1, Math.min(
+    specialist?.budget.maxTurnsCeiling ?? MAX_TASK_BUDGET.maxTurns,
+    MAX_TASK_BUDGET.maxTurns
+  ));
+  const defaultMaxTurns = specialist?.budget.defaultMaxTurns ?? DEFAULT_TASK_BUDGET.maxTurns;
+  // The floor follows the Agent's own default so a cheap Agent can allocate
+  // fewer turns than the global minimum, while `general` (default 12, ceiling
+  // 40) reproduces the historical 10/12/40 band exactly.
+  const floor = Math.max(1, Math.min(MIN_TASK_BUDGET.maxTurns, defaultMaxTurns));
   return {
-    maxTurns: normalizeBudgetNumber(
-      input?.maxTurns,
-      DEFAULT_TASK_BUDGET.maxTurns,
-      MAX_TASK_BUDGET.maxTurns,
-      MIN_TASK_BUDGET.maxTurns
-    )
+    maxTurns: normalizeBudgetNumber(input?.maxTurns, defaultMaxTurns, ceiling, floor)
   };
 }
 
@@ -7220,11 +7746,12 @@ function taskTurnIdentity(event: ExecutionEvent): string {
 }
 
 function budgetStatusSnapshot(taskEnvelope: TaskEnvelope, state?: ActiveTaskState): Record<string, unknown> {
+  const epochTurnSlice = state?.specialist?.definition.budget.epochTurnSlice ?? DEFAULT_EPOCH_TURN_SLICE;
   const budget = normalizeTaskBudget(taskEnvelope.budget);
   const taskUsedTurns = state?.taskTurnCount ?? 0;
   const taskRemainingTurns = Math.max(0, budget.maxTurns - taskUsedTurns);
   const epochUsedTurns = state?.epochTurnCount ?? 0;
-  const epochMaxTurns = Math.min(DEFAULT_EPOCH_TURN_SLICE, taskRemainingTurns + epochUsedTurns);
+  const epochMaxTurns = Math.min(epochTurnSlice, taskRemainingTurns + epochUsedTurns);
   const epochRemainingTurns = Math.max(0, epochMaxTurns - epochUsedTurns);
   const epochBudget = state?.epochBudgetClock?.snapshot();
   return {
@@ -7301,6 +7828,7 @@ function formatExecutorBudgetStatus(
   return [
     update ? "RUNTIME_BUDGET_STATUS_UPDATE" : "RUNTIME_BUDGET_STATUS",
     `reason: ${reason}`,
+    `specialist: ${state.specialist?.id ?? taskEnvelope.specialist ?? "general"}`,
     `taskAllocation: ${status.usedTurns}/${budget.maxTurns ?? "unknown"}; remaining: ${status.remainingTurns}`,
     `epochSlice: ${status.epochUsedTurns}/${status.epochMaxTurns}; remaining: ${status.epochRemainingTurns}`,
     `globalRemainingMs: ${status.globalRemainingMs ?? "unbounded"}`,
