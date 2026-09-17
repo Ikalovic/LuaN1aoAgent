@@ -8,7 +8,7 @@ import {
   renameSync,
   writeFileSync
 } from "node:fs";
-import { dirname, join, resolve, sep } from "node:path";
+import { basename, dirname, join, resolve, sep } from "node:path";
 
 export type RegisteredSkill = {
   name: string;
@@ -49,12 +49,20 @@ export class SkillRegistry {
     const root = realpathSync(this.rootDir);
     const diagnostics = findEscapingSymlinks(root);
     const loaded = loadSkillsFromDir({ dir: root, source: "project" });
-    diagnostics.push(...loaded.diagnostics.map((diagnostic) => ({
-      code: diagnostic.type === "collision" ? "skill_name_collision" : "skill_invalid",
-      message: diagnostic.message,
-      ...(diagnostic.path ? { path: diagnostic.path } : {}),
-      ...(diagnostic.collision?.name ? { skillName: diagnostic.collision.name } : {})
-    })));
+    diagnostics.push(...loaded.diagnostics.map((diagnostic) => {
+      // A parse failure means the frontmatter never yielded a name, but skills
+      // live in a directory named after themselves, so the directory is the best
+      // available identifier. Without it the diagnostic is a bare YAML error and
+      // the operator cannot tell which skill broke.
+      const derivedName = diagnostic.path ? basename(dirname(diagnostic.path)) : undefined;
+      const skillName = diagnostic.collision?.name ?? derivedName;
+      return {
+        code: diagnostic.type === "collision" ? "skill_name_collision" : "skill_invalid",
+        message: diagnostic.message,
+        ...(diagnostic.path ? { path: diagnostic.path } : {}),
+        ...(skillName ? { skillName } : {})
+      };
+    }));
     const enabledState = this.readState();
     const names = new Set<string>();
     const skills: RegisteredSkill[] = [];
