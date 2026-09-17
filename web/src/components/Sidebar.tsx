@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { Badge, Button, Empty, Menu, Tooltip } from "antd";
-import { Activity, Blocks, BrainCircuit, Cable, ChevronRight, FileText, Folder, FolderOpen, GitBranch, KeyRound, ListTree, Network, PanelLeftClose, Play, ShieldAlert } from "lucide-react";
+import { Activity, Blocks, BrainCircuit, Cable, ChevronRight, Database, FileText, Folder, FolderOpen, GitBranch, KeyRound, ListTree, Network, PanelLeftClose, Play, ShieldAlert } from "lucide-react";
 import { useLanguage } from "../language";
 import { buildSessionTree, sessionRelativePath, type SessionFolderNode } from "../sessions";
 import type { AgentEvent, RuntimeSession, ViewKey } from "../types";
@@ -35,6 +35,7 @@ export function Sidebar(props: SidebarProps) {
     ...(props.canManageCredentials ? [{ key: "credentials", icon: <KeyRound size={17} />, label: t("nav.credentials") }] : []),
     { key: "reasoning", icon: <BrainCircuit size={17} />, label: t("nav.reasoning") },
     { key: "operation", icon: <GitBranch size={17} />, label: t("nav.operation") },
+    { key: "memory", icon: <Database size={17} />, label: t("nav.memory") },
     { key: "task", icon: <ListTree size={17} />, label: t("nav.task") },
     ...(props.canApprove ? [{
       key: "approvals",

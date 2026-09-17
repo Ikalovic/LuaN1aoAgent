@@ -11,6 +11,7 @@ import { ResizableWorkspace } from "./components/ResizableWorkspace";
 import { Sidebar } from "./components/Sidebar";
 import { CapabilitiesView } from "./components/CapabilitiesView";
 import { CredentialsView } from "./components/CredentialsView";
+import { MemoryView } from "./components/MemoryView";
 import { StartRunModal } from "./components/StartRunModal";
 import { TraceView } from "./components/TraceView";
 import { TrafficInspector } from "./components/TrafficInspector";
@@ -225,7 +226,7 @@ export default function App({ user, onLogout }: { user: AuthUser; onLogout: () =
     />
   );
 
-  const viewEyebrow = activeView === "trace" ? "LIVE TRACE" : activeView === "reports" ? "RUN OUTPUT" : activeView === "traffic" ? "WEB TRAFFIC" : activeView === "connections" ? "CONNECTIVITY" : activeView === "capabilities" ? "CAPABILITIES" : activeView === "credentials" ? "CREDENTIALS" : activeView === "approvals" ? "APPROVALS" : "TRI-GRAPH";
+  const viewEyebrow = activeView === "trace" ? "LIVE TRACE" : activeView === "reports" ? "RUN OUTPUT" : activeView === "traffic" ? "WEB TRAFFIC" : activeView === "connections" ? "CONNECTIVITY" : activeView === "capabilities" ? "CAPABILITIES" : activeView === "credentials" ? "CREDENTIALS" : activeView === "approvals" ? "APPROVALS" : activeView === "memory" ? "GRAPH MEMORY" : "TRI-GRAPH";
 
   return (
     <>
@@ -358,6 +359,14 @@ export default function App({ user, onLogout }: { user: AuthUser; onLogout: () =
                   onOrderChange={() => setNewestFirst((value) => !value)}
                   onSelectTrace={setSelectedTraceId}
                 />
+              ) : activeView === "memory" ? (
+                <MemoryView
+                  runtimeDir={runtimeDir}
+                  nodes={data?.graph.nodes || []}
+                  edges={data?.graph.edges || []}
+                  selectedNodeId={selectedNodeId}
+                  onSelectNode={setSelectedNodeId}
+                />
               ) : (
                 <Suspense fallback={<Skeleton active paragraph={{ rows: 10 }} />}>
                   <GraphView
@@ -447,6 +456,7 @@ function viewTitle(view: ViewKey, locale: Locale, t: Translate): string {
   if (view === "capabilities") return t("nav.capabilities");
   if (view === "credentials") return t("nav.credentials");
   if (view === "approvals") return t("nav.approvals");
+  if (view === "memory") return t("memory.title");
   return graphLabel(view, locale);
 }
 
@@ -458,6 +468,7 @@ function viewStageTitle(view: ViewKey, locale: Locale, t: Translate): string {
   if (view === "capabilities") return t("app.capabilitiesStageTitle");
   if (view === "credentials") return t("app.credentialsStageTitle");
   if (view === "approvals") return t("app.approvalsStageTitle");
+  if (view === "memory") return t("memory.subtitle");
   return graphLabel(view, locale);
 }
 
@@ -483,7 +494,7 @@ function readInitialState(): { runtimeDir: string; view: ViewKey; capabilityTab:
   if (candidate === "skills" || candidate === "mcp" || candidate === "agents") {
     return { runtimeDir, view: "capabilities", capabilityTab: candidate };
   }
-  const view = candidate && ["trace", "reports", "reasoning", "operation", "task", "traffic", "connections", "capabilities", "credentials", "approvals"].includes(candidate) ? candidate as ViewKey : "trace";
+  const view = candidate && ["trace", "reports", "reasoning", "operation", "task", "memory", "traffic", "connections", "capabilities", "credentials", "approvals"].includes(candidate) ? candidate as ViewKey : "trace";
   return { runtimeDir, view, capabilityTab };
 }
 

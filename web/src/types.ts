@@ -3,7 +3,7 @@ export type JsonRecord = Record<string, JsonValue | undefined>;
 
 export type Role = "planner" | "executor" | "observer" | "runtime" | string;
 export type GraphKind = "reasoning" | "operation" | "task";
-export type ViewKey = "trace" | "reports" | GraphKind | "traffic" | "connections" | "capabilities" | "credentials" | "approvals";
+export type ViewKey = "trace" | "reports" | GraphKind | "memory" | "traffic" | "connections" | "capabilities" | "credentials" | "approvals";
 
 /** Tabs of the unified capabilities page (Skills / MCP / Specialist Agents). */
 export type CapabilityTab = "skills" | "mcp" | "agents";

@@ -856,3 +856,68 @@ button.artifact-row-button:hover span { color: #2563eb; }
 .specialist-option-key { margin-left: 6px; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 11px; }
 .specialist-option-author-default, .specialist-option-bound-hint { display: block; margin-top: 2px; font-size: 11px; }
 .specialist-option-number, .specialist-option-row .ant-select { width: 100%; }
+
+/* Graph memory view. Reuses GraphView for rendering, so the only layout here is
+   the summary strip and toolbar around it. */
+.memory-view {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  min-height: 0;
+  padding: 4px 2px;
+}
+
+.memory-summary {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 12px 16px;
+  border: 1px solid var(--border-subtle, rgba(148, 163, 184, 0.28));
+  border-radius: 10px;
+  background: var(--surface-raised, rgba(148, 163, 184, 0.06));
+}
+
+.memory-summary .ant-statistic-title {
+  font-size: 12px;
+}
+
+.memory-summary .ant-statistic-content {
+  font-size: 20px;
+}
+
+.memory-badges {
+  max-width: 100%;
+}
+
+.memory-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
+.memory-toolbar .ant-select {
+  min-width: 200px;
+}
+
+.memory-graph {
+  flex: 1 1 auto;
+  min-height: 420px;
+  display: flex;
+}
+
+.memory-graph > * {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.memory-row-id {
+  font-size: 11px;
+  word-break: break-all;
+}
+
+.memory-lead-alert {
+  margin: 0;
+}

@@ -137,3 +137,128 @@ describe("SpecialistOptionsDrawer", () => {
     await waitFor(() => expect(mockedMode).toHaveBeenCalledWith("bruteforce", null));
   });
 });
+
+/**
+ * Before the internet-osint Specialist shipped, no builtin declared `enum` or
+ * `string-list`, so these two controls had never been exercised against real
+ * production data.
+ */
+const osint: RegisteredSpecialist = {
+  ...specialist,
+  id: "internet-osint",
+  name: "互联网信息搜集 Agent",
+  optionsMode: "planner",
+  authorOptionsMode: "planner",
+  options: [
+    {
+      key: "collectionGoal",
+      spec: {
+        type: "enum",
+        title: "搜集目标类型",
+        description: "本轮要产出哪一类情报。",
+        default: "all",
+        options: [
+          { value: "all", label: "全部" },
+          { value: "assets", label: "资产与攻击面" },
+          { value: "contact", label: "联系方式" }
+        ]
+      },
+      value: "all",
+      isDefault: true,
+      authority: "user",
+      editable: true,
+      boundOnly: false,
+      authorDefault: "all"
+    },
+    {
+      key: "sources",
+      spec: {
+        type: "string-list",
+        title: "启用的搜索引擎",
+        description: "sogou 与 so360 遵循 site:，是主力。",
+        default: ["sogou", "so360", "bing"],
+        maxItems: 3
+      },
+      value: ["sogou", "so360", "bing"],
+      isDefault: true,
+      authority: "user",
+      editable: true,
+      boundOnly: false,
+      authorDefault: ["sogou", "so360", "bing"]
+    },
+    {
+      key: "maxRounds",
+      spec: { type: "number", title: "搜集轮次上限", default: 4, minimum: 1, maximum: 12, integer: true },
+      value: 4,
+      isDefault: true,
+      authority: "planner",
+      editable: true,
+      boundOnly: true,
+      bounds: { minimum: 1, maximum: 12 },
+      authorDefault: 4
+    },
+    {
+      key: "writeGraphMemory",
+      spec: { type: "boolean", title: "写入图记忆（作者固定）", default: true },
+      value: true,
+      isDefault: true,
+      authority: "author",
+      editable: false,
+      boundOnly: false,
+      authorDefault: true
+    }
+  ],
+  diagnostics: []
+};
+
+describe("SpecialistOptionsDrawer with enum and string-list options", () => {
+  it("renders an enum as a select carrying the declared choices", async () => {
+    render(<SpecialistOptionsDrawer specialist={osint} onClose={() => {}} />);
+
+    const select = await screen.findByLabelText("collectionGoal");
+    expect(select).toBeEnabled();
+    fireEvent.mouseDown(select);
+    const choice = await screen.findByText("资产与攻击面");
+    expect(choice).toBeInTheDocument();
+    fireEvent.click(choice);
+    fireEvent.click(screen.getByText(/保\s*存/));
+
+    await waitFor(() => expect(mockedSave).toHaveBeenCalledWith(
+      "internet-osint",
+      expect.objectContaining({ collectionGoal: "assets" })
+    ));
+  });
+
+  it("renders a string-list as free-entry tags and submits the edited set", async () => {
+    render(<SpecialistOptionsDrawer specialist={osint} onClose={() => {}} />);
+
+    const tags = await screen.findByLabelText("sources");
+    expect(tags).toBeEnabled();
+    // The declared default is what the operator starts from.
+    expect(screen.getByText("sogou")).toBeInTheDocument();
+    expect(screen.getByText("bing")).toBeInTheDocument();
+
+    // Remove one and save: the submitted list must reflect the removal.
+    const removeButtons = document.querySelectorAll(".ant-select-selection-item-remove");
+    fireEvent.click(removeButtons[removeButtons.length - 1]!);
+    fireEvent.click(screen.getByText(/保\s*存/));
+
+    await waitFor(() => expect(mockedSave).toHaveBeenCalledWith(
+      "internet-osint",
+      expect.objectContaining({ sources: ["sogou", "so360"] })
+    ));
+  });
+
+  it("still shows a planner number as a ceiling and pins the author option", async () => {
+    render(<SpecialistOptionsDrawer specialist={osint} onClose={() => {}} />);
+
+    expect(await screen.findByText("Planner 将在 [1, 12] 内选择具体取值。")).toBeInTheDocument();
+    expect(screen.getByLabelText("writeGraphMemory")).toBeDisabled();
+    // The author-fixed key is never part of the saved body.
+    fireEvent.click(screen.getByText(/保\s*存/));
+    await waitFor(() => expect(mockedSave).toHaveBeenCalled());
+    const body = mockedSave.mock.calls.at(-1)?.[1] as Record<string, unknown>;
+    expect(body).not.toHaveProperty("writeGraphMemory");
+    expect(Object.keys(body).sort()).toEqual(["collectionGoal", "maxRounds", "sources"]);
+  });
+});
