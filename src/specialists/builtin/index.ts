@@ -1,13 +1,15 @@
 import type { SpecialistAgentDefinition } from "../types.js";
 import { GENERAL_SPECIALIST_ID, generalSpecialist } from "./general.js";
 import { BRUTEFORCE_SPECIALIST_ID, bruteforceSpecialist } from "./bruteforce.js";
+import { INTERNET_OSINT_SPECIALIST_ID, internetOsintSpecialist } from "./internet-osint.js";
 
 export { GENERAL_SPECIALIST_ID, generalSpecialist } from "./general.js";
 export { BRUTEFORCE_SPECIALIST_ID, bruteforceSpecialist } from "./bruteforce.js";
+export { INTERNET_OSINT_SPECIALIST_ID, internetOsintSpecialist } from "./internet-osint.js";
 
 /** Specialists shipped with the runtime, in catalog display order. */
 export function builtinSpecialists(): SpecialistAgentDefinition[] {
-  return [generalSpecialist, bruteforceSpecialist];
+  return [generalSpecialist, internetOsintSpecialist, bruteforceSpecialist];
 }
 
 /** Built-in Specialists that must always stay enabled and loadable. */

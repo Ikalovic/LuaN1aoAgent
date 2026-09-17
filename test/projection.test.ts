@@ -609,7 +609,7 @@ test("rejects malformed projection drafts with actionable per-node and per-edge 
     batch,
     graphContext,
     value: { nodes: [{ ...baseNode, type: "Endpoint" }], edges: [] }
-  }), /has type "Endpoint"; valid node types: Host, Port, Service, WebEndpoint, Parameter, Credential, AgentSession, ShellSession, Session, File, Process, Evidence, Hypothesis, Vulnerability, Exploit/);
+  }), /has type "Endpoint"; valid node types: Host, Port, Service, WebEndpoint, Parameter, Credential, AgentSession, ShellSession, Session, File, Process, Organization, Person, Identity, Contact, Evidence, Hypothesis, Vulnerability, Exploit/);
 
   assert.doesNotThrow(() => expandProjectionDraft({
     batch,

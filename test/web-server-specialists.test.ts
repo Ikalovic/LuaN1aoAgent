@@ -16,7 +16,13 @@ type SpecialistOptionView = {
   boundOnly: boolean;
   bounds?: { minimum?: number; maximum?: number; allowed?: string[] };
   authorDefault?: unknown;
-  spec: { type: string; minimum?: number; maximum?: number };
+  spec: {
+    type: string;
+    minimum?: number;
+    maximum?: number;
+    maxItems?: number;
+    options?: Array<{ value: string; label: string }>;
+  };
 };
 
 type SpecialistView = {
@@ -79,7 +85,7 @@ test("Web API lists Specialist Agents and persists operator toggles and options"
   const listed = await fetch(`${baseUrl}/api/agents`, { headers: { cookie: adminCookie } });
   assert.equal(listed.status, 200);
   const snapshot = await listed.json() as { specialists: SpecialistView[]; diagnostics: Array<{ code: string }> };
-  assert.deepEqual(snapshot.specialists.map((entry) => entry.id), ["bruteforce", "general", "probe"]);
+  assert.deepEqual(snapshot.specialists.map((entry) => entry.id), ["bruteforce", "general", "internet-osint", "probe"]);
   const bruteforce = snapshot.specialists[0]!;
   assert.equal(bruteforce.source, "builtin");
   assert.equal(bruteforce.enabled, true);
@@ -405,3 +411,71 @@ async function waitForServer(child: ChildProcess, baseUrl: string): Promise<void
   }
   throw new Error("web server did not become ready");
 }
+
+test("Web API serves the option types only internet-osint declares", async () => {
+  const { baseUrl, jsonHeaders, adminCookie } = fixture;
+
+  // Before this Specialist shipped, no builtin declared `enum` or `string-list`,
+  // so the manifest validator, the /api/agents projection and the config-page
+  // renderer had never carried those shapes in production data.
+  const listed = await fetch(`${baseUrl}/api/agents`, { headers: { cookie: adminCookie } });
+  const snapshot = await listed.json() as { specialists: SpecialistView[]; diagnostics: Array<{ code: string }> };
+  const osint = snapshot.specialists.find((entry) => entry.id === "internet-osint");
+  assert.ok(osint, "internet-osint must be listed");
+  assert.equal(osint.source, "builtin");
+  assert.equal(osint.valid, true);
+  assert.equal(osint.options.length, 14);
+  assert.deepEqual([...osint.disabledGroups].sort(), [
+    "beekeeper", "connectivity", "credentials", "fofa", "network_diagnostics"
+  ]);
+
+  const goal = optionView(osint, "collectionGoal");
+  assert.equal(goal.spec.type, "enum");
+  assert.deepEqual(goal.spec.options, [
+    { value: "all", label: "全部" },
+    { value: "assets", label: "资产与攻击面" },
+    { value: "system", label: "系统信息" },
+    { value: "contact", label: "联系方式" },
+    { value: "people", label: "人员信息" }
+  ]);
+  assert.equal(goal.value, "all");
+  assert.equal(goal.authority, "user");
+  assert.equal(goal.editable, true);
+
+  const sources = optionView(osint, "sources");
+  assert.equal(sources.spec.type, "string-list");
+  assert.deepEqual(sources.value, ["sogou", "so360", "bing"]);
+  assert.equal(sources.spec.maxItems, 3);
+  assert.equal(sources.authority, "user");
+
+  // The author pinned the two method invariants.
+  assert.equal(optionView(osint, "writeGraphMemory").authority, "author");
+  assert.equal(optionView(osint, "writeGraphMemory").editable, false);
+  // And the Planner only gets boundaries, not values.
+  assert.equal(optionView(osint, "maxRounds").boundOnly, true);
+  assert.deepEqual(optionView(osint, "maxRounds").bounds, { minimum: 1, maximum: 12 });
+
+  // Operator writes round-trip through the API for both new types.
+  const configured = await fetch(`${baseUrl}/api/agents/internet-osint/options`, {
+    method: "PUT",
+    headers: jsonHeaders,
+    body: JSON.stringify({
+      options: { collectionGoal: "contact", sources: ["sogou", "so360"], minConfidence: "observed" }
+    })
+  });
+  assert.equal(configured.status, 200);
+  const configuredView = await configured.json() as SpecialistView;
+  assert.equal(optionView(configuredView, "collectionGoal").value, "contact");
+  assert.deepEqual(optionView(configuredView, "sources").value, ["sogou", "so360"]);
+  assert.equal(optionView(configuredView, "minConfidence").value, "observed");
+  assert.equal(optionView(configuredView, "collectionGoal").isDefault, false);
+  assert.equal(optionView(configuredView, "readPages").isDefault, true, "untouched options stay at their default");
+
+  // An enum value outside the declared set is rejected, not coerced.
+  const badEnum = await fetch(`${baseUrl}/api/agents/internet-osint/options`, {
+    method: "PUT",
+    headers: jsonHeaders,
+    body: JSON.stringify({ options: { collectionGoal: "everything" } })
+  });
+  assert.equal(badEnum.status, 400);
+});

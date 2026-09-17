@@ -19,7 +19,16 @@ export type OperationNodeType =
   | "ShellSession"
   | "Session"
   | "File"
-  | "Process";
+  | "Process"
+  // Public-internet intelligence entities. These describe what the open internet
+  // says about a target rather than something an operator confirmed on it, and
+  // they live in the operation graph because that is the only graph kind whose
+  // nodes receive content-addressed identity remapping (see graph-store
+  // `commitProjection`), which is what makes them merge across runtimes.
+  | "Organization"
+  | "Person"
+  | "Identity"
+  | "Contact";
 
 export type TaskNodeType =
   | "Goal"
@@ -59,7 +68,13 @@ export type EdgeType =
   | "produces_milestone"
   | "blocked_by"
   | "unblocked_by"
-  | "requires_evidence";
+  | "requires_evidence"
+  // Relations between public-intelligence entities.
+  | "member_of"
+  | "owns"
+  | "uses_identity"
+  | "reachable_at"
+  | "mentions";
 
 export type JsonObject = Record<string, unknown>;
 

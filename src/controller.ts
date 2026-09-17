@@ -120,6 +120,7 @@ import { createExecutorCredentialTools } from "./tools/credential-tools.js";
 import { CredentialMcpRuntime, type CredentialTrustedContext } from "./mcp/credential-runtime.js";
 import { McpRegistry } from "./mcp/mcp-registry.js";
 import { createTopologyValidationTool } from "./tools/topology-validation-tool.js";
+import { createOsintMemoryWriteTool } from "./tools/osint-memory-tool.js";
 import type {
   AgentRole,
   ControlSignal,
@@ -3174,6 +3175,16 @@ export class SecurityAgentController {
         ? createExecutorFofaTools(this.fofaRuntime, this.artifactStore, taskEnvelope.taskId)
         : []),
       ...bind("fofa", this.fofaRuntime ? [createTopologyValidationTool()] : []),
+      // Graph memory needs the runtime's own graph store and its *current*
+      // authorized scope, so it is bound here rather than in the static
+      // executor tool surface. The scope is resolved per call because it can
+      // change between Tasks within one run.
+      ...bind("osint", [createOsintMemoryWriteTool({
+        graphStore: this.graphStore,
+        executionLog: this.executionLog,
+        taskId: taskEnvelope.taskId,
+        resolveScopeSummary: () => this.activeScopeSummary
+      })]),
       ...bind("beekeeper", this.beekeeperRuntime
         ? createExecutorBeekeeperTools(this.beekeeperRuntime, taskEnvelope.taskId)
         : []),
@@ -7636,6 +7647,10 @@ function compactNodeProperties(type: string, properties: Record<string, unknown>
     Port: ["port", "protocol", "state"],
     Service: ["scheme", "server", "technology", "baseUrl"],
     WebEndpoint: ["path", "url", "method", "status", "requires_auth", "role_observed"],
+    Organization: ["org", "industry", "registrationId", "icp", "website", "source"],
+    Person: ["fullName", "organization", "title"],
+    Identity: ["email", "account", "organization", "kind"],
+    Contact: ["phone", "number", "kind"],
     Parameter: ["name", "location", "examples", "flag_path_probe_result"],
     Credential: ["username", "password", "role", "source", "valid"],
     Session: ["username", "role", "principal", "cookieName", "cookie_name", "authenticated", "valid"],

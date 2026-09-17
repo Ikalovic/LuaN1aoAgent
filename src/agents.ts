@@ -57,6 +57,7 @@ import {
   createWebFetchTool,
   createWebSearchTool
 } from "./tools/research-tools.js";
+import { createOsintSearchTool } from "./tools/osint-search-tools.js";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 import {
@@ -115,6 +116,15 @@ export function createExecutorResearchTools() {
     createWebSearchTool(),
     createVulnerabilitySearchTool()
   ];
+}
+
+/**
+ * Strictly-passive OSINT collection. Kept in its own group so a Specialist can
+ * take public-internet collection without also taking FOFA, credential stores
+ * or the gateway diagnostics that other groups carry.
+ */
+export function createExecutorOsintTools() {
+  return [createOsintSearchTool()];
 }
 
 export async function createSecurityAgentRuntime(input: {
@@ -272,6 +282,7 @@ export function executorToolBindings(input: {
   return [
     ...group("sandbox", input.sandbox.createTools()),
     ...group("research", createExecutorResearchTools()),
+    ...group("osint", createExecutorOsintTools()),
     { group: "browser", tool: createBrowserRenderTool({ runtime: input.sandbox.browserRuntime, allowHostFallback: false }) },
     {
       group: "artifact",
@@ -374,12 +385,19 @@ export async function createPlannerAgentSession(input: {
   rejectUnmanagedProviderAdmission(input.plannerLoader, input.providerAdmission);
   const graphMaterials = graphToolMaterialsResolver(input.executionLog);
   const plannerRetrievalPurpose = "Use only when a missing persisted fact would change Task status, topology, dependencies, priority, or budget; not for target-side technical investigation.";
+  const plannerSearchPurpose = "Find the node a planning question is about when no ref was handed to you, then read around it with graph_query focusNodeIds. Search by a domain, address, organization, technology or Task id. Do not use it to survey the graph or to re-derive facts already present in TaskOutcome.";
   return createAgentSession({
     cwd: input.cwd,
     noTools: "builtin",
     customTools: [
       createGraphQueryTool(input.graphStore, undefined, undefined, graphMaterials, plannerRetrievalPurpose),
       createGraphTraceTool(input.graphStore, undefined, undefined, graphMaterials, plannerRetrievalPurpose),
+      // The Planner needs a way to find a seed before it can traverse locally.
+      // Traversal (graph_query with focusNodeIds, graph_trace) is bounded and
+      // indexed; without search the only entry points are refs that some
+      // TaskOutcome happened to name, which makes collected intelligence
+      // unreachable whenever the summary does not spell out an id.
+      createGraphSearchTool(input.graphStore, undefined, undefined, graphMaterials, plannerSearchPurpose),
       ...(input.executionLog ? [
         createEvidenceListTool(input.executionLog, { description: plannerRetrievalPurpose }),
         createEvidenceReadTool(input.executionLog, { description: plannerRetrievalPurpose })

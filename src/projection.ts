@@ -33,7 +33,8 @@ const PROJECTION_NODE_KEYS = new Set([
 const PROJECTION_EDGE_KEYS = new Set(["from", "to", "type", "properties", "evidenceRefs"]);
 export const PROJECTION_OPERATION_NODE_TYPES = [
   "Host", "Port", "Service", "WebEndpoint", "Parameter", "Credential",
-  "AgentSession", "ShellSession", "Session", "File", "Process"
+  "AgentSession", "ShellSession", "Session", "File", "Process",
+  "Organization", "Person", "Identity", "Contact"
 ] as const;
 export const PROJECTION_REASONING_NODE_TYPES = [
   "Evidence", "Hypothesis", "Vulnerability", "Exploit"
@@ -46,7 +47,8 @@ export const PROJECTION_EDGE_TYPES = [
   "supports", "contradicts", "confirms", "promoted_to", "exploited_by", "produces_evidence",
   "observed_on", "affects", "has_port", "runs_service", "exposes_endpoint", "has_parameter",
   "authenticates_to", "creates_session", "session_on", "tunnels_to", "proxy_route",
-  "contains_file", "spawns_process", "discovered_by", "candidate_for", "resolves_to", "has_alias", "validated_by"
+  "contains_file", "spawns_process", "discovered_by", "candidate_for", "resolves_to", "has_alias", "validated_by",
+  "member_of", "owns", "uses_identity", "reachable_at", "mentions"
 ] as const;
 
 export type ProjectionObservation = {

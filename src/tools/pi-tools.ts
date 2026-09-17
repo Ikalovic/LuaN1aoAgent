@@ -465,19 +465,20 @@ export function createGraphSearchTool(
   graphStore: SQLiteGraphStore,
   references?: ProjectorGraphRefRegistry,
   cache?: Map<string, string>,
-  materials?: GraphToolMaterialsResolver
+  materials?: GraphToolMaterialsResolver,
+  description?: string
 ) {
   return defineTool({
     name: "graph_search",
     label: "Graph Search",
-    description: "Search semantic nodes in a byte-bounded closed graph page. Returned edges always include both endpoint nodes; use nextCursor with unchanged arguments for continuation.",
+    description: description ?? "Search semantic nodes in a byte-bounded closed graph page. Returned edges always include both endpoint nodes; use nextCursor with unchanged arguments for continuation.",
     parameters: Type.Object({
       query: Type.String({ minLength: 1, maxLength: 1_000 }),
       graphKind: Type.Optional(Type.Union([
         Type.Literal("operation"),
         Type.Literal("reasoning")
       ])),
-      limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 50 })),
+      limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 200 })),
       cursor: Type.Optional(Type.String({ minLength: 1, maxLength: 256 }))
     }, { additionalProperties: false }),
     execute: async (_toolCallId, params) => {

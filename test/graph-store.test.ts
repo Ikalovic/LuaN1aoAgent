@@ -2000,3 +2000,81 @@ test("opening a legacy graph migrates and merges incomplete operational edge ids
   assert.deepEqual(tunnels[0]?.evidenceRefs, ["event:1", "event:2"]);
   migratedStore.close();
 });
+
+test("semantic search finds operation and reasoning nodes by token", () => {
+  const runtimeDir = mkdtempSync(join(tmpdir(), "luanniao-graph-search-"));
+  const graphStore = new SQLiteGraphStore(join(runtimeDir, "state.sqlite"), join(runtimeDir, "deltas.jsonl"));
+  graphStore.upsertDelta({
+    sourceEventIds: ["event:1"],
+    nodes: [
+      { id: "op:host-a", graphKind: "operation", type: "Host", label: "shop.example.com", properties: { source: "osint" } },
+      { id: "op:org-a", graphKind: "operation", type: "Organization", label: "某某科技有限公司", properties: { origin: "osint" } },
+      { id: "op:host-b", graphKind: "operation", type: "Host", label: "unrelated.test", properties: {} },
+      { id: "evidence:a", graphKind: "reasoning", type: "Evidence", label: "example.com served a login form", properties: {}, evidenceRefs: ["event:1"] }
+    ],
+    edges: []
+  });
+
+  const byDomain = graphStore.searchSemanticNodes({ query: "shop.example.com" });
+  assert.deepEqual(byDomain.nodes.map((node) => node.id), ["op:host-a"]);
+
+  // Matches inside properties, not just the label.
+  const byOrigin = graphStore.searchSemanticNodes({ query: "origin" });
+  assert.ok(byOrigin.nodes.some((node) => node.id === "op:org-a"));
+
+  const scoped = graphStore.searchSemanticNodes({ query: "example.com", graphKind: "reasoning" });
+  assert.deepEqual(scoped.nodes.map((node) => node.id), ["evidence:a"]);
+
+  assert.deepEqual(graphStore.searchSemanticNodes({ query: "nothingmatchesthis" }).nodes, []);
+  // Tokens shorter than three characters are not searched.
+  assert.deepEqual(graphStore.searchSemanticNodes({ query: "ab" }).nodes, []);
+});
+
+test("semantic search is case-insensitive and reports omitted matches", () => {
+  const runtimeDir = mkdtempSync(join(tmpdir(), "luanniao-graph-search-case-"));
+  const graphStore = new SQLiteGraphStore(join(runtimeDir, "state.sqlite"), join(runtimeDir, "deltas.jsonl"));
+  graphStore.upsertDelta({
+    sourceEventIds: [],
+    nodes: [
+      { id: "op:upper", graphKind: "operation", type: "Service", label: "NGINX", properties: {} },
+      ...Array.from({ length: 5 }, (_, index) => ({
+        id: `op:pad-${index}`,
+        graphKind: "operation" as const,
+        type: "Host",
+        label: `nginx-${index}.example`,
+        properties: {}
+      }))
+    ],
+    edges: []
+  });
+
+  const upper = graphStore.searchSemanticNodes({ query: "nginx" });
+  assert.equal(upper.nodes.length, 6);
+  assert.ok(upper.nodes.some((node) => node.id === "op:upper"));
+
+  // The page limit is now 200 rather than 50, so a caller can reach more matches.
+  const limited = graphStore.searchSemanticNodes({ query: "nginx", limit: 3 });
+  assert.equal(limited.nodes.length, 3);
+  assert.equal(limited.summary?.matched, 6);
+  assert.equal(limited.summary?.omitted, 3);
+
+  const overCap = graphStore.searchSemanticNodes({ query: "nginx", limit: 5_000 });
+  assert.equal(overCap.nodes.length, 6, "requests past the cap are clamped, not rejected");
+});
+
+test("LIKE metacharacters in a query cannot widen a semantic search", () => {
+  const runtimeDir = mkdtempSync(join(tmpdir(), "luanniao-graph-search-escape-"));
+  const graphStore = new SQLiteGraphStore(join(runtimeDir, "state.sqlite"), join(runtimeDir, "deltas.jsonl"));
+  graphStore.upsertDelta({
+    sourceEventIds: [],
+    nodes: [
+      { id: "op:a", graphKind: "operation", type: "Host", label: "alpha.example", properties: {} },
+      { id: "op:b", graphKind: "operation", type: "Host", label: "beta.example", properties: {} }
+    ],
+    edges: []
+  });
+
+  // A bare `%` would match every row if the pattern were not escaped.
+  assert.deepEqual(graphStore.searchSemanticNodes({ query: "%%%%" }).nodes, []);
+  assert.deepEqual(graphStore.searchSemanticNodes({ query: "____" }).nodes, []);
+});

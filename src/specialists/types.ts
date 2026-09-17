@@ -10,6 +10,7 @@ import type { ExecutionLog } from "../stores/execution-log.js";
 export const SPECIALIST_TOOL_GROUPS = [
   "sandbox",
   "research",
+  "osint",
   "browser",
   "artifact",
   "evidence",

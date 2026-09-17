@@ -116,6 +116,46 @@ function directOperationIdentityKey(node: GraphNode): string | undefined {
       ? `parameter:${protocol}://host:${host}:${port}:${path}:${location}:${name}`
       : undefined;
   }
+  if (node.type === "Organization") {
+    const name = normalizedEntityName(
+      node.properties.name ?? node.properties.organization ?? node.properties.org ?? node.label
+    );
+    return name ? `organization:${name}` : undefined;
+  }
+  if (node.type === "Person") {
+    const name = normalizedEntityName(node.properties.name ?? node.properties.fullName ?? node.label);
+    if (!name) {
+      return undefined;
+    }
+    // The affiliation is part of the identity: two people who share a name but
+    // belong to different organizations are different entities, and collapsing
+    // them would silently conflate two humans across runtimes.
+    const organization = normalizedEntityName(node.properties.organization ?? node.properties.org);
+    return organization ? `person:${name}@${organization}` : `person:${name}`;
+  }
+  if (node.type === "Identity") {
+    const email = normalizedEmail(node.properties.email ?? node.properties.value ?? node.label);
+    if (email) {
+      return `identity:email:${email}`;
+    }
+    // The label is part of the fallback chain: a projected node may carry the
+    // handle in its label with no matching property, and dropping it here would
+    // leave the node without an identity and therefore unmergeable.
+    const account = normalizedEntityName(
+      node.properties.account ?? node.properties.username ?? node.properties.name ?? node.label
+    );
+    if (!account) {
+      return undefined;
+    }
+    const organization = normalizedEntityName(node.properties.organization ?? node.properties.org) ?? "unknown";
+    return `identity:account:${organization}:${account}`;
+  }
+  if (node.type === "Contact") {
+    const phone = normalizedPhone(
+      node.properties.phone ?? node.properties.number ?? node.properties.value ?? node.label
+    );
+    return phone ? `contact:phone:${phone}` : undefined;
+  }
   return undefined;
 }
 
@@ -267,6 +307,64 @@ function normalizedName(value: unknown): string | undefined {
   }
   const normalized = value.trim().toLowerCase();
   return normalized || undefined;
+}
+
+/**
+ * Entity names (organizations, people, account handles) are compared across
+ * runtimes, so the normal form has to be stable for both Latin and CJK input.
+ * Only whitespace and surrounding punctuation are folded — deliberately not
+ * removing words like 有限公司, because "XX" and "XX有限公司" may legitimately be
+ * different legal entities and merging them would be silent data loss.
+ */
+function normalizedEntityName(value: unknown): string | undefined {
+  if (typeof value !== "string") {
+    return undefined;
+  }
+  const normalized = value
+    .normalize("NFKC")
+    .toLowerCase()
+    .replace(/\s+/g, " ")
+    .replace(/^[\s@.,;:·、，。；：""''()（）\[\]<>《》]+|[\s@.,;:·、，。；：""''()（）\[\]<>《》]+$/g, "")
+    .trim();
+  return normalized || undefined;
+}
+
+function normalizedEmail(value: unknown): string | undefined {
+  if (typeof value !== "string") {
+    return undefined;
+  }
+  const normalized = value.trim().toLowerCase();
+  // Shape check only: the identity key must not accept arbitrary labels such as
+  // "Contact us" as if they were addresses.
+  return /^[^\s@]+@[^\s@.]+(?:\.[^\s@.]+)+$/.test(normalized) ? normalized : undefined;
+}
+
+/**
+ * Phone numbers arrive formatted in every possible way. Country code 86 is
+ * folded so that "+86 138-0000-0000" and "13800000000" are one identity; other
+ * country codes are preserved as digits to avoid inventing a canonical form for
+ * numbering plans this code cannot verify.
+ */
+function normalizedPhone(value: unknown): string | undefined {
+  if (typeof value !== "string" && typeof value !== "number") {
+    return undefined;
+  }
+  const raw = String(value).trim();
+  const plus = raw.startsWith("+");
+  const digits = raw.replace(/\D/g, "");
+  if (!digits) {
+    return undefined;
+  }
+  if (!plus && digits.length > 11 && digits.startsWith("86")) {
+    return digits.slice(2);
+  }
+  if (plus && digits.startsWith("86") && digits.length > 11) {
+    return digits.slice(2);
+  }
+  if (digits.length < 5 || digits.length > 15) {
+    return undefined;
+  }
+  return digits;
 }
 
 function defaultPort(protocol: string | undefined): string | undefined {

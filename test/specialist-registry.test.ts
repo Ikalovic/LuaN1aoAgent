@@ -24,7 +24,7 @@ test("registry exposes built-ins and keeps the general Specialist enabled", asyn
   const root = fixtureRoot();
   const registry = new SpecialistRegistry({ cwd: root });
   const snapshot = registry.scan();
-  assert.deepEqual(snapshot.specialists.map((entry) => entry.id), ["bruteforce", "general"]);
+  assert.deepEqual(snapshot.specialists.map((entry) => entry.id), ["bruteforce", "general", "internet-osint"]);
   const general = snapshot.specialists.find((entry) => entry.id === GENERAL_SPECIALIST_ID)!;
   assert.equal(general.enabled, true);
   assert.equal(general.source, "builtin");
@@ -37,11 +37,11 @@ test("registry exposes built-ins and keeps the general Specialist enabled", asyn
   const disabled = await registry.resolve("bruteforce");
   assert.equal(disabled.ok, false);
   assert.equal(disabled.ok === false ? disabled.reason : "", "disabled");
-  assert.deepEqual((await registry.catalog()).map((entry) => entry.id), [GENERAL_SPECIALIST_ID]);
+  assert.deepEqual((await registry.catalog()).map((entry) => entry.id), [GENERAL_SPECIALIST_ID, "internet-osint"]);
 
   await registry.setEnabled("bruteforce", true);
   const catalog = await registry.catalog();
-  assert.deepEqual(catalog.map((entry) => entry.id), ["bruteforce", GENERAL_SPECIALIST_ID]);
+  assert.deepEqual(catalog.map((entry) => entry.id), ["bruteforce", GENERAL_SPECIALIST_ID, "internet-osint"]);
   assert.deepEqual(catalog[0]!.disabledToolGroups, ["network_diagnostics", "fofa", "beekeeper"]);
 });
 
@@ -170,7 +170,7 @@ test("manifest-only project Specialists load prompt files and join the catalog",
   const resolution = await registry.resolve("recon-lite");
   assert.equal(resolution.ok, true);
   assert.equal(resolution.ok === true ? resolution.definition.prompt.content : "", "Recon carefully.");
-  assert.deepEqual((await registry.catalog()).map((candidate) => candidate.id), ["bruteforce", "general", "recon-lite"]);
+  assert.deepEqual((await registry.catalog()).map((candidate) => candidate.id), ["bruteforce", "general", "internet-osint", "recon-lite"]);
 });
 
 test("the built-in bruteforce Skill allowlist matches the Skills this repository ships", async () => {
@@ -311,7 +311,7 @@ export default (api) => ({
   assert.equal(resolution.ok, true);
   if (!resolution.ok) return;
   assert.equal(typeof resolution.definition.createTools, "function");
-  assert.deepEqual((await registry.catalog()).map((candidate) => candidate.id), ["bruteforce", "general", "module-agent"]);
+  assert.deepEqual((await registry.catalog()).map((candidate) => candidate.id), ["bruteforce", "general", "internet-osint", "module-agent"]);
 });
 
 test("invalid project Specialists degrade to diagnostics without breaking the registry", async () => {
@@ -353,7 +353,7 @@ test("invalid project Specialists degrade to diagnostics without breaking the re
   assert.equal(unknown.ok, false);
   assert.equal(unknown.ok === false ? unknown.reason : "", "unknown");
 
-  assert.deepEqual((await registry.catalog()).map((entry) => entry.id), ["bruteforce", "general"]);
+  assert.deepEqual((await registry.catalog()).map((entry) => entry.id), ["bruteforce", "general", "internet-osint"]);
 });
 
 test("registry state file is written atomically with restricted permissions", async () => {
@@ -366,4 +366,135 @@ test("registry state file is written atomically with restricted permissions", as
   await registry.setOptions("general", {});
   const rewritten = JSON.parse(readFileSync(statePath, "utf8")) as Record<string, { enabled?: boolean }>;
   assert.equal(rewritten.bruteforce?.enabled, false);
+});
+
+test("internet-osint narrows the tool surface and pins its method invariants", async () => {
+  const registry = new SpecialistRegistry({ cwd: fixtureRoot() });
+  const resolution = await registry.resolve("internet-osint");
+  assert.equal(resolution.ok, true);
+  if (!resolution.ok) return;
+
+  // Credential stores, FOFA and connectivity are other channels; removing them
+  // is what makes "this Agent never writes credentials" structural rather than
+  // prompt-enforced.
+  assert.deepEqual(resolution.definition.tools?.disableGroups, [
+    "beekeeper", "credentials", "network_diagnostics", "fofa", "connectivity"
+  ]);
+  assert.equal(resolution.definition.skills?.mode, "allowlist");
+  assert.deepEqual(
+    resolution.definition.skills?.mode === "allowlist" ? resolution.definition.skills.allow : [],
+    ["osint-query-strategy", "osint-source-reliability"]
+  );
+  assert.equal(resolution.definition.concurrency?.maxParallelTasks, 2);
+  assert.equal(resolution.definition.budget.epochTurnSlice, 14);
+});
+
+test("internet-osint splits option authority across operator, planner and author", async () => {
+  const registry = new SpecialistRegistry({ cwd: fixtureRoot() });
+  const snapshot = await registry.describeAll();
+  const osint = snapshot.specialists.find((entry) => entry.id === "internet-osint");
+  assert.ok(osint, "internet-osint must be in the registry");
+
+  const byKey = new Map(osint.options.map((option) => [option.key, option]));
+  const authorityOf = (key: string) => byKey.get(key)?.authority;
+
+  // Operator owns what to collect and how personal data is handled.
+  for (const key of [
+    "targets", "collectionGoal", "personalDataPolicy", "minConfidence",
+    "readPages", "sources", "excludeDomains", "maxMemoryNodes"
+  ]) {
+    assert.equal(authorityOf(key), "user", `${key} should be operator-editable`);
+    assert.equal(byKey.get(key)?.editable, true);
+  }
+
+  // The Planner may move collection volume, but only inside the author's maxima.
+  for (const key of ["maxRounds", "maxQueriesPerRound", "maxResultsPerQuery", "maxSourceCalls"]) {
+    assert.equal(authorityOf(key), "planner", `${key} should be Planner-tunable`);
+    assert.equal(byKey.get(key)?.boundOnly, true, `${key} must publish a boundary`);
+  }
+
+  // The two method invariants are not operator knobs.
+  for (const key of ["writeGraphMemory", "crossSourceConfirmation"]) {
+    assert.equal(authorityOf(key), "author", `${key} is pinned by the author`);
+    assert.equal(byKey.get(key)?.editable, false);
+  }
+
+  assert.equal(osint.options.length, 14);
+  assert.deepEqual(snapshot.diagnostics, []);
+});
+
+test("internet-osint ships the option types no other builtin exercised", async () => {
+  // Before this Specialist, no builtin declared `enum` or `string-list`, so
+  // those were untested paths through both the manifest validator and the
+  // config-page renderer.
+  const registry = new SpecialistRegistry({ cwd: fixtureRoot() });
+  const snapshot = await registry.describeAll();
+  const osint = snapshot.specialists.find((entry) => entry.id === "internet-osint")!;
+  const byKey = new Map(osint.options.map((option) => [option.key, option]));
+
+  const goal = byKey.get("collectionGoal")!;
+  assert.equal(goal.spec.type, "enum");
+  assert.deepEqual(
+    (goal.spec as { options: Array<{ value: string }> }).options.map((item) => item.value),
+    ["all", "assets", "system", "contact", "people"]
+  );
+  assert.equal(goal.value, "all");
+
+  const sources = byKey.get("sources")!;
+  assert.equal(sources.spec.type, "string-list");
+  assert.deepEqual(sources.value, ["sogou", "so360", "bing"]);
+
+  // An empty default would mean "no declared superset", which cannot be narrowed.
+  const exclude = byKey.get("excludeDomains")!;
+  assert.equal(exclude.spec.type, "string-list");
+  assert.deepEqual(exclude.value, []);
+});
+
+test("internet-osint treats an operator write as a boundary, not a value", async () => {
+  const registry = new SpecialistRegistry({ cwd: fixtureRoot() });
+  const applied = await registry.setOptions("internet-osint", {
+    maxQueriesPerRound: 4,
+    maxSourceCalls: 60,
+    collectionGoal: "contact",
+    sources: ["sogou", "so360"]
+  });
+  const byKey = new Map(applied.options.map((option) => [option.key, option]));
+
+  // Operator-owned options take the value directly.
+  assert.equal(byKey.get("collectionGoal")?.value, "contact");
+  assert.deepEqual(byKey.get("sources")?.value, ["sogou", "so360"]);
+
+  // Planner-owned numbers are the opposite: the operator declares the ceiling
+  // and the Planner later picks a concrete value inside it, so the value stays
+  // at the author default and only the bound moves.
+  assert.equal(byKey.get("maxQueriesPerRound")?.value, 3, "value stays at the author default");
+  assert.equal(byKey.get("maxQueriesPerRound")?.bounds?.maximum, 4, "the operator's number becomes the ceiling");
+  assert.equal(byKey.get("maxSourceCalls")?.bounds?.maximum, 60, "the ceiling narrows");
+  assert.equal(byKey.get("maxResultsPerQuery")?.bounds?.maximum, 20, "untouched planner options keep the author range");
+
+  // The declared boundary can only narrow: a request above the author maximum is
+  // an error, never a widening of the envelope.
+  await assert.rejects(
+    () => registry.setOptions("internet-osint", { maxSourceCalls: 500 }),
+    SpecialistOptionError
+  );
+  // An operator write is an explicit admin action, so out-of-range is an error
+  // rather than a silent clamp.
+  await assert.rejects(
+    () => registry.setOptions("internet-osint", { maxRounds: 999 }),
+    SpecialistOptionError
+  );
+  // Author-pinned invariants reject the write instead of ignoring it.
+  await assert.rejects(
+    () => registry.setOptions("internet-osint", { writeGraphMemory: false }),
+    SpecialistOptionError
+  );
+  await assert.rejects(
+    () => registry.setOptions("internet-osint", { collectionGoal: "not-a-goal" }),
+    SpecialistOptionError
+  );
+  await assert.rejects(
+    () => registry.setOptions("internet-osint", { noSuchOption: 1 }),
+    SpecialistOptionError
+  );
 });
