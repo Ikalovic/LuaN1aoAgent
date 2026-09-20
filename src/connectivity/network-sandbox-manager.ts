@@ -1298,6 +1298,13 @@ function dockerCommand(args: string[], stdin?: string): Promise<CommandResult> {
     child.stderr!.on("data", (chunk: Buffer) => { stderr += chunk.toString("utf8"); });
     child.on("error", (error) => finish({ code: 1, stdout, stderr: error.message }));
     child.on("close", (code) => finish({ code, stdout, stderr }));
+    // A child that exits before draining stdin — docker failing fast because the
+    // daemon is down, the container is gone, or the command was rejected — makes
+    // this write fail with EPIPE. On the stdin socket that is an 'error' event,
+    // and an unhandled one is an uncaught exception that takes down the whole
+    // process, including the web server. The child's own exit code is the
+    // authoritative outcome, so the broken pipe itself is not reported.
+    child.stdin?.on("error", () => undefined);
     if (stdin !== undefined) child.stdin!.end(stdin);
   });
 }

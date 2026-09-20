@@ -1,8 +1,19 @@
 import { useRef, useState } from "react";
-import { Alert, Button, Form, Input, InputNumber, Modal, Select, Space, Typography } from "antd";
-import { parseScopeDocument, startRun } from "../api";
+import { Alert, Button, Form, Input, InputNumber, Modal, Select, Space, Tag, Typography } from "antd";
+import { Paperclip } from "lucide-react";
+import { discardAttachment, parseScopeDocument, startRun, uploadAttachment } from "../api";
 import { useLanguage } from "../language";
-import type { ParsedScopeDocument } from "../types";
+import type { ParsedScopeDocument, StagedAttachment } from "../types";
+
+/** Mirrors ATTACHMENT_LIMITS in src/attachments/attachment-store.ts; the server is authoritative. */
+const ATTACHMENT_MAX_BYTES = 32 * 1024 * 1024;
+const ATTACHMENT_MAX_FILES = 12;
+
+function formatBytes(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KiB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MiB`;
+}
 
 interface StartRunModalProps {
   open: boolean;
@@ -27,13 +38,64 @@ export function StartRunModal({ open, onClose, onStarted, continueFrom }: StartR
   const [parsedDocument, setParsedDocument] = useState<ParsedScopeDocument>();
   const [scopeDraft, setScopeDraft] = useState("");
   const [editingScopeDraft, setEditingScopeDraft] = useState(false);
+  const [attachments, setAttachments] = useState<StagedAttachment[]>([]);
+  const [uploading, setUploading] = useState(false);
+  const [attachmentError, setAttachmentError] = useState<string>();
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const attachmentInputRef = useRef<HTMLInputElement>(null);
 
   const resetDocument = () => {
     setParsedDocument(undefined);
     setScopeDraft("");
     setEditingScopeDraft(false);
     if (fileInputRef.current) fileInputRef.current.value = "";
+  };
+
+  const resetAttachments = () => {
+    setAttachments([]);
+    setAttachmentError(undefined);
+    if (attachmentInputRef.current) attachmentInputRef.current.value = "";
+  };
+
+  /**
+   * Files are staged one by one as they are picked, so the run request stays
+   * small and a single rejected file does not discard the accepted ones.
+   */
+  const selectAttachments = async (files: FileList | null) => {
+    if (!files || files.length === 0) return;
+    const incoming = Array.from(files);
+    setAttachmentError(undefined);
+    if (attachments.length + incoming.length > ATTACHMENT_MAX_FILES) {
+      setAttachmentError(t("startRun.attachmentTooMany").replace("{max}", String(ATTACHMENT_MAX_FILES)));
+      if (attachmentInputRef.current) attachmentInputRef.current.value = "";
+      return;
+    }
+    const oversized = incoming.find((file) => file.size > ATTACHMENT_MAX_BYTES);
+    if (oversized) {
+      setAttachmentError(t("startRun.attachmentTooLarge").replace("{max}", formatBytes(ATTACHMENT_MAX_BYTES)));
+      if (attachmentInputRef.current) attachmentInputRef.current.value = "";
+      return;
+    }
+    setUploading(true);
+    const uploaded: StagedAttachment[] = [];
+    try {
+      for (const file of incoming) {
+        uploaded.push(await uploadAttachment(file));
+      }
+    } catch (cause) {
+      setAttachmentError(cause instanceof Error ? cause.message : String(cause));
+    } finally {
+      setAttachments((current) => [...current, ...uploaded]);
+      setUploading(false);
+      if (attachmentInputRef.current) attachmentInputRef.current.value = "";
+    }
+  };
+
+  const removeAttachment = async (attachmentId: string) => {
+    setAttachments((current) => current.filter((item) => item.attachmentId !== attachmentId));
+    // Staged files are released on successful start anyway; a failed discard
+    // only means the staging copy outlives the UI list.
+    await discardAttachment(attachmentId).catch(() => undefined);
   };
 
   const selectDocument = async (file: File | undefined) => {
@@ -71,6 +133,7 @@ export function StartRunModal({ open, onClose, onStarted, continueFrom }: StartR
   };
 
   const submit = async () => {
+    if (submitting || uploading || parsing) return;
     const values = await form.validateFields();
     setSubmitting(true);
     setError(undefined);
@@ -82,10 +145,12 @@ export function StartRunModal({ open, onClose, onStarted, continueFrom }: StartR
         ...(continueFrom ? { runtimeDir: continueFrom.runtimeDir } : {}),
         maxRunTimeMs: values.maxRunTimeMin ? Math.round(values.maxRunTimeMin * 60_000) : undefined,
         maxParallelTasks: values.maxParallelTasks ?? undefined,
-        maxPlannerCycles: values.maxPlannerCycles ?? undefined
+        maxPlannerCycles: values.maxPlannerCycles ?? undefined,
+        ...(attachments.length > 0 ? { attachmentIds: attachments.map((item) => item.attachmentId) } : {})
       });
       form.resetFields();
       resetDocument();
+      resetAttachments();
       onStarted(result.runtimeDir);
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : String(cause));
@@ -101,19 +166,25 @@ export function StartRunModal({ open, onClose, onStarted, continueFrom }: StartR
       okText={continuing ? t("startRun.continueAction") : t("common.start")}
       cancelText={t("common.cancel")}
       confirmLoading={submitting}
-      okButtonProps={{ disabled: parsing }}
+      okButtonProps={{ disabled: parsing || uploading }}
+      cancelButtonProps={{ disabled: submitting || uploading || parsing }}
+      closable={!submitting && !uploading && !parsing}
+      keyboard={!submitting && !uploading && !parsing}
+      mask={{ closable: !submitting && !uploading && !parsing }}
       width={560}
       destroyOnHidden
       onOk={() => void submit().catch(() => undefined)}
       onCancel={() => {
-        if (submitting) return;
+        if (submitting || uploading || parsing) return;
+        for (const item of attachments) void discardAttachment(item.attachmentId).catch(() => undefined);
         setError(undefined);
         resetDocument();
+        resetAttachments();
         onClose();
       }}
     >
-      {error ? <Alert style={{ marginBottom: 12 }} type="error" showIcon message={error} /> : null}
-      {continuing ? <Alert style={{ marginBottom: 12 }} type="info" showIcon message={t("startRun.continueHint")} /> : null}
+      {error ? <Alert style={{ marginBottom: 12 }} type="error" showIcon title={error} /> : null}
+      {continuing ? <Alert style={{ marginBottom: 12 }} type="info" showIcon title={t("startRun.continueHint")} /> : null}
       <Form
         form={form}
         layout="vertical"
@@ -153,6 +224,39 @@ export function StartRunModal({ open, onClose, onStarted, continueFrom }: StartR
             onChange={(event) => void selectDocument(event.currentTarget.files?.[0])}
           />
         </Form.Item>
+        <Form.Item label={t("startRun.attachments")} className="qx-start-attachments">
+          <Space orientation="vertical" size={8} style={{ width: "100%" }}>
+            <input
+              ref={attachmentInputRef}
+              className="qx-start-file-input"
+              aria-label={t("startRun.attachments")}
+              type="file"
+              multiple
+              disabled={uploading || submitting}
+              onChange={(event) => void selectAttachments(event.currentTarget.files)}
+            />
+            <Button icon={<Paperclip size={15} />} loading={uploading} disabled={uploading || submitting} onClick={() => attachmentInputRef.current?.click()}>{t("startRun.attachments")}</Button>
+            <Typography.Text type="secondary">{t("startRun.attachmentsHint")}</Typography.Text>
+            {attachmentError ? <Alert type="error" showIcon title={attachmentError} /> : null}
+            {attachments.length > 0 ? (
+              <Space size={[4, 4]} wrap>
+                {attachments.map((item) => (
+                  <Tag
+                    key={item.attachmentId}
+                    closable={!submitting}
+                    onClose={(event) => {
+                      event.preventDefault();
+                      void removeAttachment(item.attachmentId);
+                    }}
+                    title={`${item.mediaType} · ${formatBytes(item.byteLength)}`}
+                  >
+                    {item.fileName} · {formatBytes(item.byteLength)}
+                  </Tag>
+                ))}
+              </Space>
+            ) : null}
+          </Space>
+        </Form.Item>
         {parsedDocument ? (
           <Alert
             type="info"
@@ -179,7 +283,7 @@ export function StartRunModal({ open, onClose, onStarted, continueFrom }: StartR
             )}
           />
         ) : null}
-        <div style={{ display: "flex", gap: 12 }}>
+        <div className="qx-start-limits">
           <Form.Item name="maxRunTimeMin" label={t("startRun.maxMinutes")} style={{ flex: 1 }}>
             <InputNumber min={1} max={180} style={{ width: "100%" }} />
           </Form.Item>

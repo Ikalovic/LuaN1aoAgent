@@ -1,0 +1,31 @@
+# Wordlist provenance
+#
+# These files are assembled at image build time (see executor-image/Dockerfile).
+# Only passwords-extra.txt, usernames-extra.txt and default-credentials.txt are
+# authored in this repository; the rest is copied out of packages the image
+# installs anyway, so no third-party wordlist content is vendored into the repo.
+#
+# passwords-common.txt
+#   - /usr/share/nmap/nselib/data/passwords.lst  (nmap, Nmap Public Source
+#     License; 5000 entries, sorted -u with the curated additions below)
+#   - passwords-extra.txt                        (this repository, AGPL-3.0-only)
+#   Comments, blank lines and CR are stripped; the result is sorted and unique.
+#
+# usernames-common.txt
+#   - /usr/share/nmap/nselib/data/usernames.lst  (nmap, NPSL)
+#   - usernames-extra.txt                        (this repository, AGPL-3.0-only)
+#
+# default-credentials.txt
+#   - default-credentials.txt                    (this repository, AGPL-3.0-only)
+#   `username:password` pairs for `hydra -C`; the prose source of truth is
+#   templates/skills/default-credentials/SKILL.md.
+#
+# directories-common.txt
+#   - /usr/share/dirb/wordlists/common.txt       (dirb, GPL-2.0; 4614 paths)
+#   For ffuf:  ffuf -w /opt/luanniao/wordlists/directories-common.txt -u http://TARGET/FUZZ
+#   dirb's own big.txt (~20k paths) stays available at /usr/share/dirb/wordlists/big.txt.
+#
+# Why not a full breach corpus: Executor attempts are budget-bound (the
+# bruteforce Specialist defaults to 20 per account and 200 per Task). A list of
+# tens of millions of candidates cannot be consumed inside those bounds, and
+# carrying it would only invite plans that cannot finish.

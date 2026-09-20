@@ -10,7 +10,7 @@ import {
   renderPlannerInput,
   renderSupervisorInput
 } from "../src/prompts.js";
-import type { GraphSnapshot, PlannerDecisionView, TaskEnvelope } from "../src/types.js";
+import type { GraphSnapshot, PlannerDecisionView, RunAttachment, TaskEnvelope } from "../src/types.js";
 
 test("executor prompt uses bounded experimental method and runtime steering", () => {
   const taskEnvelope: TaskEnvelope = {
@@ -252,6 +252,65 @@ test("planner snapshot renders continuation context between fixed context and pl
   assert.doesNotMatch(without, /<continuation_context>/);
 });
 
+test("planner snapshot lists operator attachments as fixed context, once", () => {
+  const view: PlannerDecisionView = {
+    view: "planner_decision",
+    rootRefs: { goalRef: "goal:root", scopeRef: "scope:root" },
+    taskLedger: [],
+    taskOutcomes: [],
+    reasoningDigest: [],
+    operationDigest: [],
+    blockers: [],
+    graphSummary: { nodeCount: 2, edgeCount: 1, taskStatusCounts: {} }
+  };
+  const attachments: RunAttachment[] = [
+    {
+      artifactRef: "artifact:11111111-1111-4111-8111-111111111111",
+      fileName: "chall.zip",
+      mediaType: "application/zip",
+      byteLength: 2_048,
+      sha256: "a".repeat(64)
+    },
+    {
+      artifactRef: "artifact:22222222-2222-4222-8222-222222222222",
+      fileName: "vendor-advisory.pdf",
+      mediaType: "application/pdf",
+      byteLength: 51_200,
+      sha256: "b".repeat(64)
+    }
+  ];
+  const input = renderPlannerInput({
+    userGoal: "Solve the attached challenge",
+    scopeSummary: "",
+    plannerDecisionView: view,
+    attachments
+  });
+
+  assert.match(input, /<run_attachments format="compact-json">/);
+  // The Planner needs the ref and enough metadata to route the material, and
+  // nothing more: attachment bytes are never inlined into the prompt.
+  assert.match(input, /"artifactRef":"artifact:11111111-1111-4111-8111-111111111111"/);
+  assert.match(input, /"fileName":"chall\.zip"/);
+  assert.match(input, /"mediaType":"application\/zip"/);
+  assert.match(input, /"byteLength":2048/);
+  assert.doesNotMatch(input, /"sha256"/);
+  assert.ok(
+    input.indexOf("<run_attachments") > input.indexOf("<authorized_scope>"),
+    "attachments follow the fixed goal/scope context"
+  );
+  assert.ok(
+    input.indexOf("<run_attachments") < input.indexOf('<planner_state format="compact-json">'),
+    "attachments precede planner state"
+  );
+
+  const none = renderPlannerInput({
+    userGoal: "Solve the attached challenge",
+    scopeSummary: "",
+    plannerDecisionView: view
+  });
+  assert.doesNotMatch(none, /<run_attachments>/);
+});
+
 test("planner follow-up carries a complete structural delta without repeating fixed context", () => {
   const previous: PlannerDecisionView = {
     view: "planner_decision",
@@ -472,4 +531,35 @@ test("supervisor input includes persisted relevant graph knowledge", () => {
   assert.match(input, /a valid session identifier is observed/);
   assert.match(input, /Task allocation：已用 17\/40，剩余 23 turns/);
   assert.match(input, /Epoch slice：已用 5\/8，剩余 3 turns/);
+});
+
+/**
+ * The internet-osint Agent and its tools shipped before anything told the
+ * Planner or the Executor that passive public-internet collection is part of
+ * reconnaissance. In the first run that used the new build, the Executor called
+ * osint_search once as a budget-closing afterthought and never called
+ * osint_memory_write, so the collected intelligence never reached graph memory.
+ * These assertions pin the guidance that closes that gap.
+ */
+test("executor prompt teaches passive collection and requires persisting it", () => {
+  assert.match(EXECUTOR_SYSTEM_PROMPT, /# Public Intelligence/);
+  assert.match(EXECUTOR_SYSTEM_PROMPT, /使用 osint_search/);
+  assert.match(EXECUTOR_SYSTEM_PROMPT, /它只与第三方.*通信，不向目标发起任何请求/s);
+  assert.match(EXECUTOR_SYSTEM_PROMPT, /只有 no_results 是负面证据/);
+  assert.match(EXECUTOR_SYSTEM_PROMPT, /blocked、error、operator_unsupported、irrelevant 都只说明该源本轮没有给出可用信息/);
+  assert.match(EXECUTOR_SYSTEM_PROMPT, /一轮搜集得到的实体结论必须用 osint_memory_write 落库/);
+  assert.match(EXECUTOR_SYSTEM_PROMPT, /同一次调用里出现两个实体不代表它们相关/);
+  assert.match(EXECUTOR_SYSTEM_PROMPT, /公开信息里的邮箱或账号不是凭据/);
+  // The privacy switch must not be bypassed for completeness.
+  assert.match(EXECUTOR_SYSTEM_PROMPT, /按 Task 的 personalDataPolicy 处理/);
+});
+
+test("planner prompt makes passive collection its own Task rather than excluding the Agent", () => {
+  assert.match(PLANNER_SYSTEM_PROMPT, /公开信息搜集的交付物与目标侧验证不同/);
+  assert.match(PLANNER_SYSTEM_PROMPT, /应创建独立 Task 并在它出现在 available_specialists 时指定 internet-osint/);
+  assert.match(PLANNER_SYSTEM_PROMPT, /该 Agent 不可用时，这部分工作仍应作为独立 Task 由通用 Executor 承担/);
+  // The earlier instruction not to assign a trimmed Agent must not be read as
+  // "internet-osint cannot do collection" — its trimming is by design.
+  assert.match(PLANNER_SYSTEM_PROMPT, /internet-osint 的工具面被裁剪是刻意的/);
+  assert.match(PLANNER_SYSTEM_PROMPT, /不要因为它裁掉了连通性相关工具组，就把它排除在被动搜集 Task 之外/);
 });

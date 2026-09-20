@@ -2,6 +2,13 @@ import { describe, expect, it } from "vitest";
 import { parseNavigation, navigationUrl, transitionNavigation } from "./navigation";
 
 describe("workbench navigation", () => {
+  it("supports new backend views and remote capabilities deep links", () => {
+    for (const view of ["agents", "memory"]) expect(parseNavigation(`?view=${view}`, () => null).view).toBe(view);
+    for (const tab of ["skills", "mcp", "agents"]) {
+      expect(parseNavigation(`?view=capabilities&tab=${tab}`, () => null).view).toBe(tab);
+    }
+    expect(parseNavigation("?view=capabilities&tab=invalid", () => null).view).toBe("skills");
+  });
   it("defaults to overview and preserves legacy routes and opaque flow IDs", () => {
     expect(parseNavigation("", () => null).view).toBe("overview");
     expect(parseNavigation("?view=traffic&exchangeId=flow%3Aa%2Fb%2B1", () => null).exchangeId).toBe("flow:a/b+1");

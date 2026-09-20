@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { Badge, Button, Empty, Menu, Tooltip } from "antd";
-import { Activity, BrainCircuit, Cable, ChevronRight, FileText, Folder, FolderOpen, GitBranch, KeyRound, ListTree, Network, PanelLeftClose, Play, Plug, ShieldAlert, Wrench } from "lucide-react";
+import { Activity, Blocks, BrainCircuit, Cable, ChevronRight, Database, FileText, Folder, FolderOpen, GitBranch, KeyRound, ListTree, Network, PanelLeftClose, Play, ShieldAlert } from "lucide-react";
 import { useLanguage } from "../language";
 import { Brand } from "./Brand";
 import { buildSessionTree, sessionRelativePath, type SessionFolderNode } from "../sessions";
@@ -32,11 +32,11 @@ export function Sidebar(props: SidebarProps) {
     { key: "reports", icon: <FileText size={17} />, label: t("nav.reports") },
     { key: "traffic", icon: <Network size={17} />, label: t("nav.traffic") },
     { key: "connections", icon: <Cable size={17} />, label: t("nav.connections") },
-    { key: "skills", icon: <Wrench size={17} />, label: t("nav.skills") },
-    { key: "mcp", icon: <Plug size={17} />, label: t("nav.mcp") },
+    { key: "capabilities", icon: <Blocks size={17} />, label: t("nav.capabilities") },
     ...(props.canManageCredentials ? [{ key: "credentials", icon: <KeyRound size={17} />, label: t("nav.credentials") }] : []),
     { key: "reasoning", icon: <BrainCircuit size={17} />, label: t("nav.reasoning") },
     { key: "operation", icon: <GitBranch size={17} />, label: t("nav.operation") },
+    { key: "memory", icon: <Database size={17} />, label: t("nav.memory") },
     { key: "task", icon: <ListTree size={17} />, label: t("nav.task") },
     ...(props.canApprove ? [{
       key: "approvals",

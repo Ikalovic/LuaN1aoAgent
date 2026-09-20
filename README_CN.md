@@ -177,6 +177,35 @@ flowchart LR
 - 可重试 Provider 错误分类以及有界的新 Session 重试。
 - 显式 Planner 冲突检测和原子命令批次。
 
+### 专精 Agent（Specialist Agent）
+
+除 Skill 与 MCP 之外，**专精 Agent** 是 Planner 按 Task 选择的特化 Executor。每个专精 Agent 拥有自己的系统提示词、模型档位、工具面、Skill 策略、预算与并发上限，可通过 TypeScript SDK（`defineSpecialist`）显式注册，也可以放在项目级 `.agents/specialists/<id>/` 清单中，并可选带一个提供自定义工具的 JavaScript 模块。
+
+- Planner 在输入中看到 `<available_specialists>` 目录，用 `create_tasks.specialist` 指定拥有者；省略时使用 `general` Executor，其参数与既有行为一致。
+- 未知、禁用或无效的 id 会被拒绝并回灌修复反馈，不会把不可运行的 Task 写入任务图；运行中被禁用的 Agent 会把 Task 交回 Planner，而不是静默降级。
+- 工具策略只能做减法：先裁剪工具组，再用可选的白/黑名单收窄，`task_result_submit` 永不可移除。
+- 预算按 Agent 区分：`defaultMaxTurns`、`maxTurnsCeiling`（可低于全局下限，使轻量 Agent 保持低开销）、Epoch 轮次片与 Epoch 时间份额。
+- **选项权威模型**：每个选项的取值由谁决定是显式声明的，而不是默认全部可改。
+  - `authority: "author"`——作者固定，能力页只读，Planner 也不能改。安全开关与能力边界用这一档。
+  - `authority: "planner"`（默认模式下的 `number` / `string-list`）——用户在能力页只能设**上限**或**收窄授权集合**，具体取值由 Planner 在 `create_tasks.specialistOptions` 中于边界内选择，越界值由 Runtime 夹紧。
+  - `authority: "user"`——显式交给用户的任务参数（目标、材料等）。
+  - `optionsMode`（`planner` 默认 / `user`）是 Agent 级总开关，作者给默认值、用户在能力页可切换；切换只影响未显式声明 `authority` 的选项，且永远无法突破作者声明的 `minimum`/`maximum`。
+- Planner 只看到 catalog 中 `tunableOptions` 公布的选项；写入 `author` 权威或未公开的键会被 `create_tasks` 校验拒绝并回灌可调项清单。
+- 能力面（专精 Agent / Skill / MCP 的启停与参数）属于管理决策：读接口对所有已认证用户开放，写接口需要 `admin:capability`（仅 `admin` 角色），`analyst` 无法通过 API 改写能力面。
+- Web 工作台把三者合并到一个**能力**页（Skill / MCP / 专精 Agent），提供启停开关与按 schema 自动生成的选项表单；作者固定项以只读形式展示，Planner 可调项以「上限」形式展示。
+- 开发指南见 [`docs/create_agent.md`](docs/create_agent.md)，概念概览见 [`docs/specialist-agent-sdk.md`](docs/specialist-agent-sdk.md)，脚手架见 `templates/specialists/`。
+- 随仓库分发的技能在 `templates/skills/`（`.agents/` 是项目本地且被 git 忽略，所以受版本控制的副本放这里）；`install.sh` 会把它们一并安装到 `.agents/skills/`。
+
+### 内置爆破/口令猜测 Agent
+
+`bruteforce` 是**材料驱动**的通用凭据攻击 Agent，而不是按协议清单工作的穷举器：
+
+- 输入是一份材料——原始 HTTP 请求报文、curl 命令、登录 URL、账号或口令候选、哈希内容、服务 banner 或非 HTTP 目标串——由 Agent 自行识别认证面并选择路径。
+- 工作流固定为：材料识别 → 失败信号基线（已知错误 / 已知有效对照）→ CSRF 与一次性 token 的提取与刷新 → 会话保持 → 策略排序（凭据复用 > 默认凭据 > 目标推导字典 > 通用字典）→ 锁定与限速边界 → 命中最小副作用验证 → 证据与凭据交接。
+- 材料可来自操作员在能力页填写（`material` / `materialRef`），也可由 Planner 通过 Task 的 `targetRefs` 引用上游 Task 产出的 artifact。
+- 安全参数由作者固定：`stopOnLockout` 只读为 `true`；`threads`（上限 8）、`maxAttemptsPerAccount`（上限 100）、`maxTotalAttempts`（上限 2000）由 Planner 在用户设定的上限内取值。
+- 配套技能包：`password-attack`、`web-login-bruteforce`、`default-credentials`、`credential-stuffing`，内容只描述 executor 镜像内确实存在的工具（`nmap` NSE 爆破脚本、`curl`、`python3` stdlib、`sshpass`、`chromium`）；镜像内**没有** hydra / ffuf / hashcat / john。
+
 ### 工具运行时
 
 Executor 在配置的沙箱边界内使用 Pi coding tools：
@@ -422,7 +451,9 @@ npm run web -- --runtime-dir .agent-runtime/sessions/<session> --port 8787
 
 打开 <http://127.0.0.1:8787>。首个注册用户成为管理员，后续用户为分析员。
 
-Web 工作台主要用于观察：读取持久图、事件、Artifact 和运行状态。它也支持在 Web 进程内启动新任务（填写目标与授权范围）并优雅停止由本进程启动的任务；CLI 启动的 run 仍可被观察，但不能从 Web 侧停止。
+Web 工作台主要用于观察：读取持久图、事件、Artifact 和运行状态。它也支持在 Web 进程内启动新任务（填写目标与授权范围、上传授权范围文件与任务附件）并优雅停止由本进程启动的任务；CLI 启动的 run 仍可被观察，但不能从 Web 侧停止。
+
+启动新任务时可携带**任务附件**（CTF 题目附件、抓包、厂商公告、配置或凭据导出）。附件先暂存，启动后持久化为该 run 的 `attachment` Artifact：Planner 看到文件名、类型、大小与引用，Executor 用 `artifact_read({ref,materialize:true})` 把完整字节恢复到 workspace 再分析。附件是操作者提供的输入材料，不扩大授权范围；每次运行最多 12 个、单个不超过 32 MiB。
 
 所有 `/api/*` 流量与连接端点都要求有效 Session。分析员可以读取运行时元数据、敏感代理历史和连接状态，但连接生命周期变更要求管理员专属的 `connectivity:manage` capability；服务不暴露流量删除/导出端点。GET 请求豁免 CSRF，变更请求必须携带同源 double-submit token。所有 runtime 路径（包括符号链接）都会 canonicalize 并限制在配置的 `--runtime-dir` 根目录内，因此 API 不能充当任意文件系统浏览器。
 
@@ -500,6 +531,7 @@ LuaN1aoAgent/
 │   │   ├── graph-store.ts        # 三图持久化与原子变更
 │   │   ├── runtime-store.ts      # 执行与 Projector 运行状态
 │   │   └── artifact-store.ts     # 内容寻址 Artifact
+│   ├── specialists/              # 专精 Agent SDK、Registry 与内置 Agent
 │   ├── tools/                    # Pi 图、Artifact 与运行时工具
 │   ├── tui/                      # 交互式终端工作台
 │   ├── cli.ts                    # CLI 入口

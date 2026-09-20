@@ -1,6 +1,8 @@
+import { isSpecialistId } from "./specialists/types.js";
 import type {
   PlannerCommand,
   PlannerDecision,
+  PlannerSpecialistOptionValues,
   PlannerTaskPatch,
   PlannerTaskSpec,
   TaskGraphStatus
@@ -204,8 +206,46 @@ function normalizePlannerTaskSpec(value: unknown): PlannerTaskSpec {
     dependsOnTaskRefs: stringArray(value.dependsOnTaskRefs).map(requireTaskId),
     continueFromTaskRef: value.continueFromTaskRef === undefined
       ? undefined
-      : requireTaskId(value.continueFromTaskRef)
+      : requireTaskId(value.continueFromTaskRef),
+    // Ownership fields must survive normalization. Dropping them here silently
+    // downgraded every Planner-assigned Specialist back to the general Executor,
+    // so the selection never reached the task graph.
+    specialist: normalizeSpecialistId(value.specialist),
+    specialistOptions: normalizeSpecialistOptions(value.specialistOptions)
   };
+}
+
+function normalizeSpecialistId(value: unknown): string | undefined {
+  if (value === undefined || value === null) return undefined;
+  if (!isSpecialistId(value)) {
+    throw new PlannerProtocolError(
+      `specialist ${JSON.stringify(value)} is not a valid Specialist id; omit the field to use the general Executor`
+    );
+  }
+  return value;
+}
+
+/** Type-checks Task-level Specialist options; the runtime clamps them later. */
+function normalizeSpecialistOptions(value: unknown): PlannerSpecialistOptionValues | undefined {
+  if (value === undefined || value === null) return undefined;
+  if (!isRecord(value)) {
+    throw new PlannerProtocolError("specialistOptions must be an object keyed by option name");
+  }
+  const entries: PlannerSpecialistOptionValues = {};
+  for (const [key, entry] of Object.entries(value)) {
+    if (typeof entry === "string" || typeof entry === "number" || typeof entry === "boolean") {
+      entries[key] = entry;
+      continue;
+    }
+    if (Array.isArray(entry) && entry.every((item) => typeof item === "string")) {
+      entries[key] = [...entry] as string[];
+      continue;
+    }
+    throw new PlannerProtocolError(
+      `specialistOptions.${key} must be a string, number, boolean or array of strings`
+    );
+  }
+  return Object.keys(entries).length > 0 ? entries : undefined;
 }
 
 function normalizePlannerTaskPatch(value: unknown): PlannerTaskPatch {

@@ -4,7 +4,9 @@ import { Check } from "typebox/value";
 import { SettingsManager } from "@earendil-works/pi-coding-agent";
 import {
   agentCompactionSettings,
+  createExecutorOsintTools,
   createExecutorResearchTools,
+  executorToolBindings,
   observerToolsForMode
 } from "../src/agents.js";
 import {
@@ -26,6 +28,7 @@ import type { ArtifactStore } from "../src/stores/artifact-store.js";
 import type { ExecutionLog } from "../src/stores/execution-log.js";
 import type { SQLiteGraphStore } from "../src/stores/graph-store.js";
 import type { GraphSnapshot } from "../src/types.js";
+import { applySpecialistToolPolicy } from "../src/specialists/tools.js";
 
 test("supervisor observer mode exposes only the terminating control tool", () => {
   const tools = observerToolsForMode({
@@ -59,6 +62,25 @@ test("executor exposes bounded public research tools", () => {
     createExecutorResearchTools().map((tool) => tool.name),
     ["web_fetch", "web_search", "vulnerability_search"]
   );
+});
+
+test("executor exposes OSINT search as its own narrowable group", () => {
+  assert.deepEqual(createExecutorOsintTools().map((tool) => tool.name), ["osint_search"]);
+
+  // A new tool group is only real if it is both bound to the Executor surface
+  // and removable through the Specialist policy. Wiring one without the other
+  // would silently give every Specialist a capability nobody can narrow.
+  const bindings = executorToolBindings({
+    sandbox: { createTools: () => [], root: "/tmp", hostRoot: "/tmp", mode: "local" } as never,
+    artifactStore: {} as never
+  });
+  const osintBindings = bindings.filter((entry) => entry.group === "osint");
+  assert.deepEqual(osintBindings.map((entry) => entry.tool.name), ["osint_search"]);
+
+  const narrowed = applySpecialistToolPolicy(bindings, { disableGroups: ["osint"] });
+  assert.ok(!narrowed.tools.some((entry) => entry.name === "osint_search"));
+  assert.ok(narrowed.tools.some((entry) => entry.name === "web_search"), "other groups must be untouched");
+  assert.ok(narrowed.tools.some((entry) => entry.name === "task_result_submit"), "submit stays protected");
 });
 
 test("terminating runtime tools reject undeclared fields", () => {

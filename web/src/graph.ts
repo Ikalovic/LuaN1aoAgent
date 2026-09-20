@@ -43,7 +43,13 @@ const PALETTES: Record<string, NodePalette> = {
   Credential: { color: "#be185d", background: "#fdf2f8" },
   AgentSession: { color: "#047857", background: "#ecfdf5" },
   ShellSession: { color: "#15803d", background: "#f0fdf4" },
-  Session: { color: "#047857", background: "#ecfdf5" }
+  Session: { color: "#047857", background: "#ecfdf5" },
+  // Public-intelligence entities. Muted on purpose: they are collected context
+  // and should not visually compete with confirmed target-side nodes.
+  Organization: { color: "#6d28d9", background: "#f5f3ff" },
+  Person: { color: "#9333ea", background: "#faf5ff" },
+  Identity: { color: "#a21caf", background: "#fdf4ff" },
+  Contact: { color: "#0e7490", background: "#ecfeff" }
 };
 
 export function nodePalette(type: string, mode?: ThemeMode): NodePalette {

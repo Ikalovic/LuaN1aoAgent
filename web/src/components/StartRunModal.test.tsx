@@ -1,11 +1,13 @@
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { parseScopeDocument, startRun } from "../api";
+import { discardAttachment, parseScopeDocument, startRun, uploadAttachment } from "../api";
 import { StartRunModal } from "./StartRunModal";
 
 vi.mock("../api", () => ({
   parseScopeDocument: vi.fn(),
-  startRun: vi.fn()
+  startRun: vi.fn(),
+  uploadAttachment: vi.fn(),
+  discardAttachment: vi.fn()
 }));
 
 const parsed = {
@@ -19,10 +21,24 @@ const parsed = {
 
 const mockedParse = vi.mocked(parseScopeDocument);
 const mockedStart = vi.mocked(startRun);
+const mockedUpload = vi.mocked(uploadAttachment);
+const mockedDiscard = vi.mocked(discardAttachment);
+
+function stagedAttachment(fileName: string, byteLength = 1024) {
+  return {
+    attachmentId: `11111111-1111-4111-8111-${fileName.padEnd(12, "0").slice(0, 12)}`,
+    fileName,
+    mediaType: "application/octet-stream",
+    byteLength,
+    sha256: "a".repeat(64),
+    createdAt: new Date(0).toISOString()
+  };
+}
 
 beforeEach(() => {
   vi.clearAllMocks();
   mockedParse.mockResolvedValue(parsed);
+  mockedDiscard.mockResolvedValue({ ok: true });
   mockedStart.mockResolvedValue({
     runtimeDir: ".agent-runtime/sessions/example",
     name: "example",
@@ -35,6 +51,22 @@ beforeEach(() => {
 });
 
 describe("StartRunModal", () => {
+  it("retains accepted attachments when a later upload fails", async () => {
+    mockedUpload.mockResolvedValueOnce(stagedAttachment("accepted.zip")).mockRejectedValueOnce(new Error("upload failed"));
+    render(<StartRunModal open onClose={vi.fn()} onStarted={vi.fn()} />);
+    fireEvent.change(screen.getByLabelText("任务附件"), { target: { files: [new File(["x"], "accepted.zip"), new File(["x"], "failed.zip")] } });
+    await screen.findByText("upload failed");
+    expect(screen.getByText(/accepted\.zip/)).toBeInTheDocument();
+  });
+  it("discards staged files when cancelling the task form", async () => {
+    const attachment = stagedAttachment("cancelled.zip");
+    mockedUpload.mockResolvedValueOnce(attachment);
+    render(<StartRunModal open onClose={vi.fn()} onStarted={vi.fn()} />);
+    fireEvent.change(screen.getByLabelText("任务附件"), { target: { files: [new File(["x"], "cancelled.zip")] } });
+    await screen.findByText(/cancelled\.zip/);
+    fireEvent.click(screen.getByRole("button", { name: /取\s*消/ }));
+    await waitFor(() => expect(mockedDiscard).toHaveBeenCalledWith(attachment.attachmentId));
+  });
   it("accepts XLSX authorization files", () => {
     render(<StartRunModal open onClose={() => undefined} onStarted={() => undefined} />);
 
@@ -181,5 +213,98 @@ describe("StartRunModal", () => {
       scope: "new.example"
     })));
     expect(mockedStart.mock.calls[0][0]).not.toHaveProperty("runtimeDir");
+  });
+
+  it("stages picked files and submits their ids with the run", async () => {
+    mockedUpload
+      .mockResolvedValueOnce(stagedAttachment("chall.zip", 2048))
+      .mockResolvedValueOnce(stagedAttachment("pcap.bin", 4096));
+    render(<StartRunModal open onClose={() => undefined} onStarted={() => undefined} />);
+
+    fireEvent.mouseDown(screen.getByLabelText("任务类型"));
+    fireEvent.click(await screen.findByText("CTF 题目"));
+    await waitFor(() => expect(screen.getAllByTitle("CTF 题目").length).toBeGreaterThan(0));
+    fireEvent.change(screen.getByLabelText("任务目标"), { target: { value: "解这道题" } });
+    fireEvent.change(screen.getByLabelText("任务附件"), {
+      target: {
+        files: [
+          new File(["zipbytes"], "chall.zip", { type: "application/zip" }),
+          new File(["pcapbytes"], "pcap.bin", { type: "application/octet-stream" })
+        ]
+      }
+    });
+
+    expect(await screen.findByText(/chall\.zip/)).toBeInTheDocument();
+    expect(screen.getByText(/pcap\.bin/)).toBeInTheDocument();
+    expect(mockedUpload).toHaveBeenCalledTimes(2);
+
+    fireEvent.click(screen.getByRole("button", { name: /启\s*动/ }));
+    await waitFor(() => expect(mockedStart).toHaveBeenCalledWith(expect.objectContaining({
+      goal: "解这道题",
+      taskType: "ctf",
+      attachmentIds: [
+        expect.stringContaining("11111111-1111-4111-8111-"),
+        expect.stringContaining("11111111-1111-4111-8111-")
+      ]
+    })));
+  });
+
+  it("omits attachmentIds entirely when nothing was picked", async () => {
+    render(<StartRunModal open onClose={() => undefined} onStarted={() => undefined} />);
+    fireEvent.mouseDown(screen.getByLabelText("任务类型"));
+    fireEvent.click(await screen.findByText("CTF 题目"));
+    await waitFor(() => expect(screen.getAllByTitle("CTF 题目").length).toBeGreaterThan(0));
+    fireEvent.change(screen.getByLabelText("任务目标"), { target: { value: "无附件" } });
+    fireEvent.click(screen.getByRole("button", { name: /启\s*动/ }));
+
+    await waitFor(() => expect(mockedStart).toHaveBeenCalled());
+    expect(mockedStart.mock.calls[0][0]).not.toHaveProperty("attachmentIds");
+  });
+
+  it("removing a staged attachment discards it server-side", async () => {
+    mockedUpload.mockResolvedValueOnce(stagedAttachment("wrong-file.zip", 512));
+    render(<StartRunModal open onClose={() => undefined} onStarted={() => undefined} />);
+
+    fireEvent.change(screen.getByLabelText("任务附件"), {
+      target: { files: [new File(["x"], "wrong-file.zip")] }
+    });
+    const tag = await screen.findByText(/wrong-file\.zip/);
+
+    fireEvent.click(tag.closest(".ant-tag")!.querySelector(".ant-tag-close-icon") as HTMLElement);
+    await waitFor(() => expect(mockedDiscard).toHaveBeenCalledWith(
+      expect.stringContaining("11111111-1111-4111-8111-")
+    ));
+    expect(screen.queryByText(/wrong-file\.zip/)).not.toBeInTheDocument();
+  });
+
+  it("refuses an oversized file before uploading it", async () => {
+    render(<StartRunModal open onClose={() => undefined} onStarted={() => undefined} />);
+
+    const oversized = new File(["x"], "huge.img");
+    // The limit is checked on the File, so spoof its size rather than allocating 32 MiB.
+    Object.defineProperty(oversized, "size", { value: 33 * 1024 * 1024 });
+    fireEvent.change(screen.getByLabelText("任务附件"), { target: { files: [oversized] } });
+
+    expect(await screen.findByText(/单个附件不能超过/)).toBeInTheDocument();
+    expect(mockedUpload).not.toHaveBeenCalled();
+  });
+
+  it("surfaces an upload failure and still allows starting without attachments", async () => {
+    mockedUpload.mockRejectedValueOnce(new Error("附件不存在或已失效，请重新上传"));
+    render(<StartRunModal open onClose={() => undefined} onStarted={() => undefined} />);
+
+    fireEvent.change(screen.getByLabelText("任务附件"), {
+      target: { files: [new File(["x"], "bad.bin")] }
+    });
+    expect(await screen.findByText("附件不存在或已失效，请重新上传")).toBeInTheDocument();
+
+    fireEvent.mouseDown(screen.getByLabelText("任务类型"));
+    fireEvent.click(await screen.findByText("CTF 题目"));
+    await waitFor(() => expect(screen.getAllByTitle("CTF 题目").length).toBeGreaterThan(0));
+    fireEvent.change(screen.getByLabelText("任务目标"), { target: { value: "继续" } });
+    fireEvent.click(screen.getByRole("button", { name: /启\s*动/ }));
+
+    await waitFor(() => expect(mockedStart).toHaveBeenCalled());
+    expect(mockedStart.mock.calls[0][0]).not.toHaveProperty("attachmentIds");
   });
 });

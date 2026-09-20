@@ -17,6 +17,7 @@ import type {
   PlannerDigestItem,
   PlannerTaskLedgerItem,
   PlannerTaskPatch,
+  PlannerSpecialistOptionValues,
   TaskBudget,
   TaskEnvelope,
   TaskGoalAddition,
@@ -58,6 +59,10 @@ export type TaskCreateInput = {
   continueFromTaskRef?: string;
   budget?: TaskBudget;
   priority: number;
+  /** Specialist Agent id owning this Task; absent means the general Executor. */
+  specialist?: string;
+  /** Planner-chosen Specialist option values, already validated by the controller. */
+  specialistOptions?: PlannerSpecialistOptionValues;
 };
 
 export type PlannerTaskBatchCommand =
@@ -690,27 +695,53 @@ export class SQLiteGraphStore {
     ]);
     const taskContextRefs = dedupeStringValues([...taskMemoryRefs, input.scopeRef]);
     const taskNodes = this.readNodes({ focusNodeIds: taskContextRefs, limit: Math.max(taskContextRefs.length, 8) });
-    const operationNodes = this.readNodes({ graphKind: "operation", limit: 1_000_000 });
-    const reasoningNodes = this.readNodes({ graphKind: "reasoning", limit: 1_000_000 });
-    const semanticNodes = [...operationNodes, ...reasoningNodes];
-    const nodeById = new Map([...taskNodes, ...semanticNodes].map((node) => [node.id, node]));
+
+    // Nodes are loaded by id on demand rather than materialised wholesale. The
+    // previous implementation read every operation and reasoning row with
+    // `limit: 1_000_000` and JSON-parsed each one, on every Executor turn, every
+    // projection job and every supervisor check — which made graph size a
+    // per-turn cost. Lazy loading keeps the traversal bounded by what it visits.
+    const nodeCache = new Map<string, GraphNode>(taskNodes.map((node) => [node.id, node]));
+    const loadNodes = (ids: string[]): GraphNode[] => {
+      const missing = dedupeStringValues(ids).filter((id) => !nodeCache.has(id));
+      for (let offset = 0; offset < missing.length; offset += NODE_LOOKUP_CHUNK) {
+        const chunk = missing.slice(offset, offset + NODE_LOOKUP_CHUNK);
+        for (const node of this.readNodes({ focusNodeIds: chunk, limit: chunk.length })) {
+          nodeCache.set(node.id, node);
+        }
+      }
+      return ids
+        .map((id) => nodeCache.get(id))
+        .filter((node): node is GraphNode => Boolean(node));
+    };
+    const getNode = (id: string): GraphNode | undefined => {
+      if (!nodeCache.has(id)) {
+        loadNodes([id]);
+      }
+      return nodeCache.get(id);
+    };
+
     const taskEdges = this.readEdgesForNodes(taskNodes.map((node) => node.id), 200)
-      .filter((edge) => nodeById.has(edge.from) && nodeById.has(edge.to));
+      .filter((edge) => nodeCache.has(edge.from) && nodeCache.has(edge.to));
     const exactSemanticRefs = new Set((input.targetRefs ?? []).filter((ref) => {
-      const node = nodeById.get(ref);
+      const node = getNode(ref);
       return Boolean(node && node.graphKind !== "task");
     }));
     const taskEvidenceRefs = new Set(taskNodes.flatMap((node) => [
       ...(node.evidenceRefs ?? []),
       ...stringArray(node.properties.evidenceRefs)
     ]));
-    const provenanceSemanticRefs = new Set(semanticNodes
-      .filter((node) => (node.evidenceRefs ?? []).some((ref) => taskEvidenceRefs.has(ref)))
-      .map((node) => node.id));
+    const provenanceSemanticRefs = new Set(this.semanticNodeIdsByEvidenceRefs(
+      SEMANTIC_GRAPH_KINDS,
+      [...taskEvidenceRefs],
+      SEMANTIC_CANDIDATE_LIMIT
+    ));
     const anchorTokens = dedupeStringValues((input.anchors ?? []).flatMap(projectionAnchorTokens))
       .filter((token) => token.length >= 3);
-    const anchorSeedNodes = semanticNodes.filter((node) => (
-      anchorTokens.some((token) => projectionNodeSearchText(node).includes(token))
+    const anchorSeedNodes = loadNodes(this.semanticNodeIdsByTokens(
+      SEMANTIC_GRAPH_KINDS,
+      anchorTokens,
+      SEMANTIC_CANDIDATE_LIMIT
     ));
 
     const taskNodeById = new Map(taskNodes.map((node) => [node.id, node]));
@@ -733,7 +764,7 @@ export class SQLiteGraphStore {
           continue;
         }
         expanded.add(current.nodeId);
-        const currentNode = nodeById.get(current.nodeId);
+        const currentNode = getNode(current.nodeId);
         if (currentNode && !selectedIds.has(current.nodeId)) {
           selectedIds.add(current.nodeId);
           added += 1;
@@ -741,14 +772,19 @@ export class SQLiteGraphStore {
         if (current.depth >= maxDepth) {
           continue;
         }
-        const currentEdges = this.readEdgesForNodes([current.nodeId], 200)
-          .filter((edge) => nodeById.has(edge.from) && nodeById.has(edge.to));
+        // Neighbours must be loaded before they can be filtered: the cache is
+        // lazy now, so testing membership first would discard every edge whose
+        // far endpoint has not been visited yet.
+        const incidentEdges = this.readEdgesForNodes([current.nodeId], 200);
+        loadNodes(dedupeStringValues(incidentEdges.flatMap((edge) => [edge.from, edge.to])));
+        const currentEdges = incidentEdges
+          .filter((edge) => nodeCache.has(edge.from) && nodeCache.has(edge.to));
         for (const edge of currentEdges) {
           traversedEdges.set(edgeIdFor(edge), edge);
         }
         const neighbors = dedupeStringValues(currentEdges.flatMap((edge) => [edge.from, edge.to]))
           .filter((nodeId) => nodeId !== current.nodeId)
-          .map((nodeId) => nodeById.get(nodeId))
+          .map((nodeId) => getNode(nodeId))
           .filter((node): node is GraphNode => Boolean(node))
           .filter((node) => node.graphKind !== "task" || allowedTaskIds.has(node.id))
           .sort(compareProjectionSeedNodes);
@@ -772,10 +808,7 @@ export class SQLiteGraphStore {
       3
     );
 
-    const nodes = [...selectedIds]
-      .map((nodeId) => nodeById.get(nodeId))
-      .filter((node): node is GraphNode => Boolean(node))
-      .slice(0, nodeLimit);
+    const nodes = loadNodes([...selectedIds]).slice(0, nodeLimit);
     const includedIds = new Set(nodes.map((node) => node.id));
     const edges = [...traversedEdges.values()]
       .filter((edge) => includedIds.has(edge.from) && includedIds.has(edge.to))
@@ -784,23 +817,79 @@ export class SQLiteGraphStore {
     return { nodes, edges };
   }
 
+  /**
+   * Ids of semantic nodes whose searchable text contains at least one token.
+   *
+   * The predicate is deliberately the same "any token" test callers apply
+   * afterwards; SQL only narrows the candidate set so the expensive property
+   * JSON parse happens for a handful of rows instead of the entire graph.
+   */
+  private semanticNodeIdsByTokens(graphKinds: GraphKind[], tokens: string[], limit: number): string[] {
+    const usable = dedupeStringValues(tokens).filter((token) => token.length >= 3);
+    if (usable.length === 0 || graphKinds.length === 0) {
+      return [];
+    }
+    const kindPlaceholders = graphKinds.map(() => "?").join(",");
+    const clauses = usable
+      .map(() => "(lower(id) LIKE ? ESCAPE '\\' OR lower(label) LIKE ? ESCAPE '\\' OR lower(properties_json) LIKE ? ESCAPE '\\')")
+      .join(" OR ");
+    const patterns = usable.flatMap((token) => {
+      const pattern = `%${escapeLikePattern(token)}%`;
+      return [pattern, pattern, pattern];
+    });
+    const rows = this.database.prepare(`
+      SELECT id FROM nodes
+      WHERE graph_kind IN (${kindPlaceholders}) AND (${clauses})
+      ORDER BY updated_at DESC LIMIT ?
+    `).all(...graphKinds, ...patterns, limit) as Array<{ id: string }>;
+    return rows.map((row) => row.id);
+  }
+
+  /**
+   * Ids of semantic nodes citing any of the given evidence refs. The quotes in
+   * the pattern keep `event:ab` from matching `event:abc`, since refs are stored
+   * as a JSON array of strings.
+   */
+  private semanticNodeIdsByEvidenceRefs(
+    graphKinds: GraphKind[],
+    evidenceRefs: string[],
+    limit: number
+  ): string[] {
+    const usable = dedupeStringValues(evidenceRefs);
+    if (usable.length === 0 || graphKinds.length === 0) {
+      return [];
+    }
+    const kindPlaceholders = graphKinds.map(() => "?").join(",");
+    const clauses = usable.map(() => "evidence_refs_json LIKE ? ESCAPE '\\'").join(" OR ");
+    const patterns = usable.map((ref) => `%"${escapeLikePattern(ref)}"%`);
+    const rows = this.database.prepare(`
+      SELECT id FROM nodes
+      WHERE graph_kind IN (${kindPlaceholders}) AND (${clauses})
+      ORDER BY updated_at DESC LIMIT ?
+    `).all(...graphKinds, ...patterns, limit) as Array<{ id: string }>;
+    return rows.map((row) => row.id);
+  }
+
   searchSemanticNodes(input: {
     query: string;
     graphKind?: "operation" | "reasoning";
     limit?: number;
   }): GraphSnapshot {
     const requestedLimit = Number.isFinite(input.limit) ? Math.trunc(input.limit!) : 20;
-    const limit = Math.max(1, Math.min(requestedLimit, 50));
+    const limit = Math.max(1, Math.min(requestedLimit, SEMANTIC_SEARCH_MAX_LIMIT));
     const tokens = dedupeStringValues(input.query.split(/\s+/))
       .map(normalizeProjectionToken)
       .filter((token) => token.length >= 3);
-    const graphKinds: GraphKind[] = input.graphKind ? [input.graphKind] : ["operation", "reasoning"];
-    const candidates = graphKinds.flatMap((graphKind) => (
-      this.readNodes({ graphKind, limit: 1_000_000 })
-    )).map((node) => ({
-      node,
-      matches: tokens.filter((token) => projectionNodeSearchText(node).includes(token)).length
-    })).filter((candidate) => candidate.matches > 0)
+    const graphKinds: GraphKind[] = input.graphKind ? [input.graphKind] : SEMANTIC_GRAPH_KINDS;
+    // SQL narrows the candidate set; the exact predicate and ranking below are
+    // unchanged, so results are identical to the previous full-scan version
+    // while only the matching rows are ever hydrated.
+    const candidateIds = this.semanticNodeIdsByTokens(graphKinds, tokens, SEMANTIC_CANDIDATE_LIMIT);
+    const candidates = this.readNodes({ focusNodeIds: candidateIds, limit: candidateIds.length })
+      .map((node) => ({
+        node,
+        matches: tokens.filter((token) => projectionNodeSearchText(node).includes(token)).length
+      })).filter((candidate) => candidate.matches > 0)
       .sort((left, right) => right.matches - left.matches || compareProjectionSeedNodes(left.node, right.node));
     const nodes = candidates.slice(0, limit).map((candidate) => candidate.node);
     return {
@@ -917,7 +1006,9 @@ export class SQLiteGraphStore {
         parentTaskId: input.parentTaskId,
         continueFromTaskRef: input.continueFromTaskRef,
         budget: input.budget,
-        priority: input.priority
+        priority: input.priority,
+        ...(input.specialist ? { specialist: input.specialist } : {}),
+        ...(input.specialistOptions ? { specialistOptions: input.specialistOptions } : {})
       }
     }));
     const edges: GraphEdge[] = inputs.flatMap((input) => {
@@ -1122,7 +1213,9 @@ export class SQLiteGraphStore {
         parentTaskId: task.parentTaskId,
         continueFromTaskRef: task.continueFromTaskRef,
         budget: task.budget,
-        priority: task.priority
+        priority: task.priority,
+        ...(task.specialist ? { specialist: task.specialist } : {}),
+        ...(task.specialistOptions ? { specialistOptions: task.specialistOptions } : {})
       },
       evidenceRefs: input.sourceEventIds
     }));
@@ -1716,6 +1809,10 @@ export class SQLiteGraphStore {
       CREATE INDEX IF NOT EXISTS idx_edges_from ON edges(from_id);
       CREATE INDEX IF NOT EXISTS idx_edges_to ON edges(to_id);
       CREATE INDEX IF NOT EXISTS idx_operation_identities_node ON operation_identities(node_id);
+      -- readNodes orders by updated_at DESC within a graph kind. Without this the
+      -- planner/supervisor/projector context paths sort the whole kind on every
+      -- call, which turns a large intelligence graph into per-turn latency.
+      CREATE INDEX IF NOT EXISTS idx_nodes_kind_updated ON nodes(graph_kind, updated_at DESC);
     `);
     ensureGraphStoreColumn(this.database, "projection_states", "pending_since", "TEXT");
     ensureGraphStoreColumn(this.database, "projection_states", "terminal_target_seq", "INTEGER");
@@ -1881,6 +1978,34 @@ function projectionAnchorTokens(value: string): string[] {
   ]);
 }
 
+/** Graph kinds that participate in semantic (operation + reasoning) traversal. */
+const SEMANTIC_GRAPH_KINDS: GraphKind[] = ["operation", "reasoning"];
+
+/**
+ * Candidate ceiling for one semantic lookup. The SQL pass only narrows which rows
+ * get hydrated, so this bounds memory rather than correctness; callers still rank
+ * their candidates with the exact JavaScript predicate afterwards.
+ */
+const SEMANTIC_CANDIDATE_LIMIT = 2_000;
+
+/**
+ * Upper bound on a semantic search page. Raised from 50 so a caller that needs
+ * more than one page of matches can actually reach them: the store has no
+ * cursor, so anything past this limit is reported as `omitted` and unreachable.
+ */
+const SEMANTIC_SEARCH_MAX_LIMIT = 200;
+
+/** SQLite allows ~32k bound parameters; stay well inside that per statement. */
+const NODE_LOOKUP_CHUNK = 400;
+
+/**
+ * Escapes LIKE metacharacters so a node id or anchor containing `%` or `_` cannot
+ * silently widen the match. Callers must pair this with `ESCAPE '\'`.
+ */
+function escapeLikePattern(value: string): string {
+  return value.replace(/[\\%_]/g, (char) => `\\${char}`);
+}
+
 function compareProjectionSeedNodes(left: GraphNode, right: GraphNode): number {
   return left.id.localeCompare(right.id);
 }
@@ -1901,6 +2026,13 @@ function compareProjectionEdges(left: GraphEdge, right: GraphEdge): number {
     exposes_endpoint: 60,
     runs_service: 55,
     has_port: 50,
+    // Intelligence relations rank below confirmed target state: a collected
+    // organization/person link must never outrank an observed service.
+    owns: 48,
+    member_of: 46,
+    uses_identity: 44,
+    reachable_at: 42,
+    mentions: 30,
     depends_on: 45,
     within_scope: 40
   };
@@ -1979,7 +2111,7 @@ function expectedGraphKindForNodeType(type: string): GraphKind | undefined {
   if (["Evidence", "Hypothesis", "Vulnerability", "Exploit"].includes(type)) {
     return "reasoning";
   }
-  if (["Host", "Port", "Service", "WebEndpoint", "Parameter", "Credential", "AgentSession", "ShellSession", "Session", "File", "Process"].includes(type)) {
+  if (["Host", "Port", "Service", "WebEndpoint", "Parameter", "Credential", "AgentSession", "ShellSession", "Session", "File", "Process", "Organization", "Person", "Identity", "Contact"].includes(type)) {
     return "operation";
   }
   if (["Goal", "Task", "Milestone", "Blocker", "Scope"].includes(type)) {
@@ -2212,6 +2344,15 @@ function scoreDecisionImpact(node: GraphNode): number {
     case "Service":
     case "Host":
       return 4;
+    // Collected intelligence is context, not a decision driver. Scored below
+    // every target-side node so an information-gathering haul cannot crowd
+    // confirmed findings out of the bounded planner decision view.
+    case "Identity":
+    case "Organization":
+      return 2;
+    case "Person":
+    case "Contact":
+      return 1;
     default:
       return 0;
   }
@@ -2273,6 +2414,20 @@ const DIGEST_PROPERTY_ALLOWLIST = [
   "successCriteria",
   "checkpointReason",
   "resultSummary",
+  // Public-intelligence entity properties. `confidence` and `origin` matter most:
+  // the Planner must be able to tell a collected claim from a confirmed fact
+  // without fetching the underlying artifact.
+  "origin",
+  "organization",
+  "org",
+  "email",
+  "account",
+  "phone",
+  "number",
+  "title",
+  "icp",
+  "registrationId",
+  "provenance",
   "method",
   "accessMethod",
   "preconditions",
@@ -2418,8 +2573,30 @@ function taskNodeToEnvelope(
     continueFromTaskRef: typeof node.properties.continueFromTaskRef === "string"
       ? node.properties.continueFromTaskRef
       : undefined,
-    budget: isRecord(node.properties.budget) ? node.properties.budget as TaskBudget : undefined
+    budget: isRecord(node.properties.budget) ? node.properties.budget as TaskBudget : undefined,
+    specialist: typeof node.properties.specialist === "string" ? node.properties.specialist : undefined,
+    specialistOptions: plannerSpecialistOptionValues(node.properties.specialistOptions)
   };
+}
+
+/**
+ * Reads Task-level Specialist option values back from a graph node. Malformed
+ * entries are dropped rather than coerced: the runtime re-validates and clamps
+ * every value against the live definition before it is applied.
+ */
+function plannerSpecialistOptionValues(value: unknown): PlannerSpecialistOptionValues | undefined {
+  if (!isRecord(value)) return undefined;
+  const entries: PlannerSpecialistOptionValues = {};
+  for (const [key, entry] of Object.entries(value)) {
+    if (typeof entry === "string" || typeof entry === "number" || typeof entry === "boolean") {
+      entries[key] = entry;
+      continue;
+    }
+    if (Array.isArray(entry) && entry.every((item) => typeof item === "string")) {
+      entries[key] = [...entry] as string[];
+    }
+  }
+  return Object.keys(entries).length > 0 ? entries : undefined;
 }
 
 function withDerivedTaskDependencies(nodes: GraphNode[], edges: GraphEdge[]): GraphNode[] {

@@ -7,7 +7,7 @@ export interface NavigationState {
   nodeType?: string; findingType?: string; taskStatus?: string; role?: string;
   wallGraph?: string; wallSize?: string;
 }
-export const VIEWS = ["overview", "operation", "trace", "task", "findings", "reasoning", "traffic", "connections", "reports", "skills", "mcp", "env", "credentials", "approvals", "wallboard"] as const;
+export const VIEWS = ["overview", "operation", "memory", "trace", "task", "findings", "reasoning", "traffic", "connections", "reports", "skills", "mcp", "agents", "capabilities", "env", "credentials", "approvals", "wallboard"] as const;
 const entities = ["nodeId", "traceId", "taskId", "exchangeId"] as const;
 const enums = {
   wallGraph: ["operation", "reasoning", "task"],
@@ -22,7 +22,9 @@ export function parseNavigation(search: string, readStorage = () => localStorage
   const params = new URLSearchParams(search);
   let stored: string | null = null;
   try { stored = readStorage(); } catch { /* Browser storage is optional. */ }
-  const candidate = params.get("view");
+  const requested = params.get("view");
+  const tab = params.get("tab");
+  const candidate = requested === "capabilities" ? (tab === "mcp" || tab === "agents" ? tab : "skills") : requested;
   const result: NavigationState = { runtimeDir: params.get("runtimeDir")?.trim() || stored || ".agent-runtime", view: VIEWS.includes(candidate as ViewKey) ? candidate as ViewKey : "overview" };
   for (const key of entities) if (params.get(key)) result[key] = params.get(key)!;
   for (const key of Object.keys(enums) as Array<keyof typeof enums>) {

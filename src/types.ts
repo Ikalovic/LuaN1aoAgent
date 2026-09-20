@@ -19,7 +19,16 @@ export type OperationNodeType =
   | "ShellSession"
   | "Session"
   | "File"
-  | "Process";
+  | "Process"
+  // Public-internet intelligence entities. These describe what the open internet
+  // says about a target rather than something an operator confirmed on it, and
+  // they live in the operation graph because that is the only graph kind whose
+  // nodes receive content-addressed identity remapping (see graph-store
+  // `commitProjection`), which is what makes them merge across runtimes.
+  | "Organization"
+  | "Person"
+  | "Identity"
+  | "Contact";
 
 export type TaskNodeType =
   | "Goal"
@@ -59,7 +68,13 @@ export type EdgeType =
   | "produces_milestone"
   | "blocked_by"
   | "unblocked_by"
-  | "requires_evidence";
+  | "requires_evidence"
+  // Relations between public-intelligence entities.
+  | "member_of"
+  | "owns"
+  | "uses_identity"
+  | "reachable_at"
+  | "mentions";
 
 export type JsonObject = Record<string, unknown>;
 
@@ -124,7 +139,24 @@ export type TaskDefinition = {
   constraints: string[];
   successCriteria: string[];
   goalAdditions?: TaskGoalAddition[];
+  /**
+   * Specialist Agent that owns this Task. Absent means the default `general`
+   * Executor profile. The owner is fixed for the Task's lifetime; changing it
+   * requires the Planner to create a successor Task.
+   */
+  specialist?: string;
+  /**
+   * Planner-chosen values for the owning Specialist's planner-tunable options.
+   * The runtime clamps every value into the boundary the author and the
+   * operator declared, so a Task can only ever narrow a Specialist's envelope.
+   */
+  specialistOptions?: PlannerSpecialistOptionValues;
 };
+
+/** Structurally identical to the Specialist option value union. */
+export type PlannerSpecialistOptionValue = string | number | boolean | string[];
+
+export type PlannerSpecialistOptionValues = Record<string, PlannerSpecialistOptionValue>;
 
 export type TaskGoalAddition = {
   goal: string;
@@ -189,6 +221,14 @@ export type PlannerTaskSpec = {
   parentTaskId?: string;
   dependsOnTaskRefs?: string[];
   continueFromTaskRef?: string;
+  /** Specialist Agent id from the Planner catalog; omit for the general Executor. */
+  specialist?: string;
+  /**
+   * Values for the chosen Specialist's `tunableOptions`, as published in
+   * `available_specialists`. Any other key is rejected and every value is
+   * clamped into the published boundary.
+   */
+  specialistOptions?: PlannerSpecialistOptionValues;
 };
 
 export type PlannerTaskPatch = {
@@ -379,7 +419,12 @@ export type ProjectionClaim = {
 export type ArtifactRecord = {
   artifactRef: string;
   taskId?: string;
-  kind: "http_body" | "screenshot" | "stdout" | "stderr" | "poc" | "json" | "text" | "report" | "credential" | "other";
+  /**
+   * `attachment` is written by the Runtime when an operator uploads a file with
+   * the run, never by `artifact_write`: an agent must not be able to label its
+   * own output as operator-provided material.
+   */
+  kind: "http_body" | "screenshot" | "stdout" | "stderr" | "poc" | "json" | "text" | "report" | "credential" | "attachment" | "other";
   mediaType: string;
   path: string;
   byteLength: number;
@@ -387,6 +432,21 @@ export type ArtifactRecord = {
   preview: string;
   contentHash?: string;
 };
+
+/**
+ * An operator-provided file made available to a run. The Planner sees this
+ * descriptor (name, type, size, digest) and passes the ref to the Task that
+ * needs the material; the Executor materializes the bytes into its workspace
+ * with `artifact_read({ref, materialize:true})`.
+ */
+export type RunAttachment = {
+  artifactRef: string;
+  fileName: string;
+  mediaType: string;
+  byteLength: number;
+  sha256: string;
+};
+
 
 export type GraphView = "planner" | "reasoning" | "operation" | "task" | "sessions";
 
@@ -407,6 +467,8 @@ export type GraphSnapshot = {
   summary: JsonObject;
 };
 
+export type SpecialistTaskStatus = "ready" | "disabled" | "invalid" | "unknown";
+
 export type PlannerTaskLedgerItem = {
   taskId: string;
   status: string;
@@ -426,6 +488,13 @@ export type PlannerTaskLedgerItem = {
   dependencyStatuses?: Record<string, string>;
   priority?: number;
   dependsOnTaskRefs?: string[];
+  /** Owning Specialist Agent and whether the runtime can currently execute it. */
+  specialist?: {
+    id: string;
+    status: SpecialistTaskStatus;
+  };
+  /** Task-level Specialist option values as persisted, so the Planner sees its own choice. */
+  specialistOptions?: PlannerSpecialistOptionValues;
   projection?: {
     committedSeq: number;
     desiredSeq: number;

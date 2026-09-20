@@ -385,6 +385,10 @@ function dockerCommand(args: string[], stdin?: string, timeoutMs = 30_000): Prom
       finish({ code: null, stdout, stderr: `${stderr}${stderr ? "\n" : ""}docker command timed out after ${timeoutMs}ms` });
     }, timeoutMs);
     timeout.unref();
+    // See network-sandbox-manager.ts: an EPIPE on a fast-exiting docker child is
+    // an 'error' event on the stdin socket, and an unhandled one kills the whole
+    // process rather than failing this one command.
+    child.stdin?.on("error", () => undefined);
     if (stdin !== undefined) child.stdin!.end(stdin);
     child.stdout!.on("data", (chunk: Buffer) => { stdout += chunk.toString("utf8"); });
     child.stderr!.on("data", (chunk: Buffer) => { stderr += chunk.toString("utf8"); });

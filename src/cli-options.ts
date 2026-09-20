@@ -1,3 +1,9 @@
+import {
+  APPROVAL_MODE_ENV,
+  DEFAULT_APPROVAL_MODE,
+  type ApprovalMode
+} from "./approval/dangerous-tool-policy.js";
+
 export type CliOptions = {
   goal: string;
   scope?: string;
@@ -76,7 +82,7 @@ export function parseCliOptions(rawArgs: string[]): CliOptions {
     scope: values.get("scope"),
     scopeFiles,
     confirmScopeFiles: flags.has("confirm-scope-files"),
-    approvalMode: values.get("approval-mode") === "off" ? "off" : values.get("approval-mode") === "strict" ? "strict" : values.get("approval-mode") === "auto" || !values.has("approval-mode") ? "auto" : (() => { throw new Error("--approval-mode must be off, auto or strict"); })(),
+    approvalMode: resolveApprovalMode(values.get("approval-mode")),
     proxy: values.get("proxy"),
     runtimeDir: values.get("runtime-dir"),
     resumeDir: values.get("resume"),
@@ -89,6 +95,24 @@ export function parseCliOptions(rawArgs: string[]): CliOptions {
     noTui: flags.has("no-tui"),
     help: flags.has("help")
   };
+}
+
+/**
+ * Resolves the dangerous-operation approval mode.
+ *
+ * Precedence is `--approval-mode` flag, then the `APPROVAL_MODE` environment
+ * variable, then `auto`. The environment path matters for headless runs: with
+ * `auto`, a command the risk judge flags needs an approver, and a run whose
+ * stdin is not a TTY has nobody to ask — so a credential-attack Agent would be
+ * denied its core action on every attempt. Letting `.env` pre-authorize the run
+ * is what makes automated brute-force work possible without weakening the
+ * default for interactive use.
+ */
+export function resolveApprovalMode(flagValue: string | undefined, env: NodeJS.ProcessEnv = process.env): ApprovalMode {
+  const candidate = flagValue ?? env[APPROVAL_MODE_ENV];
+  if (candidate === undefined || candidate === null || candidate === "") return DEFAULT_APPROVAL_MODE;
+  if (candidate === "off" || candidate === "auto" || candidate === "strict") return candidate;
+  throw new Error(`approval mode must be off, auto or strict; got ${JSON.stringify(candidate)}`);
 }
 
 export function shouldUseTui(options: CliOptions, terminal: { stdinIsTTY?: boolean; stdoutIsTTY?: boolean }): boolean {

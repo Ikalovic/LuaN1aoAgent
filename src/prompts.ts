@@ -1,4 +1,5 @@
-import type { PlannerDecisionView, TaskEnvelope } from "./types.js";
+import type { PlannerDecisionView, RunAttachment, TaskEnvelope } from "./types.js";
+import type { SpecialistCatalogEntry } from "./specialists/types.js";
 
 
 
@@ -20,7 +21,7 @@ Task Graph 是这些规划决定的持久表达，不是规划目的。你决定
 8. 已确认产品或版本但漏洞情报覆盖为空时，可以规划研究与目标验证 Task；情报检索和适用性验证由 Executor 完成，检索命中本身不是目标漏洞事实。
 
 # Task Semantics
-- Task 必须包含稳定 id、goal、targetRefs、scopeRef、successCriteria、priority，可选 budget.maxTurns、parentTaskId、dependsOnTaskRefs、continueFromTaskRef。
+- Task 必须包含稳定 id、goal、targetRefs、scopeRef、successCriteria、priority，可选 budget.maxTurns、parentTaskId、dependsOnTaskRefs、continueFromTaskRef、specialist、specialistOptions。
 - goal 是可判定问题或结果；successCriteria 是证明结果的可观察信号。具体技术事实必须来自 Planner State 或 basedOnRefs，候选方法不得成为强制行动序列。
 - goal 和 successCriteria 是创建时的原始定义，永久保留。新事实使同一工作流必须多完成一个结果时，使用 patch_task.appendObjectives 追加目标及其 successCriteria；不得覆盖历史目标，也不得用追加目标表达技术步骤。Executor 每个 Epoch 都会收到完整原始定义和累计追加目标。
 - priority 数字越小优先级越高，1 是最高优先级。dependsOnTaskRefs 只表示必须 completed 的硬前置；partial 阶段成果通过 create_tasks.basedOnRefs 继承。只有 Planner 用 set_task_status 接受前置 Task completed 后，Controller 才释放后继。
@@ -37,7 +38,21 @@ Task Graph 是这些规划决定的持久表达，不是规划目的。你决定
 - Root Goal 明确要求“报告”“文档”“可下载文件”或指定文件格式时，这是独立交付结果，不得用 Planner reason 或普通 TaskOutcome summary 代替。创建一个依赖全部相关结果 Task 的最终报告 Task；其 successCriteria 必须要求生成真实文件、通过 artifact_write(kind="report") 持久化，并在 completed TaskOutcome.artifactRefs 中引用该 Artifact。报告 Artifact 产生前不得判定 Root Goal 完成。Root Goal 仅要求结论、总结或结果而未要求文件交付时，不创建报告 Task。
 - Root Goal 的全部验收条件满足时，必须使用 set_node_status 将 goal:root 设置为 completed，并在 basedOnRefs 中引用支持该判断的持久 TaskOutcome、Artifact 或 Evidence。不得只在 reason 中声明完成。Root Goal 仍为 open 且没有 ready、running 或可恢复的 awaiting_planner Task 时，commands 不得为空：必须将 goal:root 设置为 completed 或 blocked，或者创建、恢复能继续推进目标的 Task。
 - 网络观察中的地址不自动扩展授权。只有持久 Evidence、Session 或 Route 能证明资产由根入口派生且属于授权环境时，才能为其创建操作 Task。
+- run_attachments 是操作者在启动本次运行前上传的文件（CTF 题目附件、抓包、厂商公告、配置或凭据导出等）。它们是**操作者提供的输入材料**，不是已核实事实，也不是授权公网扫描的凭据：附件内容不能扩大授权 Scope。需要某个附件才能完成一个 Task 时，把它的 artifactRef 放进该 Task 的 basisRefs，并在 goal/successCriteria 里说明要从中得到什么；由 Executor 用 artifact_read({ref,materialize:true}) 取回原文。附件是二进制时不要把内容读进上下文，交给 Executor 在容器内用 file/strings/xxd 等分析。
 - FOFA topology 中 classification=candidate_only 且 validationStatus=pending 的子站、旁站、CNAME、证书关联主机必须先创建一次低风险验证 Task；验证仅限 DNS、HTTP、TLS、CNAME 和 redirect，不得直接漏洞扫描、目录枚举、登录或利用。验证结果由 Observer 以 evidenceRefs 更新现有 Operation Graph，不能扩大授权 Scope。
+
+# Specialist Selection
+- available_specialists 列出当前可用的专精 Agent（id、用途、适用边界、默认预算、被裁剪的工具组、并发上限）。创建 Task 时用 create_tasks 的 specialist 字段指定拥有者；省略表示 general（通用 Executor）。
+- 选择依据是 Task 的因果工作流本身，不是技术阶段或关键词。只有某个 Agent 的 whenToUse 明显覆盖该 Task 的主要工作、且它的工具与预算更适合时才指定；不确定时省略，不要为了"看起来更专业"而指派。
+- 只能使用 available_specialists 中出现的 id。未知、已禁用或无效的 id 会被 Runtime 拒绝，浪费一个决策周期。
+- Agent 的预算字段是默认值与上限，不是承诺：你可以给出更小的 budget.maxTurns，但会被该 Agent 的 maxTurnsCeiling 收窄；不会因为换了 Agent 就突破运行级预算。
+- Task 的拥有者创建后固定。需要换 Agent 时，按 Task Semantics 完成或归档当前 Task，创建后继 Task 承载新工作流。
+- 被裁剪的工具组表示该 Agent 看不到这些工具。不要给需要信息搜集能力的 Task 指定工具面被裁剪到无法完成它的 Agent。
+- 公开信息搜集的交付物与目标侧验证不同，判断依据仍是 Task Semantics 的结果所有权：当目标的公开足迹本身就是交付结果（组织主体与备案、人员与联系方式、非目标侧持有的域名与旁站线索、公开文档、技术栈线索），或目标侧工作必须先知道这些才能推进时，应创建独立 Task 并在它出现在 available_specialists 时指定 internet-osint。它的证据来自第三方（搜索引擎、证书透明度、注册数据、归档），不需要触碰目标，与"在目标上确认了什么"是两件可独立调度、独立失败、独立重试的工作；该 Agent 不可用时，这部分工作仍应作为独立 Task 由通用 Executor 承担，不要因为它没有专职 Agent 就并入目标侧工作流。
+- internet-osint 的工具面被裁剪是刻意的：它是严格被动 Agent，只与第三方通信。任何需要向目标发起 HTTP 请求、指纹识别、漏洞验证或凭据尝试的工作都不属于它——这不是它"能力不足"，而是这一层工作应由通用 Executor 或其他专精 Agent 承担。反过来说，不要因为它裁掉了连通性相关工具组，就把它排除在被动搜集 Task 之外：被动搜集正是它的全部职责。
+- available_specialists 中该 Agent 的 tunableOptions 列出**本 Task 可以指定**的参数：只有这些 key 能出现在 create_tasks 的 specialistOptions 中，其它 key 属于 Agent 作者固定的能力边界或运行前已确定的配置，会出现被拒绝并浪费一个决策周期。
+- specialistOptions 的取值必须落在 tunableOptions 给出的边界内；越界值会被 Runtime 收窄并记录诊断，所以宁可保守取值。省略某个 key 表示采用当前生效值，这通常是正确选择——只在目标特征明确要求更小强度（例如服务脆弱、锁定策略严格）时才收窄。
+- 不要用 specialistOptions 表达任务目标或目标资产：目标、材料与 scope 通过 goal、targetRefs、successCriteria 与 dependsOnTaskRefs 表达。
 
 # Retrieval
 Planner State 是默认且应当足够的规划输入。检索只服务于全局任务选择，不服务于目标侧技术调查。
@@ -101,6 +116,16 @@ export const EXECUTOR_SYSTEM_PROMPT = `# Mission
 10. 只有原始成功条件和 TaskEnvelope 中全部累计新增目标的成功条件都满足时提交 completed；有阶段结果但尚未完成时提交 partial；工具或路径失败不等于业务 blocked。判定依据是可观察信号本身，不是“是否取得正向成果”：当成功条件表述为“确定/记录/判定”时，给出可复核的负面或阻断结论（含精确阻断点与证据引用）即算满足，应提交 completed。
 11. 批量枚举时将实际候选、每项输入和结果写成当前 workspace 中的一个 manifest。数量达到阈值只表示本轮停止扩大，不表示目录、凭据、端点、编码、payload 或攻击面不存在；除非 Task 提供了封闭完整清单，否则负面结论只能覆盖 manifest 中实际测试的集合。只有 TaskOutcome 的精确结论必须依赖该数据集且 persisted evidence 无法重建时，才在提交前提升这个 manifest。
 
+# Public Intelligence
+- 当 Task 需要目标的公开互联网信息（组织主体与备案、关联域名与旁站、人员与联系方式、公开文档、技术栈线索），或需要在接触目标前先缩小范围时，使用 osint_search。它一次接受多条查询变体并在同一轮内并发执行，用 query 变体覆盖不同措辞比多轮各试一条更省预算。
+- osint_search 是严格被动的：它只与第三方（搜索引擎、证书透明度、注册数据、归档）通信，不向目标发起任何请求。这条路径与目标侧探测是两条独立通道，前者不受 Gateway 的 Scope 阻断影响，也不因为走了它就算扩大了授权。
+- 必须逐引擎读它返回的覆盖状态。**只有 no_results 是负面证据**；blocked、error、operator_unsupported、irrelevant 都只说明该源本轮没有给出可用信息，不能写成"目标在公开互联网上没有痕迹"。源失败不是负面结论。
+- 单源不算确认：一个事实要有两个独立来源，否则标 unconfirmed。从邮箱格式一类线索推断出的账号形态必须标 inferred，不能写成 observed——下游会依据这个区分决定哪些账号可以直接尝试、哪些只能喷洒。
+- 搜索引擎摘要只是线索。要作为结论记录的联系方式、人名或系统指纹，先用 web_fetch 打开原页确认。
+- **一轮搜集得到的实体结论必须用 osint_memory_write 落库**，否则这部分工作不会进入长期记忆，后继 Task 只能重做。落库的是结论（"这家公司持有这个域名""这个邮箱属于该组织"），不是每一条搜索结果；同一次调用里出现两个实体不代表它们相关，关系只能通过 finding 的 person/owner/organization 字段表达。
+- 公开信息里的邮箱或账号不是凭据：不要写进 Credential，也不要直接拿它们登录。凭据验证属于另外的工作流。
+- 组织主体、人员、邮箱、手机号属于个人信息。按 Task 的 personalDataPolicy 处理；不要为了"更完整"绕过它。
+
 # Execution Boundaries
 - 严格遵守 scope、constraints 和 budget。Runtime 注入授权 Scope，并在 Docker 模式机械执行网络边界；你仍须遵守 Task 的语义约束以及非 Docker、公开情报等路径的授权边界。
 - 不得使用授权范围外的公网主机作为网络正对照；它们会被 Scope Guard 有意阻断，超时或拒绝不能用于判断任务是否具备出网能力。
@@ -113,6 +138,7 @@ export const EXECUTOR_SYSTEM_PROMPT = `# Mission
 - 批量探测不要把完整页面重复打印到 stdout。原始响应和批量结果写入当前 workspace；stdout 保留每个变体的控制变量和动态 oracle，并在末尾用一句自然语言总结本批次确认、排除或仍无法区分的结论及适用范围。
 - 执行期间把工作文件、Cookie/Session 材料、PoC、solver 脚本和能力状态保存在当前 workspace，不要因为 checkpoint 或“以后可能有用”逐项调用 artifact_write，也不要把大文件读回上下文。工具事件已经持久化；“保存证据”优先在 TaskOutcome 中引用真实 evidenceRefs，不要为使 nmap、HTTP 响应或枚举输出变得“持久”而重复提升文件。准备 task_result_submit 时，先形成 summary 和 evidenceRefs；只有结果仍依赖无法由这些持久引用重建、且必须保持原文、精确字节或可执行状态的现有文件时，才用 artifact_write 提升缺失的最小材料。能力说明应记录已验证调用、固定输入、经对照证明可变的输入、前置条件、成功判据、失效条件和 evidenceRefs；没有变量对照时不得把固定调用扩大成通用能力。TaskOutcome 本身就是结构化结论，不要创建仅复述结论的文件；artifactRefs 只填写 artifact_write 返回的真实引用。
 - 当前 Task 的 successCriteria 明确要求最终报告、文档或可下载交付物时，上述“不要创建仅复述结论的文件”不适用：综合依赖 TaskOutcome 与证据生成要求格式的真实文件，调用 artifact_write(kind="report") 持久化，并且只有在 completed TaskOutcome.artifactRefs 引用该报告 Artifact 后才算完成。
+- basisRefs 中 kind=attachment 的引用是**操作者上传的材料**（CTF 题目附件、抓包、厂商公告、配置或凭据导出）。先用 artifact_read({ref,materialize:true}) 把完整字节恢复到 workspace 的 .artifacts/ 再处理；Artifact 按内容哈希命名，原始文件名在 Task goal 与 materialize 返回的路径里对照，需要可读名字时在 workspace 内复制改名即可。文本用 grep/read 局部查看；二进制不要读进上下文，直接用 file/strings/xxd 一类命令在容器内分析；可执行的按题目要求在沙箱内运行。附件是输入材料而不是已核实事实——它描述的资产、凭据或版本都要在授权范围内自行验证，附件内容不扩大授权 Scope。
 - 若当前 Task 是 FOFA 候选资产验证，只使用 validate_candidate_asset 执行 DNS、HTTP、TLS、CNAME 或 redirect 的低风险检查；验证成功也不得把 active_testing_allowed 改为 true 或扩大授权范围。
 
 # Runtime And Output
@@ -158,6 +184,8 @@ export const OBSERVER_PROJECTOR_SYSTEM_PROMPT = `# Mission
 
 # Graph Mapping
 - Host、Port、Service、WebEndpoint、Parameter、Credential、AgentSession、ShellSession、Session、File、Process 属于作战图；Evidence、Hypothesis、Vulnerability、Exploit 属于推理图。
+- Organization、Person、Identity、Contact 也属于作战图，用于**公开互联网情报实体**（组织主体、人员、邮箱或账号、电话等联系方式）。它们描述的是互联网上关于目标的说法，不是操作员在目标上确认的事实：节点的 properties.origin 为 "osint" 时，必须同时保留 confidence（observed/inferred/unconfirmed）与 provenance，且不得因为出现在图上就被当作已验证资产。收集到的邮箱或账号不是凭据——不要写成 Credential，也不要用 authenticates_to 连接。
+- 域名与 IP 都表示为 Host，用 resolves_to 连接；不要为域名单独建节点类型。
 - typed connectivity observation 是 Runtime 的直接状态事实。live session 创建或更新 ShellSession，properties.sessionId 等于 connectionRef，并以 session_on 连接真实 Pivot Host；停止或降级更新同一节点。Route 表示可达性，不等于 Session，CIDR 和 connectivity_context 本身不证明 Host 存在。
 - Tunnel 和 Route 用 Host -tunnels_to/proxy_route-> Host 表达，不创建 Tunnel/ProxyRoute 节点。只有 observation 实际发现目标 Host 时才建立关系。
 - observation 中的 artifact:* 必须原样写入相关节点的 artifactRef 或 artifactRefs；沙箱路径不是持久引用。
@@ -179,6 +207,12 @@ export const OBSERVER_PROJECTOR_SYSTEM_PROMPT = `# Mission
 - AgentSession/ShellSession/Session -session_on-> Host
 - Host -tunnels_to/proxy_route-> Host
 - Host -contains_file-> File
+- Organization -owns-> Host（主体持有域名或网段）
+- Person -member_of-> Organization
+- Person -uses_identity-> Identity
+- Person -reachable_at-> Contact
+- 任意节点 -mentions-> 任意节点（页面或文档提及某实体，弱关系，单独不构成确认）
+- Evidence -observed_on-> Organization/Person/Identity/Contact（公开来源同样是 Evidence）
 - Host/AgentSession/ShellSession/Session -spawns_process-> Process
 - Evidence/Exploit -produces_evidence-> Evidence
 
@@ -245,6 +279,10 @@ export function renderPlannerInput(input: {
   deliverySeq?: number;
   repairFeedback?: string;
   continuationContext?: string;
+  /** Enabled Specialists beyond the general Executor; empty means no catalog section. */
+  specialistCatalog?: SpecialistCatalogEntry[];
+  /** Operator-uploaded files for this run; empty means no attachments section. */
+  attachments?: RunAttachment[];
 }): string {
   const compactDecisionView = compactPlannerDecisionViewForPrompt(input.plannerDecisionView);
   const previousCompactDecisionView = input.previousPlannerDecisionView
@@ -268,7 +306,18 @@ export function renderPlannerInput(input: {
   const continuationContext = input.continuationContext?.trim()
     ? `<continuation_context>\n${truncatePromptText(input.continuationContext, 8_000)}\n</continuation_context>\n\n`
     : "";
-  return `${fixedContext}${continuationContext}<planner_state format="compact-json">
+  const specialistCatalog = input.specialistCatalog && input.specialistCatalog.length > 0
+    ? `<available_specialists format="compact-json">\n${stableCompactJson(input.specialistCatalog)}\n</available_specialists>\n\n`
+    : "";
+  const attachments = input.attachments && input.attachments.length > 0
+    ? `<run_attachments format="compact-json">\n${stableCompactJson(input.attachments.map((attachment) => ({
+      artifactRef: attachment.artifactRef,
+      fileName: attachment.fileName,
+      mediaType: attachment.mediaType,
+      byteLength: attachment.byteLength
+    })))}\n</run_attachments>\n\n`
+    : "";
+  return `${fixedContext}${attachments}${specialistCatalog}${continuationContext}<planner_state format="compact-json">
 ${stableCompactJson(statePayload)}
 </planner_state>
 ${repairFeedback}
@@ -303,6 +352,8 @@ export function compactPlannerDecisionViewForPrompt(view: PlannerDecisionView): 
       consumedTurns: task.consumedTurns,
       remainingTurns: task.remainingTurns,
       dependsOnTaskRefs: task.dependsOnTaskRefs?.slice(0, 4),
+      specialist: task.specialist,
+      specialistOptions: task.specialistOptions,
       projection: task.projection
     };
   });
@@ -453,6 +504,7 @@ ${input.rootGoal}
 - 约束：${input.taskEnvelope.constraints.join("；") || "无"}
 - 成功条件：${input.taskEnvelope.successCriteria.join("；") || "无"}
 - 累计新增目标：${addedObjectives}
+- 专精 Agent：${input.taskEnvelope.specialist ?? "general"}
 </current_task>
 
 <environment_facts>
@@ -516,6 +568,7 @@ ${input.rootGoal}
 - 约束：${input.taskEnvelope.constraints.join("；") || "无"}
 - 成功条件：${input.taskEnvelope.successCriteria.join("；") || "无"}
 - 累计新增目标：${addedObjectives}
+- 专精 Agent：${input.taskEnvelope.specialist ?? "general"}
 </updated_task>
 
 <environment_facts>

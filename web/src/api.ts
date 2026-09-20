@@ -1,5 +1,5 @@
 import { translate } from "./language";
-import type { ActiveRunsResponse, ApprovalDecisionResponse, ApprovalMode, ApprovalModeUpdateResponse, ApprovalsResponse, ArtifactContent, AuthResponse, ConnectionItem, ConnectionsResponse, CredentialCreateInput, CredentialRecord, CredentialsResponse, EnvConfigChanges, EnvConfigView, McpRegistrySnapshot, ParsedScopeDocument, RegisteredMcpServer, RegisteredSkill, RuntimeState, SessionsResponse, SkillRegistrySnapshot, StartRunInput, StartRunResponse, StopRunResponse, TrafficExchange, TrafficFlowRef, TrafficHistoryBody, TrafficHistoryFilters, TrafficHistoryPage, TrafficReplayInput, TrafficReplayResponse } from "./types";
+import type { ActiveRunsResponse, ApprovalDecisionResponse, ApprovalMode, ApprovalModeUpdateResponse, ApprovalsResponse, ArtifactContent, AuthResponse, ConnectionItem, ConnectionsResponse, CredentialCreateInput, CredentialRecord, CredentialsResponse, EnvConfigChanges, EnvConfigView, McpRegistrySnapshot, ParsedScopeDocument, RegisteredMcpServer, RegisteredSkill, RegisteredSpecialist, RuntimeState, SessionsResponse, SkillRegistrySnapshot, SpecialistOptionsMode, SpecialistRegistrySnapshot, StagedAttachment, StartRunInput, StartRunResponse, StopRunResponse, TrafficExchange, TrafficFlowRef, TrafficHistoryBody, TrafficHistoryFilters, TrafficHistoryPage, TrafficReplayInput, TrafficReplayResponse } from "./types";
 
 export class ApiError extends Error {
   constructor(message: string, readonly status: number, readonly code?: string) {
@@ -121,6 +121,41 @@ export function setMcpEnabled(name: string, enabled: boolean): Promise<Registere
   });
 }
 
+export function fetchSpecialists(signal?: AbortSignal): Promise<SpecialistRegistrySnapshot> {
+  return requestJson("/api/agents", { signal });
+}
+
+export function setSpecialistEnabled(id: string, enabled: boolean): Promise<RegisteredSpecialist> {
+  return requestJson(`/api/agents/${encodeURIComponent(id)}/state`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ enabled })
+  });
+}
+
+export function updateSpecialistOptions(
+  id: string,
+  options: Record<string, string | number | boolean | string[]>
+): Promise<RegisteredSpecialist> {
+  return requestJson(`/api/agents/${encodeURIComponent(id)}/options`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ options })
+  });
+}
+
+/** Switches the Agent-wide option authority mode; `null` resets to the author default. */
+export function setSpecialistOptionsMode(
+  id: string,
+  mode: SpecialistOptionsMode | null
+): Promise<RegisteredSpecialist> {
+  return requestJson(`/api/agents/${encodeURIComponent(id)}/options-mode`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ mode })
+  });
+}
+
 export function fetchEnvConfig(signal?: AbortSignal): Promise<EnvConfigView> {
   return requestJson("/api/env", { signal });
 }
@@ -131,6 +166,25 @@ export function updateEnvConfig(changes: EnvConfigChanges): Promise<EnvConfigVie
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(changes)
   });
+}
+
+/**
+ * Stages one operator attachment and returns its id. Files are uploaded one at a
+ * time so a single oversized or unreadable file does not discard the rest.
+ */
+export async function uploadAttachment(file: File): Promise<StagedAttachment> {
+  return requestJson("/api/attachments", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      fileName: file.name,
+      contentBase64: await fileAsBase64(file)
+    })
+  }).then((body) => (body as { attachment: StagedAttachment }).attachment);
+}
+
+export function discardAttachment(attachmentId: string): Promise<{ ok: boolean }> {
+  return requestJson(`/api/attachments/${encodeURIComponent(attachmentId)}`, { method: "DELETE" });
 }
 
 export function startRun(input: StartRunInput): Promise<StartRunResponse> {

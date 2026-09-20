@@ -25,21 +25,42 @@ export type ExecutorToolProbe = (toolNames: string[]) => Promise<string[]>;
 export const EXECUTOR_TOOL_PROBE_LIST = [
   "python3", "python", "pip", "curl", "wget", "nc", "ncat", "nmap", "sqlmap",
   "go", "node", "npm", "git", "gcc", "make", "jq", "unzip", "tar", "dig",
-  "whois", "ssh", "sshpass", "hydra", "john", "hashcat", "gdb", "objdump",
-  "strings", "file", "xxd", "base64"
+  "whois", "ssh", "sshpass", "hydra", "medusa", "john", "hashcat", "gdb",
+  "objdump", "strings", "file", "xxd", "base64", "ffuf", "gobuster", "dirb",
+  "crunch"
 ];
+
+// What an Executor image claims about itself. `tools` is what agents are told
+// they can run; `wordlists` are paths a build has verified exist.
+export type ExecutorImageFacts = {
+  tools: string[];
+  wordlists: string[];
+};
+
+const EMPTY_IMAGE_FACTS: ExecutorImageFacts = { tools: [], wordlists: [] };
 
 const TOOL_PROBE_TIMEOUT_MS = 5_000;
 
 let hostToolCache: Promise<string[]> | undefined;
-const dockerToolCache = new Map<string, Promise<string[]>>();
+const dockerToolCache = new Map<string, Promise<ExecutorImageFacts>>();
 const EXECUTOR_FACTS_LABEL = "io.luanniao.executor.facts";
 
 export async function getExecutorEnvironmentFacts(
   input: ExecutorEnvironmentFactsInput,
   probe?: ExecutorToolProbe
 ): Promise<string> {
-  const tools = await probeExecutorTools(input, probe);
+  return renderExecutorEnvironmentFacts(input, await probeExecutorFacts(input, probe));
+}
+
+/**
+ * Pure rendering half of the facts block, split out so the wording can be
+ * asserted without probing a real image.
+ */
+export function renderExecutorEnvironmentFacts(
+  input: ExecutorEnvironmentFactsInput,
+  facts: ExecutorImageFacts
+): string {
+  const { tools, wordlists } = facts;
   const lines = ["# Executor 环境事实（Runtime 已核实，直接采信，不要重复探测）"];
   if (input.mode === "docker") {
     const workdir = input.containerWorkdir ?? "/workspace";
@@ -71,6 +92,9 @@ export async function getExecutorEnvironmentFacts(
   if (tools.length > 0) {
     lines.push(`- 可用工具：${tools.join(" ")}`);
   }
+  if (wordlists.length > 0) {
+    lines.push(`- 预置字典（只读，可直接喂给 hydra -P/-L、hydra -C、hashcat、ffuf -w）：${wordlists.join(" ")}`);
+  }
   return lines.join("\n");
 }
 
@@ -91,26 +115,52 @@ function defaultPlatform(os: string): string {
   return `${name} ${process.arch}`;
 }
 
-async function probeExecutorTools(
+async function probeExecutorFacts(
   input: ExecutorEnvironmentFactsInput,
   probe?: ExecutorToolProbe
-): Promise<string[]> {
+): Promise<ExecutorImageFacts> {
   if (probe) {
     try {
-      return await probe(EXECUTOR_TOOL_PROBE_LIST);
+      return { tools: await probe(EXECUTOR_TOOL_PROBE_LIST), wordlists: [] };
     } catch {
-      return [];
+      return EMPTY_IMAGE_FACTS;
     }
   }
   if (input.mode === "docker") {
     const image = input.image ?? "luanniao-executor:latest";
-    return inspectDockerImageTools(image);
+    return inspectDockerImageFacts(image);
   }
   hostToolCache ??= runToolProbe("sh", ["-c", probeShellLoop()]);
-  return hostToolCache;
+  return { tools: await hostToolCache, wordlists: [] };
 }
 
-async function inspectDockerImageTools(image: string): Promise<string[]> {
+/**
+ * Reads the `io.luanniao.executor.facts` label. The label is the contract
+ * between the image build and the Runtime: the Dockerfile asserts every name in
+ * it resolves on PATH, so a tool listed here is one the Executor can really run.
+ * Version 1 labels predate `wordlists`; both versions are accepted, and anything
+ * malformed yields nothing rather than a half-trusted tool list.
+ */
+export function parseExecutorImageFacts(raw: string | undefined): ExecutorImageFacts {
+  if (!raw) return EMPTY_IMAGE_FACTS;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return EMPTY_IMAGE_FACTS;
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return EMPTY_IMAGE_FACTS;
+  const facts = parsed as Record<string, unknown>;
+  if (facts.version !== 1 && facts.version !== 2) return EMPTY_IMAGE_FACTS;
+  if (facts.uid !== 1000 || facts.rawSockets !== false) return EMPTY_IMAGE_FACTS;
+  return { tools: stringArray(facts.tools), wordlists: stringArray(facts.wordlists) };
+}
+
+function stringArray(value: unknown): string[] {
+  return Array.isArray(value) ? value.filter((item): item is string => typeof item === "string") : [];
+}
+
+async function inspectDockerImageFacts(image: string): Promise<ExecutorImageFacts> {
   try {
     const { stdout } = await execFileAsync("docker", ["image", "inspect", "--format", "{{json .}}", image], {
       timeout: TOOL_PROBE_TIMEOUT_MS
@@ -120,28 +170,26 @@ async function inspectDockerImageTools(image: string): Promise<string[]> {
       Config?: { Labels?: Record<string, string> };
     };
     const imageId = inspected.Id?.trim();
-    if (!imageId) return [];
+    if (!imageId) return EMPTY_IMAGE_FACTS;
     let cached = dockerToolCache.get(imageId);
     if (!cached) {
-      cached = Promise.resolve().then(() => {
-        const raw = inspected.Config?.Labels?.[EXECUTOR_FACTS_LABEL];
-        if (!raw) return [];
-        const facts = JSON.parse(raw) as { version?: unknown; uid?: unknown; rawSockets?: unknown; tools?: unknown };
-        if (facts.version !== 1 || facts.uid !== 1000 || facts.rawSockets !== false || !Array.isArray(facts.tools)) {
-          return [];
-        }
-        return facts.tools.filter((tool): tool is string => typeof tool === "string");
-      }).catch(() => []);
+      cached = Promise.resolve()
+        .then(() => parseExecutorImageFacts(inspected.Config?.Labels?.[EXECUTOR_FACTS_LABEL]))
+        .catch(() => EMPTY_IMAGE_FACTS);
       dockerToolCache.set(imageId, cached);
     }
     return cached;
   } catch {
-    return [];
+    return EMPTY_IMAGE_FACTS;
   }
 }
 
 function probeShellLoop(): string {
-  return `for t in ${EXECUTOR_TOOL_PROBE_LIST.join(" ")}; do command -v "$t" >/dev/null 2>&1 && echo "$t"; done`;
+  // The trailing `exit 0` is load-bearing: the loop's status is the status of
+  // its last iteration, so a host missing the last probed tool would make the
+  // whole probe exit non-zero and silently erase the tool line for every tool
+  // that *is* installed.
+  return `for t in ${EXECUTOR_TOOL_PROBE_LIST.join(" ")}; do command -v "$t" >/dev/null 2>&1 && echo "$t"; done; exit 0`;
 }
 
 async function runToolProbe(command: string, args: string[]): Promise<string[]> {

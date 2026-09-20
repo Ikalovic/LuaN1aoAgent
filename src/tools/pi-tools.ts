@@ -100,7 +100,25 @@ const PlannerTaskSpecSchema = Type.Object({
     minLength: 6,
     maxLength: 256,
     description: "Completed direct dependency whose Executor session and workspace should move to this sequential successor. Omit for independent or parallel work."
-  }))
+  })),
+  specialist: Type.Optional(Type.String({
+    pattern: "^[a-z0-9]+(?:-[a-z0-9]+)*$",
+    maxLength: 64,
+    description: "Specialist Agent id that should own this Task, chosen from available_specialists. Omit for the general Executor. A Task's Specialist is fixed once created; to switch owners, complete or archive this Task and create a successor."
+  })),
+  specialistOptions: Type.Optional(Type.Record(
+    Type.String({ maxLength: 64 }),
+    Type.Union([
+      Type.String({ maxLength: 4_096 }),
+      Type.Number(),
+      Type.Boolean(),
+      Type.Array(Type.String({ maxLength: 256 }), { maxItems: 64 })
+    ]),
+    {
+      maxProperties: 16,
+      description: "Values for the selected Specialist's tunableOptions, copied from available_specialists. Keys that are not published there are rejected; every value is clamped into the published boundary, so an out-of-range value is narrowed rather than honoured."
+    }
+  ))
 }, { additionalProperties: false });
 const PlannerTaskPatchSchema = Type.Object({
   additionalTurns: Type.Optional(Type.Integer({
@@ -447,19 +465,20 @@ export function createGraphSearchTool(
   graphStore: SQLiteGraphStore,
   references?: ProjectorGraphRefRegistry,
   cache?: Map<string, string>,
-  materials?: GraphToolMaterialsResolver
+  materials?: GraphToolMaterialsResolver,
+  description?: string
 ) {
   return defineTool({
     name: "graph_search",
     label: "Graph Search",
-    description: "Search semantic nodes in a byte-bounded closed graph page. Returned edges always include both endpoint nodes; use nextCursor with unchanged arguments for continuation.",
+    description: description ?? "Search semantic nodes in a byte-bounded closed graph page. Returned edges always include both endpoint nodes; use nextCursor with unchanged arguments for continuation.",
     parameters: Type.Object({
       query: Type.String({ minLength: 1, maxLength: 1_000 }),
       graphKind: Type.Optional(Type.Union([
         Type.Literal("operation"),
         Type.Literal("reasoning")
       ])),
-      limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 50 })),
+      limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 200 })),
       cursor: Type.Optional(Type.String({ minLength: 1, maxLength: 256 }))
     }, { additionalProperties: false }),
     execute: async (_toolCallId, params) => {

@@ -3,7 +3,10 @@ export type JsonRecord = Record<string, JsonValue | undefined>;
 
 export type Role = "planner" | "executor" | "observer" | "runtime" | string;
 export type GraphKind = "reasoning" | "operation" | "task";
-export type ViewKey = "overview" | "findings" | "wallboard" | "trace" | "reports" | GraphKind | "traffic" | "connections" | "skills" | "mcp" | "env" | "credentials" | "approvals";
+export type ViewKey = "overview" | "findings" | "wallboard" | "trace" | "reports" | GraphKind | "memory" | "traffic" | "connections" | "skills" | "mcp" | "agents" | "capabilities" | "env" | "credentials" | "approvals";
+
+/** Tabs of the unified capabilities page (Skills / MCP / Specialist Agents). */
+export type CapabilityTab = "skills" | "mcp" | "agents";
 
 export interface AuthUser {
   id: string;
@@ -94,6 +97,99 @@ export interface McpRegistrySnapshot {
   scannedAt: string;
   servers: RegisteredMcpServer[];
   diagnostics: McpRegistryDiagnostic[];
+}
+
+export type SpecialistOptionType = "string" | "text" | "number" | "boolean" | "enum" | "string-list";
+
+/** Who owns an option's effective value, ordered from most to least restrictive. */
+export type SpecialistOptionAuthority = "author" | "planner" | "user";
+
+/** Agent-level default authority for options that do not declare their own. */
+export type SpecialistOptionsMode = "planner" | "user";
+
+export type SpecialistOptionValue = string | number | boolean | string[];
+
+/** Effective boundary of an option after intersecting author and operator bounds. */
+export interface SpecialistOptionBounds {
+  minimum?: number;
+  maximum?: number;
+  allowed?: string[];
+}
+
+export interface SpecialistOptionSpec {
+  type: SpecialistOptionType;
+  title: string;
+  description?: string;
+  default?: SpecialistOptionValue;
+  pattern?: string;
+  placeholder?: string;
+  maxLength?: number;
+  minimum?: number;
+  maximum?: number;
+  integer?: boolean;
+  maxItems?: number;
+  options?: Array<{ value: string; label: string }>;
+  /** Option-level authority override declared by the author. */
+  authority?: SpecialistOptionAuthority;
+}
+
+export interface RegisteredSpecialistOption {
+  key: string;
+  spec: SpecialistOptionSpec;
+  value: SpecialistOptionValue;
+  isDefault: boolean;
+  /** Effective authority after the Agent mode and the option-level tightening. */
+  authority: SpecialistOptionAuthority;
+  /** False only for `author` authority: the capability page renders these read-only. */
+  editable: boolean;
+  /** True when the operator's editable value is a boundary rather than the value itself. */
+  boundOnly: boolean;
+  bounds?: SpecialistOptionBounds;
+  authorDefault?: SpecialistOptionValue;
+}
+
+export interface SpecialistRegistryDiagnostic {
+  code: string;
+  message: string;
+  specialistId?: string;
+  path?: string;
+}
+
+export interface RegisteredSpecialist {
+  id: string;
+  name: string;
+  description: string;
+  whenToUse?: string;
+  version?: string;
+  source: "builtin" | "project";
+  enabled: boolean;
+  valid: boolean;
+  introspected: boolean;
+  executability: "prompt-only" | "module";
+  promptMode: "extend" | "replace";
+  enabledGroups: string[];
+  disabledGroups: string[];
+  deniedTools: string[];
+  skillMode: "auto" | "allowlist" | "pinned" | "off";
+  budget: {
+    defaultMaxTurns: number;
+    maxTurnsCeiling: number;
+    epochTurnSlice: number;
+    epochTimeShare: number;
+  };
+  concurrency?: { maxParallelTasks?: number };
+  /** Option authority mode in force now. */
+  optionsMode: SpecialistOptionsMode;
+  /** Mode the author declared; what the capability page resets to. */
+  authorOptionsMode: SpecialistOptionsMode;
+  options: RegisteredSpecialistOption[];
+  diagnostics: SpecialistRegistryDiagnostic[];
+}
+
+export interface SpecialistRegistrySnapshot {
+  scannedAt: string;
+  specialists: RegisteredSpecialist[];
+  diagnostics: SpecialistRegistryDiagnostic[];
 }
 
 export interface EnvConfigEntry {
@@ -241,6 +337,25 @@ export interface RuntimeSession {
   running?: boolean;
 }
 
+/** A file staged for a run before it starts; see POST /api/attachments. */
+export interface StagedAttachment {
+  attachmentId: string;
+  fileName: string;
+  mediaType: string;
+  byteLength: number;
+  sha256: string;
+  createdAt: string;
+}
+
+/** A staged file after the run started: its persisted artifact identity. */
+export interface RunAttachment {
+  artifactRef: string;
+  fileName: string;
+  mediaType: string;
+  byteLength: number;
+  sha256: string;
+}
+
 export interface StartRunInput {
   goal: string;
   scope: string;
@@ -251,6 +366,7 @@ export interface StartRunInput {
   maxRunTimeMs?: number;
   maxParallelTasks?: number;
   maxPlannerCycles?: number;
+  attachmentIds?: string[];
 }
 
 export interface ScopeDocumentCandidate {
@@ -285,6 +401,7 @@ export interface StartRunResponse {
   startedAt: string;
   running: boolean;
   continued?: boolean;
+  attachments?: RunAttachment[];
 }
 
 export interface ActiveRun {

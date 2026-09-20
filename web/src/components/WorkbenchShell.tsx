@@ -6,14 +6,14 @@ import type { ViewKey } from "../types";
 import { Brand } from "./Brand";
 const groups = [
   { label: "总览", en: "Overview", icon: LayoutDashboard, views: ["overview"] },
-  { label: "资产", en: "Assets", icon: Network, views: ["operation"] },
+  { label: "资产", en: "Assets", icon: Network, views: ["operation", "memory"] },
   { label: "执行", en: "Execution", icon: Activity, views: ["trace", "task"] },
   { label: "发现", en: "Findings", icon: ShieldAlert, views: ["findings", "reasoning"] },
   { label: "网络", en: "Network", icon: Workflow, views: ["traffic", "connections"] },
   { label: "产出", en: "Reports", icon: FileText, views: ["reports"] },
-  { label: "管理", en: "Manage", icon: Settings, views: ["skills", "mcp", "env", "credentials", "approvals"] }
+  { label: "管理", en: "Manage", icon: Settings, views: ["skills", "mcp", "agents", "env", "credentials", "approvals"] }
 ];
-const titles: Partial<Record<ViewKey, [string, string]>> = { overview: ["态势总览", "Overview"], operation: ["资产拓扑", "Asset topology"], trace: ["执行轨迹", "Trace"], task: ["任务树", "Tasks"], findings: ["发现列表", "Findings"], reasoning: ["证据关系", "Evidence graph"], traffic: ["请求记录", "Traffic"], connections: ["连接管理", "Connections"], reports: ["产物与报告", "Artifacts & reports"], skills: ["Skills", "Skills"], mcp: ["MCP", "MCP"], env: ["环境变量", "Environment"], credentials: ["凭证管理", "Credentials"], approvals: ["审批", "Approvals"] };
+const titles: Partial<Record<ViewKey, [string, string]>> = { overview: ["态势总览", "Overview"], operation: ["资产拓扑", "Asset topology"], memory: ["图记忆", "Graph memory"], trace: ["执行轨迹", "Trace"], task: ["任务树", "Tasks"], findings: ["发现列表", "Findings"], reasoning: ["证据关系", "Evidence graph"], traffic: ["请求记录", "Traffic"], connections: ["连接管理", "Connections"], reports: ["产物与报告", "Artifacts & reports"], skills: ["Skills", "Skills"], mcp: ["MCP", "MCP"], agents: ["专精 Agent", "Agents"], env: ["环境变量", "Environment"], credentials: ["凭证管理", "Credentials"], approvals: ["审批", "Approvals"] };
 export function WorkbenchShell({ view, wallboardUrl, onViewChange, onHome, canApprove, canManageCredentials = false, canManageEnvironment = false, pendingCount, toolbar, children, inspector, onCloseInspector }: { view: ViewKey; wallboardUrl?: string; onViewChange: (view: ViewKey) => void; onHome?: () => void; canApprove: boolean; canManageCredentials?: boolean; canManageEnvironment?: boolean; pendingCount: number; toolbar: ReactNode; children: ReactNode; inspector?: ReactNode; onCloseInspector: () => void }) {
   const { locale } = useLanguage();
   const zh = locale === "zh-CN";

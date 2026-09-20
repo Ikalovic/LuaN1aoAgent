@@ -38,6 +38,8 @@ vi.mock("./components/SkillsView", () => ({
 }));
 
 vi.mock("./components/GraphView", () => ({ GraphView: () => <div>graph content</div> }));
+vi.mock("./components/AgentsPanel", () => ({ AgentsPanel: ({ user }: { user: AuthUser }) => <div>specialists for {user.role}</div> }));
+vi.mock("./components/MemoryView", () => ({ MemoryView: ({ runtimeDir }: { runtimeDir: string }) => <div>memory for {runtimeDir}</div> }));
 
 vi.mock("./components/CredentialsView", () => ({
   CredentialsView: ({ runtimeDir }: { runtimeDir: string }) => <div>credentials for {runtimeDir}</div>
@@ -63,6 +65,19 @@ describe("App Skills route", () => {
     render(<LanguageProvider><App user={admin} onLogout={vi.fn()} /></LanguageProvider>);
 
     expect(screen.getByText("skill registry content")).toBeInTheDocument();
+  });
+  it("exposes specialist management independently of runtime data for both roles", () => {
+    window.history.replaceState({}, "", "/?view=agents");
+    render(<LanguageProvider><App user={{ ...admin, role: "analyst" }} onLogout={vi.fn()} /></LanguageProvider>);
+    expect(screen.getByText("specialists for analyst")).toBeInTheDocument();
+    expect(screen.getByRole("tab", { name: "Agents", selected: true })).toBeInTheDocument();
+    expect(screen.queryByText("runtime unavailable")).not.toBeInTheDocument();
+  });
+  it("connects graph memory to the active runtime and assets navigation", () => {
+    window.history.replaceState({}, "", "/?view=memory&runtimeDir=runtime-memory");
+    render(<LanguageProvider><App user={admin} onLogout={vi.fn()} /></LanguageProvider>);
+    expect(screen.getByText("memory for runtime-memory")).toBeInTheDocument();
+    expect(screen.getByRole("tab", { name: "Graph memory", selected: true })).toBeInTheDocument();
   });
 
   it("defaults to overview with unavailable metrics and contextual detail only", () => {

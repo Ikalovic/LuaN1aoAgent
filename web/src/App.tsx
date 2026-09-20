@@ -11,6 +11,8 @@ import { SkillsView } from "./components/SkillsView";
 import { McpView } from "./components/McpView";
 import { CredentialsView } from "./components/CredentialsView";
 import { EnvConfigEditor } from "./components/EnvConfigEditor";
+import { AgentsPanel } from "./components/AgentsPanel";
+import { MemoryView } from "./components/MemoryView";
 import { StartRunModal } from "./components/StartRunModal";
 import { TraceView } from "./components/TraceView";
 import { TrafficInspector } from "./components/TrafficInspector";
@@ -57,7 +59,7 @@ export default function App({ user, onLogout, onHome }: { user: AuthUser; onLogo
   const [approvalPendingCount, setApprovalPendingCount] = useState(0);
   const [approvalSnapshot, setApprovalSnapshot] = useState<PendingApproval[]>();
   const isAdmin = user.role === "admin";
-  const globalView = ["skills", "mcp", "env", "approvals"].includes(activeView);
+  const globalView = ["skills", "mcp", "agents", "env", "approvals"].includes(activeView);
   const dashboard = useRuntimeDashboard(runtimeDir);
   const dataMatchesDir = dashboard.loadedRuntimeDir !== undefined && normalizeDir(dashboard.loadedRuntimeDir) === normalizeDir(runtimeDir);
   const data = dataMatchesDir ? dashboard.data : undefined;
@@ -95,7 +97,7 @@ export default function App({ user, onLogout, onHome }: { user: AuthUser; onLogo
   const selectExchange = (exchangeId?: string) => navigate({ exchangeId }, "replace");
   const onExchangeLoaded = useCallback((exchange?: TrafficExchange) => setSelectedExchange(exchange), []);
   const closeInspector = () => navigate({ nodeId: undefined, taskId: undefined, traceId: undefined, exchangeId: undefined }, "replace");
-  const nodeView = ["overview", "operation", "reasoning", "task", "findings"].includes(activeView);
+  const nodeView = ["overview", "operation", "memory", "reasoning", "task", "findings"].includes(activeView);
   const selection = activeView === "trace" ? selectedTraceId : activeView === "traffic" ? selectedExchangeId : nodeView ? selectedNodeId ?? navigation.taskId : undefined;
   const missing = selection && activeView !== "traffic" && !(activeView === "trace" ? selectedTrace : selectedNode);
   const inspector = !globalView && selection ? <>{missing ? <Alert type="warning" title={zh ? "所选记录未加载或已不存在" : "Selected record is not loaded or no longer exists"} /> : activeView === "traffic" ? <TrafficInspector key={runtimeDir + ":" + selectedExchangeId} runtimeDir={runtimeDir} exchange={selectedExchange?.id === selectedExchangeId ? selectedExchange : undefined} user={user} onDirtyChange={(value) => { dirty.current = value; }} onSelectExchange={selectExchange} onReplayed={(exchangeId) => { dirty.current = false; selectExchange(exchangeId); setTrafficRefreshToken((value) => value + 1); }} /> : <Inspector nodes={situation.nodes} traceItems={data?.traceItems ?? []} onSelectNode={(node) => navigate({ view: node.graphKind as GraphKind, nodeId: node.id })} onSelectTrace={(traceId) => navigate({ view: "trace", traceId, role: "all", range: "loaded" })} view={activeView} runtimeDir={runtimeDir} trace={selectedTrace} node={selectedNode} edges={inspectorGraph.edges} artifacts={data?.artifacts.records ?? []} tasks={data?.overview.tasks.items ?? []} agents={data?.overview.agents ?? {}} />}{selectedNode && activeView === "findings" ? <Button onClick={() => navigate({ view: "reasoning", nodeId: selectedNode.id })}>{zh ? "查看证据关系" : "View evidence graph"}</Button> : null}</> : undefined;
@@ -114,7 +116,7 @@ export default function App({ user, onLogout, onHome }: { user: AuthUser; onLogo
   if (activeView === "wallboard") return <Suspense fallback={<div style={{ background: "#090d10", color: "#f1f3f5", minHeight: "100dvh", padding: 32 }}>青玄 · 正在加载态势大屏</div>}><WallboardView dashboard={dashboard} data={data} situation={situation} navigation={navigation} onNavigate={navigate} /></Suspense>;
   const toolbar = <div className="qx-topbar-controls">
     <RunSwitcher runtimeDir={runtimeDir} sessions={sessions} onChange={(next) => navigate({ runtimeDir: next })} onContinue={setContinueTarget} />
-    <Tooltip title={t("app.startTask")}><Button className="qx-start" icon={<Play size={16} />} onClick={() => setStartRunOpen(true)}>{t("app.startTask")}</Button></Tooltip>
+    <Tooltip title={t("app.startTask")}><Button className="qx-start" aria-label={t("app.startTask")} icon={<Play size={16} />} onClick={() => setStartRunOpen(true)}>{t("app.startTask")}</Button></Tooltip>
     {runningNow || stopAccepted ? <Popconfirm title={t("app.stopConfirm")} description={t("app.stopDescription")} onConfirm={stopCurrentRun} okText={t("common.stop")} cancelText={t("common.cancel")}><Button danger loading={stopping} disabled={stopAccepted} icon={<Square size={15} />}>{stopAccepted ? (zh ? "正在停止" : "Stopping") : t("common.stop")}</Button></Popconfirm> : null}
     <Tooltip title={t("app.refreshRuntime")}><Button aria-label={t("app.refreshRuntime")} icon={<RefreshCw size={16} className={dashboard.refreshing ? "spin" : ""} />} onClick={() => void dashboard.refresh()} /></Tooltip>
     <label className="qx-auto-refresh"><Switch size="small" checked={dashboard.autoRefresh} onChange={dashboard.setAutoRefresh} /><span>{t("app.autoRefresh")}</span></label>
@@ -125,6 +127,8 @@ export default function App({ user, onLogout, onHome }: { user: AuthUser; onLogo
   if (activeView === "approvals") content = isAdmin ? <ApprovalsView user={user} onPendingChange={setApprovalPendingCount} /> : <Alert type="warning" title={zh ? "需要管理员权限" : "Administrator access required"} action={<Button onClick={() => navigate({ view: "overview" })}>{zh ? "返回总览" : "Back to overview"}</Button>} />;
   else if (activeView === "skills") content = <SkillsView user={user} />;
   else if (activeView === "mcp") content = <McpView user={user} />;
+  else if (activeView === "agents") content = <AgentsPanel user={user} />;
+  else if (activeView === "memory") content = <MemoryView key={runtimeDir} runtimeDir={runtimeDir} nodes={situation.nodes} edges={situation.edges} selectedNodeId={selectedNodeId} onSelectNode={selectNode} />;
   else if (activeView === "env") content = isAdmin ? <EnvConfigEditor onDirtyChange={onEnvDirtyChange} /> : <Alert type="warning" title={zh ? "需要管理员权限" : "Administrator access required"} action={<Button onClick={() => navigate({ view: "overview" })}>{zh ? "返回总览" : "Back to overview"}</Button>} />;
   else if (activeView === "credentials") content = isAdmin ? <CredentialsView key={runtimeDir} runtimeDir={runtimeDir} /> : <Alert type="warning" title={zh ? "需要管理员权限" : "Administrator access required"} action={<Button onClick={() => navigate({ view: "overview" })}>{zh ? "返回总览" : "Back to overview"}</Button>} />;
   else if (activeView === "connections") content = <ConnectionsView runtimeDir={runtimeDir} user={user} />;

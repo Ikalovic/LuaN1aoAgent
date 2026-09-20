@@ -57,7 +57,16 @@ export async function selectSkillsForTask(input: {
   providerAdmission?: ProviderAdmissionOptions;
   invoke?: () => Promise<SkillSelectionSubmission>;
 }): Promise<SkillSelectionResult> {
-  const eligible = input.snapshot.skills.filter((skill) => skill.valid && skill.enabled && skill.modelInvocable);
+  // An allowlist/denylist restricts the candidate set *before* the model sees
+  // it, so a Specialist Skill policy never wastes a selection cycle on a Skill
+  // it would reject anyway.
+  const allowed = input.allowlist ? new Set(input.allowlist) : undefined;
+  const denied = new Set(input.denylist ?? []);
+  const eligible = input.snapshot.skills.filter((skill) => skill.valid
+    && skill.enabled
+    && skill.modelInvocable
+    && (!allowed || allowed.has(skill.name))
+    && !denied.has(skill.name));
   if (eligible.length === 0) return { selected: [], reasons: {}, diagnostics: [] };
   try {
     const submission = input.invoke

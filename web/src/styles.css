@@ -823,3 +823,101 @@ button.artifact-row-button:hover span { color: #2563eb; }
   .artifact-card { transition: none; }
   .planning-task-status.running svg { animation: none; }
 }
+
+/* Unified capabilities page: Skills + MCP + Specialist Agents */
+.capabilities-view { height: 100%; min-height: 0; overflow: auto; padding: 10px 14px 14px; background: #f7f9fc; }
+.capabilities-view > .ant-tabs { height: 100%; }
+.capabilities-view .ant-tabs-content-holder { min-height: 0; }
+.capabilities-inspector h5 { margin: 0 0 8px !important; font-size: 14px !important; }
+.capabilities-inspector p { margin: 0; color: #657187; font-size: 11px; line-height: 1.65; }
+.agents-view { height: 100%; min-height: 0; overflow: auto; padding: 6px 2px 2px; }
+.agents-summary { display: grid; grid-template-columns: repeat(4, minmax(120px, 1fr)); margin-bottom: 12px; border: 1px solid #e1e6ee; border-radius: 6px; background: #fff; }
+.agents-summary span { min-width: 0; padding: 10px 12px; color: #475569; border-right: 1px solid #edf0f4; font-size: 11px; font-weight: 700; }
+.agents-summary span:last-child { border-right: 0; }
+.agents-toolbar { display: flex; align-items: center; justify-content: space-between; gap: 16px; margin-bottom: 10px; }
+.agents-toolbar h5 { margin: 0 0 2px !important; font-size: 14px !important; }
+.agents-toolbar > div:first-child > span { color: #657187; font-size: 11px; }
+.agents-toolbar-controls { display: grid; grid-template-columns: minmax(210px, 1fr) 150px auto; gap: 7px; align-items: center; }
+.agents-diagnostics { margin-bottom: 10px; }
+.agents-loading { display: grid; min-height: 240px; place-items: center; }
+.agents-table { overflow: hidden; border: 1px solid #e1e6ee; border-radius: 6px; background: #fff; }
+.agents-name { font-size: 11px; }
+.agents-description { display: block; min-width: 240px; color: #526078; line-height: 1.5; overflow-wrap: anywhere; }
+.agents-description small { display: block; margin-top: 3px; color: #8490a3; font-size: 11px; }
+.agents-capabilities .ant-tag { margin-inline-end: 0; }
+.agents-author-fixed { font-size: 10px; }
+.agents-budget-cell { display: flex; flex-direction: column; gap: 2px; }
+.agents-budget { color: #475569; font-size: 11px; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+.agents-readonly-note { display: block; margin-top: 9px; color: #778399; font-size: 10px; }
+.specialist-options-mode { margin-bottom: 16px; padding-bottom: 12px; border-bottom: 1px solid #edf0f4; }
+.specialist-options-form { display: flex; flex-direction: column; gap: 14px; }
+.specialist-option-row { display: flex; flex-direction: column; gap: 6px; }
+.specialist-option-label p { margin: 2px 0 0; color: #657187; font-size: 11px; line-height: 1.55; }
+.specialist-option-key { margin-left: 6px; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 11px; }
+.specialist-option-author-default, .specialist-option-bound-hint { display: block; margin-top: 2px; font-size: 11px; }
+.specialist-option-number, .specialist-option-row .ant-select { width: 100%; }
+
+/* Graph memory view. Reuses GraphView for rendering, so the only layout here is
+   the summary strip and toolbar around it. */
+.memory-view {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  min-height: 0;
+  padding: 4px 2px;
+}
+
+.memory-summary {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 12px 16px;
+  border: 1px solid var(--border-subtle, rgba(148, 163, 184, 0.28));
+  border-radius: 10px;
+  background: var(--surface-raised, rgba(148, 163, 184, 0.06));
+}
+
+.memory-summary .ant-statistic-title {
+  font-size: 12px;
+}
+
+.memory-summary .ant-statistic-content {
+  font-size: 20px;
+}
+
+.memory-badges {
+  max-width: 100%;
+}
+
+.memory-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
+.memory-toolbar .ant-select {
+  min-width: 200px;
+}
+
+.memory-graph {
+  flex: 1 1 auto;
+  min-height: 420px;
+  display: flex;
+}
+
+.memory-graph > * {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.memory-row-id {
+  font-size: 11px;
+  word-break: break-all;
+}
+
+.memory-lead-alert {
+  margin: 0;
+}
