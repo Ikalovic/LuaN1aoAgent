@@ -2,7 +2,7 @@
 name: password-attack
 description: Methodology for controlled credential guessing against an authentication surface — building a failure-signal baseline, choosing between password spraying, single-account exhaustion and credential reuse, detecting lockout/rate-limit/CAPTCHA boundaries, and verifying and handing off a hit. Use when the task is to obtain valid credentials for a known authentication entry point (web login, SSH, FTP, database, SMB, or an offline hash). Do not use it for attack-surface discovery (a login endpoint must already be identified or be identifiable from the supplied material), for exploiting authentication logic flaws that need no guessing, or for social engineering.
 license: MIT
-compatibility: Requires a filesystem-based agent with bash, curl, and Python 3. The executor image ships nmap with NSE brute scripts, curl, python3 (stdlib only), openssh-client with sshpass, and chromium; it does not ship hydra, medusa, ncrack, patator, ffuf, gobuster, hashcat or john.
+compatibility: Requires a filesystem-based agent with bash, curl, and Python 3. The executor image ships hydra 9.4 and medusa 2.2 for online guessing, nmap with NSE brute scripts, sqlmap, hashcat (CPU OpenCL) for offline cracking, curl, python3 stdlib, openssh-client with sshpass, chromium, and the wordlists under /opt/luanniao/wordlists. It does not ship john, hashcat-utils, ncrack, patator or wfuzz.
 allowed-tools: Bash Read Write Edit Glob Grep
 metadata:
   user-invocable: "false"
@@ -63,7 +63,7 @@ wc -c /tmp/bad.txt         # 响应体长度
 1. 已知有效凭据复用（材料里已有凭据，先验证它在这台机器上是否有效）。
 2. 默认与产品文档凭据（见 `default-credentials`）。
 3. 从目标线索推导的字典（产品名、域名、年份、单位缩写 + 常见后缀）。
-4. 通用弱口令字典。
+4. 通用弱口令字典（`/opt/luanniao/wordlists/passwords-common.txt`，先用 `wc -l` 看规模）。
 5. 只在 1–4 都排除后才考虑扩大字典规模。
 
 **账号枚举优先于穷举**：如果"账号不存在"与"口令错误"的响应可区分（文案、长度、耗时），先枚举出有效账号，再对有效账号定向尝试。这通常比无差别喷洒少一个数量级的尝试次数。
@@ -88,11 +88,35 @@ wc -c /tmp/bad.txt         # 响应体长度
 3. 把凭据写入凭据存储并引用 artifact；说明它有效的证据，而不是只写结论。
 4. 立刻停止对该入口的继续尝试——命中之后继续喷洒只会增加告警面。
 
-## 六、反模式
+## 六、工具与字典
+
+在线猜测按这个顺序选，语法用 `hydra -U <module>` 现查，不要凭记忆写参数：
+
+| 场景 | 工具 |
+|---|---|
+| SSH / FTP / IMAP / SMTP / POP3 / RDP / VNC / SMB / MySQL / MSSQL / PostgreSQL / HTTP 认证头 | `hydra`（首选），`medusa` 作为某模块失败时的替代 |
+| 表单字段固定、无一次性 token 的 Web 登录 | `hydra http-post-form`；字段简单时也可用 `nmap --script http-form-brute` |
+| 带 CSRF 刷新、JSON 体、多步登录 | `curl` 或 python3 stdlib 自建脚本（见 `web-login-bruteforce`） |
+| 注入点上的库表与凭据 | `sqlmap`（`--dbs`、`--dump`、`--passwords`） |
+| 离线哈希 | `hashcat`（CPU OpenCL，无 GPU；先 `--identify` 定算法，再看启动横幅的 Speed 决定可行性） |
+
+预置字典（只读）：
+
+```
+/opt/luanniao/wordlists/passwords-common.txt      # 口令 top-N
+/opt/luanniao/wordlists/usernames-common.txt      # 账号名（喷洒用）
+/opt/luanniao/wordlists/default-credentials.txt   # user:pass 对，hydra -C 直接吃
+```
+
+`hydra -C` 的例子：`hydra -C /opt/luanniao/wordlists/default-credentials.txt -f -t 4 ssh://TARGET`。产品指纹明确时，这一份比通用字典命中率高得多。
+
+**没有** john、hashcat-utils、ncrack、patator、wfuzz。需要它们的能力时改用上表工具，或如实报告边界。
+
+## 七、反模式
 
 - 没有失败基线就批量喷洒。
 - 只看状态码判定命中（大量系统成功失败都是 200 或都是 302）。
 - 用同一字典对同一目标重复喷洒并报告为进展。
 - 把默认凭据表条目、公开泄露线索当作已确认凭据。
-- 假设环境里有 hydra / hashcat / john / ffuf。这个环境没有；用 `nmap` 的 NSE 爆破脚本、`curl` 或 python3 stdlib 实现。
+- 把 `账号数 × 口令数` 超过尝试上限的字典直接丢给 hydra：先 `head -n` 截断并记录截断位置，否则"跑完了"是假的。
 - 把"尝试了 N 次"当作"排除了 N 个候选"——只有可复现的判定信号才能支撑排除结论。

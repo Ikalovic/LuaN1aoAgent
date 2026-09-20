@@ -1,0 +1,114 @@
+# Curated usernames appended to the short list that ships with nmap (10 entries).
+# Blank lines and lines starting with # are stripped at image build time; the
+# build sorts -u.
+#
+# Every entry must be a plausible *account name*, not a password. Vendor account
+# names first, then service accounts, then the generic names operators actually
+# create. See templates/skills/credential-stuffing/SKILL.md for how to narrow
+# this list from material instead of spraying it whole.
+
+# --- vendor / appliance defaults ---
+admin
+administrator
+Admin
+Administrator
+root
+toor
+user
+guest
+support
+operator
+manager
+supervisor
+service
+system
+default
+cisco
+huawei
+h3c
+ruijie
+zte
+ubnt
+mikrotik
+pi
+admin1
+administrator1
+# --- platform and middleware ---
+tomcat
+weblogic
+jboss
+wildfly
+jenkins
+grafana
+zabbix
+nagios
+nagiosadmin
+pfsense
+opnsense
+sa
+postgres
+mysql
+mariadb
+oracle
+redis
+mongodb
+elastic
+elasticsearch
+kibana
+rabbitmq
+minio
+# --- service accounts seen in real deployments ---
+svc
+svcuser
+service-account
+svc_backup
+backup
+deploy
+deployer
+git
+gitlab
+jenkins-build
+ansible
+puppet
+docker
+vagrant
+ubuntu
+ec2-user
+azureuser
+centos
+fedora
+ftp
+ftpuser
+www
+www-data
+web
+webadmin
+webmaster
+apache
+nginx
+nobody
+daemon
+cron
+mail
+postfix
+dovecot
+vpn
+vpnuser
+test
+testuser
+tester
+demo
+dev
+developer
+qa
+stage
+staging
+prod
+# --- Chinese-context IT accounts ---
+admin888
+guanli
+guanliyuan
+yunwei
+yunweiadmin
+运维
+管理员

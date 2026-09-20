@@ -56,6 +56,15 @@ curl -sS http://TARGET/favicon.ico | md5sum
 | FTP 匿名 | `anonymous` | 任意邮箱 | 见 `ftp-anon` |
 | CUPS | — | — | 通常无认证 |
 
+上表的机器可读版本随镜像发布在 `/opt/luanniao/wordlists/default-credentials.txt`，格式就是 `hydra -C` 直接吃的 `user:pass` 行（`root:` 表示空口令，不是笔误）。指纹确认产品后投递对应行：
+
+```bash
+hydra -C /opt/luanniao/wordlists/default-credentials.txt -f -t 4 ssh://TARGET
+hydra -C /opt/luanniao/wordlists/default-credentials.txt -f -t 4 TARGET ftp
+```
+
+**不要**把整份文件无差别喂给一个还没识别的登录框——那既浪费尝试预算，又更容易触发锁定。
+
 ## 三、产品名派生候选（比通用字典命中率高得多）
 
 产品被识别后，按目标线索派生候选，并**记录派生规则**（这是可复核的推理，也是后续复用能力）：

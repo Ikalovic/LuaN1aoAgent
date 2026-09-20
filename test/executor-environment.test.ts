@@ -2,7 +2,9 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   EXECUTOR_TOOL_PROBE_LIST,
-  getExecutorEnvironmentFacts
+  getExecutorEnvironmentFacts,
+  parseExecutorImageFacts,
+  renderExecutorEnvironmentFacts
 } from "../src/executor-environment.js";
 
 test("workspace facts state the real cwd, $TMPDIR and the no-/workspace boundary", async () => {
@@ -113,7 +115,77 @@ test("docker facts degrade silently when the image probe fails", async () => {
 test("the default host probe resolves real PATH tools and caches per process", async () => {
   const facts = await getExecutorEnvironmentFacts({ mode: "workspace", sandboxRoot: "/tmp/run" });
   const toolLine = facts.split("\n").find((line) => line.startsWith("- 可用工具："));
+  // A host missing the last probed tool must still report the tools it has: the
+  // shell loop's status is its last iteration's status, so the probe forces a
+  // zero exit. `crunch` is deliberately probed even though most hosts lack it.
   assert.ok(toolLine, "host PATH probe should find at least one common tool");
   assert.ok(toolLine.includes("curl"));
   assert.ok(toolLine.includes("tar"));
 });
+
+test("the probe list asks about the bruteforce toolchain the image ships", () => {
+  for (const tool of ["hydra", "medusa", "hashcat", "sqlmap", "ffuf", "gobuster", "dirb", "crunch"]) {
+    assert.ok(EXECUTOR_TOOL_PROBE_LIST.includes(tool), `${tool} must be probed`);
+  }
+});
+
+test("docker facts advertise the verified wordlist paths", () => {
+  const facts = renderExecutorEnvironmentFacts(
+    { mode: "docker", sandboxRoot: "/host/sandboxes/task-6" },
+    {
+      tools: ["hydra", "hashcat"],
+      wordlists: ["/opt/luanniao/wordlists/passwords-common.txt", "/opt/luanniao/wordlists/default-credentials.txt"]
+    }
+  );
+
+  const wordlistLine = facts.split("\n").find((line) => line.startsWith("- 预置字典"));
+  assert.ok(wordlistLine, "a verified wordlist must be advertised");
+  assert.ok(wordlistLine.includes("/opt/luanniao/wordlists/passwords-common.txt"));
+  assert.ok(wordlistLine.includes("hydra -C"));
+  assert.ok(facts.split("\n").length <= 25);
+});
+
+test("no wordlists and no tools means no dangling lines", () => {
+  const facts = renderExecutorEnvironmentFacts(
+    { mode: "docker", sandboxRoot: "/host/sandboxes/task-7" },
+    { tools: [], wordlists: [] }
+  );
+
+  assert.ok(!facts.includes("预置字典"));
+  assert.ok(!facts.includes("可用工具"));
+});
+
+test("image facts accept both label schema versions and fail closed otherwise", () => {
+  const v2 = parseExecutorImageFacts(
+    JSON.stringify({
+      version: 2,
+      uid: 1000,
+      rawSockets: false,
+      tools: ["hydra", "hashcat", 7],
+      wordlists: ["/opt/luanniao/wordlists/passwords-common.txt"]
+    })
+  );
+  assert.deepEqual(v2.tools, ["hydra", "hashcat"]);
+  assert.deepEqual(v2.wordlists, ["/opt/luanniao/wordlists/passwords-common.txt"]);
+
+  // Version 1 labels predate the wordlist list and must keep working.
+  const v1 = parseExecutorImageFacts(JSON.stringify({ version: 1, uid: 1000, rawSockets: false, tools: ["nmap"] }));
+  assert.deepEqual(v1, { tools: ["nmap"], wordlists: [] });
+
+  const rejected: Array<string | undefined> = [
+    undefined,
+    "",
+    "not json",
+    "[]",
+    JSON.stringify({ version: 3, uid: 1000, rawSockets: false, tools: ["nmap"] }),
+    // A label claiming raw sockets would describe a different sandbox than the
+    // one the container actually runs in, so no tool list is better than a
+    // half-trusted one.
+    JSON.stringify({ version: 2, uid: 1000, rawSockets: true, tools: ["nmap"] }),
+    JSON.stringify({ version: 2, uid: 0, rawSockets: false, tools: ["nmap"] })
+  ];
+  for (const raw of rejected) {
+    assert.deepEqual(parseExecutorImageFacts(raw), { tools: [], wordlists: [] }, `must reject ${String(raw)}`);
+  }
+});
+

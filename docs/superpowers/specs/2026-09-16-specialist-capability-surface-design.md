@@ -20,6 +20,7 @@
 - `skills.allow` 指向 `password-attack` / `default-credentials` / `hydra` / `credential-stuffing`，仓库内**四个技能都不存在**（`.agents/skills/` 只有 `ctf-web`），技能面实际为空。
 - Web 表单爆破所需的 CSRF/token 提取、失败信号基线指纹、会话保持、锁定与验证码检测没有进入工作流。
 - executor 镜像内**没有 hydra/ffuf/hashcat/john/medusa**，只有 `nmap`（605 个 NSE 脚本，含 `http-form-brute`/`http-brute`/`ssh-brute`/`ftp-brute`/`mysql-brute`/`smb-brute`）、`curl`、`python3`、`openssh-client`、`sshpass`、`chromium`。以 hydra 为中心的提示词描述的是一套镜像里不存在的工具链。
+  - **更正（2026-09-17）：这一条已按"补工具"而不是"改提示词"解决。** 镜像现在装有 `hydra`/`medusa`/`hashcat`（含 `ocl-icd-libopencl1` + `pocl-opencl-icd`）/`sqlmap`/`ffuf`/`gobuster`/`dirb`/`crunch`，以及 `/opt/luanniao/wordlists/` 下的字典；镜像 label 升到 schema v2 并携带字典路径，构建期断言"label 里承诺的每个工具都必须在 PATH 上"（`test/executor-image-contract.test.ts` 防止 label 与断言漂移）。`john` 仍**故意不装**：Debian 打包的是非 jumbo 版，读不了裸哈希、也没有 `*2john` 提取器，装上只会误导。据此重写了 bruteforce 提示词与 `password-attack`/`web-login-bruteforce`/`credential-stuffing` 三个技能（此前它们都在告诉 Agent"这些工具不存在"）。
 
 ## 2. 目标与非目标
 

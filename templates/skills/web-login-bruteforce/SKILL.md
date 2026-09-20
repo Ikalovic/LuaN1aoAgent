@@ -1,8 +1,8 @@
 ---
 name: web-login-bruteforce
-description: End-to-end procedure for brute-forcing an HTTP login surface from a raw request capture, a curl command, or just a login URL — extracting and refreshing CSRF/one-time tokens, keeping the session, handling form-encoded vs JSON bodies, fingerprinting the failure signal, and choosing between nmap http-form-brute and a purpose-built curl/python script. Use when the target of the credential attack is a web form, JSON API, or HTTP auth header (Basic/Digest/NTLM). Do not use it for non-HTTP services (see password-attack) or when the login flow requires solving a CAPTCHA or a hardware second factor.
+description: End-to-end procedure for brute-forcing an HTTP login surface from a raw request capture, a curl command, or just a login URL — extracting and refreshing CSRF/one-time tokens, keeping the session, handling form-encoded vs JSON bodies, fingerprinting the failure signal, and choosing between hydra, nmap http-form-brute and a purpose-built curl/python script. Use when the target of the credential attack is a web form, JSON API, or HTTP auth header (Basic/Digest/NTLM). Do not use it for non-HTTP services (see password-attack) or when the login flow requires solving a CAPTCHA or a hardware second factor.
 license: MIT
-compatibility: Requires a filesystem-based agent with bash, curl, and Python 3 (stdlib only; requests is not installed). nmap 7.93 with NSE scripts is available. chromium is available for JS-driven flows.
+compatibility: Requires a filesystem-based agent with bash, curl, and Python 3 (stdlib only; requests is not installed). hydra 9.4, medusa 2.2, nmap 7.93 with NSE scripts, ffuf, gobuster and sqlmap are available, as are the wordlists under /opt/luanniao/wordlists. chromium is available for JS-driven flows. john and hashcat-utils are not installed.
 allowed-tools: Bash Read Write Edit Glob Grep
 metadata:
   user-invocable: "false"
@@ -85,7 +85,7 @@ if __name__ == "__main__":
 
 ## 三、会话与 Cookie
 
-- 用 Cookie jar 保持会话（curl 的 `-c/-b`，或 python 的 `http.cookiejar`）。
+- 用 Cookie jar 保持会话（curl 的 `-c/-b`，或 python 的 `http.cookiejar`）。hydra 只能在模块串里固定一份 Cookie（`...:C=PHPSESSID=abc`），不能逐次刷新。
 - 不要跨尝试复用陈旧的会话状态；验证码、锁定计数、token 都可能绑定在会话上。
 - `curl` 默认跟随重定向会让 `-w '%{http_code}'` 报最终状态码而掩盖 302 的成功信号。要么用 `-D -` 看原始响应头，要么显式禁用跟随（python 里覆盖 `redirect_request` 返回 `None`）。
 
@@ -96,11 +96,33 @@ if __name__ == "__main__":
 | 表单 | `application/x-www-form-urlencoded`，`curl -d 'user=a&pass=b'` |
 | JSON API | `curl -H 'Content-Type: application/json' -d '{"username":"a","password":"b"}'`；python 用 `json.dumps` |
 | GraphQL | `POST` + `{"query":"...","variables":{...}}` |
-| Basic / Digest / NTLM | `curl -u user:pass --basic|--digest|--ntlm`，或 `nmap --script http-brute` |
+| Basic / Digest / NTLM | `curl -u user:pass --basic|--digest|--ntlm`，或 `hydra ... http-get /`，或 `nmap --script http-brute` |
 
-## 五、nmap http-form-brute 与自建脚本的分工
+## 五、路径选择：hydra / nmap http-form-brute / 自建脚本
 
-**适用 `nmap --script http-form-brute`**：表单字段固定、**没有一次性 token**、字段名已知。
+| 认证面 | 用哪个 | 为什么 |
+|---|---|---|
+| 表单字段固定、**无一次性 token** | `hydra http-post-form`（首选） | 最快，自带并发、命中即停、结果落盘 |
+| 表单字段固定、无 token、想少写参数 | `nmap --script http-form-brute` | 参数少，`onsuccess`/`onfailure` 判定直观 |
+| Basic / Digest / NTLM 认证头 | `hydra http-get` 或 `curl -u` | 无会话概念，判定就是状态码 |
+| Cookie 形态、字段名已知、无 token | `hydra http-post-form` + 手工 Cookie | hydra 的 cookie 支持弱，必要时落脚本 |
+| **带一次性 CSRF token** | 自建脚本（第二节骨架） | hydra 与 NSE 都无法逐次刷新 token |
+| JSON 体、多步登录、按响应差异判定 | 自建脚本 | 请求构造超出 hydra 的表达能力 |
+
+`hydra` 的关键语法（详细参数先跑 `hydra -U http-post-form` 确认）：
+
+```bash
+hydra -L users.txt -P /opt/luanniao/wordlists/passwords-common.txt -f -t 4 \
+  -o hydra.out TARGET http-post-form \
+  "/login.php:username=^USER^&password=^PASS^:F=Login failed"
+```
+
+- 第三段用 `:` 分成三部分：路径、请求体模板、判定。`^USER^` / `^PASS^` 是占位符。
+- `F=` 是**失败时出现**的字符串，`S=` 是**成功时出现**的字符串。字符串取自已观察到的响应原文片段，不要改写措辞；两者都拿不到时先回到失败基线这一步。
+- `-f` 首个命中即停；`-t` 不要超过 Planner 下发的并发上限。
+- hydra 没有"跑完整个字典"之外的花样：规模必须先算进尝试预算（见 `password-attack` 第六节）。
+
+**`nmap --script http-form-brute`** 的适用面：表单字段固定、**没有一次性 token**、字段名已知。
 
 已核实的可用参数（nmap 7.93）：
 
@@ -153,6 +175,29 @@ chromium --headless --disable-gpu --no-sandbox \
 - 命中后用一条只读请求确认已认证会话（例如 `GET /index.php` 并检查页面出现用户名），不要执行任何写操作。
 - 把**失败基线**与**命中响应**两份原文都留成证据。
 
-## 九、这个环境里没有的工具
+## 九、可用工具与字典
 
-`hydra`、`medusa`、`ncrack`、`patator`、`ffuf`、`gobuster`、`wfuzz` **都不存在**。不要生成会因命令缺失而失败的计划；Web 侧一律走 `nmap` NSE 或 `curl` / `python3 stdlib`。
+这个环境里**有**：
+
+| 工具 | 用途 |
+|---|---|
+| `hydra` 9.4 | 首选：`http-post-form` / `http-get` / 40+ 服务模块 |
+| `medusa` 2.2 | hydra 某模块出错时的替代实现 |
+| `nmap` 7.93 | NSE 爆破脚本（`http-form-brute`、`http-brute`、`ssh-brute` 等） |
+| `curl` / `python3` stdlib | 带 token、JSON、多步登录的定制流程 |
+| `ffuf` / `gobuster` / `dirb` | 路径与参数爆破 |
+| `sqlmap` | 注入点上的库表与凭据提取 |
+| `chromium` | 观察 SPA 真实登录请求 |
+
+字典（只读，直接引用，不要临时拼通用字典）：
+
+```
+/opt/luanniao/wordlists/passwords-common.txt      # 口令，top-N
+/opt/luanniao/wordlists/usernames-common.txt      # 账号名
+/opt/luanniao/wordlists/default-credentials.txt   # user:pass 对，供 hydra -C
+/opt/luanniao/wordlists/directories-common.txt    # Web 路径
+```
+
+先 `wc -l` 看规模再决定用哪个。产品指纹明确时，`default-credentials.txt` 里的对应行比通用字典命中率高得多（见 `default-credentials` 技能）。
+
+**没有** john、hashcat-utils、ncrack、patator、wfuzz。不要生成会因命令缺失而失败的计划；需要它们的能力时改用上表工具，或如实报告这是环境边界。

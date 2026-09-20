@@ -2,7 +2,7 @@
 name: credential-stuffing
 description: Reuse of already-obtained credentials and pair material — building username:password pairs from leaked lists, configuration files, prior task artifacts or partial knowledge, testing reuse across hosts and services without exploding into a cartesian product, and minimising and de-duplicating validity checks. Use when some credential material already exists and the question is where else it works, or when only one half of the pair is known (accounts without passwords, or a password without accounts). Do not use it for guessing unknown credentials from scratch (see password-attack) or for offline hash cracking.
 license: MIT
-compatibility: Requires bash, curl, and Python 3 stdlib. Works with the credentials tooling provided by the runtime.
+compatibility: Requires bash, curl, Python 3 stdlib, and hashcat for the offline path. Works with the credentials tooling provided by the runtime; the shared wordlists live under /opt/luanniao/wordlists.
 allowed-tools: Bash Read Write Edit Glob Grep
 metadata:
   user-invocable: "false"
@@ -87,7 +87,21 @@ for target in targets:
 
 ## 四、离线哈希材料
 
-本环境**没有 hashcat / john**，只能用 python3 `hashlib` 做字典比对：
+**首选 `hashcat`**（镜像内有；CPU OpenCL，没有 GPU）。字典、规则、掩码三种攻击它都能表达，而且比手写脚本快一个数量级：
+
+```bash
+head -n 3 hashes.txt                                  # 先看清格式，一行一个哈希
+hashcat --identify hashes.txt                         # 定算法；或按前缀判断
+#   $1$ -> 500   $2y$/$2a$ -> 3200   $6$ -> 1800   NTLM -> 1000   裸 md5 -> 0   裸 sha1 -> 100
+hashcat -m <mode> -a 0 hashes.txt /opt/luanniao/wordlists/passwords-common.txt
+hashcat -m <mode> -a 0 hashes.txt /opt/luanniao/wordlists/passwords-common.txt \
+  -r /usr/share/hashcat/rules/best64.rule            # 字典 + 变形规则
+hashcat -m <mode> hashes.txt --show                  # 复核命中
+```
+
+启动横幅里的 `Speed` 行给出本机真实速率，**用它估算完成时间再决定要不要跑**；CPU 上 bcrypt（3200）这类慢哈希基本不可行，要如实说，而不是让它挂着。
+
+**什么时候还用手写脚本**：候选口令派生出的摘要要拿去做别的用途（例如从明文算 NTLM 再复用）、或需要 hashcat 表达不了的组合逻辑时。下面这份骨架仍然有效：
 
 ```python
 #!/usr/bin/env python3
@@ -118,7 +132,7 @@ for word in open(wordlist, encoding="utf-8"):
 print(f"[info] unresolved={len(targets)}")
 ```
 
-**先算规模再跑**：字典行数 × 哈希数就是要做的摘要次数。跑不完就如实报告"当前环境在预算内无法完成"，不要把"跑了 3 分钟"写成"排除了该口令空间"。
+**先算规模再跑**：字典行数 × 哈希数就是要做的摘要次数。跑不完就如实报告"当前环境在预算内无法完成"，不要把"跑了 3 分钟"写成"排除了该口令空间"。镜像里**没有 john**，也没有 `*2john` 提取器：材料是 zip / office / ssh 私钥等容器格式、需要先取出哈希时，如实报告这是环境边界，不要臆造命令。
 
 ## 五、结论与交接
 
