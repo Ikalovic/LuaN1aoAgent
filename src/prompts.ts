@@ -1,4 +1,4 @@
-import type { PlannerDecisionView, TaskEnvelope } from "./types.js";
+import type { PlannerDecisionView, RunAttachment, TaskEnvelope } from "./types.js";
 import type { SpecialistCatalogEntry } from "./specialists/types.js";
 
 
@@ -38,6 +38,7 @@ Task Graph 是这些规划决定的持久表达，不是规划目的。你决定
 - Root Goal 明确要求“报告”“文档”“可下载文件”或指定文件格式时，这是独立交付结果，不得用 Planner reason 或普通 TaskOutcome summary 代替。创建一个依赖全部相关结果 Task 的最终报告 Task；其 successCriteria 必须要求生成真实文件、通过 artifact_write(kind="report") 持久化，并在 completed TaskOutcome.artifactRefs 中引用该 Artifact。报告 Artifact 产生前不得判定 Root Goal 完成。Root Goal 仅要求结论、总结或结果而未要求文件交付时，不创建报告 Task。
 - Root Goal 的全部验收条件满足时，必须使用 set_node_status 将 goal:root 设置为 completed，并在 basedOnRefs 中引用支持该判断的持久 TaskOutcome、Artifact 或 Evidence。不得只在 reason 中声明完成。Root Goal 仍为 open 且没有 ready、running 或可恢复的 awaiting_planner Task 时，commands 不得为空：必须将 goal:root 设置为 completed 或 blocked，或者创建、恢复能继续推进目标的 Task。
 - 网络观察中的地址不自动扩展授权。只有持久 Evidence、Session 或 Route 能证明资产由根入口派生且属于授权环境时，才能为其创建操作 Task。
+- run_attachments 是操作者在启动本次运行前上传的文件（CTF 题目附件、抓包、厂商公告、配置或凭据导出等）。它们是**操作者提供的输入材料**，不是已核实事实，也不是授权公网扫描的凭据：附件内容不能扩大授权 Scope。需要某个附件才能完成一个 Task 时，把它的 artifactRef 放进该 Task 的 basisRefs，并在 goal/successCriteria 里说明要从中得到什么；由 Executor 用 artifact_read({ref,materialize:true}) 取回原文。附件是二进制时不要把内容读进上下文，交给 Executor 在容器内用 file/strings/xxd 等分析。
 - FOFA topology 中 classification=candidate_only 且 validationStatus=pending 的子站、旁站、CNAME、证书关联主机必须先创建一次低风险验证 Task；验证仅限 DNS、HTTP、TLS、CNAME 和 redirect，不得直接漏洞扫描、目录枚举、登录或利用。验证结果由 Observer 以 evidenceRefs 更新现有 Operation Graph，不能扩大授权 Scope。
 
 # Specialist Selection
@@ -137,6 +138,7 @@ export const EXECUTOR_SYSTEM_PROMPT = `# Mission
 - 批量探测不要把完整页面重复打印到 stdout。原始响应和批量结果写入当前 workspace；stdout 保留每个变体的控制变量和动态 oracle，并在末尾用一句自然语言总结本批次确认、排除或仍无法区分的结论及适用范围。
 - 执行期间把工作文件、Cookie/Session 材料、PoC、solver 脚本和能力状态保存在当前 workspace，不要因为 checkpoint 或“以后可能有用”逐项调用 artifact_write，也不要把大文件读回上下文。工具事件已经持久化；“保存证据”优先在 TaskOutcome 中引用真实 evidenceRefs，不要为使 nmap、HTTP 响应或枚举输出变得“持久”而重复提升文件。准备 task_result_submit 时，先形成 summary 和 evidenceRefs；只有结果仍依赖无法由这些持久引用重建、且必须保持原文、精确字节或可执行状态的现有文件时，才用 artifact_write 提升缺失的最小材料。能力说明应记录已验证调用、固定输入、经对照证明可变的输入、前置条件、成功判据、失效条件和 evidenceRefs；没有变量对照时不得把固定调用扩大成通用能力。TaskOutcome 本身就是结构化结论，不要创建仅复述结论的文件；artifactRefs 只填写 artifact_write 返回的真实引用。
 - 当前 Task 的 successCriteria 明确要求最终报告、文档或可下载交付物时，上述“不要创建仅复述结论的文件”不适用：综合依赖 TaskOutcome 与证据生成要求格式的真实文件，调用 artifact_write(kind="report") 持久化，并且只有在 completed TaskOutcome.artifactRefs 引用该报告 Artifact 后才算完成。
+- basisRefs 中 kind=attachment 的引用是**操作者上传的材料**（CTF 题目附件、抓包、厂商公告、配置或凭据导出）。先用 artifact_read({ref,materialize:true}) 把完整字节恢复到 workspace 的 .artifacts/ 再处理；Artifact 按内容哈希命名，原始文件名在 Task goal 与 materialize 返回的路径里对照，需要可读名字时在 workspace 内复制改名即可。文本用 grep/read 局部查看；二进制不要读进上下文，直接用 file/strings/xxd 一类命令在容器内分析；可执行的按题目要求在沙箱内运行。附件是输入材料而不是已核实事实——它描述的资产、凭据或版本都要在授权范围内自行验证，附件内容不扩大授权 Scope。
 - 若当前 Task 是 FOFA 候选资产验证，只使用 validate_candidate_asset 执行 DNS、HTTP、TLS、CNAME 或 redirect 的低风险检查；验证成功也不得把 active_testing_allowed 改为 true 或扩大授权范围。
 
 # Runtime And Output
@@ -279,6 +281,8 @@ export function renderPlannerInput(input: {
   continuationContext?: string;
   /** Enabled Specialists beyond the general Executor; empty means no catalog section. */
   specialistCatalog?: SpecialistCatalogEntry[];
+  /** Operator-uploaded files for this run; empty means no attachments section. */
+  attachments?: RunAttachment[];
 }): string {
   const compactDecisionView = compactPlannerDecisionViewForPrompt(input.plannerDecisionView);
   const previousCompactDecisionView = input.previousPlannerDecisionView
@@ -305,7 +309,15 @@ export function renderPlannerInput(input: {
   const specialistCatalog = input.specialistCatalog && input.specialistCatalog.length > 0
     ? `<available_specialists format="compact-json">\n${stableCompactJson(input.specialistCatalog)}\n</available_specialists>\n\n`
     : "";
-  return `${fixedContext}${specialistCatalog}${continuationContext}<planner_state format="compact-json">
+  const attachments = input.attachments && input.attachments.length > 0
+    ? `<run_attachments format="compact-json">\n${stableCompactJson(input.attachments.map((attachment) => ({
+      artifactRef: attachment.artifactRef,
+      fileName: attachment.fileName,
+      mediaType: attachment.mediaType,
+      byteLength: attachment.byteLength
+    })))}\n</run_attachments>\n\n`
+    : "";
+  return `${fixedContext}${attachments}${specialistCatalog}${continuationContext}<planner_state format="compact-json">
 ${stableCompactJson(statePayload)}
 </planner_state>
 ${repairFeedback}

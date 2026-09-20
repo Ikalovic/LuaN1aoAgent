@@ -337,6 +337,25 @@ export interface RuntimeSession {
   running?: boolean;
 }
 
+/** A file staged for a run before it starts; see POST /api/attachments. */
+export interface StagedAttachment {
+  attachmentId: string;
+  fileName: string;
+  mediaType: string;
+  byteLength: number;
+  sha256: string;
+  createdAt: string;
+}
+
+/** A staged file after the run started: its persisted artifact identity. */
+export interface RunAttachment {
+  artifactRef: string;
+  fileName: string;
+  mediaType: string;
+  byteLength: number;
+  sha256: string;
+}
+
 export interface StartRunInput {
   goal: string;
   scope: string;
@@ -347,6 +366,7 @@ export interface StartRunInput {
   maxRunTimeMs?: number;
   maxParallelTasks?: number;
   maxPlannerCycles?: number;
+  attachmentIds?: string[];
 }
 
 export interface ScopeDocumentCandidate {
@@ -381,6 +401,7 @@ export interface StartRunResponse {
   startedAt: string;
   running: boolean;
   continued?: boolean;
+  attachments?: RunAttachment[];
 }
 
 export interface ActiveRun {

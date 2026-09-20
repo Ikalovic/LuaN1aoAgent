@@ -419,7 +419,12 @@ export type ProjectionClaim = {
 export type ArtifactRecord = {
   artifactRef: string;
   taskId?: string;
-  kind: "http_body" | "screenshot" | "stdout" | "stderr" | "poc" | "json" | "text" | "report" | "credential" | "other";
+  /**
+   * `attachment` is written by the Runtime when an operator uploads a file with
+   * the run, never by `artifact_write`: an agent must not be able to label its
+   * own output as operator-provided material.
+   */
+  kind: "http_body" | "screenshot" | "stdout" | "stderr" | "poc" | "json" | "text" | "report" | "credential" | "attachment" | "other";
   mediaType: string;
   path: string;
   byteLength: number;
@@ -427,6 +432,21 @@ export type ArtifactRecord = {
   preview: string;
   contentHash?: string;
 };
+
+/**
+ * An operator-provided file made available to a run. The Planner sees this
+ * descriptor (name, type, size, digest) and passes the ref to the Task that
+ * needs the material; the Executor materializes the bytes into its workspace
+ * with `artifact_read({ref, materialize:true})`.
+ */
+export type RunAttachment = {
+  artifactRef: string;
+  fileName: string;
+  mediaType: string;
+  byteLength: number;
+  sha256: string;
+};
+
 
 export type GraphView = "planner" | "reasoning" | "operation" | "task" | "sessions";
 

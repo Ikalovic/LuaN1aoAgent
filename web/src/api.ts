@@ -1,5 +1,5 @@
 import { translate } from "./language";
-import type { ActiveRunsResponse, ApprovalDecisionResponse, ApprovalMode, ApprovalModeUpdateResponse, ApprovalsResponse, ArtifactContent, AuthResponse, ConnectionItem, ConnectionsResponse, CredentialCreateInput, CredentialRecord, CredentialsResponse, EnvConfigChanges, EnvConfigView, McpRegistrySnapshot, ParsedScopeDocument, RegisteredMcpServer, RegisteredSkill, RegisteredSpecialist, RuntimeState, SessionsResponse, SkillRegistrySnapshot, SpecialistOptionsMode, SpecialistRegistrySnapshot, StartRunInput, StartRunResponse, StopRunResponse, TrafficExchange, TrafficFlowRef, TrafficHistoryBody, TrafficHistoryFilters, TrafficHistoryPage, TrafficReplayInput, TrafficReplayResponse } from "./types";
+import type { ActiveRunsResponse, ApprovalDecisionResponse, ApprovalMode, ApprovalModeUpdateResponse, ApprovalsResponse, ArtifactContent, AuthResponse, ConnectionItem, ConnectionsResponse, CredentialCreateInput, CredentialRecord, CredentialsResponse, EnvConfigChanges, EnvConfigView, McpRegistrySnapshot, ParsedScopeDocument, RegisteredMcpServer, RegisteredSkill, RegisteredSpecialist, RuntimeState, SessionsResponse, SkillRegistrySnapshot, SpecialistOptionsMode, SpecialistRegistrySnapshot, StagedAttachment, StartRunInput, StartRunResponse, StopRunResponse, TrafficExchange, TrafficFlowRef, TrafficHistoryBody, TrafficHistoryFilters, TrafficHistoryPage, TrafficReplayInput, TrafficReplayResponse } from "./types";
 
 export class ApiError extends Error {
   constructor(message: string, readonly status: number, readonly code?: string) {
@@ -161,6 +161,25 @@ export function updateEnvConfig(changes: EnvConfigChanges): Promise<EnvConfigVie
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(changes)
   });
+}
+
+/**
+ * Stages one operator attachment and returns its id. Files are uploaded one at a
+ * time so a single oversized or unreadable file does not discard the rest.
+ */
+export async function uploadAttachment(file: File): Promise<StagedAttachment> {
+  return requestJson("/api/attachments", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      fileName: file.name,
+      contentBase64: await fileAsBase64(file)
+    })
+  }).then((body) => (body as { attachment: StagedAttachment }).attachment);
+}
+
+export function discardAttachment(attachmentId: string): Promise<{ ok: boolean }> {
+  return requestJson(`/api/attachments/${encodeURIComponent(attachmentId)}`, { method: "DELETE" });
 }
 
 export function startRun(input: StartRunInput): Promise<StartRunResponse> {

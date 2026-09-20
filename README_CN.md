@@ -451,7 +451,9 @@ npm run web -- --runtime-dir .agent-runtime/sessions/<session> --port 8787
 
 打开 <http://127.0.0.1:8787>。首个注册用户成为管理员，后续用户为分析员。
 
-Web 工作台主要用于观察：读取持久图、事件、Artifact 和运行状态。它也支持在 Web 进程内启动新任务（填写目标与授权范围）并优雅停止由本进程启动的任务；CLI 启动的 run 仍可被观察，但不能从 Web 侧停止。
+Web 工作台主要用于观察：读取持久图、事件、Artifact 和运行状态。它也支持在 Web 进程内启动新任务（填写目标与授权范围、上传授权范围文件与任务附件）并优雅停止由本进程启动的任务；CLI 启动的 run 仍可被观察，但不能从 Web 侧停止。
+
+启动新任务时可携带**任务附件**（CTF 题目附件、抓包、厂商公告、配置或凭据导出）。附件先暂存，启动后持久化为该 run 的 `attachment` Artifact：Planner 看到文件名、类型、大小与引用，Executor 用 `artifact_read({ref,materialize:true})` 把完整字节恢复到 workspace 再分析。附件是操作者提供的输入材料，不扩大授权范围；每次运行最多 12 个、单个不超过 32 MiB。
 
 所有 `/api/*` 流量与连接端点都要求有效 Session。分析员可以读取运行时元数据、敏感代理历史和连接状态，但连接生命周期变更要求管理员专属的 `connectivity:manage` capability；服务不暴露流量删除/导出端点。GET 请求豁免 CSRF，变更请求必须携带同源 double-submit token。所有 runtime 路径（包括符号链接）都会 canonicalize 并限制在配置的 `--runtime-dir` 根目录内，因此 API 不能充当任意文件系统浏览器。
 

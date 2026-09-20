@@ -392,7 +392,7 @@ XLSX parsing reads every worksheet and preserves worksheet/cell evidence for ext
 npm start -- --goal "Assess authorized assets" --scope-file authorization.docx --confirm-scope-files --no-tui
 ```
 
-Repeat `--scope-file` and combine it with `--scope` to form a union. The Web start-run dialog also uploads and previews scope documents. Each file is limited to 5 MiB; scanned PDFs are not OCRed; AI may select only evidence-backed assets literally present in the document and cannot broaden authorization through DNS, FOFA, or inferred relationships. In both CLI and Web flows, only CTF runs may omit scope; pentest behavior is unchanged.
+Repeat `--scope-file` and combine it with `--scope` to form a union. The Web start-run dialog also uploads and previews scope documents, and accepts task attachments (challenge binaries, packet captures, advisories, configuration or credential exports). Each attachment is staged first, then persisted as an `attachment` Artifact of the run: the Planner sees its name, media type, size and ref, and the Executor materializes the bytes into its workspace with `artifact_read({ref,materialize:true})`. Attachments are operator-provided input, so they never broaden the authorized scope, and they are limited to 12 files of 32 MiB each per run. Each file is limited to 5 MiB; scanned PDFs are not OCRed; AI may select only evidence-backed assets literally present in the document and cannot broaden authorization through DNS, FOFA, or inferred relationships. In both CLI and Web flows, only CTF runs may omit scope; pentest behavior is unchanged.
 
 ### CLI options
 

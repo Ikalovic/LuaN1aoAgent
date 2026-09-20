@@ -10,7 +10,7 @@ import {
   renderPlannerInput,
   renderSupervisorInput
 } from "../src/prompts.js";
-import type { GraphSnapshot, PlannerDecisionView, TaskEnvelope } from "../src/types.js";
+import type { GraphSnapshot, PlannerDecisionView, RunAttachment, TaskEnvelope } from "../src/types.js";
 
 test("executor prompt uses bounded experimental method and runtime steering", () => {
   const taskEnvelope: TaskEnvelope = {
@@ -250,6 +250,65 @@ test("planner snapshot renders continuation context between fixed context and pl
     plannerDecisionView: view
   });
   assert.doesNotMatch(without, /<continuation_context>/);
+});
+
+test("planner snapshot lists operator attachments as fixed context, once", () => {
+  const view: PlannerDecisionView = {
+    view: "planner_decision",
+    rootRefs: { goalRef: "goal:root", scopeRef: "scope:root" },
+    taskLedger: [],
+    taskOutcomes: [],
+    reasoningDigest: [],
+    operationDigest: [],
+    blockers: [],
+    graphSummary: { nodeCount: 2, edgeCount: 1, taskStatusCounts: {} }
+  };
+  const attachments: RunAttachment[] = [
+    {
+      artifactRef: "artifact:11111111-1111-4111-8111-111111111111",
+      fileName: "chall.zip",
+      mediaType: "application/zip",
+      byteLength: 2_048,
+      sha256: "a".repeat(64)
+    },
+    {
+      artifactRef: "artifact:22222222-2222-4222-8222-222222222222",
+      fileName: "vendor-advisory.pdf",
+      mediaType: "application/pdf",
+      byteLength: 51_200,
+      sha256: "b".repeat(64)
+    }
+  ];
+  const input = renderPlannerInput({
+    userGoal: "Solve the attached challenge",
+    scopeSummary: "",
+    plannerDecisionView: view,
+    attachments
+  });
+
+  assert.match(input, /<run_attachments format="compact-json">/);
+  // The Planner needs the ref and enough metadata to route the material, and
+  // nothing more: attachment bytes are never inlined into the prompt.
+  assert.match(input, /"artifactRef":"artifact:11111111-1111-4111-8111-111111111111"/);
+  assert.match(input, /"fileName":"chall\.zip"/);
+  assert.match(input, /"mediaType":"application\/zip"/);
+  assert.match(input, /"byteLength":2048/);
+  assert.doesNotMatch(input, /"sha256"/);
+  assert.ok(
+    input.indexOf("<run_attachments") > input.indexOf("<authorized_scope>"),
+    "attachments follow the fixed goal/scope context"
+  );
+  assert.ok(
+    input.indexOf("<run_attachments") < input.indexOf('<planner_state format="compact-json">'),
+    "attachments precede planner state"
+  );
+
+  const none = renderPlannerInput({
+    userGoal: "Solve the attached challenge",
+    scopeSummary: "",
+    plannerDecisionView: view
+  });
+  assert.doesNotMatch(none, /<run_attachments>/);
 });
 
 test("planner follow-up carries a complete structural delta without repeating fixed context", () => {

@@ -137,6 +137,7 @@ import type {
   PlannerDecision,
   PlannerTaskSpec,
   ProjectionClaim,
+  RunAttachment,
   RuntimeAbortContext,
   SupervisorVerdict,
   TaskBudget,
@@ -521,6 +522,8 @@ export class SecurityAgentController {
   private readonly terminalApprover?: TerminalApprover;
   private approvalJudge?: LlmRiskJudge;
   private activeScopeSummary?: string;
+  /** Operator-uploaded files for this run; shown to the Planner in the first snapshot. */
+  private runAttachments: RunAttachment[] = [];
 
   constructor(input: {
     cwd: string;
@@ -1000,9 +1003,12 @@ export class SecurityAgentController {
     maxPlannerCycles?: number;
     maxParallelTasks?: number;
     maxRunTimeMs?: number;
+    /** Operator-provided attachments, already persisted as `attachment` artifacts. */
+    attachments?: RunAttachment[];
     continuation?: { reopenRootGoal?: boolean };
   }): Promise<RunResult> {
     this.activeScopeSummary = input.scopeSummary;
+    this.runAttachments = input.attachments ?? [];
     this.reportingContext = input.reportingContext ?? { taskType: input.taskType ?? "pentest" };
     this.reportingContext = { ...this.reportingContext, taskType: input.taskType ?? this.reportingContext.taskType ?? "pentest" };
     await this.connectivityRuntime?.configureAuthorizedScope(input.scopeSummary);
@@ -1033,6 +1039,15 @@ export class SecurityAgentController {
         maxParallelTasks,
         maxRunTimeMs,
         deadlineAt: new Date(deadlineAt).toISOString(),
+        attachments: this.runAttachments.length > 0
+          ? this.runAttachments.map((attachment) => ({
+            artifactRef: attachment.artifactRef,
+            fileName: attachment.fileName,
+            mediaType: attachment.mediaType,
+            byteLength: attachment.byteLength,
+            sha256: attachment.sha256
+          }))
+          : undefined,
         structuredInvocationsEnabled: this.structuredInvocationsEnabled,
         runtimeDir: this.runtimeDir,
         nodeVersion: process.version,
@@ -3996,6 +4011,9 @@ export class SecurityAgentController {
         repairFeedback: attemptFeedback,
         plannerDecisionView,
         specialistCatalog,
+        // Only meaningful on the first snapshot: renderPlannerInput emits the
+        // fixed context once, and attachments never change mid-run.
+        attachments: this.runAttachments,
         ...(plannerStateDelivery === "snapshot"
           ? this.continuationDigest
             ? { continuationContext: this.continuationDigest }

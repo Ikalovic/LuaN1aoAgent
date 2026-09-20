@@ -7,6 +7,7 @@ import { createInterface } from "node:readline";
 import { DatabaseSync } from "node:sqlite";
 import { WebAuthError, WebAuthService, type WebUser } from "./web-auth.js";
 import { SecurityAgentController } from "./controller.js";
+import type { RunAttachment } from "./types.js";
 import { createLlmRuntime, loadLocalEnvFile } from "./llm-config.js";
 import { stableSessionNodeId } from "./operation-identity.js";
 import {
@@ -43,6 +44,7 @@ import { ScopeDocumentError, SCOPE_DOCUMENT_LIMITS } from "./scope-documents/sco
 import { resolveDocumentScopeWithLlm } from "./scope-documents/scope-document-resolver.js";
 import { ScopeDocumentService, ScopeDocumentServiceError } from "./scope-documents/scope-document-service.js";
 import { ScopeDocumentStore } from "./scope-documents/scope-document-store.js";
+import { ATTACHMENT_LIMITS, AttachmentStore, attachmentExtension } from "./attachments/attachment-store.js";
 import { SkillRegistry } from "./skills/skill-registry.js";
 import { McpRegistry } from "./mcp/mcp-registry.js";
 import { SpecialistOptionError, SpecialistRegistry } from "./specialists/registry.js";
@@ -268,6 +270,9 @@ const defaultRuntimeDir = args["runtime-dir"] ?? ".agent-runtime";
 const authService = new WebAuthService(resolve(cwd, args["auth-db"] ?? ".agent-runtime/web-auth.sqlite"));
 const runtimePathPolicy = await RuntimePathPolicy.create(defaultRuntimeDir, { baseDir: cwd });
 const scopeDocumentStore = new ScopeDocumentStore(join(runtimePathPolicy.rootDir, "scope-documents"));
+// Operator attachments staged before a run starts; on start they are copied into
+// the run's own ArtifactStore as kind=attachment artifacts.
+const attachmentStore = new AttachmentStore(join(runtimePathPolicy.rootDir, "attachments"));
 const skillRegistry = new SkillRegistry(join(cwd, ".agents", "skills"));
 const mcpRegistry = new McpRegistry({ cwd, environment: process.env });
 const specialistRegistry = new SpecialistRegistry({ cwd });
@@ -340,6 +345,25 @@ const server = createServer(async (request, response) => {
       }
       requireRuntimeAccess(user!, "operator:mutate");
       await handleScopeDocumentUpload(request, response);
+      return;
+    }
+    if (url.pathname === "/api/attachments") {
+      if (request.method !== "POST") {
+        await sendJson(response, { error: { code: "method_not_allowed", message: "仅支持 POST" } }, 405);
+        return;
+      }
+      requireRuntimeAccess(user!, "operator:mutate");
+      await handleAttachmentUpload(request, response);
+      return;
+    }
+    const attachmentRoute = /^\/api\/attachments\/([^/]+)$/.exec(url.pathname);
+    if (attachmentRoute) {
+      if (request.method !== "DELETE") {
+        await sendJson(response, { error: { code: "method_not_allowed", message: "仅支持 DELETE" } }, 405);
+        return;
+      }
+      requireRuntimeAccess(user!, "operator:mutate");
+      await handleAttachmentDiscard(response, decodeURIComponent(attachmentRoute[1]));
       return;
     }
     if (url.pathname === "/api/skills") {
@@ -1859,6 +1883,47 @@ function integerValue(value: string, name: string, min: number, max: number): nu
   return parsed;
 }
 
+async function handleAttachmentUpload(request: IncomingMessage, response: ServerResponse): Promise<void> {
+  // Base64 in JSON keeps one upload transport for the whole Web API (the scope
+  // document upload works the same way), at the cost of a 4/3 size overhead.
+  const body = await readJsonBody(request, Math.ceil(ATTACHMENT_LIMITS.inputBytes * 4 / 3) + 4_096);
+  assertOnlyKeys(body, ["fileName", "contentBase64"]);
+  const fileName = stringValue(body.fileName).trim();
+  const contentBase64 = stringValue(body.contentBase64);
+  // An empty payload is called out separately: a different base64-string shape
+  // cannot produce an empty buffer, so this is always "the operator picked a
+  // zero-byte file", which is a mistake worth naming.
+  if (!contentBase64) {
+    throw new HttpError(400, "invalid_attachment_empty", "附件内容为空");
+  }
+  if (!validBase64(contentBase64)) {
+    throw new HttpError(400, "invalid_attachment_base64", "附件内容不是有效的 Base64");
+  }
+  const data = Buffer.from(contentBase64, "base64");
+  if (data.byteLength > ATTACHMENT_LIMITS.inputBytes) {
+    throw new HttpError(413, "attachment_too_large", `附件不能超过 ${Math.floor(ATTACHMENT_LIMITS.inputBytes / (1024 * 1024))} MiB`);
+  }
+  let record;
+  try {
+    record = await attachmentStore.put({ fileName, data });
+  } catch (error) {
+    throw new HttpError(400, "invalid_attachment_name", error instanceof Error ? error.message : String(error));
+  }
+  await sendJson(response, { attachment: record }, 201);
+}
+
+async function handleAttachmentDiscard(response: ServerResponse, attachmentId: string): Promise<void> {
+  let discarded: boolean;
+  try {
+    discarded = await attachmentStore.discard(attachmentId);
+  } catch {
+    throw new HttpError(400, "invalid_attachment_id", "附件 ID 无效");
+  }
+  // Deleting an already-discarded upload is not an error: the operator may have
+  // removed it in another tab, and the run request is the authoritative use.
+  await sendJson(response, { ok: true, discarded });
+}
+
 async function handleScopeDocumentUpload(request: IncomingMessage, response: ServerResponse): Promise<void> {
   const body = await readJsonBody(request, 8 << 20);
   assertOnlyKeys(body, ["fileName", "contentBase64", "useAi"]);
@@ -1909,6 +1974,58 @@ async function handleScopeDocumentRead(response: ServerResponse, documentId: str
   await sendJson(response, stored.parsed);
 }
 
+/**
+ * Attachment ids are validated for shape here and resolved in
+ * `attachRunAttachments`; an unknown id is a client error rather than a silent
+ * no-op, because starting a run without the material the operator selected is
+ * worse than refusing to start.
+ */
+function readAttachmentIds(value: unknown): string[] {
+  if (value === undefined) return [];
+  if (!Array.isArray(value) || value.some((item) => typeof item !== "string")) {
+    throw new HttpError(400, "invalid_request", "attachmentIds 必须是字符串数组");
+  }
+  const ids = [...new Set((value as string[]).map((item) => item.trim()).filter(Boolean))];
+  if (ids.length > ATTACHMENT_LIMITS.filesPerRun) {
+    throw new HttpError(400, "too_many_attachments", `一次运行最多携带 ${ATTACHMENT_LIMITS.filesPerRun} 个附件`);
+  }
+  return ids;
+}
+
+/**
+ * Copies each staged upload into the run's ArtifactStore as a kind=attachment
+ * artifact. The Executor later materializes the bytes into its workspace with
+ * `artifact_read({ref, materialize:true})`, so this is the only place operator
+ * bytes enter the run.
+ */
+async function attachRunAttachments(
+  controller: SecurityAgentController,
+  attachmentIds: string[]
+): Promise<RunAttachment[]> {
+  const attachments: RunAttachment[] = [];
+  for (const attachmentId of attachmentIds) {
+    const staged = await attachmentStore.get(attachmentId).catch(() => undefined);
+    if (!staged) {
+      throw new HttpError(400, "attachment_not_found", "附件不存在或已失效，请重新上传");
+    }
+    const data = await attachmentStore.read(attachmentId);
+    const record = await controller.artifactStore.write({
+      kind: "attachment",
+      mediaType: staged.mediaType,
+      data,
+      extension: attachmentExtension(staged.fileName)
+    });
+    attachments.push({
+      artifactRef: record.artifactRef,
+      fileName: staged.fileName,
+      mediaType: staged.mediaType,
+      byteLength: staged.byteLength,
+      sha256: staged.sha256
+    });
+  }
+  return attachments;
+}
+
 async function handleStartRun(request: IncomingMessage, response: ServerResponse): Promise<void> {
   const body = await readJsonBody(request);
   const goalInput = stringValue(body.goal, "").trim();
@@ -1916,6 +2033,7 @@ async function handleStartRun(request: IncomingMessage, response: ServerResponse
   const scopeDocumentId = stringValue(body.scopeDocumentId, "").trim();
   const confirmedDocumentScope = stringValue(body.confirmedDocumentScope, "").trim();
   const requestedRuntimeDir = stringValue(body.runtimeDir, "").trim();
+  const attachmentIds = readAttachmentIds(body.attachmentIds);
   let runtimeDir: string;
   let continued = false;
   let storedIdentity: StoredRunIdentity | undefined;
@@ -2014,6 +2132,23 @@ async function handleStartRun(request: IncomingMessage, response: ServerResponse
       toolApproval: { mode: () => approvalMode, registry: toolApprovalRegistry }
     });
     const { controller } = agentRuntime;
+    const attachments = await attachRunAttachments(controller, attachmentIds);
+    if (attachments.length > 0) {
+      await controller.executionLog.append({
+        role: "runtime",
+        eventType: "attachments_provided",
+        summary: `Operator attached ${attachments.length} file(s): ${attachments.map((item) => item.fileName).join(", ")}`,
+        payload: {
+          attachments: attachments.map((attachment) => ({
+            artifactRef: attachment.artifactRef,
+            fileName: attachment.fileName,
+            mediaType: attachment.mediaType,
+            byteLength: attachment.byteLength,
+            sha256: attachment.sha256
+          }))
+        }
+      });
+    }
     if (scopeDocumentId) {
       await scopeDocumentStore.copyToRuntime(scopeDocumentId, runtimeDir);
       await controller.executionLog.append({
@@ -2045,6 +2180,7 @@ async function handleStartRun(request: IncomingMessage, response: ServerResponse
       scopeSummary: scope,
       taskType,
       reportingContext,
+      attachments,
       ...(continued ? { continuation: { reopenRootGoal: true } } : {})
     };
     const maxRunTimeMs = optionalPositiveNumber(body.maxRunTimeMs);
@@ -2069,6 +2205,13 @@ async function handleStartRun(request: IncomingMessage, response: ServerResponse
         console.error(`[web run cleanup failed] ${activeRun.runtimeInput}:`, error instanceof Error ? error.message : error);
       }));
 
+    // The bytes now live in the run's ArtifactStore; staged copies are only a
+    // pre-start convenience, and leaving them would grow the staging root
+    // without bound. Best-effort: a stale staged file is not a run failure.
+    await Promise.all(attachmentIds.map((attachmentId) =>
+      attachmentStore.discard(attachmentId).catch(() => false)
+    ));
+
     await sendJson(response, {
       runtimeDir: activeRun.runtimeInput,
       name: basename(runtimeDir),
@@ -2078,7 +2221,8 @@ async function handleStartRun(request: IncomingMessage, response: ServerResponse
       templateDigest: reportingContext.templateDigest,
       startedAt: activeRun.startedAt,
       running: true,
-      continued
+      continued,
+      attachments
     }, 201);
   } catch (error) {
     activeRuns.delete(runtimeDir);
