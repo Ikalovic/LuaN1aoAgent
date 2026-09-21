@@ -74,7 +74,14 @@ export type DockerTaskNetworkAttachment = {
   dnsAddress: string;
 };
 
-export type DockerExecResult = { code: number | null; stdout: Buffer; stderr: Buffer };
+/**
+ * `killedBy` records why the runner terminated the docker CLI. A CLI killed by
+ * us closes with a null exit code either way, so the reason cannot be recovered
+ * from `code` alone — and the bash tool must distinguish "the command printed
+ * nothing" from "we killed it at the timeout".
+ */
+export type DockerExecResult = { code: number | null; stdout: Buffer; stderr: Buffer; killedBy?: "timeout" | "abort" };
+
 
 export type DockerRunner = (
   args: string[],
@@ -584,12 +591,24 @@ export async function createDockerTaskSandbox(input: DockerTaskSandboxInput): Pr
                 { timeoutMs: 10_000 }
               ).catch(() => undefined);
             };
+            const timeoutSeconds = options.timeout ?? executorBashDefaultTimeoutSeconds();
             const result = await execBashInContainer(wrapped, {
               signal: options.signal,
-              timeoutMs: (options.timeout ?? executorBashDefaultTimeoutSeconds()) * 1000,
+              timeoutMs: timeoutSeconds * 1000,
               onKill: killInContainer,
               onData: options.onData ? (chunk) => options.onData(chunk) : undefined
             });
+            // The bash tool recognises exactly two kill reasons from `exec`, and
+            // reports them as "Command timed out after N seconds" / "Command
+            // aborted". Resolving normally instead reaches the model as
+            // "(no output)" with isError=false: measured on a real run, a command
+            // killed at the 300s timeout told the Executor only that it had
+            // produced no output, so it could not tell that 5 minutes of its run
+            // budget were gone. The host backends get this for free from the
+            // SDK's own bash operations; the Docker backend must speak the same
+            // contract.
+            if (result.killedBy === "timeout") throw new Error(`timeout:${timeoutSeconds}`);
+            if (result.killedBy === "abort") throw new Error("aborted");
             return { exitCode: result.code };
           }
         }
@@ -659,14 +678,18 @@ export async function defaultDockerRunner(
     let stdoutBytes = 0;
     let stderrBytes = 0;
     const timeoutMs = options.timeoutMs ?? DOCKER_CONTROL_TIMEOUT_MS;
-    const killChild = (): void => {
+    // First reason wins: a timeout that fires while an abort is already pending
+    // must still read as a timeout.
+    let killedBy: "timeout" | "abort" | undefined;
+    const killChild = (reason: "timeout" | "abort"): void => {
+      killedBy ??= reason;
       options.onKill?.();
       child.kill("SIGTERM");
       setTimeout(() => child.kill("SIGKILL"), 2_000).unref();
     };
-    const timer = setTimeout(killChild, timeoutMs);
+    const timer = setTimeout(() => killChild("timeout"), timeoutMs);
     timer.unref?.();
-    const onAbort = () => killChild();
+    const onAbort = () => killChild("abort");
     options.signal?.addEventListener("abort", onAbort, { once: true });
     child.stdout.on("data", (chunk: Buffer) => {
       stdoutBytes += chunk.byteLength;
@@ -689,7 +712,8 @@ export async function defaultDockerRunner(
       resolvePromise({
         code: code ?? (signal ? null : 1),
         stdout: Buffer.concat(stdout),
-        stderr: Buffer.concat(stderr)
+        stderr: Buffer.concat(stderr),
+        ...(killedBy ? { killedBy } : {})
       });
     });
   });

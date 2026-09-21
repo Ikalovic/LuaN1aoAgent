@@ -21,7 +21,7 @@ const TEST_NETWORK = {
   dnsAddress: "172.30.0.2"
 };
 
-function fakeRunner(handler: (args: string[]) => { code?: number | null; stdout?: string | Buffer; stderr?: string }): { runner: DockerRunner; calls: string[][] } {
+function fakeRunner(handler: (args: string[]) => { code?: number | null; stdout?: string | Buffer; stderr?: string; killedBy?: "timeout" | "abort" }): { runner: DockerRunner; calls: string[][] } {
   const calls: string[][] = [];
   const runner: DockerRunner = async (args) => {
     calls.push(args);
@@ -35,7 +35,8 @@ function fakeRunner(handler: (args: string[]) => { code?: number | null; stdout?
     return {
       code: result.code ?? 0,
       stdout: Buffer.isBuffer(result.stdout) ? result.stdout : Buffer.from(result.stdout ?? ""),
-      stderr: Buffer.from(result.stderr ?? "")
+      stderr: Buffer.from(result.stderr ?? ""),
+      ...(result.killedBy ? { killedBy: result.killedBy } : {})
     };
   };
   return { runner, calls };
@@ -630,6 +631,60 @@ test("docker bash uses the shared default timeout and honors overrides", async (
     } else {
       process.env.EXECUTOR_BASH_DEFAULT_TIMEOUT_S = previous;
     }
+  }
+});
+
+test("docker bash reports a kill reason instead of an empty success", async () => {
+  const runtimeDir = mkdtempSync(join(tmpdir(), "lnw-docker-sandbox-kill-"));
+  const { workspaceDir } = dockerSandboxNames(runtimeDir, "task:kill");
+  mkdirSync(join(workspaceDir, "home"), { recursive: true });
+  chmodSync(workspaceDir, 0o755);
+  chmodSync(join(workspaceDir, "home"), 0o755);
+
+  // The docker CLI closes with a null exit code whether the command finished
+  // silently or we killed it; only the runner knows which, so the fake runner
+  // reports it the same way the real one does.
+  let killedBy: "timeout" | "abort" | undefined;
+  const { runner } = fakeRunner((args) => {
+    if (args[0] === "inspect" && args.at(-1) === "gateway") return { stdout: "gateway-container-id" };
+    if (args[0] === "inspect") return { code: 1 };
+    if (args[0] === "exec" && args[3] === "bash") return { code: null, killedBy };
+    return {};
+  });
+
+  const sandbox = await createDockerTaskSandbox({
+    runtimeDir,
+    runRef: "run:test",
+    taskId: "task:kill",
+    network: TEST_NETWORK,
+    transparentCaPath: "/runtime/traffic/ca/mitmproxy-ca-cert.pem",
+    runner
+  });
+  try {
+    await sandbox.start();
+    const bashTool = sandbox.createTools().find((tool) => tool.name === "bash");
+    assert.ok(bashTool);
+    const signal = new AbortController().signal;
+    const run = (toolCallId: string, timeout?: number) =>
+      bashTool.execute(toolCallId, { command: "sleep 600", ...(timeout ? { timeout } : {}) }, signal, () => undefined, {} as never);
+
+    // A 300s call killed by the per-call timeout must say so: the Executor read
+    // "(no output)" on a real run and could not tell that the command had been
+    // killed and that five minutes of its budget were gone.
+    killedBy = "timeout";
+    await assert.rejects(() => run("call:timeout", 300), /Command timed out after 300 seconds/);
+
+    // Aborts speak the SDK's other documented reason.
+    killedBy = "abort";
+    await assert.rejects(() => run("call:abort"), /Command aborted/);
+
+    // A command that died from a signal we did not send keeps the previous
+    // behaviour: without a kill reason there is nothing to claim.
+    killedBy = undefined;
+    const quiet = await run("call:quiet");
+    assert.match(JSON.stringify(quiet), /no output/);
+  } finally {
+    await sandbox.dispose();
   }
 });
 
