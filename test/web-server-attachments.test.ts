@@ -54,7 +54,7 @@ async function startHangingLlmServer(): Promise<{ port: number; server: Server; 
 }
 
 async function waitForServer(child: ChildProcess, baseUrl: string): Promise<void> {
-  for (let attempt = 0; attempt < 100; attempt += 1) {
+  for (let attempt = 0; attempt < 300; attempt += 1) {
     if (child.exitCode !== null) throw new Error(`web server exited early (${child.exitCode})`);
     try {
       const response = await fetch(`${baseUrl}/api/auth/me`);

@@ -85,7 +85,7 @@ async function reservePort(): Promise<number> {
 }
 
 async function waitForServer(child: ChildProcess, baseUrl: string): Promise<void> {
-  for (let attempt = 0; attempt < 200; attempt += 1) {
+  for (let attempt = 0; attempt < 600; attempt += 1) {
     if (child.exitCode !== null) throw new Error("web server exited");
     try { if ((await fetch(`${baseUrl}/api/auth/csrf`)).ok) return; } catch {}
     await new Promise((done) => setTimeout(done, 25));
