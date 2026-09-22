@@ -607,8 +607,8 @@ const server = createServer(async (request, response) => {
         throw new HttpError(400, "invalid_request", "decision 必须是 approve 或 deny");
       }
       const approvalId = decodeURIComponent(approvalDecisionRoute[1]);
-      if (!toolApprovalRegistry.decide(approvalId, decision)) {
-        throw new HttpError(404, "approval_not_found", "批准请求不存在或已处理");
+      if (!await toolApprovalRegistry.decide(approvalId, decision)) {
+        throw new HttpError(404, "approval_not_found", "批准请求不存在、已失效、正在处理或审计写入失败；本次未放行");
       }
       await sendJson(response, { ok: true, approvalId, decision });
       return;

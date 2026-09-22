@@ -1,6 +1,7 @@
 import { Type } from "typebox";
 import { defineTool } from "@earendil-works/pi-coding-agent";
 import { invokeStructured } from "../pi-runner.js";
+import { serializeToolArgs } from "./tool-approval-payload.js";
 
 /**
  * LLM risk judge for dangerous tool calls.
@@ -144,7 +145,15 @@ export class LlmRiskJudge {
     if (this.disposed) {
       throw new LlmJudgeUnavailableError("Judge session is closed");
     }
-    const argsText = summarizeArgs(input.toolArgs);
+    const argsText = serializeToolArgs(input.toolArgs);
+    if (argsText.length > 4_000) {
+      return {
+        verdict: "require_approval",
+        intent: "审阅完整工具参数",
+        riskLevel: "medium",
+        reason: "完整参数超过自动评估预算，需人工审阅；未向裁判发送截断参数"
+      };
+    }
     const verdictLine = input.forcedVerdict
       ? "verdict 必须为 require_approval；只负责生成 intent/riskLevel/reason。"
       : "verdict 由你按上述标准判定。";
@@ -180,15 +189,5 @@ export class LlmRiskJudge {
         error instanceof Error ? error.message : String(error)
       );
     }
-  }
-}
-
-function summarizeArgs(args: unknown): string {
-  if (args === undefined || args === null) return "{}";
-  try {
-    const text = JSON.stringify(args) ?? String(args);
-    return text.length > 4_000 ? `${text.slice(0, 4_000)}... (truncated)` : text;
-  } catch {
-    return String(args);
   }
 }

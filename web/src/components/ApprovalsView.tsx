@@ -125,7 +125,7 @@ function ApprovalCard({ approval, canDecide, deciding, formatRelative, onDecide 
   formatRelative: (value?: string | number | Date) => string;
   onDecide: (decision: "approve" | "deny") => void;
 }) {
-  const { t } = useLanguage();
+  const { t, formatDate } = useLanguage();
   return (
     <div className="approval-card">
       <div className="approval-card-header">
@@ -151,6 +151,7 @@ function ApprovalCard({ approval, canDecide, deciding, formatRelative, onDecide 
         </div>
       ) : null}
       <div className="approval-card-details">
+        {approval.expiresAt ? <div><span className="approval-card-label">{t("approvals.expiresAt")}</span><p>{formatDate(approval.expiresAt)}</p></div> : null}
         {approval.taskGoal ? <div><span className="approval-card-label">{t("approvals.task")}</span><p>{approval.taskGoal}</p></div> : null}
         {approval.scopeSummary ? <div><span className="approval-card-label">{t("approvals.scope")}</span><p>{approval.scopeSummary}</p></div> : null}
         <div>
