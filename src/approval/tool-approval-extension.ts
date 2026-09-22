@@ -2,10 +2,10 @@ import { createInterface } from "node:readline";
 import type { ExtensionFactory } from "@earendil-works/pi-coding-agent";
 import {
   classifyTool,
-  isDangerousTool,
   type ApprovalMode
 } from "./dangerous-tool-policy.js";
-import { LlmRiskJudge, LlmJudgeUnavailableError, type ToolRiskAssessment } from "./llm-risk-judge.js";
+import { LlmRiskJudge, type ToolRiskAssessment } from "./llm-risk-judge.js";
+import { DEFAULT_APPROVAL_TIMEOUT_MS, serializeToolArgs } from "./tool-approval-payload.js";
 import {
   ToolApprovalRegistry,
   type ApprovalDecision,
@@ -33,6 +33,7 @@ export type TerminalApprover = (input: {
   riskLevel: "low" | "medium" | "high";
   reason?: string;
   taskGoal?: string;
+  signal?: AbortSignal;
 }) => Promise<ApprovalDecision>;
 
 export type ToolApprovalExtensionOptions = {
@@ -45,6 +46,7 @@ export type ToolApprovalExtensionOptions = {
   registry?: ToolApprovalRegistry;
   /** Terminal mode: callback that asks the operator on the CLI. */
   terminalApprover?: TerminalApprover;
+  signal?: AbortSignal | (() => AbortSignal);
 };
 
 export function createToolApprovalExtension(input: ToolApprovalExtensionOptions): ExtensionFactory {
@@ -53,53 +55,55 @@ export function createToolApprovalExtension(input: ToolApprovalExtensionOptions)
       const record = event as unknown as { toolName?: string; input?: unknown };
       const toolName = typeof record.toolName === "string" ? record.toolName : "";
       if (!toolName) return;
+      const signal = typeof input.signal === "function" ? input.signal() : input.signal;
+      const cancelled = { block: true, reason: "任务已取消，审批不可用于执行" };
+      if (signal?.aborted) return cancelled;
       const mode = typeof input.mode === "function" ? input.mode() : input.mode;
       const classification = classifyTool(toolName, mode);
       if (classification === "auto_allow") return;
 
-      const toolArgs = record.input;
-      let assessment: ToolRiskAssessment | undefined;
-      const judge = typeof input.judge === "function" ? await input.judge() : input.judge;
-
-      if (classification === "judge") {
-        if (judge) {
-          try {
-            assessment = await judge.assess({
-              toolName,
-              toolArgs,
-              taskGoal: input.context.taskGoal,
-              scopeSummary: input.context.scopeSummary
-            });
-          } catch (error) {
-            if (!(error instanceof LlmJudgeUnavailableError)) throw error;
-            // Judge unavailable: fall back to the conservative static list.
-            // Unknown tools are allowed; known-dangerous tools require approval.
-            if (!isDangerousTool(toolName)) return;
-          }
-        }
-        if (assessment?.verdict === "allow") return;
-      }
-
-      if (classification === "require_approval" && judge) {
+      let argsText: string;
+      try { argsText = serializeToolArgs(record.input); }
+      catch { return { block: true, reason: "无法完整序列化工具参数，拒绝执行" }; }
+      const toolArgs: unknown = JSON.parse(argsText);
+      const context = { ...input.context };
+      const contextText = JSON.stringify(context);
+      const invalidated = () => {
+        if (signal?.aborted) return cancelled;
         try {
-          assessment = await judge.assess({
+          const currentMode = typeof input.mode === "function" ? input.mode() : input.mode;
+          if (record.toolName === toolName && serializeToolArgs(record.input) === argsText
+            && JSON.stringify(input.context) === contextText && currentMode === mode) return undefined;
+        } catch { /* Changed or non-serializable input cannot reuse approval. */ }
+        return { block: true, reason: "工具参数、上下文或审批模式已变化，请重新发起调用与审批" };
+      };
+      let assessment: ToolRiskAssessment | undefined;
+      try {
+        const judge = await untilAborted(
+          Promise.resolve().then(() => typeof input.judge === "function" ? input.judge() : input.judge), signal
+        );
+        if (signal?.aborted) return cancelled;
+        if (judge) {
+          assessment = await untilAborted(judge.assess({
             toolName,
-            toolArgs,
-            taskGoal: input.context.taskGoal,
-            scopeSummary: input.context.scopeSummary,
-            forcedVerdict: "require_approval"
-          });
-        } catch {
-          assessment = undefined;
+            toolArgs: JSON.parse(argsText),
+            taskGoal: context.taskGoal,
+            scopeSummary: context.scopeSummary,
+            ...(classification === "require_approval" ? { forcedVerdict: "require_approval" as const } : {})
+          }), signal);
         }
+      } catch {
+        assessment = undefined;
       }
+      const changed = invalidated();
+      if (changed) return changed;
+      if (classification === "judge" && assessment?.verdict === "allow") return;
 
-      const decision = await requestDecision(input, {
-        toolName,
-        toolArgs,
-        assessment
-      });
-      if (decision === "approve") return;
+      let decision: ApprovalDecision = "deny";
+      try {
+        decision = await requestDecision({ ...input, context, signal }, { toolName, toolArgs, assessment });
+      } catch { /* Approval interface failure denies execution. */ }
+      if (decision === "approve") return invalidated();
       const intentText = assessment?.intent ? `（意图：${assessment.intent}）` : "";
       const reason = assessment?.reason || "操作存在潜在风险";
       return { block: true, reason: `危险操作 ${toolName}${intentText || " "}未被批准：${reason}` };
@@ -122,18 +126,25 @@ async function requestDecision(
       toolArgs: toolCall.toolArgs,
       intent: toolCall.assessment?.intent,
       riskLevel: toolCall.assessment?.riskLevel ?? "medium",
-      reason: toolCall.assessment?.reason
+      reason: toolCall.assessment?.reason,
+      signal: typeof input.signal === "function" ? input.signal() : input.signal
     });
   }
   if (input.terminalApprover) {
-    return input.terminalApprover({
+    const parentSignal = typeof input.signal === "function" ? input.signal() : input.signal;
+    const expiresAt = Date.now() + DEFAULT_APPROVAL_TIMEOUT_MS;
+    const timeout = AbortSignal.timeout(DEFAULT_APPROVAL_TIMEOUT_MS);
+    const signal = parentSignal ? AbortSignal.any([parentSignal, timeout]) : timeout;
+    const decision = await untilAborted(input.terminalApprover({
       toolName: toolCall.toolName,
-      toolArgs: summarizeToolArgs(toolCall.toolArgs),
+      toolArgs: JSON.stringify(JSON.parse(serializeToolArgs(toolCall.toolArgs)), null, 2),
       intent: toolCall.assessment?.intent,
       riskLevel: toolCall.assessment?.riskLevel ?? "medium",
       reason: toolCall.assessment?.reason,
-      taskGoal: input.context.taskGoal
-    });
+      taskGoal: input.context.taskGoal,
+      signal
+    }), signal);
+    return signal.aborted || Date.now() >= expiresAt ? "deny" : decision;
   }
   // No decision interface configured (e.g. web run without a registry).
   // Deny by default: a dangerous operation must never run unapproved.
@@ -146,6 +157,7 @@ async function requestDecision(
  */
 export function createStdinApprover(): TerminalApprover {
   return (input) => new Promise<ApprovalDecision>((resolve) => {
+    if (input.signal?.aborted) { resolve("deny"); return; }
     // A non-interactive stdin can never answer this prompt. Failing closed keeps
     // the run moving instead of deadlocking the Executor forever on a question
     // nobody can answer — which is exactly what happens to a credential-attack
@@ -172,10 +184,18 @@ export function createStdinApprover(): TerminalApprover {
       ""
     ].filter((line) => line.length > 0);
     const prompt = createInterface({ input: process.stdin, output: process.stdout });
+    let finished = false;
     const finish = (decision: ApprovalDecision): void => {
+      if (finished) return;
+      finished = true;
+      input.signal?.removeEventListener("abort", cancel);
       prompt.close();
       resolve(decision);
     };
+    const cancel = () => finish("deny");
+    input.signal?.addEventListener("abort", cancel, { once: true });
+    prompt.once("close", cancel);
+    if (input.signal?.aborted) { cancel(); return; }
     prompt.question(`${lines.join("\n")}\n批准执行？[y/N] `, (answer) => {
       const normalized = answer.trim().toLowerCase();
       finish(normalized === "y" || normalized === "yes" ? "approve" : "deny");
@@ -183,12 +203,13 @@ export function createStdinApprover(): TerminalApprover {
   });
 }
 
-function summarizeToolArgs(args: unknown): string {
-  if (args === undefined || args === null) return "{}";
-  try {
-    const text = JSON.stringify(args, null, 2) ?? String(args);
-    return text.length > 4_000 ? `${text.slice(0, 4_000)}\n... (truncated)` : text;
-  } catch {
-    return String(args);
-  }
+function untilAborted<T>(work: Promise<T>, signal?: AbortSignal): Promise<T> {
+  if (!signal) return work;
+  return new Promise<T>((resolve, reject) => {
+    const abort = () => reject(new Error("Approval cancelled"));
+    const cleanup = () => signal.removeEventListener("abort", abort);
+    signal.addEventListener("abort", abort, { once: true });
+    if (signal.aborted) { cleanup(); abort(); }
+    work.then((value) => { cleanup(); resolve(value); }, (error) => { cleanup(); reject(error); });
+  });
 }

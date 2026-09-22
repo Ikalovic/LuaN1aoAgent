@@ -35,6 +35,8 @@ export interface PendingApproval {
   riskLevel: "low" | "medium" | "high";
   reason?: string;
   createdAt: string;
+  expiresAt?: string;
+  payloadHash?: string;
   status: "pending" | "approved" | "denied" | "settled";
   decidedAt?: string;
 }

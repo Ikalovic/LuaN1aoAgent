@@ -3126,6 +3126,12 @@ export class SecurityAgentController {
   private async executorToolApproval(taskEnvelope: TaskEnvelope) {
     return {
       mode: this.approvalMode,
+      signal: () => {
+        const taskSignal = this.getActiveTaskState(taskEnvelope.taskId)?.invocationAbortController.signal;
+        return taskSignal
+          ? AbortSignal.any([this.invocationAbortController.signal, taskSignal])
+          : this.invocationAbortController.signal;
+      },
       context: {
         runId: this.runId,
         runtimeDir: this.runtimeDir,

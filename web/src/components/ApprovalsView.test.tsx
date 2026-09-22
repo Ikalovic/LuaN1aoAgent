@@ -67,6 +67,17 @@ beforeEach(() => {
 });
 
 describe("ApprovalsView", () => {
+  it("shows the complete payload and approval expiration", async () => {
+    const toolArgs = JSON.stringify({ command: "x".repeat(9_000) + " FULL_TAIL" });
+    mockedFetch.mockResolvedValue(snapshot([pendingApproval({
+      toolArgs, expiresAt: "2026-09-22T10:15:00.000Z"
+    })]));
+    const { container } = render(<ApprovalsView user={admin} />);
+    await screen.findByText("bash");
+    expect(container.querySelector(".approval-card-args")?.textContent).toBe(toolArgs);
+    expect(screen.getByText("审批有效期至")).toBeInTheDocument();
+  });
+
   it("renders the pending approval card with intent, risk and context", async () => {
     mockedFetch.mockResolvedValue(snapshot([pendingApproval()]));
     render(<ApprovalsView user={admin} />);

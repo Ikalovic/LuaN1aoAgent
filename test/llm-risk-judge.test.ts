@@ -139,3 +139,17 @@ test("default judge invoker keeps the structured tool name", async () => {
   assert.equal(judge instanceof LlmRiskJudge, true);
   assert.equal(APPROVAL_JUDGE_TOOL_NAME, "approval_judge_submit");
 });
+
+test("oversized arguments require complete manual review without a truncated model call", async () => {
+  const { session } = sessionMock();
+  let calls = 0;
+  const judge = new LlmRiskJudge(session, async () => {
+    calls += 1;
+    return { verdict: "allow", intent: "ok", riskLevel: "low", reason: "" };
+  });
+  const assessment = await judge.assess({
+    toolName: "bash", toolArgs: { command: "x".repeat(4_100) + " TAIL" }
+  });
+  assert.equal(assessment.verdict, "require_approval");
+  assert.equal(calls, 0);
+});

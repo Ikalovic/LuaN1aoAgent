@@ -101,19 +101,107 @@ test("auto mode submits judge-flagged calls to the registry and denies blocks", 
   });
 });
 
-test("auto mode falls back to the static dangerous list when the judge fails", async () => {
+test("auto mode requires approval for unknown tools when the judge fails", async () => {
   const { pi, handlers } = harness();
-  const { judge } = judgeMock({ bash: new LlmJudgeUnavailableError("judge down") });
+  const { judge } = judgeMock({
+    bash: new LlmJudgeUnavailableError("judge down"),
+    some_future_tool: new LlmJudgeUnavailableError("judge down")
+  });
   const { registry, submissions } = registryMock();
   createToolApprovalExtension({ mode: "auto", context, judge: judge as never, registry })(pi as never);
 
   await invoke(handlers, "bash", {});
   assert.deepEqual(submissions.map((item) => item.toolName), ["bash"]);
 
-  // Unknown tool + unavailable judge: allowed (conservative fallback allows unknowns).
   const result = await invoke(handlers, "some_future_tool", {});
-  assert.equal(result, undefined);
+  assert.equal((result as { block: boolean }).block, true);
+  assert.equal(submissions.length, 2);
+});
+
+test("lazy judge initialization failure falls back to manual approval", async () => {
+  const { pi, handlers } = harness();
+  const { registry, submissions } = registryMock();
+  createToolApprovalExtension({
+    mode: "auto", context, registry,
+    judge: async () => { throw new Error("initialization failed"); }
+  })(pi as never);
+  const result = await invoke(handlers, "some_future_tool", {});
+  assert.equal((result as { block: boolean }).block, true);
   assert.equal(submissions.length, 1);
+});
+
+test("manual approval sees the complete payload and cannot authorize mutated arguments", async () => {
+  const { pi, handlers } = harness();
+  const args = { command: "x".repeat(9_000) + " ORIGINAL_TAIL" };
+  const original = args.command;
+  let reviewed = "";
+  createToolApprovalExtension({
+    mode: "strict", context,
+    terminalApprover: async (input) => {
+      reviewed = input.toolArgs;
+      args.command = "changed after review";
+      return "approve";
+    }
+  })(pi as never);
+  const result = await invoke(handlers, "bash", args);
+  assert.equal(JSON.parse(reviewed).command, original);
+  assert.equal((result as { block: boolean }).block, true);
+});
+
+test("judge approval cannot authorize arguments changed while judging", async () => {
+  const { pi, handlers } = harness();
+  const args = { command: "original" };
+  createToolApprovalExtension({
+    mode: "auto", context,
+    judge: { assess: async () => {
+      args.command = "changed";
+      return { verdict: "allow", intent: "ok", riskLevel: "low", reason: "" };
+    } } as never
+  })(pi as never);
+  const result = await invoke(handlers, "bash", args);
+  assert.equal((result as { block: boolean }).block, true);
+});
+
+test("stop during judge wait promptly blocks and creates no late approval", async () => {
+  const { pi, handlers } = harness();
+  const abort = new AbortController();
+  const { registry, submissions } = registryMock();
+  let release!: (value: never) => void;
+  const judge = new Promise<never>((resolve) => { release = resolve; });
+  createToolApprovalExtension({ mode: "auto", context, registry, signal: abort.signal,
+    judge: () => judge
+  })(pi as never);
+  const result = invoke(handlers, "bash", {});
+  abort.abort();
+  assert.equal((await result as { block: boolean }).block, true);
+  release(undefined as never);
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(submissions.length, 0);
+});
+
+test("a stricter live policy invalidates an in-flight judge allow", async () => {
+  const { pi, handlers } = harness();
+  let mode: "auto" | "strict" = "auto";
+  createToolApprovalExtension({ mode: () => mode, context,
+    judge: { assess: async () => {
+      mode = "strict";
+      return { verdict: "allow", intent: "ok", riskLevel: "low", reason: "" };
+    } } as never
+  })(pi as never);
+  assert.equal((await invoke(handlers, "bash", {}) as { block: boolean }).block, true);
+});
+
+test("task cancellation clears a pending web approval", async () => {
+  const { pi, handlers } = harness();
+  const abort = new AbortController();
+  const registry = new ToolApprovalRegistry();
+  createToolApprovalExtension({ mode: "strict", context, registry, signal: abort.signal })(pi as never);
+  const result = invoke(handlers, "bash", {});
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(registry.pendingCount, 1);
+  abort.abort();
+  assert.equal((await result as { block: boolean }).block, true);
+  assert.equal(registry.pendingCount, 0);
 });
 
 test("auto mode without a judge submits non-readonly tools for approval", async () => {
