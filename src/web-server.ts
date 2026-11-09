@@ -263,6 +263,11 @@ type ActiveRun = {
 
 const args = parseArgs(process.argv.slice(2));
 loadLocalEnvFile(process.env);
+const networkPool = process.env.LUANNIAO_NETWORK_POOL?.trim();
+if (networkPool) {
+  // 这是绕开 docker 默认小地址池的关键开关；打出来是为了在续跑失败时能自证。
+  console.log(`[network] docker network pool: ${networkPool}`);
+}
 const host = args.host ?? (process.env.WEB_HOST?.trim() || "127.0.0.1");
 const port = parseWebPort(args.port ?? process.env.WEB_PORT ?? "8787");
 const cwd = process.cwd();
@@ -2197,7 +2202,16 @@ async function handleStartRun(request: IncomingMessage, response: ServerResponse
         console.log(`[web run finished] ${activeRun.runtimeInput}: completed=${result.completed} reason=${result.stoppedReason ?? "-"}`);
       })
       .catch((error: unknown) => {
-        console.error(`[web run failed] ${activeRun.runtimeInput}:`, error instanceof Error ? error.message : error);
+        const message = error instanceof Error ? error.message : String(error);
+        console.error(`[web run failed] ${activeRun.runtimeInput}:`, message);
+        // 续跑失败以前只写 console，界面上表现为"点了继续没反应"。写进事件流后
+        // Trace 页能直接看到原因，这一条与 run_started 之前抛错的路径对应。
+        void activeRun.controller.executionLog.append({
+          role: "runtime",
+          eventType: "run_failed",
+          summary: `Run failed before completion: ${message}`,
+          payload: { runtimeDir: activeRun.runtimeInput, continued, message }
+        }).catch(() => undefined);
       })
       // Cleanup is best-effort. A slow Docker/Gateway teardown must not turn
       // an otherwise completed run into an unhandled rejection that crashes
@@ -2228,7 +2242,18 @@ async function handleStartRun(request: IncomingMessage, response: ServerResponse
   } catch (error) {
     activeRuns.delete(runtimeDir);
     if (run) await cleanupRun(run);
-    else await agentRuntime?.close();
+    else {
+      const message = error instanceof Error ? error.message : String(error);
+      if (agentRuntime) {
+        await agentRuntime.controller.executionLog.append({
+          role: "runtime",
+          eventType: "run_failed",
+          summary: `Run failed to start: ${message}`,
+          payload: { runtimeDir, continued, message }
+        }).catch(() => undefined);
+      }
+      await agentRuntime?.close();
+    }
     throw error;
   }
 }

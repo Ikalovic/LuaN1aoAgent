@@ -127,6 +127,7 @@ export class NetworkSandboxManager {
   private connectorStartPromise?: Promise<void>;
   private targetImageIdPromise?: Promise<string>;
   private cleanupNetworkPending = false;
+  private readonly networkPool?: ParsedAddressPool;
 
   constructor(input: {
     runtimeDir: string;
@@ -152,6 +153,10 @@ export class NetworkSandboxManager {
     this.captureEnvironment = networkCaptureDockerEnv(input.environment ?? process.env);
     this.knownTaskIds = [...new Set(input.knownTaskIds ?? [])].sort();
     this.hostEgressBroker = input.hostEgressBroker ?? new HostEgressBroker();
+    this.networkPool = parseAddressPool(
+      (input.environment ?? process.env).LUANNIAO_NETWORK_POOL,
+      (input.environment ?? process.env).LUANNIAO_NETWORK_POOL_SIZE
+    );
   }
 
   configureAuthorizedScope(scope: string): Promise<void> {
@@ -911,14 +916,11 @@ export class NetworkSandboxManager {
       }
       return false;
     }
-    const created = await this.runner([
-      "network", "create", "--driver", "bridge",
+    await this.createManagedNetwork("network", this.networkName, [
       "--label", "luanniao.managed=true", "--label", "luanniao.role=run-network",
       "--label", `luanniao.run_ref=${this.runRef}`,
-      "--label", `luanniao.runtime_dir=${this.runtimeDir}`,
-      this.networkName
+      "--label", `luanniao.runtime_dir=${this.runtimeDir}`
     ]);
-    if (created.code !== 0) throw new Error(`Failed to create network ${this.networkName}: ${created.stderr}`);
     return true;
   }
 
@@ -940,18 +942,112 @@ export class NetworkSandboxManager {
       this.taskNetworks.add(taskId);
       return { name, subnet };
     }
-    const created = await this.runner([
-      "network", "create", "--driver", "bridge",
+    await this.createManagedNetwork("task network", name, [
       "--label", "luanniao.managed=true", "--label", "luanniao.role=task-network",
       "--label", `luanniao.run_ref=${this.runRef}`,
       "--label", `luanniao.task_ref=${taskId}`,
-      "--label", `luanniao.runtime_dir=${this.runtimeDir}`,
-      name
+      "--label", `luanniao.runtime_dir=${this.runtimeDir}`
     ]);
-    if (created.code !== 0) throw new Error(`Failed to create task network ${name}: ${created.stderr}`);
     this.taskNetworks.add(taskId);
     const subnet = await this.networkSubnet(name);
     return { name, subnet };
+  }
+
+  /**
+   * 创建受管网络。Docker 默认地址池很小（172.16.0.0/12 的 13 个 /16，再加
+   * 192.168.0.0/16 的 16 个 /20），而这个项目每个任务要两张网络。池子一旦被
+   * 占满，`network create` 会报 "all predefined address pools have been fully
+   * subnetted"，运行会在 run_started 之前死掉，界面上只看到"点了没反应"。
+   *
+   * 这里做两件事：配置了 LUANNIAO_NETWORK_POOL 时从指定网段分配显式 subnet；
+   * 没配置且撞上池耗尽时，回收没有容器挂载的孤儿网络后重试一次。
+   */
+  private async createManagedNetwork(
+    kind: "network" | "task network",
+    name: string,
+    labels: string[]
+  ): Promise<void> {
+    const first = await this.tryCreateManagedNetwork(name, labels);
+    if (first.code === 0) return;
+    const message = (first.stderr || first.stdout || "").trim() || "docker network create failed";
+    if (!isAddressPoolExhausted(message)) {
+      throw new Error(`Failed to create ${kind} ${name}: ${message}`);
+    }
+    const reaped = await this.reapOrphanManagedNetworks(name);
+    if (reaped > 0) {
+      const retry = await this.tryCreateManagedNetwork(name, labels);
+      if (retry.code === 0) return;
+      const retryMessage = (retry.stderr || retry.stdout || "").trim() || message;
+      throw new Error(`Failed to create ${kind} ${name} after reaping ${reaped} orphan network(s): ${retryMessage}`);
+    }
+    throw new Error(
+      `Failed to create ${kind} ${name}: ${message}. `
+      + "Docker 地址池已耗尽，且没有可回收的孤儿网络；"
+      + "请设置 LUANNIAO_NETWORK_POOL（例如 10.213.0.0/16）或放宽 docker 的 default-address-pools。"
+    );
+  }
+
+  private async tryCreateManagedNetwork(name: string, labels: string[]): Promise<CommandResult> {
+    const base = ["network", "create", "--driver", "bridge"];
+    const candidates = this.subnetCandidates(name);
+    if (candidates.length === 0) return this.runner([...base, ...labels, name]);
+    let last: CommandResult | undefined;
+    for (const subnet of candidates) {
+      const result = await this.runner([...base, "--subnet", subnet, ...labels, name]);
+      if (result.code === 0) return result;
+      last = result;
+      if (!isSubnetConflict(`${result.stderr}\n${result.stdout}`)) return result;
+    }
+    return last ?? { code: 1, stdout: "", stderr: "no candidate subnet left in LUANNIAO_NETWORK_POOL" };
+  }
+
+  /** 按网络名散列出候选子网，避免并发创建时抢同一个段。 */
+  private subnetCandidates(name: string): string[] {
+    const pool = this.networkPool;
+    if (!pool) return [];
+    const slots = 2 ** (pool.subnetPrefix - pool.prefixLength);
+    if (!Number.isFinite(slots) || slots <= 0) return [];
+    const start = createHash("sha256").update(name).digest().readUInt32BE(0) % slots;
+    const attempts = Math.min(slots, 16);
+    const candidates: string[] = [];
+    for (let offset = 0; offset < attempts; offset += 1) {
+      candidates.push(formatSubnet(pool.base, pool.subnetPrefix, (start + offset) % slots));
+    }
+    return candidates;
+  }
+
+  /** 回收没有容器挂载的受管网络，最旧的先删，最多 8 张。 */
+  private async reapOrphanManagedNetworks(keep: string): Promise<number> {
+    const listed = await this.runner([
+      "network", "ls", "--filter", "label=luanniao.managed=true", "--format", "{{.Name}}"
+    ]);
+    if (listed.code !== 0) return 0;
+    const protectedNames = this.taskNetworkNames();
+    protectedNames.add(this.networkName);
+    protectedNames.add(keep);
+    const orphans: Array<{ name: string; created: string }> = [];
+    for (const raw of listed.stdout.split("\n")) {
+      const name = raw.trim();
+      if (!name || protectedNames.has(name)) continue;
+      const inspected = await this.runner(["network", "inspect", "--format", "{{len .Containers}}|{{.Created}}", name]);
+      if (inspected.code !== 0) continue;
+      const [containers, created] = inspected.stdout.trim().split("|");
+      if (containers !== "0" || !created) continue;
+      orphans.push({ name, created });
+    }
+    orphans.sort((left, right) => left.created.localeCompare(right.created));
+    let removed = 0;
+    for (const orphan of orphans.slice(0, 8)) {
+      const result = await this.runner(["network", "rm", orphan.name]);
+      if (result.code === 0) removed += 1;
+    }
+    return removed;
+  }
+
+  private taskNetworkNames(): Set<string> {
+    const names = new Set<string>();
+    for (const taskId of this.taskNetworks) names.add(this.taskNetworkName(taskId));
+    return names;
   }
 
   private async networkSubnet(name: string): Promise<string> {
@@ -1270,6 +1366,72 @@ function parseDrainAck(stdout: string, expectedEpochRef: string): GatewayEpochDr
     netBytes: Number(result.netBytes),
     flushed: true
   };
+}
+
+/** LUANNIAO_NETWORK_POOL 的解析结果，用来绕开 Docker 默认的小地址池。 */
+type ParsedAddressPool = {
+  /** 池的起始网络地址，32 位无符号整数。 */
+  base: number;
+  /** 池本身的掩码长度，例如 10.213.0.0/16 的 16。 */
+  prefixLength: number;
+  /** 分给每张网络的掩码长度，默认 /24。 */
+  subnetPrefix: number;
+};
+
+function parseAddressPool(baseValue?: string, sizeValue?: string): ParsedAddressPool | undefined {
+  const raw = baseValue?.trim();
+  if (!raw) return undefined;
+  const [address, prefixText] = raw.split("/");
+  const base = address ? parseIpv4(address) : undefined;
+  const prefixLength = Number.parseInt(prefixText ?? "", 10);
+  const subnetPrefix = Number.parseInt((sizeValue ?? "").trim() || "24", 10);
+  if (base === undefined) return undefined;
+  if (!Number.isInteger(prefixLength) || prefixLength < 8 || prefixLength > 28) return undefined;
+  if (!Number.isInteger(subnetPrefix) || subnetPrefix <= prefixLength || subnetPrefix > 30) return undefined;
+  return { base: (base & prefixMask(prefixLength)) >>> 0, prefixLength, subnetPrefix };
+}
+
+function parseIpv4(value: string): number | undefined {
+  const parts = value.split(".");
+  if (parts.length !== 4) return undefined;
+  let result = 0;
+  for (const part of parts) {
+    if (!/^\d{1,3}$/.test(part)) return undefined;
+    const octet = Number(part);
+    if (octet > 255) return undefined;
+    result = (result << 8) + octet;
+  }
+  return result >>> 0;
+}
+
+function prefixMask(prefixLength: number): number {
+  if (prefixLength <= 0) return 0;
+  return (0xffffffff << (32 - prefixLength)) >>> 0;
+}
+
+function formatSubnet(base: number, subnetPrefix: number, index: number): string {
+  const step = 2 ** (32 - subnetPrefix);
+  return `${intToIpv4(base + index * step)}/${subnetPrefix}`;
+}
+
+function intToIpv4(value: number): string {
+  const normalized = value % 4294967296;
+  return [
+    (normalized >>> 24) & 0xff,
+    (normalized >>> 16) & 0xff,
+    (normalized >>> 8) & 0xff,
+    normalized & 0xff
+  ].join(".");
+}
+
+/** Docker 地址池耗尽的报错。命中后先回收孤儿网络再重试。 */
+function isAddressPoolExhausted(message: string): boolean {
+  return /all predefined address pools have been fully subnetted|no available subnet|address pool|pool exhausted/i.test(message);
+}
+
+/** 显式 --subnet 撞车时的报错，换下一个候选子网。 */
+function isSubnetConflict(message: string): boolean {
+  return /Pool overlaps|overlaps with existing|already exists|invalid subnet|out of range|is reserved/i.test(message);
 }
 
 function dockerCommand(args: string[], stdin?: string): Promise<CommandResult> {
